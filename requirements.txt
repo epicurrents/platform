@@ -21,7 +21,7 @@ pywebpush==2.4.0
 # OpenID Connect external login (user/oidc.py). Used only for ID-token
 # (JWS/JWKS) signature validation; imported lazily so the platform runs
 # without it when OIDC_ENABLED is off.
-Authlib>=1.7.2,<2
+Authlib>=1.8.0,<2
 
 # Federated FUSE filesystem (optional — only needed to run mount_federation_fs)
 # Also requires libfuse2 on the host: sudo apt install libfuse2
