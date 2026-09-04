@@ -1,0 +1,64 @@
+# Observability overlay — Loki + Promtail + Grafana on the `observability`
+# profile. STARTING TEMPLATE; pin/tune before production use.
+#
+# Run alongside the base stack (paths resolve from the project root, which
+# is the first -f file's directory):
+#
+#   docker compose -f docker-compose.yml \
+#     -f examples/observability/docker-compose.observability.yml \
+#     --profile observability up -d
+#
+# Grafana then lives at http://127.0.0.1:3000 — add a Loki data source at
+# http://loki:3100 and query, e.g.:
+#   {container=~"epicurrents.*"} | json | logger="epicurrents.security"
+#
+# The `epicurrents` network is defined by the base compose file and shared
+# here so Promtail can reach Loki and all three join the app network.
+services:
+  loki:
+    image: grafana/loki:3.1.1
+    profiles: ["observability"]
+    command: -config.file=/etc/loki/loki-config.yaml
+    volumes:
+      - ./examples/observability/loki-config.yaml:/etc/loki/loki-config.yaml:ro
+      - ./examples/observability/rules.yaml:/loki/rules/fake/rules.yaml:ro
+      - loki-data:/loki
+    networks:
+      - epicurrents
+
+  promtail:
+    image: grafana/promtail:3.1.1
+    profiles: ["observability"]
+    command: -config.file=/etc/promtail/promtail-config.yaml
+    volumes:
+      - ./examples/observability/promtail-config.yaml:/etc/promtail/promtail-config.yaml:ro
+      # Read-only access to the Docker socket for container discovery. This
+      # grants visibility into all containers on the host — acceptable for a
+      # log shipper, but note it is a privileged mount.
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - promtail-positions:/tmp
+    depends_on:
+      - loki
+    networks:
+      - epicurrents
+
+  grafana:
+    image: grafana/grafana:11.2.0
+    profiles: ["observability"]
+    environment:
+      - GF_AUTH_ANONYMOUS_ENABLED=false
+    # Loopback-only by default — put it behind the same proxy/auth as the
+    # rest of the stack before exposing it.
+    ports:
+      - "127.0.0.1:3000:3000"
+    volumes:
+      - grafana-data:/var/lib/grafana
+    depends_on:
+      - loki
+    networks:
+      - epicurrents
+
+volumes:
+  loki-data:
+  promtail-positions:
+  grafana-data:

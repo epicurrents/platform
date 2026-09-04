@@ -1,0 +1,42 @@
+# Auth boundary in front of Loki on the evidence host. STARTING TEMPLATE.
+#
+# Loki OSS has no authentication. The tailnet already limits who can reach
+# this port, but a shipping credential is what makes the application host's
+# access *write-only* — with tailnet reachability alone, a compromised
+# application host can read back and search everything it ever sent, which
+# is most of what an attacker wants from a log archive.
+#
+# Two credentials, deliberately different:
+#   - shipper: may POST to the push endpoint only.
+#   - reader:  may query. Used by a human with Grafana or logcli, never by
+#              the application host.
+#
+# Generate hashes with:  docker run --rm caddy:2.11.4 caddy hash-password
+:3100 {
+	# Plain HTTP: the tailnet already provides transport encryption
+	# (WireGuard). Do not expose this port outside the tailnet — see
+	# BIND_ADDR in docker-compose.evidence.yml.
+
+	@push {
+		method POST
+		path /loki/api/v1/push
+	}
+
+	handle @push {
+		basic_auth {
+			# FILL: replace with the output of `caddy hash-password`.
+			shipper $2a$14$REPLACE_WITH_BCRYPT_HASH_FOR_SHIPPER
+		}
+		reverse_proxy loki:3100
+	}
+
+	# Everything else is the read/query surface, behind a different
+	# credential. Listed second so the push matcher wins for that one path.
+	handle {
+		basic_auth {
+			# FILL: replace with the output of `caddy hash-password`.
+			reader $2a$14$REPLACE_WITH_BCRYPT_HASH_FOR_READER
+		}
+		reverse_proxy loki:3100
+	}
+}

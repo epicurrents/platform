@@ -1,0 +1,237 @@
+# Caddyfile — TLS termination and static-asset offload for the Epicurrents stack.
+#
+# Mounted read-only into the `caddy` service by docker-compose.proxy.yml. Caddy
+# owns three jobs here:
+#
+#   1. TLS. Certificates are obtained and renewed automatically from Let's
+#      Encrypt for {$PROXY_DOMAIN}; plain HTTP is redirected to HTTPS. Django
+#      keeps SECURE_SSL_REDIRECT as a second line of defence for anyone who
+#      reaches gunicorn directly, and remains the single source of the HSTS
+#      header (see epicurrents/settings/production.py) so the two layers cannot
+#      drift apart.
+#
+#   2. Static-asset offload. gunicorn runs a bounded thread pool
+#      (GUNICORN_WORKERS x GUNICORN_THREADS), and every one of the viewer's
+#      multi-megabyte bundles, Pyodide wheels, and SPA chunks used to occupy a
+#      slot in it. Those files are served from disk here instead. Anything that
+#      needs Django — the SPA document, the public viewer, the API, recording
+#      downloads — still proxies through.
+#
+#   3. Edge hygiene. A header-read timeout the WSGI tier cannot express, and a
+#      request-body ceiling that rejects an oversized upload before it reaches
+#      the application.
+#
+# The static blocks replicate the Cache-Control / CORP / Content-Type decisions
+# made in epicurrents/views.py. When a rule changes there, change it here too —
+# a mismatch is invisible until a stale bundle or a COEP-blocked fetch shows up
+# in a browser. The pairing is asserted by
+# epicurrents/tests/test_proxy_asset_headers.py.
+#
+# What deliberately does NOT move here: index.html and every other SPA document
+# response. frontend_view() calls Django's get_token() to seed the csrftoken
+# cookie on the document, and SESSION_CSRF_ENFORCED rejects session-authenticated
+# writes without it. Serving index.html from disk would break every write in the
+# SPA. Only /assets/* — content-hashed, cookie-free — is offloaded.
+{
+	# ACME account contact. Let's Encrypt mails expiry warnings here once
+	# renewal has been failing for a while, which is the only notification an
+	# unmonitored single-host deployment gets before the cert lapses.
+	email {$PROXY_ACME_EMAIL}
+
+	# Point at Let's Encrypt staging while working out DNS and firewall rules:
+	# staging issues untrusted certs but has far higher rate limits, so a failed
+	# dry run does not burn the production quota for the week.
+	acme_ca {$PROXY_ACME_CA:https://acme-v02.api.letsencrypt.org/directory}
+
+	servers {
+		timeouts {
+			# Slowloris guard — a client that dribbles out its request headers
+			# is cut loose. There is deliberately no read_body timeout: a 2 GB
+			# recording upload legitimately runs for many minutes.
+			read_header 15s
+			idle 5m
+		}
+	}
+}
+
+{$PROXY_DOMAIN} {
+	log {
+		output stdout
+		format json
+	}
+
+	# Reject an oversized body at the edge instead of streaming gigabytes into
+	# gunicorn only for the upload view to refuse it. Keep in step with
+	# RECORDINGS_MAX_UPLOAD_SIZE (default 2 GB); the application still enforces
+	# its own per-type limits, this is only the outer ceiling.
+	request_body {
+		max_size {$PROXY_MAX_BODY_SIZE:2GB}
+	}
+
+	# ── /static/ — collectstatic output (Django admin + API docs chrome) ──────
+	# Not content-hashed (no ManifestStaticFilesStorage), so a long max-age would
+	# serve stale admin assets across a Django upgrade. Django sends no-store on
+	# these today; this keeps that exactly and takes only the bytes off gunicorn.
+	handle /static/* {
+		root * /srv
+		header Cache-Control "no-store, no-cache, must-revalidate, private"
+		header Cross-Origin-Resource-Policy same-origin
+		encode zstd gzip
+		file_server
+	}
+
+	# ── /assets/ — content-hashed SPA bundles ────────────────────────────────
+	# Immutable, matching frontend_view()'s opt-in for this prefix. A miss 404s
+	# rather than falling through to the SPA index: a stale client asking for a
+	# deleted chunk should get an obvious 404, not an HTML document delivered to
+	# a script tag. This is the same reasoning viewer_view() already applies to
+	# file-like paths, and it also keeps the immutable Cache-Control off any
+	# Django response.
+	handle /assets/* {
+		root * /srv/frontend
+		header Cache-Control "public, max-age=31536000, immutable"
+		header Cross-Origin-Resource-Policy same-origin
+		encode zstd gzip
+		file_server
+	}
+
+	# ── /vendor/ — the Pyodide lockfile ──────────────────────────────────────
+	# Unlike the wheels beside it the lockfile is not version-pinned: it is
+	# edited after vendoring (the mne/pooch merge) and may be regenerated, so it
+	# has to revalidate. An immutable entry pins a stale lock and, once a service
+	# worker has cached it, survives even DevTools' "disable cache".
+	#
+	# It gets its own block rather than a matcher inside the block below because
+	# two `header Cache-Control` lines in one block do not narrow the way they
+	# read: the unconditional one wins and the matcher-scoped one is silently
+	# inert. Mutually exclusive handle blocks are unambiguous. The contract test
+	# enforces one Cache-Control per block for exactly this reason.
+	@vendor_lock path /vendor/*.json
+	handle @vendor_lock {
+		root * /srv
+		header Cache-Control no-cache
+		header Cross-Origin-Resource-Policy same-origin
+		encode zstd gzip
+		file_server
+	}
+
+	# ── /vendor/ — deploy-vendored Pyodide runtime and wheel closure ──────────
+	# Version-pinned, so immutable. The Content-Type overrides use the `>`
+	# (defer) form so they apply after file_server has written its own guess:
+	# Go's mime table maps neither .wasm nor .mjs reliably, and a browser
+	# refuses to compile WebAssembly served under the wrong type.
+	handle /vendor/* {
+		root * /srv
+		header Cache-Control "public, max-age=31536000, immutable"
+		header Cross-Origin-Resource-Policy same-origin
+		@wasm path *.wasm
+		header @wasm >Content-Type application/wasm
+		@mjs path *.mjs
+		header @mjs >Content-Type "text/javascript; charset=utf-8"
+		encode zstd gzip
+		file_server
+	}
+
+	# ── /viewer/ — the viewer library bundle ─────────────────────────────────
+	# Fixed filename, so it must revalidate on every load or a deploy keeps
+	# serving the previous lib. The regexp (rather than a path glob) is load-
+	# bearing: per-project builds live at viewer-dist/<project>/, and Caddy's
+	# path globs do not cross a path separator, so a glob silently missed every
+	# nested build and cached it for a year.
+	@viewer_lib path_regexp ^/viewer/.*epicurrents-lib\.
+	handle @viewer_lib {
+		root * /srv
+		header Cache-Control no-cache
+		header Cross-Origin-Resource-Policy same-origin
+		@cjs path *.cjs
+		header @cjs >Content-Type "application/javascript; charset=utf-8"
+		encode zstd gzip
+		file_server
+	}
+
+	# ── /viewer/ — content-hashed worker bundles ─────────────────────────────
+	@viewer_worker path_regexp ^/viewer/.*\.worker-
+	handle @viewer_worker {
+		root * /srv
+		header Cache-Control "public, max-age=31536000, immutable"
+		header Cross-Origin-Resource-Policy same-origin
+		encode zstd gzip
+		file_server
+	}
+
+	# ── /viewer/ — everything else that names a file ─────────────────────────
+	# The extension test is what keeps /viewer/<mode> (the public viewer, which
+	# has no extension) on the Django path: that route resolves modes from
+	# settings and sets the COOP/COEP document headers that make the page
+	# cross-origin isolated. Django's URLconf gives the public-viewer route
+	# precedence over the file passthrough, and this preserves that precedence.
+	@viewer_asset {
+		path /viewer/*
+		path_regexp \.[A-Za-z0-9]+$
+	}
+	handle @viewer_asset {
+		root * /srv
+		header Cache-Control "no-store, no-cache, must-revalidate, private"
+		header Cross-Origin-Resource-Policy same-origin
+		encode zstd gzip
+		file_server
+	}
+
+	# ── Error responses ──────────────────────────────────────────────────────
+	# A miss inside an immutable-cached prefix would otherwise inherit that
+	# prefix's year-long Cache-Control and pin the 404 in every browser cache
+	# that saw it — including one produced by a half-finished deploy, where the
+	# file reappears seconds later and no client ever asks again.
+	handle_errors {
+		header >Cache-Control "no-store, no-cache, must-revalidate, private"
+		respond "{err.status_code} {err.status_text}" {err.status_code}
+	}
+
+	# ── Everything else — Django ─────────────────────────────────────────────
+	# reverse_proxy sets X-Forwarded-For / -Proto / -Host. Django only trusts the
+	# forwarded scheme when TRUSTED_PROXIES or USE_X_FORWARDED_PROTO says to; the
+	# proxy overlay sets the latter, since with this overlay in place the web
+	# container is no longer published to anything but loopback.
+	#
+	# No response buffering: a streamed download must pass through rather than
+	# accumulate here.
+	handle {
+		reverse_proxy web:8000 {
+			# Announces that a proxy able to serve files from disk is in front.
+			# Set rather than merely trusted, so a client cannot supply it — and
+			# its absence is what makes a request that reached gunicorn directly
+			# (over the loopback binding kept for debugging) stream normally
+			# instead of answering with an empty body.
+			header_up X-Epicurrents-Offload 1
+
+			# X-Accel-Redirect, spelled for Caddy. Django authorises the request
+			# on its own terms — same URL, same permission check, same Activity
+			# row — and answers with an empty 200 plus X-Epicurrents-Serve-Path when the
+			# caller may have the file verbatim. Everything else (a 403, a 404,
+			# a middleware-transformed stream) carries no such header, matches
+			# no handle_response, and passes through untouched. The decision
+			# lives entirely in epicurrents/offload.py; nothing here knows which
+			# URLs are downloadable. The header is namespaced because this
+			# matcher sees every response Django returns, and a generic name
+			# could be set by some plugin's upstream and silently replace its
+			# response with a file from disk.
+			#
+			# Headers come from the upstream rather than being guessed, because
+			# file_server knows nothing about display names or PHI. Cache-Control
+			# in particular is not optional: SecurityHeadersMiddleware never runs
+			# on a response Django did not write, and an offloaded recording
+			# without no-store is PHI sitting in a browser cache. The `>` form
+			# defers each one until after file_server has written its own.
+			@offload header X-Epicurrents-Serve-Path *
+			handle_response @offload {
+				header >Cache-Control "no-store, no-cache, must-revalidate, private"
+				header >Content-Type {rp.header.X-Epicurrents-Serve-Content-Type}
+				header >Content-Disposition {rp.header.X-Epicurrents-Serve-Disposition}
+				header >Cross-Origin-Resource-Policy same-origin
+				rewrite * {rp.header.X-Epicurrents-Serve-Path}
+				root * /srv/protected
+				file_server
+			}
+		}
+	}
+}

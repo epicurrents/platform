@@ -1,0 +1,38 @@
+{
+    // Python editing — use Ruff (the project's pinned linter / formatter, enforced
+    // in CI via .github/workflows/ci.yml) for both format-on-save and lint
+    // surfacing.  Without this file every contributor's editor falls back to
+    // Pylance / Pyright defaults, which surface a different set of warnings
+    // than CI cares about — so "no errors locally, fails on CI" (or the inverse)
+    // becomes the norm.  Requires the charliermarsh.ruff extension (recommended
+    // via .vscode/extensions.json).
+    "[python]": {
+        "editor.defaultFormatter": "charliermarsh.ruff",
+        "editor.formatOnSave": true,
+        "editor.codeActionsOnSave": {
+            "source.fixAll.ruff": "explicit",
+            "source.organizeImports.ruff": "explicit"
+        }
+    },
+
+    // Disable the legacy Python linting API so it doesn't run in parallel with
+    // Ruff and surface duplicate / divergent warnings.  Ruff covers everything
+    // the legacy linters would.
+    "python.linting.enabled": false,
+
+    // The Python extension's type-checker (Pyright) is a separate concern from
+    // linting — the project does not currently enforce type coverage as an
+    // invariant, so leaving it on surfaces thousands of "errors" on untyped
+    // Django ORM calls that are not actual defects.  Set to "basic" if you
+    // personally want light type checking; "off" matches what CI enforces.
+    "python.analysis.typeCheckingMode": "off",
+
+    // Soft-cap ruler at column 120 — the project's Python / TypeScript line-length
+    // limit (see AGENTS.md → Style and convention rules → Line length).  Shared here
+    // so the visual guide is consistent across contributors and survives machine
+    // migrations.  Markdown is exempt: its prose is not hard-wrapped, so no ruler.
+    "editor.rulers": [120],
+    "[markdown]": {
+        "editor.rulers": []
+    }
+}

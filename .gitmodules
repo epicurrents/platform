@@ -1,0 +1,19 @@
+[submodule "frontend/viewer"]
+	path = frontend/viewer
+	url = https://github.com/epicurrents/app
+
+[submodule "docs/epicurrents"]
+	path = docs/epicurrents
+	url = https://github.com/epicurrents/epicurrents.github.io
+	branch = main
+
+[submodule "plugins/dicom/ohif-viewer"]
+	path = plugins/dicom/ohif-viewer
+	url = https://github.com/OHIF/Viewers.git
+	# Plugin-specific submodule: only initialised when the dicom plugin is
+	# enabled (EPICURRENTS_PLUGINS contains `dicom`). `update = none` tells
+	# `git submodule update --init --recursive` to skip it by default.
+	# scripts/bootstrap.sh and scripts/enable_plugin.sh check the enabled
+	# plugins and call `git submodule update --init --checkout
+	# plugins/dicom/ohif-viewer` explicitly when dicom is enabled.
+	update = none

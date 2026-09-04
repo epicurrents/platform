@@ -1,0 +1,1 @@
+"""Recordings app test suite."""

@@ -1,0 +1,81 @@
+# Automated dependency-update PRs. Covers the ecosystems Dependabot scans
+# directly. Note what it does NOT cover: docker-compose image pins (postgres,
+# redis, busybox, borgmatic, and the observability examples) are not read by
+# Dependabot's docker ecosystem (it scans Dockerfiles only), and the viewer git
+# submodule carries its dependencies in its own repo — both stay on the manual /
+# security-audit cadence.
+#
+# Conventional-commit prefixes match the repo convention; minor + patch
+# updates are grouped per ecosystem to limit PR noise, while major updates
+# arrive as individual PRs for deliberate review.
+version: 2
+updates:
+  # Python — requirements*.txt at the repo root (bounded by constraints.txt).
+  - package-ecosystem: pip
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "chore(deps)"
+    groups:
+      python-minor-patch:
+        update-types: ["minor", "patch"]
+        # Django is excluded so it never rides along in a grouped auto-update.
+        # Its "minor" releases (6.0 → 6.1 …) are feature releases that drop
+        # deprecated APIs and need a deliberate, code-reviewed upgrade — the
+        # kind that broke the group PR. Excluding it here means every Django
+        # bump (even a patch) arrives as its own PR we can review on its own.
+        exclude-patterns:
+          - "django"
+
+  # Frontend npm packages (the platform SPA; the viewer submodule is separate).
+  - package-ecosystem: npm
+    directory: "/frontend"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "chore(deps)"
+    groups:
+      npm-minor-patch:
+        update-types: ["minor", "patch"]
+    ignore:
+      # TypeScript 7 is the native (Go) compiler: it ships platform binaries, drops
+      # `tsserver`, and no longer exposes `lib/tsc` — which is exactly what vue-tsc
+      # loads, so `vue-tsc` (and therefore `npm run build`) crashes outright on it.
+      # No released vue-tsc supports TS 7; its `typescript: ">=5.0.0"` peer range is
+      # open-ended, so npm installs the combination happily and it fails only at run
+      # time. Suppress major bumps until Volar/vue-tsc ships TS 7 support, then drop
+      # this entry and upgrade deliberately. Minor/patch updates are unaffected.
+      - dependency-name: "typescript"
+        update-types: ["version-update:semver-major"]
+      # @types/node is held at 24.x deliberately. @lit-labs/ssr (via
+      # @awesome.me/webawesome) requires @types/node 24.x, so 24 is the only major
+      # that dedupes to a single flat copy. Any other major forces a *nested*
+      # @types/node + undici-types under @awesome.me/webawesome — and Dependabot's
+      # lockfile updater omits those nested entries, producing a lockfile that
+      # `npm ci` rejects outright ("Missing: @types/node@24.13.3 from lock file").
+      # That broke main twice. 24.x is also closer to the Node 22 the project
+      # actually runs on than 26 was. Revisit when webawesome/@lit-labs/ssr moves.
+      - dependency-name: "@types/node"
+        update-types: ["version-update:semver-major"]
+
+  # The Dockerfile base image (python:3.x-slim).
+  - package-ecosystem: docker
+    directory: "/"
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: "chore(deps)"
+
+  # GitHub Actions — keeps the SHA-pinned actions in .github/workflows current.
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: "chore(deps)"
+    groups:
+      actions-minor-patch:
+        update-types: ["minor", "patch"]

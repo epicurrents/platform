@@ -1,0 +1,156 @@
+# Loki ruler rules for the evidence host. STARTING TEMPLATE — tune windows
+# and thresholds to your traffic before relying on them.
+#
+# Two families, and the first is why this host exists.
+#
+# ABSENCE rules fire when the application host stops sending its heartbeat.
+# Every other control in the intrusion-detection design produces evidence
+# *on the host it protects*, so stopping the stack, killing celery-beat or
+# dropping the log shipper silences all of them at once. Only a rule
+# evaluated somewhere else notices that silence. These cannot be hosted on
+# the application host and mean anything.
+#
+# They key on the system.heartbeat event, not on log traffic in general,
+# because the shipper sends only the epicurrents.security stream and a
+# healthy quiet system emits nothing on it. Absence of *any* line is normal
+# here; absence of the heartbeat is not.
+#
+# PRESENCE rules fire on security events in the stream. They are the same
+# rules as examples/observability/rules.yaml, which is the development-time
+# copy; this is the one that matters, because it is out of reach of anyone
+# who compromises the application host. The duplication is deliberate and
+# is a drift hazard — the planned contract test (see README) checks both
+# files against the taxonomy in epicurrents/security_log.py.
+#
+# Selectors here use {host="epicurrents-app"}, the shipper's external
+# label, rather than a container-name pattern: the compose project name
+# prefixes container names, so a pattern that assumes it matches nothing on
+# a deployment that renamed the project — and a rule matching nothing never
+# fires and never says why.
+#
+# NOT COVERED HERE: backup liveness. Borgmatic writes to its own container
+# stdout, which the narrowed shipper does not send, so a "no backup in 26h"
+# rule would have nothing to evaluate. That signal is BORG_MONITOR_URL\'s
+# job — see docs/operations.md -> Know when a backup fails. Two mechanisms
+# for two streams, deliberately, rather than widening this one.
+groups:
+  - name: evidence-host-deadman
+    rules:
+      # The watchdog: always firing, by design. Route it to an external
+      # dead-man's-switch (healthchecks.io, Dead Man's Snitch) that alerts
+      # when it STOPS arriving. Without it, the evidence host itself is an
+      # unwatched single point of failure — every rule below is silent if
+      # this machine is off, and silence is indistinguishable from calm.
+      # Confirm this expression evaluates against the pinned Loki version
+      # before relying on it — a ruler that errors on the rule produces no
+      # alert, which is indistinguishable from a healthy host until the
+      # external monitor's first timeout. Deploying it is its own test: no
+      # ping means no rule.
+      - alert: EvidenceHostWatchdog
+        expr: vector(1) > 0
+        for: 0m
+        labels:
+          severity: watchdog
+        annotations:
+          summary: "Evidence host alive"
+          description: "Always firing. Its absence at the external monitor means the evidence host or its Alertmanager is down."
+
+      # The heartbeat is missing. This is the rule the whole host exists for.
+      #
+      # It keys on system.heartbeat rather than on log flow in general,
+      # because the shipper sends only the epicurrents.security stream —
+      # which on a healthy, quiet system emits nothing at all. Watching for
+      # "any line" would fire on every calm half-hour; watching for the one
+      # event that says all is well distinguishes calm from severed.
+      #
+      # Fires whether the cause is an attacker stopping the stack, celery
+      # beat dying, a broken shipper or the tailnet going down. It does not
+      # distinguish, deliberately: all four need looking at, and an attacker
+      # gets to choose which one it looks like.
+      #
+      # 20m against a 5m emit interval tolerates three missed beats. Derive
+      # this from the interval_seconds field the event carries rather than
+      # from memory — the sender publishes it so the two ends cannot drift.
+      - alert: ApplicationHostHeartbeatMissing
+        expr: |
+          absent_over_time(
+            {host="epicurrents-app"} | json | security_event_type="system.heartbeat" [20m]
+          )
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: "No heartbeat from the application host for 20 minutes"
+          description: "epicurrents.tasks.emit_security_heartbeat has stopped arriving. The host, celery-beat, the logging path, the shipper or the network is down — or someone stopped one of them. Treat as an incident until shown otherwise."
+
+      # Enable when Phase 1 of the intrusion-detection design lands and the
+      # integrity check emits a clean-run summary line. Until then it would
+      # fire permanently, which trains people to ignore the channel.
+      # - alert: AuditIntegrityCheckMissing
+      #   expr: |
+      #     absent_over_time({host="epicurrents-app"} |= "verify_audit_integrity" [26h])
+      #   for: 0m
+      #   labels:
+      #     severity: critical
+      #   annotations:
+      #     summary: "No audit-integrity check run in 26 hours"
+
+  - name: epicurrents-security
+    rules:
+      # Audit-trail tampering — the highest-signal events. Any occurrence is
+      # worth paging on: the hash chain only breaks on corruption or
+      # tampering.
+      - alert: EpicurrentsAuditTamper
+        expr: |
+          sum(count_over_time(
+            {host="epicurrents-app"} | json
+              | security_event_type=~"audit\\.(chain_break|hash_verification_failed|genesis_invalid|chain_gap)"
+            [5m]
+          )) > 0
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Audit-trail integrity event ({{ $labels.security_event_type }})"
+          description: "An audit hash-chain integrity event was logged. Investigate immediately — see docs/debugging.md and activity/README.md."
+
+      # Federated auth failures — probing, or a misconfigured/compromised peer.
+      - alert: EpicurrentsFederationAuthFailures
+        expr: |
+          sum(count_over_time(
+            {host="epicurrents-app"} | json
+              | security_event_type="federation.auth_failed"
+            [10m]
+          )) > 5
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Elevated federated authentication failures"
+          description: "More than 5 federation.auth_failed events in 10m. Check FederationAuditLog for the source peer."
+
+      - alert: EpicurrentsLoginBruteForce
+        expr: |
+          sum(count_over_time(
+            {host="epicurrents-app"} | json
+              | security_event_type=~"auth\\.login_(lockout|blocked)"
+            [10m]
+          )) > 10
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Login lockouts/blocks elevated — possible brute force"
+
+      - alert: EpicurrentsPermissionDenialSpike
+        expr: |
+          sum(count_over_time(
+            {host="epicurrents-app"} | json
+              | security_event_type="permission.denied"
+            [10m]
+          )) > 50
+        for: 0m
+        labels:
+          severity: info
+        annotations:
+          summary: "Permission-denial rate elevated"

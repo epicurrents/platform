@@ -1,0 +1,24 @@
+cff-version: 1.2.0
+message: >-
+  If you use this software, please cite it using the metadata below. A journal
+  article describing the platform is in preparation; this file will be updated
+  with the article's citation on acceptance.
+type: software
+title: Epicurrents platform
+abstract: >-
+  A self-hosted platform for storing, viewing, annotating and sharing
+  neurophysiological signal recordings, with content-addressed immutable
+  storage, an audited access model, de-identifying export middleware and
+  virtual private network federation between instances.
+authors:
+  - family-names: Lohi
+    given-names: Sampsa
+version: 0.1.0
+license: Apache-2.0
+repository-code: https://github.com/epicurrents/platform
+url: https://docs.epicurrents.io
+keywords:
+  - EEG
+  - neurophysiology
+  - EDF
+  - biosignals

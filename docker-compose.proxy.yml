@@ -1,0 +1,121 @@
+# TLS-termination overlay, layered on top of docker-compose.prod.yml.
+#
+# Usage:
+#     docker compose -f docker-compose.yml -f docker-compose.prod.yml -f docker-compose.proxy.yml up -d
+#
+# scripts/bootstrap.sh and scripts/update.sh append this file automatically when
+# PROXY_DOMAIN is set in .env, so the three-file invocation above is only needed
+# when driving compose by hand.
+#
+# The overlay is opt-in because not every deployment terminates its own TLS. A
+# tailnet-only deployment (compose profile ``tailnet``) already gets HTTPS from
+# Tailscale's certificate service, and an institutional deployment often sits
+# behind an existing ingress. Those keep the prod overlay's direct binding and
+# set TRUSTED_PROXIES to the fronting proxy's range instead.
+#
+# What it changes:
+#
+#   - Adds ``caddy``: terminates TLS on 80/443 (and 443/udp for HTTP/3), obtains
+#     and renews Let's Encrypt certificates for PROXY_DOMAIN, serves the static
+#     asset trees straight from disk, and proxies everything else to web. The
+#     routing and per-prefix cache headers live in caddy/Caddyfile.
+#
+#   - Un-publishes web. The prod overlay binds ${HOST_PORT} on all interfaces
+#     because without a proxy that binding *is* the deployment; with caddy in
+#     front the only thing that should reach gunicorn is caddy, so the binding
+#     drops back to loopback. It stays published there so an operator on the
+#     host can still curl the health endpoint and compare it against what the
+#     proxy is serving.
+#
+#   - Sets USE_X_FORWARDED_PROTO so Django trusts caddy's X-Forwarded-Proto and
+#     SECURE_SSL_REDIRECT stops looping. That is safe *because* of the previous
+#     point: the header is client-supplied, and a client can no longer reach
+#     gunicorn to supply it. TRUSTED_PROXIES is still worth setting so the
+#     security log attributes the real client IP rather than caddy's — see
+#     .env.example.
+
+services:
+  web:
+    ports: !override
+      - "127.0.0.1:${HOST_PORT:-8000}:8000"
+    environment:
+      - USE_X_FORWARDED_PROTO=True
+      # Only true where a proxy is in front AND mounts the recordings volume —
+      # both of which this overlay is. Django still authorises and audits every
+      # request; only the byte transfer moves. Never applies to a
+      # middleware-applied grant (epicurrents/offload.py).
+      - PROXY_FILE_OFFLOAD_ENABLED=True
+      # Passed to the app as well as the proxy so the boot guard in
+      # epicurrents/apps.py can compare the two ceilings and refuse to start on
+      # a mismatch, rather than letting large uploads fail at the edge with a
+      # 413 that says nothing about which limit rejected them.
+      - PROXY_MAX_BODY_SIZE=${PROXY_MAX_BODY_SIZE:-2GiB}
+
+  caddy:
+    # Pinned to a patch version like the other non-Dockerfile images here.
+    # Dependabot's docker ecosystem only scans Dockerfiles, so compose pins are
+    # bumped by hand — check https://hub.docker.com/_/caddy on update.
+    image: caddy:2.11.4
+    # A TLS terminator that does not come back after a host reboot takes the
+    # whole deployment with it.
+    restart: unless-stopped
+    # Caddy writes a JSON access line per request, including one per range
+    # request from the viewer, so it is the noisiest service in the stack. The
+    # anchor in docker-compose.prod.yml cannot be referenced across files, hence
+    # the repetition; keep the two in step.
+    logging:
+      driver: json-file
+      options:
+        max-size: "${LOG_MAX_SIZE:-10m}"
+        max-file: "${LOG_MAX_FILE:-5}"
+    ports:
+      # 80 is not optional: it carries the ACME HTTP-01 challenge and the
+      # redirect to HTTPS. 443/udp enables HTTP/3.
+      - "${PROXY_HTTP_PORT:-80}:80"
+      - "${PROXY_HTTPS_PORT:-443}:443"
+      - "${PROXY_HTTPS_PORT:-443}:443/udp"
+    environment:
+      - PROXY_DOMAIN=${PROXY_DOMAIN:?PROXY_DOMAIN is not set — add the public hostname to .env (e.g. PROXY_DOMAIN=eeg.example.com), or drop docker-compose.proxy.yml from the compose file list if this deployment does not terminate its own TLS}
+      - PROXY_ACME_EMAIL=${PROXY_ACME_EMAIL:?PROXY_ACME_EMAIL is not set — add a contact address to .env; Let's Encrypt mails certificate-expiry warnings there, which is the only renewal alarm an unmonitored deployment gets}
+      - PROXY_ACME_CA=${PROXY_ACME_CA:-https://acme-v02.api.letsencrypt.org/directory}
+      # 2GiB, not 2GB: Caddy reads bare `GB` as decimal 2,000,000,000 while
+      # RECORDINGS_MAX_UPLOAD_SIZE defaults to 2 * 1024^3 = 2,147,483,648. The
+      # old default left a 147 MB window where an upload passed Django's own
+      # limit and was then rejected at the edge with an unrelated 413.
+      - PROXY_MAX_BODY_SIZE=${PROXY_MAX_BODY_SIZE:-2GiB}
+    volumes:
+      - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      # Issued certificates and the ACME account key. This is state, not cache:
+      # losing it forces re-issuance on next start, and Let's Encrypt's
+      # duplicate-certificate rate limit will refuse after a handful of those.
+      - caddy-data:/data
+      - caddy-config:/config
+      # The same trees web serves from, read-only. Both services mount the
+      # identical host paths and named volume, so they cannot fall out of step.
+      - static:/srv/static:ro
+      - ./frontend/dist:/srv/frontend:ro
+      - ./frontend/viewer-dist:/srv/viewer:ro
+      - ./frontend/vendor:/srv/vendor:ro
+      # Read-only mount of the recordings volume, reachable only through the
+      # handle_response block in the Caddyfile — no route serves /srv/protected
+      # directly, so an unauthorised request has nothing to ask for. Read-only
+      # because the proxy has no business writing to the recording store.
+      - recordings-data:/srv/protected/recordings:ro
+    healthcheck:
+      # Caddy's admin API listens on loopback inside the container and answers
+      # only once the config has been loaded, which makes it a truthful
+      # readiness signal for the proxy itself. A GET, not `wget --spider`: that
+      # sends HEAD, which this endpoint answers with 405, so the check would
+      # have failed forever and left the container permanently unhealthy.
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:2019/config/"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+    depends_on:
+      - web
+    networks:
+      - epicurrents
+
+volumes:
+  caddy-data:
+  caddy-config:

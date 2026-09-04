@@ -1,0 +1,155 @@
+# Python / Django
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg-link
+*.manifest
+*.spec
+
+
+# Virtual environment
+.venv/
+venv/
+env/
+ENV/
+
+# Environment variables
+.env
+.env.*
+!.env.example
+
+# Django
+*.sqlite3
+/staticfiles/
+# collectstatic output when STATIC_ROOT points at the checkout (build sweep).
+/static/
+/mediafiles/
+# Runtime upload/staging volumes — the source app lives at /media/ in-repo
+# and is committed; only the file-system trees configured by
+# MEDIA_UPLOAD_PATH / MEDIA_STAGING_PATH should be ignored.
+/media_uploads/
+/media_staging/
+
+# Project lifecycle state — per-deployment archive registry written by the
+# activate_project / deactivate_project commands. Regenerated when missing
+# (project_loader.get_project_state returns {} if absent); not source.
+projects/.state.json
+
+# Celery
+celerybeat-schedule
+celerybeat.pid
+
+# Logs
+*.log
+logs/
+
+# Cache directories
+.*_cache/
+
+# pytest-cov data file and HTML report
+.coverage
+.coverage.*
+htmlcov/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDEs
+# Personal Claude Code settings; the shared hook config and skills are tracked.
+.claude/settings.local.json
+# Symlink to .review/agents/, recreated by scripts/install-dev-tools.sh.
+.claude/agents
+# Ignore VS Code dir by default but track the two project-wide files that pin
+# editor behaviour (Ruff as Python formatter, recommended extensions list) so
+# every contributor's editor surfaces the same diagnostics as CI.  See
+# docs/developing.md → "VS Code setup".
+.vscode/*
+!.vscode/settings.json
+!.vscode/extensions.json
+.idea/
+*.swp
+*.swo
+
+# Frontend – Vite / Node
+frontend/node_modules/
+# Each project's frontend links to the platform's node_modules so it can
+# resolve the platform's dependencies from outside frontend/. Created by
+# `npm run link:projects`, which the frontend postinstall runs.
+projects/*/frontend/node_modules
+frontend/node_external/
+frontend/dist/
+frontend/viewer-dist/
+frontend/.dist/
+frontend/.vite/
+frontend/.cache/
+frontend/*.local
+frontend/coverage/
+frontend/.env
+frontend/.env.*
+!frontend/.env.example
+
+# Local-only scripts (personal dev workflow, target paths, etc.)
+scripts-local/
+
+# Credentials created in place beside tracked templates, which is exactly the
+# arrangement that gets one committed by accident: the log-shipping password on
+# the application host and the SMTP password on the evidence host (see
+# examples/evidence-host/README.md), and the Hetzner API tokens in the
+# per-machine provisioning configs under examples/hetzner/.
+/shipper-password
+/examples/evidence-host/smtp-password
+/examples/evidence-host/shipper-password
+/examples/evidence-host/watchdog-url
+
+/examples/hetzner/*.env
+!/examples/hetzner/*.env.example
+
+# Deployment-specific documents — a filled-in privacy notice, correspondence
+# with a data protection officer, the operator's own runbook notes. The repo
+# ships templates; what an operator writes into one names a real organisation
+# and often its open compliance gaps, so it must not reach a shared history.
+# Excluded from the Docker build context too (see .dockerignore). The README
+# documents the convention and IS tracked, hence the negation — which requires
+# the /* form, since git cannot re-include a path inside an excluded directory.
+/local/*
+!/local/README.md
+
+# Local test data — real recordings the smoke tests read. Never committed: they
+# are patient data and far too large for git. Drop a de-identified EDF/BDF in
+# (``testdata/test.edf`` is the name the smoke tests look for by default, or point
+# EPICURRENTS_SMOKE_EDF at another file). Excluded from the Docker build context
+# too (see .dockerignore) — the test service reaches it through the .:/code bind
+# mount, so no recording is ever baked into an image. The README documents the
+# convention and IS tracked, hence the negation — which requires the /* form,
+# since git cannot re-include a path inside an excluded directory.
+/testdata/*
+!/testdata/README.md
+
+# Deploy-vendored, version-pinned assets (self-hosted Pyodide runtime + wheel
+# closure). Fetched at deploy, served at /vendor/, never committed.
+/frontend/vendor/
+
+# Review-agent transient diff snapshot — produced by the caller before
+# invoking the documentation-style agent (see .review/agents/documentation-style.md).
+.review/staged.diff
+# Don't track the findings produced by agents.
+.review/findings/*.md
+
+# Key material — belt-and-braces against an accidental `git add` of a
+# generated keypair (platform keys normally live only in .env).
+*.pem
+*.key
+id_rsa*
+id_ed25519*
+
+# scripts/lock-requirements.sh writes its scratch file beside the lock so the
+# final move is a same-filesystem rename; an interrupted run can leave one.
+requirements.lock.*
+projects/.spec-backend-only/

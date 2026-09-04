@@ -1,0 +1,9 @@
+# LF everywhere: the platform has no Windows runtime target and deploys to
+# Linux containers, so CRLF has no upside — it only bloats diffs when a
+# whole-file rewrite normalizes endings as a side effect. text=auto lets git
+# content-detect binaries (EDF fixtures, images) and leave them untouched.
+* text=auto eol=lf
+
+# Kept from the earlier shell-script rule (shellcheck rejects CR after a
+# shebang, SC1017); now redundant with the global rule but explicit is fine.
+*.sh text eol=lf

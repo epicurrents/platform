@@ -1,0 +1,1 @@
+"""Example project app scaffold."""

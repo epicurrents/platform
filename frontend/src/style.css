@@ -1,0 +1,323 @@
+:root {
+  font-family: Inter, system-ui, Avenir, Helvetica, Arial, sans-serif;
+  line-height: 1.5;
+  font-weight: 400;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-width: 320px;
+  min-height: 100vh;
+}
+
+#app {
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+}
+
+/* ── WA overrides ───────────────────────────────────────────────────── */
+
+wa-icon.inline {
+    /* Align inline icons a bit better with the adjacent text. */
+    position: relative;
+    top: -0.05em;
+}
+
+/* ── Navigation bar ─────────────────────────────────────────────────── */
+
+.app-nav {
+  display: flex;
+  align-items: center;
+  gap: var(--wa-space-2xs);
+  padding: 0 var(--wa-space-m);
+  height: var(--wa-space-3xl);
+  border-bottom: var(--wa-border-width-s) solid var(--wa-color-surface-border);
+  background: var(--wa-color-surface-default);
+  position: sticky;
+  top: 0;
+  z-index: 100;
+  flex-shrink: 0;
+}
+
+.nav-brand {
+  font-weight: 700;
+  font-size: var(--wa-font-size-m);
+  color: var(--wa-color-text-normal);
+  text-decoration: none;
+  margin-right: var(--wa-space-xs);
+}
+
+.nav-links {
+  display: flex;
+  align-items: center;
+  gap: var(--wa-space-3xs);
+  flex: 1;
+}
+
+.nav-link {
+  font-size: var(--wa-font-size-s);
+  color: var(--wa-color-text-quiet);
+  text-decoration: none;
+  padding: var(--wa-space-xs) var(--wa-space-s);
+  border-radius: var(--wa-border-radius-m);
+  transition: background-color var(--wa-transition-fast), color var(--wa-transition-fast);
+  white-space: nowrap;
+  letter-spacing: 0.022em;
+}
+
+.nav-link:hover {
+  background: var(--wa-color-neutral-fill-quiet);
+  color: var(--wa-color-text-normal);
+}
+
+.nav-link.active {
+  color: var(--wa-color-brand-on-quiet);
+  font-weight: 600;
+  background: var(--wa-color-brand-fill-quiet);
+  letter-spacing: 0;
+}
+
+.nav-end {
+  display: flex;
+  align-items: center;
+  gap: var(--wa-space-xs);
+  flex-shrink: 0;
+}
+
+/* ── Page layout ─────────────────────────────────────────────────────── */
+
+.page-view {
+  max-width: 960px;
+  margin: 0 auto;
+  padding: var(--wa-space-xl) var(--wa-space-m);
+  flex: 1;
+}
+  .page-view wa-callout {
+    margin-bottom: var(--wa-space-m);
+  }
+
+.page-view--narrow {
+  max-width: 640px;
+}
+
+.page-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--wa-space-m);
+  margin-bottom: var(--wa-space-l);
+}
+
+.page-header h1 {
+  margin: 0;
+  font-size: var(--wa-font-size-xl);
+}
+
+.page-header-start {
+  display: flex;
+  align-items: center;
+  gap: var(--wa-space-s);
+}
+
+.go-back-button {
+  margin-left: auto;
+}
+
+/* ── Loading & empty states ──────────────────────────────────────────── */
+
+.loading-center {
+  display: block;
+  margin: var(--wa-space-3xl) auto;
+  font-size: var(--wa-font-size-2xl);
+}
+
+.empty-state {
+  color: var(--wa-color-text-quiet);
+  text-align: center;
+  padding: var(--wa-space-3xl) 0;
+}
+
+/* ── Home sections ───────────────────────────────────────────────────── */
+
+.home-section {
+  margin-bottom: var(--wa-space-xl);
+}
+
+.section-heading {
+  display: flex;
+  align-items: center;
+  gap: var(--wa-space-xs);
+  font-size: var(--wa-font-size-m);
+  font-weight: 600;
+  margin: 0 0 var(--wa-space-s);
+  color: var(--wa-color-text-quiet);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+/* ── List rows ───────────────────────────────────────────────────────── */
+
+.list-rows {
+  display: flex;
+  flex-direction: column;
+}
+
+.list-row {
+  display: flex;
+  flex-direction: column;
+  padding: var(--wa-space-xs) var(--wa-space-s);
+  border-bottom: var(--wa-border-width-s) solid var(--wa-color-neutral-border-quiet);
+  transition: background-color var(--wa-transition-fast);
+}
+
+.list-row:last-child {
+  border-bottom: none;
+}
+
+.list-row.clickable {
+  cursor: pointer;
+  border-radius: var(--wa-border-radius-m);
+}
+
+.list-row.clickable:hover {
+  background-color: var(--wa-color-neutral-fill-quiet);
+}
+
+.list-row-main {
+  display: flex;
+  align-items: center;
+  gap: var(--wa-space-s);
+}
+
+.list-row-name {
+  font-weight: 500;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  flex: 1;
+}
+
+.list-row-meta {
+  font-size: var(--wa-font-size-s);
+  color: var(--wa-color-text-quiet);
+  flex-shrink: 0;
+}
+
+.list-row-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--wa-space-3xs);
+  flex-shrink: 0;
+  /* Keep actions visible but subtle until row is hovered */
+  opacity: 0.4;
+  transition: opacity var(--wa-transition-fast);
+}
+
+.list-row:hover .list-row-actions {
+  opacity: 1;
+}
+
+.row-badges {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--wa-space-2xs);
+}
+
+/* ── Section elements ────────────────────────────────────────────────── */
+
+.section-divider {
+    margin-block: 0.5rem;
+}
+
+.section-header {
+  display: flex;
+  align-items: center;
+  gap: var(--wa-space-s);
+  margin-top: var(--wa-space-l);
+  margin-bottom: var(--wa-space-s);
+}
+
+/*
+ * Title sits flush left; everything that follows clusters on the right edge
+ * with a consistent ``gap``. ``justify-content: space-between`` would spread
+ * the trailing buttons across the remaining width when there is more than
+ * one — using ``margin-right: auto`` on the title instead keeps the spacing
+ * static regardless of how many buttons follow.
+ */
+.section-header h2 {
+  margin: 0 auto 0 0;
+  font-size: var(--wa-font-size-m);
+  font-weight: 600;
+  color: var(--wa-color-text-normal);
+}
+
+/* ── Inline form panels ──────────────────────────────────────────────── */
+
+.form-panel {
+  background: var(--wa-color-surface-lowered);
+  border: var(--wa-border-width-s) solid var(--wa-color-neutral-border-quiet);
+  border-radius: var(--wa-border-radius-m);
+  padding: var(--wa-space-m);
+  margin-block: var(--wa-space-s);
+  display: flex;
+  flex-direction: column;
+  gap: var(--wa-space-s);
+}
+
+.form-actions {
+  display: flex;
+  gap: var(--wa-space-xs);
+  justify-content: flex-end;
+  margin-top: var(--wa-space-2xs);
+}
+
+/* ── Details drawer ──────────────────────────────────────────────────── */
+
+.details-hash {
+  font-family: var(--wa-font-family-code);
+  font-size: var(--wa-font-size-xs);
+  word-break: break-all;
+}
+
+/* ── Multi-selection ─────────────────────────────────────────────────── */
+
+.selection-bar {
+  display: flex;
+  align-items: center;
+  gap: var(--wa-space-s);
+  padding: var(--wa-space-xs) var(--wa-space-s);
+  background: var(--wa-color-brand-fill-quiet);
+  border-radius: var(--wa-border-radius-m);
+  margin-top: var(--wa-space-2xs);
+}
+
+.selection-bar__count {
+  flex: 1;
+  font-size: var(--wa-font-size-s);
+  font-weight: 500;
+  color: var(--wa-color-brand-on-quiet);
+}
+
+/* ── Project drawer ─────────────────────────────────────────────────── */
+
+.project-toggle-tab {
+    font-size: 0.5rem;
+    height: 1.5rem;
+    line-height: 1.5rem;
+    position: fixed;
+    right: 2.25rem;
+    top: -1px;
+    z-index: 10;
+}
+    .project-toggle-tab::part(base) {
+        border-radius: 0;
+    }

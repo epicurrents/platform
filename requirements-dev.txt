@@ -1,0 +1,5 @@
+-c constraints.txt
+# Pinned so CI's enforced formatting and lint rule set stay deterministic — an
+# unpinned ruff silently expands the rules each release. Bump deliberately (Dependabot).
+ruff==0.16.2
+pip-audit>=2.7

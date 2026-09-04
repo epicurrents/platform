@@ -1,0 +1,51 @@
+# Loki single-binary config — STARTING TEMPLATE, not production-tuned.
+# Filesystem storage, single replica, 31-day retention. For a real
+# deployment review storage backend, retention, and multi-tenant auth.
+# Targeted at Loki 3.x (pinned in docker-compose.observability.yml).
+auth_enabled: false
+
+server:
+  http_listen_port: 3100
+  grpc_listen_port: 9095
+
+common:
+  instance_addr: 127.0.0.1
+  path_prefix: /loki
+  storage:
+    filesystem:
+      chunks_directory: /loki/chunks
+      rules_directory: /loki/rules
+  replication_factor: 1
+  ring:
+    kvstore:
+      store: inmemory
+
+schema_config:
+  configs:
+    - from: 2024-01-01
+      store: tsdb
+      object_store: filesystem
+      schema: v13
+      index:
+        prefix: index_
+        period: 24h
+
+limits_config:
+  # Match (or exceed) the platform's own retention expectations; security
+  # events in particular should outlive a single incident-response window.
+  retention_period: 744h  # 31 days
+
+# The ruler evaluates the LogQL alert rules in rules.yaml and forwards
+# firing alerts to Alertmanager. With auth_enabled:false the single tenant
+# is "fake", so the compose overlay mounts rules.yaml at
+# /loki/rules/fake/rules.yaml.
+ruler:
+  storage:
+    type: local
+    local:
+      directory: /loki/rules
+  rule_path: /tmp/loki-rules
+  # Point this at your Alertmanager. Without one, rules still evaluate and
+  # are visible via the ruler API, but nothing is delivered.
+  alertmanager_url: http://alertmanager:9093
+  enable_api: true

@@ -1,0 +1,20 @@
+{
+  "files": [],
+  "compilerOptions": {
+    /* No "baseUrl": it is deprecated in TypeScript 6 and removed in 7. Path
+     * targets are therefore written relative to this file, which `paths` has
+     * supported without a baseUrl since TypeScript 4.1. */
+    "paths": {
+      "#root/*": ["./*"],
+      /* All the rest must point to the src-folder. */
+      "#*": ["./src/*"],
+    },
+  },
+  "exclude": [
+    "node_modules"
+  ],
+  "references": [
+    { "path": "./tsconfig.app.json" },
+    { "path": "./tsconfig.node.json" }
+  ]
+}

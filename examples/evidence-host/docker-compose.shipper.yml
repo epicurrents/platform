@@ -1,0 +1,46 @@
+# Log shipper overlay for the APPLICATION host. STARTING TEMPLATE.
+#
+# Runs alongside the base stack and pushes container logs to the evidence
+# host. Paths resolve from the project root, which is the first -f file's
+# directory:
+#
+#   docker compose -f docker-compose.yml \
+#     -f examples/evidence-host/docker-compose.shipper.yml \
+#     --profile shipper up -d
+#
+# Mutually exclusive with the observability example in practice — that one
+# ships to a Loki on this same host, which is the development story. Running
+# both is legitimate (query locally, retain remotely) but doubles the log
+# volume leaving the container runtime.
+services:
+  promtail-evidence:
+    image: grafana/promtail:3.1.1
+    profiles: ["shipper"]
+    restart: unless-stopped
+    command: -config.file=/etc/promtail/promtail-remote.yaml -config.expand-env=true
+    environment:
+      # The evidence host's push endpoint, e.g.
+      #   http://epicurrents-evidence.<tailnet>.ts.net:3100/loki/api/v1/push
+      - EVIDENCE_PUSH_URL=${EVIDENCE_PUSH_URL:?set EVIDENCE_PUSH_URL in .env}
+      # Empty (the default) sends direct, which needs this HOST on the tailnet.
+      # Set it to the compose tailscale container's outbound proxy — usually
+      # http://tailscale:1055 — to ship without installing anything on the host.
+      # promtail-remote.yaml explains why this cannot be an HTTP_PROXY variable.
+      - TAILNET_PROXY_URL=${TAILNET_PROXY_URL:-}
+    volumes:
+      - ./examples/evidence-host/promtail-remote.yaml:/etc/promtail/promtail-remote.yaml:ro
+      # The write-only shipping credential. Create it on this host with
+      #   printf '%s' 'the-password' > ./shipper-password
+      # It is the plaintext whose bcrypt hash goes in the evidence host's
+      # Caddyfile. Keep it out of git.
+      - ./shipper-password:/etc/promtail/shipper-password:ro
+      # Read-only Docker socket for container discovery. A privileged mount
+      # that sees every container on this host — and one the intrusion
+      # design's auditd rules watch, so expect it in the access record.
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - promtail-evidence-positions:/tmp
+    networks:
+      - epicurrents
+
+volumes:
+  promtail-evidence-positions:

@@ -1,0 +1,47 @@
+# Promtail config — ships the compose stack's container stdout to Loki,
+# parsing the production JSON log lines. STARTING TEMPLATE.
+#
+# Note: Grafana has succeeded Promtail with Grafana Alloy. Promtail still
+# works and is the simplest thing to illustrate the pipeline; for a
+# long-lived deployment migrate to Alloy (the JSON-parse + label stages
+# map across directly). See examples/observability/README.md.
+server:
+  http_listen_port: 9080
+
+positions:
+  filename: /tmp/positions.yaml
+
+clients:
+  - url: http://loki:3100/loki/api/v1/push
+
+scrape_configs:
+  - job_name: epicurrents-containers
+    # Discover containers via the Docker socket rather than tailing files,
+    # so this works regardless of the host log driver.
+    docker_sd_configs:
+      - host: unix:///var/run/docker.sock
+        refresh_interval: 5s
+    relabel_configs:
+      # /epicurrents-web-1 -> container="epicurrents-web-1"
+      - source_labels: ['__meta_docker_container_name']
+        regex: '/(.*)'
+        target_label: container
+      - source_labels: ['__meta_docker_container_log_stream']
+        target_label: stream
+    pipeline_stages:
+      # Parse the production JSON formatter's output (see
+      # epicurrents/log_formatters.py). Dev mode emits plain text, where
+      # these expressions simply find nothing and the raw line is kept.
+      - json:
+          expressions:
+            level: level
+            logger: logger
+            security_event_type: security_event_type
+      # Promote only low-cardinality fields to labels. security_event_type
+      # is a bounded set (~a dozen tokens) and is the field alert rules
+      # pivot on; level is bounded. logger is left as a parsed field and
+      # filtered at query time via `| json | logger="..."` to avoid stream
+      # explosion.
+      - labels:
+          level:
+          security_event_type:

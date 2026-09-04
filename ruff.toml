@@ -1,0 +1,64 @@
+# 120-column soft cap for Python (code + docstrings + comments).
+# Documented in AGENTS.md → Style and convention rules → Line length.
+line-length = 120
+
+[lint]
+# RUF012 (mutable-class-default) fires constantly on Django class attributes
+# (Meta options, field/permission lists); RUF059 (unused-unpacked-variable) is
+# usually an intentional throwaway. BLE001 (blind-except) flags the deliberate
+# catch-all `except Exception` in Celery tasks and signal handlers, where a
+# handler must never crash the worker or request — narrowing every site adds
+# noise without value. All three are noise for this codebase, so ignore them
+# rather than annotate every occurrence.
+ignore = ["RUF012", "RUF059", "BLE001"]
+
+# D100 — every Python module gets a docstring.
+# D104 — every Python package (__init__.py) gets a docstring.
+# Documented in AGENTS.md → Style and convention rules → Python docstring conventions.
+extend-select = ["D100", "D104"]
+
+[lint.isort]
+# Name the first-party packages explicitly rather than letting ruff infer them
+# from the directories present. Several apps import each other lazily inside
+# functions, and a checkout that lacks one of them (an intermediate commit of
+# the extraction ladder, a partial worktree) would otherwise reclassify the
+# import as third-party and reorder the block.
+known-first-party = [
+    "activity",
+    "annotations",
+    "compute",
+    "epicurrents",
+    "federation",
+    "library",
+    "media",
+    "notifications",
+    "plugins",
+    "projects",
+    "recordings",
+    "user",
+]
+
+[lint.flake8-bugbear]
+# django-ninja declares request params as call-valued argument defaults
+# (`def endpoint(q: str = Query(...))`, `file: UploadedFile = File(...)`). That
+# is the framework's intended API, not the B008 footgun, so treat these ninja
+# constructors as immutable.
+extend-immutable-calls = [
+    "ninja.Query",
+    "ninja.File",
+    "ninja.Form",
+    "ninja.Body",
+    "ninja.Path",
+    "ninja.Header",
+    "ninja.Cookie",
+]
+
+[lint.per-file-ignores]
+"epicurrents/settings/*.py" = ["F401", "F403", "F405"]
+# Django auto-generates migrations; forcing docstrings (module or package) here
+# is ceremony.
+"**/migrations/*.py" = ["D100", "D104"]
+# Nested `with` blocks in tests are usually a fixture stack (override_settings +
+# several patches); collapsing them into one parenthesized block hurts rather
+# than helps readability, so don't enforce SIM117 in test modules.
+"**/tests/*.py" = ["SIM117"]

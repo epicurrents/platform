@@ -1,0 +1,101 @@
+# Alertmanager for the evidence host. STARTING TEMPLATE — every [FILL]
+# below has to be answered before an alert reaches anyone.
+#
+# Alertmanager does NOT interpolate environment variables. Values here are
+# literal, which is why the SMTP password is read from a mounted file
+# instead: putting it in this file would commit a credential.
+#
+# Delivery is deliberately two-channel with email primary. A single channel
+# that fails silently is the same failure the dead-man rules exist to catch,
+# one level up.
+global:
+  resolve_timeout: 5m
+  # Port 587 with authentication, not 25: cloud providers commonly block
+  # outbound 25 on new accounts, and a blocked port looks exactly like a
+  # quiet night.
+  smtp_smarthost: "[FILL: smtp.provider.example:587]"
+  smtp_from: "[FILL: evidence-host@your-domain.example]"
+  smtp_auth_username: "[FILL: smtp username]"
+  smtp_auth_password_file: /etc/alertmanager/smtp-password
+  smtp_require_tls: true
+
+route:
+  receiver: oncall
+  group_by: ["alertname"]
+  group_wait: 30s
+  group_interval: 5m
+  # Long enough not to spam, short enough that an ignored critical comes
+  # back the same working day.
+  repeat_interval: 4h
+
+  routes:
+    # The watchdog never reaches a person. It goes to an external service
+    # whose job is to notice when it stops — which is what covers the case
+    # of this whole host being down. repeat_interval is short because the
+    # external monitor's own timeout is what it feeds.
+    - receiver: watchdog
+      matchers:
+        - severity = "watchdog"
+      group_wait: 0s
+      group_interval: 1m
+      repeat_interval: 1m
+      continue: false
+
+    # Informational rules go to the webhook only; they do not earn an email.
+    - receiver: chat
+      matchers:
+        - severity = "info"
+      continue: false
+
+receivers:
+  - name: oncall
+    email_configs:
+      - to: "[FILL: the address a human actually reads]"
+        send_resolved: true
+    webhook_configs:
+      # Second channel. Teams, Slack and ntfy all accept a webhook POST;
+      # Teams and Slack need their own payload shape, so put a small
+      # adapter (alertmanager-webhook-* or Prometheus msteams) in front
+      # rather than pointing this straight at a Teams connector URL.
+      - url: "[FILL: webhook URL, or delete this block to run email-only]"
+        send_resolved: true
+
+  - name: chat
+    webhook_configs:
+      - url: "[FILL: webhook URL]"
+        send_resolved: true
+
+  - name: watchdog
+    webhook_configs:
+      # A dead-man's-switch endpoint: healthchecks.io, Dead Man's Snitch or
+      # the same self-hosted monitor BORG_MONITOR_URL points at. It must be
+      # somewhere OTHER than this host and other than the application host,
+      # or it cannot report on either being gone.
+      #
+      # Read from a file, not written here: possession of a ping URL is enough
+      # to suppress the alarm by pinging it yourself, so it is a credential and
+      # belongs beside smtp-password rather than in a config file. Create it
+      # with, and note that the trailing newline matters:
+      #   umask 077; printf '%s' 'https://hc-ping.com/...' > watchdog-url
+      #   chown 65534:65534 watchdog-url        # Alertmanager runs as nobody
+      - url_file: /etc/alertmanager/watchdog-url
+        send_resolved: false
+
+inhibit_rules:
+  # When the heartbeat has stopped, every presence rule stops firing anyway;
+  # suppress the lower-severity noise around it so the page says one thing.
+  #
+  # The alertname must match rules.yaml exactly. It did not, once: the alert
+  # was renamed when it was re-pointed from log traffic to the heartbeat and
+  # this matcher kept the old name, which inhibits nothing and reports
+  # nothing. Alertmanager does not validate that an inhibit source exists.
+  #
+  # No `equal:` clause deliberately. Matching on a shared label would be
+  # tighter, but absence rules do not reliably carry the selector's labels
+  # through absent_over_time, and an inhibit rule that silently fails to
+  # match is worse than one that is slightly too broad — there is one
+  # application host.
+  - source_matchers:
+      - alertname = "ApplicationHostHeartbeatMissing"
+    target_matchers:
+      - severity =~ "warning|info"

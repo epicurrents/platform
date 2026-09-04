@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+# pre-commit — refuse the commit while any review agent has unresolved
+# findings.
+#
+# The repo's review agents (.review/agents/) each write a report to
+# .review/findings/<agent-name>.md.  An EMPTY file means clean; any
+# content means the agent flagged something on its last run.
+#
+# This hook only inspects file size — it does not parse the reports.
+# Address the findings (either fix the underlying issue and re-run the
+# agent so it overwrites the file with an empty result, or acknowledge
+# the finding by manually emptying the file), then retry the commit.
+#
+# Skip with `git commit --no-verify` when knowingly mid-flight.
+
+set -euo pipefail
+
+repo_root="$(git rev-parse --show-toplevel)"
+findings_dir="$repo_root/.review/findings"
+
+if [ ! -d "$findings_dir" ]; then
+    exit 0
+fi
+
+unresolved=()
+while IFS= read -r -d '' f; do
+    base="$(basename "$f")"
+    # README files document the directory; skip them.
+    [ "$base" = "README.md" ] && continue
+    if [ -s "$f" ]; then
+        unresolved+=("$base")
+    fi
+done < <(find "$findings_dir" -maxdepth 1 -type f -name '*.md' -print0)
+
+if [ ${#unresolved[@]} -gt 0 ]; then
+    printf '\n'
+    printf 'ERROR: review-agent findings are unresolved; commit blocked.\n'
+    printf '\n'
+    printf 'The following agents flagged issues on their last run:\n'
+    for agent in "${unresolved[@]}"; do
+        printf '  - %s\n' "${agent%.md}"
+        printf '      cat .review/findings/%s\n' "$agent"
+    done
+    printf '\n'
+    printf 'Resolve each finding (or empty its file to acknowledge), then\n'
+    printf 'retry the commit.  Bypass with `git commit --no-verify` only\n'
+    printf 'when knowingly mid-flight.\n'
+    printf '\n'
+    exit 1
+fi
+
+exit 0

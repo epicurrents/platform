@@ -1,0 +1,71 @@
+# Loki ruler alert rules for the epicurrents.security log stream.
+# STARTING TEMPLATE — tune thresholds and windows to your traffic, and
+# wire the ruler's alertmanager_url (see loki-config.yaml) to deliver them.
+#
+# Each rule filters the JSON log stream by logger and security_event_type
+# (see epicurrents/security_log.py for the taxonomy). The `| json` stage
+# makes both available whether or not Promtail promoted them to labels.
+groups:
+  - name: epicurrents-security
+    rules:
+      # Audit-trail tampering — the highest-signal events. Any occurrence
+      # is worth paging on: the hash chain only breaks on corruption or
+      # tampering.
+      - alert: EpicurrentsAuditTamper
+        expr: |
+          sum(count_over_time(
+            {container=~"epicurrents.*"} | json
+              | logger="epicurrents.security"
+              | security_event_type=~"audit\\.(chain_break|hash_verification_failed|genesis_invalid|chain_gap)"
+            [5m]
+          )) > 0
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Audit-trail integrity event ({{ $labels.security_event_type }})"
+          description: "An audit hash-chain integrity event was logged. Investigate immediately — see docs/debugging.md and activity/README.md."
+
+      # Federated auth failures — probing or a misconfigured/compromised peer.
+      - alert: EpicurrentsFederationAuthFailures
+        expr: |
+          sum(count_over_time(
+            {container=~"epicurrents.*"} | json
+              | security_event_type="federation.auth_failed"
+            [10m]
+          )) > 5
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Elevated federated authentication failures"
+          description: "More than 5 federation.auth_failed events in 10m. Check FederationAuditLog for the source peer."
+
+      # Login brute-force signal — lockouts and blocked-during-lockout attempts.
+      - alert: EpicurrentsLoginBruteForce
+        expr: |
+          sum(count_over_time(
+            {container=~"epicurrents.*"} | json
+              | security_event_type=~"auth\\.login_(lockout|blocked)"
+            [10m]
+          )) > 10
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Login lockouts/blocks elevated — possible brute force"
+
+      # Permission-denial spike — could indicate an account probing for
+      # objects it cannot reach (IDOR attempts).
+      - alert: EpicurrentsPermissionDenialSpike
+        expr: |
+          sum(count_over_time(
+            {container=~"epicurrents.*"} | json
+              | security_event_type="permission.denied"
+            [10m]
+          )) > 50
+        for: 0m
+        labels:
+          severity: info
+        annotations:
+          summary: "Permission-denial rate elevated"

@@ -1,0 +1,1 @@
+"""User app test suite."""

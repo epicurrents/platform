@@ -1,0 +1,107 @@
+# Promtail config for the APPLICATION host — ships container logs to the
+# evidence host over the tailnet. STARTING TEMPLATE.
+#
+# This file belongs on the application host, not the evidence host. It is
+# kept here so the two halves of the arrangement stay in one place; the
+# compose overlay that runs it is docker-compose.shipper.yml, alongside.
+#
+# Differs from examples/observability/promtail-config.yaml in four ways:
+# the client is remote and authenticated, an external label identifies this
+# host so the absence rules have something to key on, retries are generous
+# because a dropped batch here is a hole in the evidence, and — the
+# important one — only the epicurrents.security stream is sent.
+#
+# WHY THE SCOPE IS NARROW. The evidence host is off-premises, so everything
+# reaching it leaves the deployment's control. Shipping every container's
+# stdout would send far more than security events: gunicorn paths, celery
+# task arguments and, worst, tracebacks. Recording.processing_error is
+# author-private precisely because stack traces carry filesystem paths, and
+# paths on the data volumes can embed subject identifiers. The security
+# stream is the one channel with a standing no-raw-PII rule at every call
+# site (AGENTS.md -> Log security-related activity), which is what makes it
+# safe to send somewhere the deployment does not own.
+#
+# The cost is forensic reach: after an incident, the application logs that
+# would reconstruct it are still only on the host that was compromised.
+# That is the trade accepted here, and the reason the drop stage below is
+# an allowlist (keep what is named) rather than a blocklist (drop what is
+# named) -- a new noisy logger must not be able to start leaking by
+# default.
+server:
+  http_listen_port: 9080
+
+positions:
+  filename: /tmp/positions.yaml
+
+clients:
+  # Read from the environment rather than written in, so this file stays a
+  # template and the deployment's tailnet name lives in .env with every other
+  # deployment-specific value. Requires -config.expand-env=true, which the
+  # compose overlay passes.
+  - url: "${EVIDENCE_PUSH_URL}"
+    # Empty means direct, which is right whenever the host itself is on the
+    # tailnet. Set TAILNET_PROXY_URL (e.g. http://tailscale:1055) to go through
+    # the compose tailscale container's outbound proxy instead — the
+    # host-installs-nothing arrangement.
+    #
+    # It has to be named here. Promtail's client is built on Prometheus's HTTP
+    # config, which leaves the transport's proxy nil unless one is configured in
+    # the client block, so HTTP_PROXY / HTTPS_PROXY in the container environment
+    # are ignored and promtail dials the target itself. Measured, not assumed:
+    # with only the environment variables set it failed every push with
+    # "dial tcp: lookup ... server misbehaving", and the same container with
+    # this line delivered. An empty value is a clean no-op rather than an error.
+    proxy_url: "${TAILNET_PROXY_URL}"
+    # The write-only credential from the evidence host's Caddyfile. This
+    # host is never given the read credential: an attacker who takes it
+    # should not be able to search back through everything it has sent.
+    basic_auth:
+      username: shipper
+      password_file: /etc/promtail/shipper-password
+    # This label is what the ApplicationHostSilent rule watches for. Change
+    # it here and the dead-man rule stops matching, silently.
+    external_labels:
+      host: epicurrents-app
+    backoff_config:
+      min_period: 500ms
+      max_period: 5m
+      max_retries: 20
+
+scrape_configs:
+  - job_name: epicurrents-containers
+    docker_sd_configs:
+      - host: unix:///var/run/docker.sock
+        refresh_interval: 5s
+    relabel_configs:
+      # /epicurrents-web-1 -> container="epicurrents-web-1"
+      - source_labels: ["__meta_docker_container_name"]
+        regex: "/(.*)"
+        target_label: container
+      - source_labels: ["__meta_docker_container_log_stream"]
+        target_label: stream
+    pipeline_stages:
+      # In production the stack emits one JSON object per line; in
+      # development it is plain text, where `logger` parses as empty and the
+      # drop stage below discards the line. That is the intended behaviour:
+      # a development stack must not ship to an evidence host at all.
+      - json:
+          expressions:
+            level: level
+            logger: logger
+            security_event_type: security_event_type
+      # Promote the logger name so the allowlist below can select on it.
+      - labels:
+          logger:
+      # The allowlist. A label selector rather than a regex, because
+      # promtail's drop stage matches with Go RE2, which has no negative
+      # lookahead — "everything except this one value" is not expressible
+      # there and a regex attempt fails at config load. `!=` also matches a
+      # line whose logger label is absent, which is what a non-JSON
+      # (development-mode) line produces, so those are dropped too.
+      - match:
+          selector: '{logger!="epicurrents.security"}'
+          action: drop
+          drop_counter_reason: not_security_stream
+      - labels:
+          level:
+          security_event_type:

@@ -1,0 +1,42 @@
+<?xml version="1.0"?>
+<svg width="512" height="512" xmlns="http://www.w3.org/2000/svg" xmlns:svg="http://www.w3.org/2000/svg" version="1.1">
+
+ <g class="layer">
+  <title>Layer 1</title>
+  <g id="layer2">
+   <rect fill="#eee" height="512" width="512" rx="128" ry="128" x="0" y="0"/>
+   <path d="m64.36,117.77c87.22,-103.03 267.73,-101.54 357.81,-37.92c65.12,45.9 63.6,99.47 54.66,133.3c-8.54,25.63 -29.61,39.88 -56.36,41.88" fill="none" fill-opacity="0.5" id="path8840" stroke="#000000" stroke-width="7.5"/>
+   <path d="m411.61,268.63c24.99,38.44 -2.41,90.32 -68.77,77.72" fill="none" fill-opacity="0.5" id="path9259" stroke="#000000" stroke-width="7.5"/>
+   <path d="m47.43,144.46c-11.7,22.84 -31.27,106.33 30.72,145.13m28.38,10.24c28.7,8.51 64.31,9.13 88.45,5.69m23.05,12.88c0,0 11.77,21.02 20.73,28.71c14.41,12.36 39.76,12.04 49.35,28.42c7.56,12.91 4.38,43.1 4.38,43.1" fill="none" fill-opacity="0.5" id="path9261" stroke="#000000" stroke-width="7.5"/>
+   <path d="m349.32,397.2l-0.49,51.35" fill="none" fill-opacity="0.5" id="path9263" stroke="#000000" stroke-width="7.5"/>
+   <path d="m290.61,224.52c73.5,-21.84 73.59,-71.68 66.28,-108.62" fill="none" fill-opacity="0.5" id="path9267-2" stroke="#0057af" stroke-width="20" transform="matrix(1, 0, 0, 1, 0, 0)"/>
+   <path d="m418.88,128.43c45.28,34.99 19.31,102.18 -23.61,83.63" fill="none" fill-opacity="0.5" id="path9269" stroke="#0057af" stroke-width="20"/>
+   <path d="m220.21,110.24c-17.68,26.59 -22.78,91.14 -11.57,125.53" fill="none" fill-opacity="0.5" id="path9273" stroke="#0057af" stroke-width="20" transform="matrix(1, 0, 0, 1, 0, 0)"/>
+   <path d="m285,84.48c-10.51,-6.29 -34.48,-3.05 -46.21,5.86" fill="none" fill-opacity="0.5" id="path9273-7" stroke="#0057af" stroke-width="20" transform="matrix(1, 0, 0, 1, 0, 0)"/>
+   <path d="m139.58,255.26c-15.83,7.5 -53.16,7.08 -63.84,-33.69c-10.68,-40.77 13.42,-102.89 72.22,-124.06" fill="none" fill-opacity="0.5" id="path9275" stroke="#0057af" stroke-width="20" transform="matrix(1, 0, 0, 1, 0, 0)"/>
+   <path d="m144.26,181.57c-24.46,8.68 -44.04,8.3 -66.91,0.75" fill="none" fill-opacity="0.5" id="path9275-3" stroke="#0057af" stroke-width="20" transform="matrix(1, 0, 0, 1, 0, 0)"/>
+   <path d="m312.11,287.28l26.96,-13.05" fill="none" fill-opacity="0.5" id="path9279" stroke="#000000" stroke-width="7.5"/>
+   <circle cx="57.68" cy="131.22" fill="#007fff" fill-opacity="0.5" id="path9333" r="15" stroke="#000000" stroke-width="7.5"/>
+   <circle cx="161.19" cy="96.06" fill="#007fff" id="path9333-0" r="15" stroke="#000000" stroke-width="7.5" transform="matrix(1, 0, 0, 1, 0, 0)"/>
+   <circle cx="228.53" cy="99.18" fill="#007fff" id="path9333-0-5" r="15" stroke="#000000" stroke-width="7.5" transform="matrix(1, 0, 0, 1, 0, 0)"/>
+   <circle cx="152.23" cy="252.26" fill="#007fff" id="path9333-0-7" r="15" stroke="#000000" stroke-width="7.5" transform="matrix(1, 0, 0, 1, 0, 0)"/>
+   <circle cx="211.15" cy="249.65" fill="#007fff" id="path9333-0-45" r="15" stroke="#000000" stroke-width="7.5" transform="matrix(1, 0, 0, 1, 0, 0)"/>
+   <circle cx="408.79" cy="119.79" fill="#007fff" id="path9333-0-1" r="15" stroke="#000000" stroke-width="7.5" transform="matrix(1, 0, 0, 1, 0, 0)"/>
+   <circle cx="355.6" cy="102.41" fill="#007fff" id="path9333-0-1-7" r="15" stroke="#000000" stroke-width="7.5" transform="matrix(1, 0, 0, 1, 0, 0)"/>
+   <circle cx="383.26" cy="209.46" fill="#007fff" id="path9333-0-72" r="15" stroke="#000000" stroke-width="7.5" transform="matrix(1, 0, 0, 1, 0, 0)"/>
+   <circle cx="404.25" cy="255.33" fill="#007fff" fill-opacity="0.5" id="path9333-0-55" r="15" stroke="#000000" stroke-width="7.5"/>
+   <circle cx="299.03" cy="294.22" fill="#007fff" fill-opacity="0.5" id="path9333-0-08" r="15" stroke="#000000" stroke-width="7.5"/>
+   <circle cx="353.77" cy="265.86" fill="#007fff" fill-opacity="0.5" id="path9333-0-3" r="15" stroke="#000000" stroke-width="7.5"/>
+   <circle cx="327.89" cy="341.86" fill="#007fff" fill-opacity="0.5" id="path9333-0-64" r="15" stroke="#000000" stroke-width="7.5"/>
+   <circle cx="349.83" cy="383.23" fill="#007fff" fill-opacity="0.5" id="path9333-0-43" r="15" stroke="#000000" stroke-width="7.5"/>
+   <circle cx="347.83" cy="463" fill="#007fff" fill-opacity="0.5" id="path9333-0-89" r="15" stroke="#000000" stroke-width="7.5"/>
+   <circle cx="291.99" cy="435.08" fill="#007fff" fill-opacity="0.5" id="path9333-0-65" r="15" stroke="#000000" stroke-width="7.5"/>
+   <circle cx="92.08" cy="295.99" fill="#007fff" fill-opacity="0.5" id="path9333-0-79" r="15" stroke="#000000" stroke-width="7.5"/>
+   <circle cx="210.05" cy="305.09" fill="#007fff" fill-opacity="0.5" id="path9333-0-01" r="15" stroke="#000000" stroke-width="7.5"/>
+   <circle cx="277.77" cy="228.52" fill="#007fff" id="path9333-0-48" r="15" stroke="#000000" stroke-width="7.5" transform="matrix(1, 0, 0, 1, 0, 0)"/>
+   <circle cx="155.34" cy="176.6" fill="#007fff" id="path9333-0-7-4" r="15" stroke="#000000" stroke-width="7.5" transform="matrix(1, 0, 0, 1, 0, 0)"/>
+   <path d="m240.65,173.25c36.14,6.31 102.02,-26.58 66.72,-71.92" fill="none" fill-opacity="0.5" id="path9273-70" stroke="#0057af" stroke-width="20" transform="matrix(1, 0, 0, 1, 0, 0)"/>
+   <circle cx="297.88" cy="90.99" fill="#007fff" id="svg_1" r="15" stroke="#000000" stroke-width="7.5" transform="matrix(1, 0, 0, 1, 0, 0)"/>
+  </g>
+ </g>
+</svg>

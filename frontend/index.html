@@ -1,0 +1,90 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/svg+xml" href="/logo.svg" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <link rel="stylesheet" href="/viewer/epicurrents-lib.css" />
+    <title>Epicurrents</title>
+    <script>
+      // Prevent duplicate custom element registration errors when multiple bundles
+      // (e.g. the main app and the Epicurrents viewer UMD) both include WebAwesome.
+      ;(function () {
+          const _define = customElements.define.bind(customElements)
+          customElements.define = function (name, constructor, options) {
+              if (!customElements.get(name)) {
+                  _define(name, constructor, options)
+              }
+          }
+      })()
+    </script>
+    <script>
+      const setup = Object.assign(
+          new Object(null),
+          {
+              activeModules: [],
+              activeViews: ['biosignal', 'media'],
+              allowInsecureAuth: true,
+              appId: 'app',
+              appName: 'Epicurrents',
+              assetPath: '/viewer/',
+              containerId: 'viewer',
+              embedded: false,
+              isProduction: true,
+              locale: 'en',
+              logThreshold: 'WARN',
+              modules: {},
+              // Same-origin, matching src/App.vue and the public viewer's
+              // PUBLIC_VIEWER_MODES setup in epicurrents/settings/common.py. It was a
+              // jsdelivr URL pinned to Pyodide 0.25.0 while the deployment vendors
+              // 314.0.2, so the two disagreed on both the origin and the version: any
+              // path reaching this value before App.vue's override would have fetched a
+              // nine-major-versions-old runtime from a third party. Kept in step with
+              // the other two by hand — the version appears in three files.
+              pyodideAssetPath: '/vendor/pyodide/314.0.2/',
+              scope: 'local',
+              signalCacheMaxSize: 1000,
+              usePyodide: false,
+              user: null,
+              useSAB: true,
+          }
+      )
+      // Create the global Epicurrents object if not available.
+      if (typeof window.__EPICURRENTS__ === 'undefined') {
+          window.__EPICURRENTS__ = {
+              EVENT_BUS: null,
+              RUNTIME: null,
+              SETUP: setup,
+          }
+      } else {
+          if (typeof window.__EPICURRENTS__.EVENT_BUS === 'undefined') {
+              window.__EPICURRENTS__.EVENT_BUS = null
+          }
+          if (typeof window.__EPICURRENTS__.RUNTIME === 'undefined') {
+              window.__EPICURRENTS__.RUNTIME = null
+          }
+          if (typeof window.__EPICURRENTS__.SETUP === 'undefined') {
+              window.__EPICURRENTS__.SETUP = setup
+          } else {
+              // Merge existing setup with defaults.
+              window.__EPICURRENTS__.SETUP = Object.assign(
+                  new Object(null),
+                  setup,
+                  window.__EPICURRENTS__.SETUP
+              )
+          }
+      }
+    </script>
+  </head>
+  <body>
+    <div id="app"></div>
+    <script type="module" src="/src/main.ts"></script>
+    <script src="/viewer/epicurrents-lib.umd.js" defer></script>
+  </body>
+  <style>
+    html, body, main, #app {
+      width: 100%;
+      height: 100%;
+    }
+  </style>
+</html>

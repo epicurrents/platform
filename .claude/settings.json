@@ -1,0 +1,17 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Agent|Task",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "jq -r '.tool_input.subagent_type // \"\"' | { read -r t; if [ \"$t\" = \"documentation-style\" ]; then git -C \"${CLAUDE_PROJECT_DIR:-.}\" diff --staged -U0 > \"${CLAUDE_PROJECT_DIR:-.}/.review/staged.diff\"; fi; } 2>/dev/null || true",
+            "statusMessage": "Refreshing .review/staged.diff",
+            "timeout": 15
+          }
+        ]
+      }
+    ]
+  }
+}

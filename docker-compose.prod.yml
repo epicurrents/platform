@@ -1,0 +1,169 @@
+# Production overlay for docker-compose.yml.
+#
+# Usage:
+#     docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
+#
+# Or set COMPOSE_FILE=docker-compose.yml:docker-compose.prod.yml in the
+# shell / CI environment so plain `docker compose` commands pick up both
+# files automatically.
+#
+# Mode: the base file defines a docker DEVELOPMENT stack (DJANGO_MODE=
+# development, Postgres via DB_DEV_ENGINE=postgres, loopback-only port
+# binding). This overlay flips DJANGO_MODE=production for the four
+# Django services, replaces the runserver command with gunicorn, and
+# restores public port binding so the web container is reachable from
+# the host network. The DB_DEV_ENGINE setting becomes a no-op since
+# production.py drives Postgres directly via DB_*.
+#
+# Architecture: the web image is Python-only. Frontend bundles
+# (frontend/dist + frontend/viewer-dist) are produced on the deploy host
+# by the on-demand ``frontend-build`` profile service (Node.js) — see
+# docker-compose.yml. This overlay then bind-mounts only the resulting
+# dist directories into the web/migrate containers, dropping the
+# ``.:/code`` bind-mount that dev uses. The image is the deployment unit
+# for the Python side; the host carries the frontend bundles separately.
+#
+# The ``!override`` tag on each volumes list replaces (rather than appends
+# to) the dev volumes — without it, compose would *merge* the lists and
+# the ``.:/code`` bind-mount from the dev file would leak through.
+
+# Runtime posture shared by every long-running production service.
+#
+# Deliberately not applied to the one-shot services (init-volumes, migrate):
+# `unless-stopped` restarts a container whenever it stops, including a clean
+# exit, so a job that runs to completion would be restarted forever.
+x-production-runtime: &production-runtime
+  # A service that does not come back after a host reboot or an OOM kill takes
+  # the deployment down with it until a human notices. Only borg and tailscale
+  # carried a restart policy before this, so a reboot left the database, the
+  # web tier and the workers stopped.
+  restart: unless-stopped
+  # Docker's default json-file driver has no size cap at all. gunicorn writes an
+  # access line per request and the application logs JSON to stdout, so an
+  # untended host eventually fills its root disk — at which point Postgres stops
+  # accepting writes and the failure looks like everything at once. The default
+  # here bounds each service at LOG_MAX_SIZE x LOG_MAX_FILE.
+  logging:
+    driver: json-file
+    options:
+      max-size: "${LOG_MAX_SIZE:-10m}"
+      max-file: "${LOG_MAX_FILE:-5}"
+
+services:
+  # db and redis are defined only in the base file; these blocks exist purely to
+  # give them the production runtime posture.
+  db:
+    <<: *production-runtime
+
+  redis:
+    <<: *production-runtime
+
+  migrate:
+    environment:
+      - DJANGO_MODE=production
+    volumes: !override
+      - static:/code/static
+      # migrate runs collectstatic, which needs the frontend bundles on disk.
+      - ./frontend/dist:/code/frontend/dist:ro
+      - ./frontend/viewer-dist:/code/frontend/viewer-dist:ro
+
+  web:
+    <<: *production-runtime
+    # gunicorn replaces ``manage.py runserver``, which Django explicitly
+    # documents as unfit for production (single-threaded, no process
+    # supervision, security caveats).  Tunables (workers / threads /
+    # timeout) are exposed via .env so an operator can size to the host
+    # without rebuilding the image; see .env.example. The gthread worker
+    # class handles many concurrent streaming downloads (large EDF
+    # slices) without spawning a process per connection.
+    #
+    # --timeout is not a request deadline here. gthread's accept loop calls
+    # notify() once a second regardless of what its request threads are doing,
+    # so a 2 GB upload running for half an hour never trips the arbiter. Switch
+    # --worker-class to sync and that stops being true: the timeout becomes the
+    # longest a single request may take, and uploads start dying mid-transfer.
+    command:
+      - gunicorn
+      - epicurrents.wsgi:application
+      - --bind=0.0.0.0:8000
+      - --worker-class=gthread
+      - --workers=${GUNICORN_WORKERS:-2}
+      - --threads=${GUNICORN_THREADS:-4}
+      - --timeout=${GUNICORN_TIMEOUT:-120}
+      - --access-logfile=-
+      - --capture-output
+    environment:
+      - DJANGO_MODE=production
+      - RECORDINGS_UPLOAD_PATH=/data/recordings
+      - RECORDINGS_STAGING_PATH=/data/staging
+      - MEDIA_UPLOAD_PATH=/data/media/uploads
+      - MEDIA_STAGING_PATH=/data/media/staging
+      - REDIS_CACHE_URL=redis://:${REDIS_PASSWORD:-}@redis:6379/2
+    # Restore public port binding — the base file pins to 127.0.0.1 for
+    # dev safety; production deploys must be reachable from the proxy
+    # tier (or directly from the host network in single-host setups).
+    ports: !override
+      - "${HOST_PORT:-8000}:8000"
+    volumes: !override
+      - static:/code/static
+      # Web serves the platform's compiled frontend + viewer lib from these
+      # paths. Read-only is enough — the container should never write here;
+      # rebuilds happen via the ``frontend-build`` profile service.
+      - ./frontend/dist:/code/frontend/dist:ro
+      - ./frontend/viewer-dist:/code/frontend/viewer-dist:ro
+      # Self-hosted Pyodide runtime + wheel closure, served at /vendor/. Populated
+      # on the host at deploy (fetch script), read-only like the frontend bundles.
+      - ./frontend/vendor:/code/frontend/vendor:ro
+      - recordings-data:/data/recordings
+      - staging-data:/data/staging
+      - media-data:/data/media
+
+  celery:
+    <<: *production-runtime
+    # The workers are the only tier that can exhaust the host: an MNE leadfield
+    # allocates in proportion to the recording, not to request
+    # volume, and when the host runs out it is Postgres that gets OOM-killed
+    # alongside — an ingest job takes the database down with it. web and db stay
+    # unbounded because neither has that failure mode.
+    #
+    # Both default to 0, which compose emits as "no limit", because a cap set too
+    # low converts a slow job into a killed one and there is no number that is
+    # right for every host. Sizing rule and how to tell a limit is too low are in
+    # docs/operations.md; production warns at boot while these are unset, so the
+    # unbounded case stays a choice rather than an oversight.
+    #
+    # The cap covers the container, not a job: the worker pool holds
+    # CELERY_CONCURRENCY children and each can be running a full-recording job,
+    # so size this against the pool rather than against one job. Unlike the
+    # concurrency default in the base file, no memory default is applied here —
+    # this is a hard cgroup ceiling, and a process killed against it dies by
+    # SIGKILL with no traceback, which is the wrong thing to impose on a host
+    # whose size is unknown.
+    mem_limit: ${CELERY_MEM_LIMIT:-0}
+    cpus: ${CELERY_CPUS:-0}
+    environment:
+      - DJANGO_MODE=production
+      - PYTHONPATH=/code
+      - RECORDINGS_UPLOAD_PATH=/data/recordings
+      - RECORDINGS_STAGING_PATH=/data/staging
+      - MEDIA_UPLOAD_PATH=/data/media/uploads
+      - MEDIA_STAGING_PATH=/data/media/staging
+      - REDIS_CACHE_URL=redis://:${REDIS_PASSWORD:-}@redis:6379/2
+    volumes: !override
+      # Celery doesn't serve the frontend; only the runtime data volumes.
+      - recordings-data:/data/recordings
+      - staging-data:/data/staging
+      - media-data:/data/media
+      - celery-data:/data/celery
+
+  celery-beat:
+    <<: *production-runtime
+    environment:
+      - DJANGO_MODE=production
+      - PYTHONPATH=/code
+    volumes: !override []
+
+  # Already restarts via the base file; this adds the log cap so that no
+  # long-running service in the stack writes without a bound.
+  borg:
+    <<: *production-runtime

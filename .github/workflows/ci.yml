@@ -1,0 +1,292 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# The workflow only reads the repo; an injected step in a compromised
+# third-party action gets a read-only GITHUB_TOKEN.
+permissions:
+  contents: read
+
+jobs:
+  format:
+    # Blocking: `ruff format` is deterministic and mechanical, so the codebase
+    # is kept fully formatted. ruff is pinned via requirements-dev.txt so the
+    # style can't drift with a new release.
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.14"
+          cache: pip
+      - run: pip install -r requirements-dev.txt
+      - run: ruff format --check .
+
+  lint:
+    # Blocking: `ruff check` (rule set: ruff.toml). The pre-existing backlog has
+    # been burned down to zero, so any new violation should fail CI rather than
+    # accumulate. Framework-idiomatic false positives (blind-except in tasks,
+    # django-ninja param defaults, SIM117 in tests) are handled in ruff.toml.
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.14"
+          cache: pip
+      - run: pip install -r requirements-dev.txt
+      - run: ruff check .
+
+  shell:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
+      - name: Install shellcheck
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+      - name: shellcheck + bash -n
+        # Locally devs run the same wrapper via Docker (no host install
+        # needed); CI uses the apt-installed shellcheck for speed.
+        run: bash scripts/lint-shell.sh
+
+  security:
+    runs-on: ubuntu-latest
+    # Budgeted for the lock verification, which pulls python:3.14-slim, installs
+    # uv, and universally re-resolves the 80-package closure before pip-audit
+    # runs at all. The two audits themselves are quick.
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.14"
+          cache: pip
+      - run: pip install pip-audit
+      - name: Verify the dependency lock is current
+        # A stale lock means the audit below and the image build disagree about
+        # what is installed, which is the whole failure mode the lock exists to
+        # remove. Regenerate with scripts/lock-requirements.sh and commit it.
+        run: ./scripts/lock-requirements.sh --check
+      - name: Audit the production dependency closure
+        # The production closure is audited via requirements.lock rather than
+        # requirements.txt: the lock names every transitive package and the exact
+        # artifacts the image installs, so a CVE in a dependency-of-a-dependency
+        # is in scope and the report describes the tree that actually ships.
+        #
+        # Audited alone, not alongside the unpinned files below. pip-audit resolves
+        # every -r it is given in ONE pip --dry-run, and a single --hash= line puts
+        # that whole resolution into --require-hashes mode, which then rejects the
+        # range-pinned entries in the other files. The combined form fails outright.
+        run: pip-audit -r requirements.lock
+      - name: Audit the test and lint dependencies
+        # Separate invocation, and unpinned by design: these never reach a runtime
+        # container, so they are audited for developer-machine exposure only.
+        run: pip-audit -r requirements-test.txt -r requirements-dev.txt
+
+  migrations:
+    # Blocking: a model change without its migration boots fine locally on a
+    # database that already has the column and breaks on the next fresh deploy.
+    # `migrate` on an empty database also proves the graph applies from nothing.
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      DJANGO_SETTINGS_MODULE: epicurrents.settings.test_platform
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.14"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - run: python manage.py makemigrations --check
+      - run: python manage.py migrate
+
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      DJANGO_SETTINGS_MODULE: epicurrents.settings.test_platform
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.14"
+          cache: pip
+      - run: pip install -r requirements.txt -r requirements-dev.txt -r requirements-test.txt
+      # A bare pytest: conftest.py decides what the platform suite collects
+      # (foreign project and plugin trees are pruned, FUSE tests skip themselves),
+      # so there is no --ignore list here to drift from the README's.
+      - run: pytest --cov --cov-fail-under=70 -q
+
+  test-example:
+    # The example project's suite runs under its own settings module, which adds
+    # the project to INSTALLED_APPS; the bare pytest above prunes project trees
+    # for exactly that reason (see conftest.py).
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      DJANGO_SETTINGS_MODULE: projects.example.settings_test
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.14"
+          cache: pip
+      - run: pip install -r requirements.txt -r requirements-dev.txt -r requirements-test.txt
+      # Validates this configuration's registries against its real schema:
+      # the subject-export classification, the erasure PII registry, and the
+      # project's requires_platform pin. The suite above exercises the app's
+      # own tests and would not notice a model of its own that no registry
+      # covers.
+      - run: python manage.py check
+      - run: pytest projects/example/tests/ -q
+
+  test-dicom:
+    # The dicom plugin's suite runs under its own settings module, which adds
+    # the plugin to INSTALLED_APPS; the bare pytest above prunes plugin trees
+    # for exactly that reason (see conftest.py).
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      DJANGO_SETTINGS_MODULE: plugins.dicom.settings_test
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.14"
+          cache: pip
+      - run: pip install -r requirements.txt -r requirements-dev.txt -r requirements-test.txt
+      # Validates this configuration's registries against its real schema:
+      # the subject-export classification, the erasure PII registry, and the
+      # plugin's requires_platform pin. The suite below exercises the app's
+      # own tests and would not notice a model of its own that no registry
+      # covers — which is how the dicom plugin once shipped unclassified for
+      # export.
+      - run: python manage.py check
+      - run: pytest plugins/dicom/tests/ -q
+
+  stack-smoke:
+    # Builds the image and brings up the full stack to validate things the
+    # host-only jobs above cannot: image packaging (the source tree is NOT
+    # mounted), migrations, collectstatic, createadmin, and the db / redis /
+    # web / celery wiring end to end. This is the first rung of the full-stack
+    # CI pipeline tracked in ROADMAP.md; the compose integration suite and the
+    # production-overlay path build on it.
+    #
+    # Heavier than the other jobs (a full image build with the scientific
+    # stack). If CI minutes become a concern, the obvious follow-up is GHA
+    # build-layer caching (docker/build-push-action with cache type=gha).
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
+        with:
+          submodules: true
+      - name: Build the platform image
+        run: docker build -t epicurrents-ci:smoke .
+      - name: Image packaging + config check
+        # Runs from the built image with the source NOT mounted, so a missing
+        # app or a .dockerignore packaging gap fails here rather than silently
+        # passing the host test jobs. --entrypoint python bypasses the
+        # postgres-wait entrypoint; `check` needs no database.
+        run: >
+          docker run --rm --entrypoint python -e DJANGO_MODE=development
+          epicurrents-ci:smoke manage.py check
+      - name: Prepare .env
+        run: |
+          cp .env.example .env
+          # REDIS_PASSWORD must be non-empty before any compose command — the
+          # redis service guards on ${REDIS_PASSWORD:?...}. The base compose
+          # runs in development mode (DJANGO_MODE override per service), so the
+          # remaining .env.example placeholders are tolerated without the
+          # production boot guards firing. Exercising `init_env` and the
+          # production overlay is the next increment (see ROADMAP.md).
+          sed -i "s/^REDIS_PASSWORD=.*/REDIS_PASSWORD=ci-$(openssl rand -hex 12)/" .env
+      - name: Bring up the stack
+        # Start only web + celery and their dependency chain (init-volumes, db,
+        # redis, migrate); skips borg (empty passphrase would crash-loop) and
+        # celery-beat. The image build is cache-hit from the explicit build
+        # above. migrate runs migrations, collectstatic, and createadmin.
+        run: docker compose up -d --build web celery
+      - name: Wait for the health endpoint
+        run: |
+          for i in $(seq 1 60); do
+            if curl -fsS "localhost:${HOST_PORT:-8000}/api/v1/health" | grep -qE '"status": ?"ok"'; then
+              echo "stack healthy"; exit 0
+            fi
+            sleep 3
+          done
+          echo "health endpoint did not become ready in time"; exit 1
+      - name: Dump logs on failure
+        if: failure()
+        run: docker compose logs --no-color --tail=400 || true
+      - name: Tear down
+        if: always()
+        run: docker compose down -v || true
+
+  bootstrap-fixture-smoke:
+    # Assembles the minimal bootstrap fixture (Docker config + backend apps
+    # only — no frontend, no projects) and runs its bring-up smoke end to end.
+    # Where stack-smoke proves the full repo comes up, this proves the BACKEND
+    # is self-sufficient: if a backend path quietly grows a dependency on the
+    # frontend or a project plugin, stack-smoke still passes but this fails.
+    # Same heavy image build as stack-smoke (no cross-job cache yet — see the
+    # caching note on stack-smoke).
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
+        with:
+          submodules: true
+      - name: Assemble the fixture
+        # Copies Docker config + the backend apps only.
+        run: scripts/make-bootstrap-fixture.sh "$RUNNER_TEMP/fixture"
+      - name: Run the bring-up smoke
+        # build -> init_env -> up web+celery (pulls init-volumes, db, redis,
+        # migrate) -> health. The runner tears the stack down on exit via its
+        # own trap; its stdout (captured here) carries build / migrate errors.
+        working-directory: ${{ runner.temp }}/fixture
+        run: ./bootstrap-smoke.sh
+      - name: Tear down (safety net)
+        if: always()
+        working-directory: ${{ runner.temp }}/fixture
+        run: docker compose down -v || true
+
+  frontend:
+    # Blocking: the SPA previously had no CI at all, so npm dependency bumps
+    # merged without anything ever running its test suite. The job was landed
+    # advisory first, against a deliberately red baseline, to prove it actually
+    # executes the specs rather than passing vacuously; the suite is green now,
+    # so it gates (the same rollout used for the ruff lint job above).
+    #
+    # Note vitest skips the viewer-dependent spec(s) here: they import viewer
+    # BUILD OUTPUT, and the frontend/viewer submodule is the Epicurrents builder
+    # whose packages/dist are git-ignored until `npm run setup` runs inside it —
+    # so no CI checkout (even with submodules) can load them. vitest.config.ts
+    # detects the built viewer, skips only those files, and logs what it skipped.
+    #
+    # Scope is intentionally just `npm ci` + vitest for now. Typecheck/build are
+    # a deliberate follow-up: `npm run build` runs `vue-tsc -b`, which needs
+    # @epicurrents/core's ambient types (window.__EPICURRENTS__) — not a declared
+    # dependency yet — so it can't go green until that is resolved.
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: npm ci
+      - name: Unit tests (vitest)
+        run: npm run test

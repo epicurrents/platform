@@ -1,0 +1,10 @@
+{
+    "name": "@epicurrents-project/example",
+    "private": true,
+    "type": "module",
+    "imports": {
+        "#root/*": "../../../frontend/*",
+        "#epicurrents/*": "../../../frontend/viewer/epicurrents/*",
+        "#*": "../../../frontend/src/*"
+    }
+}

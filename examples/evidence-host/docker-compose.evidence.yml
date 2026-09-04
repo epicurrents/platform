@@ -1,0 +1,75 @@
+# Evidence host stack — Caddy (auth) + Loki (sink + ruler) + Alertmanager.
+# STARTING TEMPLATE; review before relying on it.
+#
+# This file is NOT an overlay of the platform's compose stack. It runs on a
+# SECOND machine, from its own clone, with its own credentials. That
+# separation is the entire point: a stack deployed from the same clone as
+# the thing it watches falls to the same compromise. See README.md.
+#
+#   docker compose -f docker-compose.evidence.yml up -d
+#
+# Exposure is default-deny. Ports bind to ${BIND_ADDR}, which defaults to
+# loopback, so an unconfigured deployment publishes nothing. Set it to the
+# host's tailnet address (100.x.y.z) — never 0.0.0.0, which on a public
+# cloud VM puts the log sink and Alertmanager on the internet.
+services:
+  caddy:
+    image: caddy:2.11.4
+    restart: unless-stopped
+    # The auth boundary in front of Loki. Loki OSS has no authentication of
+    # its own, so without this any host that can reach the port can both
+    # write and read the log stream.
+    ports:
+      - "${BIND_ADDR:-127.0.0.1}:3100:3100"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on:
+      - loki
+    networks:
+      - evidence
+
+  loki:
+    image: grafana/loki:3.1.1
+    restart: unless-stopped
+    command: -config.file=/etc/loki/loki-config.yaml
+    volumes:
+      - ./loki-config.yaml:/etc/loki/loki-config.yaml:ro
+      - ./rules.yaml:/loki/rules/fake/rules.yaml:ro
+      - loki-data:/loki
+    # No ports: reachable only through Caddy, on the internal network.
+    networks:
+      - evidence
+
+  alertmanager:
+    image: prom/alertmanager:v0.27.0
+    restart: unless-stopped
+    command:
+      - --config.file=/etc/alertmanager/alertmanager.yml
+      - --storage.path=/alertmanager
+    volumes:
+      - ./alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+      # SMTP password as a file rather than in the config: Alertmanager does
+      # no environment interpolation, so the alternative is a credential
+      # committed in cleartext. Create it with
+      #   printf '%s' 'the-password' > ./smtp-password
+      # and keep it out of git (this directory's contents are templates; the
+      # secret is not one of them).
+      - ./smtp-password:/etc/alertmanager/smtp-password:ro
+      # The dead-man's-switch ping URL, same reasoning as the password above.
+      - ./watchdog-url:/etc/alertmanager/watchdog-url:ro
+      - alertmanager-data:/alertmanager
+    ports:
+      - "${BIND_ADDR:-127.0.0.1}:9093:9093"
+    networks:
+      - evidence
+
+volumes:
+  loki-data:
+  caddy-data:
+  caddy-config:
+  alertmanager-data:
+
+networks:
+  evidence:

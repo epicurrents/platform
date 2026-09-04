@@ -1,0 +1,81 @@
+{
+  "extends": "@vue/tsconfig/tsconfig.dom.json",
+  "compilerOptions": {
+    "tsBuildInfoFile": "./node_modules/.tmp/tsconfig.app.tsbuildinfo",
+    "types": ["vite/client", "node"],
+
+    /* Resolve # import paths. No "baseUrl" — it is deprecated in TypeScript 6
+     * and removed in 7, so targets below are written relative to this file
+     * (`paths` has worked without a baseUrl since TypeScript 4.1). */
+    "paths": {
+      /* Frontend root — reach the viewer monorepo via "#root/viewer/...".
+       * A dedicated "#viewer/*" alias was removed: it collided with the
+       * catch-all "#*" -> src/* because src/viewer/ exists (the platform's
+       * viewer build folder), and vite-tsconfig-paths resolved "#viewer/..."
+       * through src/viewer/ (nonexistent subpath) so the Rollup build failed
+       * while tsc, which tries every matching pattern, still passed. "#root/*"
+       * is safe because src/root/ does not exist. */
+      "#root/*": ["./*"],
+      /* Viewer sub-packages — must appear before the catch-all "#*" below. */
+      "#epicurrents/*": ["./viewer/epicurrents/*"],
+      /* Viewer utility packages (workspace siblings of epicurrents/*). */
+      "scoped-event-bus/*": ["./viewer/util/scoped-event-bus/*"],
+      "scoped-event-log": ["./viewer/util/scoped-event-log/dist/index"],
+      "scoped-event-log/*": ["./viewer/util/scoped-event-log/*"],
+      /* Catch-all: everything else under # points to src/. */
+      "#*": ["./src/*"],
+    },
+
+    /* Linting */
+    "strict": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "erasableSyntaxOnly": true,
+    "noFallthroughCasesInSwitch": true,
+    "noUncheckedSideEffectImports": true
+  },
+  "include": [
+    "src/**/*.ts",
+    "src/**/*.tsx",
+    "src/**/*.vue",
+    /* The viewer interface's augmentation of the core-owned `EpicurrentsGlobal`, which carries the
+     * `announce` host callback the platform installs. It applies only while it is part of the
+     * compilation unit, and nothing under src/ imports it — a value import would pull the module
+     * into the bundle for a declaration that emits nothing. See src/types/core-global-augment.ts
+     * for the platform's own additions to the same interface. */
+    "viewer/interface/src/types/core-global-augment.ts",
+    /* The active project's Vue plugin, which lives outside src/ because the
+     * project is its own repository checked out at projects/<name>/. Globbed
+     * rather than pinned to VITE_PROJECT, which tsconfig cannot interpolate —
+     * a deployment has exactly one project on disk, so the glob matches it and
+     * nothing else. Without this the project's code is never type-checked. */
+    "../projects/*/frontend/**/*.ts",
+    "../projects/*/frontend/**/*.vue",
+  ],
+  "exclude": [
+    "node_modules",
+    "src/**/__tests__/**",
+    "src/**/*.test.ts",
+    "src/**/*.spec.ts",
+    /* The same exclusions for the active project, which the include above now
+     * reaches. Not a new gap: vitest files are outside the type-check project
+     * platform-wide, tracked in ROADMAP. Without these the project's tests
+     * would be the only ones checked, and they fail for the reason that item
+     * describes — nothing has ever type-checked them. node_modules is a
+     * symlink into the platform's, so the glob would otherwise walk it. */
+    "../projects/*/frontend/**/__tests__/**",
+    "../projects/*/frontend/**/*.test.ts",
+    "../projects/*/frontend/**/*.spec.ts",
+    "../projects/*/frontend/node_modules/**",
+    /* Viewer overlays are built by vite.config.base.ts with the viewer's
+     * own @epicurrents/* aliases, not by the SPA build — the same reason
+     * src/viewer/** is excluded above. Each overlay file says so itself. */
+    "../projects/*/frontend/viewer.ts",
+    // Built by vite.config.base.ts with its own @epicurrents/* aliases — not part
+    // of the SPA compilation unit, so the SPA's vue-tsc must not type-check it.
+    "src/viewer/**",
+    // A project's viewer-lib overlay (src/projects/<project>/viewer.ts) is also
+    // built by vite.config.base.ts, not the SPA — same exclusion rationale.
+    "src/projects/*/viewer.ts"
+  ]
+}

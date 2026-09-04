@@ -1,0 +1,79 @@
+# Loki config for the evidence host — receive, retain, evaluate rules.
+# STARTING TEMPLATE. Targeted at Loki 3.x (pinned in the compose file).
+#
+# Differs from examples/observability/loki-config.yaml in two ways that
+# matter, both because this instance is evidence rather than convenience:
+# retention is a year instead of a month, and the ruler is the point of the
+# deployment rather than an extra.
+auth_enabled: false
+
+server:
+  http_listen_port: 3100
+  grpc_listen_port: 9095
+
+common:
+  instance_addr: 127.0.0.1
+  path_prefix: /loki
+  storage:
+    filesystem:
+      chunks_directory: /loki/chunks
+      rules_directory: /loki/rules
+  replication_factor: 1
+  ring:
+    kvstore:
+      store: inmemory
+
+schema_config:
+  configs:
+    - from: 2024-01-01
+      store: tsdb
+      object_store: filesystem
+      schema: v13
+      index:
+        prefix: index_
+        period: 24h
+
+limits_config:
+  # A year. An incident is often discovered long after it started, and a log
+  # archive that has already rotated past the interesting window is not
+  # evidence. Size it against the disk before raising it further.
+  #
+  # This retention is a statement about personal data: the stream carries IP
+  # addresses and actor ids, so whatever is set here belongs in the privacy
+  # notice's retention table as a distinct row. It is a second copy with its
+  # own lifetime, not covered by the application's own log retention.
+  retention_period: 8760h  # 365 days
+  reject_old_samples: true
+  reject_old_samples_max_age: 168h
+
+compactor:
+  working_directory: /loki/compactor
+  # Without delete_request_store, retention_period above is advisory: Loki
+  # keeps the chunks and simply stops querying them.
+  delete_request_store: filesystem
+  retention_enabled: true
+
+ruler:
+  storage:
+    type: local
+    local:
+      directory: /loki/rules
+  rule_path: /tmp/loki-rules
+  alertmanager_url: http://alertmanager:9093
+  # Required, not optional. Without it the ruler posts to Alertmanager's
+  # /api/v1/alerts, which Alertmanager 0.27 removed — every alert is answered
+  # 410 Gone and silently dropped. Nothing else reports a problem: the rules
+  # evaluate, Alertmanager runs, its config validates, and no alert ever
+  # arrives. Found only by firing one and looking for it at the other end,
+  # which is why the README asks you to do exactly that.
+  #
+  # The key is enable_alertmanager_v2 (flag: -ruler.alertmanager-use-v2), not
+  # enable_alertmanager_v2_api. Loki rejects unknown config keys outright, so
+  # a wrong name here crash-loops the container rather than being ignored —
+  # which is the good failure, but reads as "no errors in the log" if you
+  # check the log of a process that is not running.
+  enable_alertmanager_v2: true
+  enable_api: true
+  # Evaluate often enough that the absence rules are not themselves a
+  # source of delay on top of their own windows.
+  evaluation_interval: 1m

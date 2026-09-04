@@ -1,0 +1,653 @@
+# ──────────────────────────────────────────────────────────────────────────────
+# Mode layout
+#
+# This base file targets a docker-based DEVELOPMENT deployment:
+# DJANGO_MODE=development, DB_DEV_ENGINE=postgres (the docker Postgres
+# instance is the dev database), and the web container's port mapping
+# binds to 127.0.0.1 only — the dev box is not reachable from the LAN
+# without explicit operator action.
+#
+# Production deploys overlay docker-compose.prod.yml, which flips
+# DJANGO_MODE back to production for the four Django services, replaces
+# the loopback port mapping with a public binding, and swaps the
+# runserver command for gunicorn. See docker-compose.prod.yml for the
+# full overlay.
+#
+# Settings consumed by DJANGO_MODE=development from this stack:
+# - Postgres backend (DB_DEV_ENGINE=postgres, falls through to DB_*
+#   credentials from .env).
+# - DEBUG=True by default (override via DEBUG=False in .env).
+# - CSRF_COOKIE_SECURE / SESSION_COOKIE_SECURE default False so session
+#   writes work over plain HTTP localhost; production overlay restores
+#   both to True.
+# - The SPA carries a "DEV MODE" banner sourced from the health
+#   endpoint's `mode` field.
+#
+# Volume layout note
+#
+# The platform's runtime state lives in six separate named volumes
+# (postgres-data / recordings-data / staging-data / media-data /
+# celery-data / borg-data). Earlier revisions of this file used a single `data` volume
+# with `volume.subpath:` for each domain, which is more ergonomic for
+# operators (one volume to back up, one volume to provision through a
+# driver like NFS / cloud storage). The subpath approach was reverted to
+# the per-domain layout because Podman's Docker-API socket drops the
+# `subpath:` mount option when translating Compose mounts to native
+# mounts: Postgres ends up seeing the whole volume root with the
+# recordings / staging / celery / borg siblings and refuses initdb.
+# docker-compose v2/v5 emits the spec correctly; the gap is in Podman's
+# API translation, not the compose tool.
+#
+# When Podman supports `volume.subpath:` end-to-end (track upstream
+# podman/podman issues and the corresponding ROADMAP entry), this file
+# should revert to the single-volume + subpath layout. The change is
+# mechanical: collapse the five volume definitions, restore the `data:`
+# block, reintroduce `volume.subpath:` on each mount, and bring back
+# the depends_on init-volumes condition on db.
+# ──────────────────────────────────────────────────────────────────────────────
+
+# Build arguments shared by every service built from the Dockerfile. Anchored
+# rather than repeated: the six build blocks differ only in `target`, and a
+# service that missed the argument would build an image without the active
+# project's dependencies while its siblings had them — a discrepancy that shows
+# up as one container crash-looping on an import.
+#
+# EPICURRENTS_PROJECT is interpolated from .env, the same value that tells
+# Django which project to load, so the image is built for the project the stack
+# will run. Empty is the base platform and a supported build.
+x-build-args: &build-args
+  EPICURRENTS_PROJECT: ${EPICURRENTS_PROJECT:-}
+
+services:
+  init-volumes:
+    image: busybox:1.38.0
+    command: ["sh", "-c", "mkdir -p /media/uploads /media/staging && chown -R 1000:1000 /recordings /staging /media /celery /static"]
+    volumes:
+      - recordings-data:/recordings
+      - staging-data:/staging
+      - media-data:/media
+      - celery-data:/celery
+      - static:/static
+
+  db:
+    # Pinned to a patch version, not the floating `17` tag: Dependabot's docker
+    # ecosystem scans Dockerfiles only, so a compose image never gets an update
+    # PR and a floating tag moves silently on the next pull. Bump by hand against
+    # https://hub.docker.com/_/postgres — 17.x to 17.y is a patch upgrade and
+    # needs no dump/restore, but do it deliberately rather than during an incident.
+    image: postgres:17.11
+    environment:
+      - POSTGRES_USER=${DB_USERNAME}
+      - POSTGRES_PASSWORD=${DB_PASSWORD}
+      - POSTGRES_DB=${DB_NAME}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    # service_started only means the process spawned; a crashed-but-running
+    # Postgres passes it. pg_isready lets dependents gate on a server that
+    # actually answers.
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    networks:
+      - epicurrents
+
+  redis:
+    # Pinned for the same reason as db above. Note this is the 7.x line while
+    # upstream is on 8.x; moving major is a separate decision, not a pin bump.
+    image: redis:7.4.10
+    # Redis carries Celery task payloads, the rate-limit counters, and the
+    # federation JWT replay cache — an unauthenticated instance lets any
+    # container that reaches the shared network inject tasks or reset
+    # those counters. The :?err interpolation fails the stack fast with a
+    # clear message instead of silently booting open.
+    command:
+      - redis-server
+      - --requirepass
+      - ${REDIS_PASSWORD:?REDIS_PASSWORD is not set — add it to .env and run 'python manage.py init_env' to generate a value}
+      # Redis is the Celery broker as well as the result backend, so without
+      # persistence a restart drops every queued conversion silently — the task
+      # is gone and nothing records that it existed, leaving a Recording stuck
+      # in PROCESSING with no worker coming for it. The append-only file
+      # replays the accepted-task log on boot instead. everysec is Redis's own
+      # default and is named here because it is the size of the remaining
+      # window: work accepted in the last second before an unclean stop is
+      # still lost. Closing that window entirely is the recording state
+      # machine, not a broker setting.
+      - --appendonly
+      - "yes"
+      - --appendfsync
+      - everysec
+    volumes:
+      # The official image's WORKDIR is /data, so this is where both the AOF and
+      # the RDB snapshots land. Fresh named volumes inherit the image's
+      # ownership, so no init-volumes chown is needed here.
+      - redis-data:/data
+    # Redis answers PING with -LOADING while it replays the append-only file, so
+    # grep -q PONG fails for the whole of that window. Measured at ~2 s for a
+    # 426 MB AOF, and auto-rewrite keeps the real file far smaller, so the retry
+    # budget below already covers it — start_period makes that explicit rather
+    # than incidental, and stops a slow load counting as failures.
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli --no-auth-warning -a \"$${REDIS_PASSWORD}\" ping | grep -q PONG"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 20s
+    environment:
+      - REDIS_PASSWORD=${REDIS_PASSWORD}
+    networks:
+      - epicurrents
+
+  migrate:
+    build:
+      context: .
+      target: runtime
+      args: *build-args
+    # Unprivileged like celery/celery-beat; init-volumes pre-chowns the
+    # static volume that collectstatic writes into.
+    user: "1000:1000"
+    entrypoint: []
+    working_dir: /code
+    command: >
+      sh -c "
+        while ! nc -z $$DB_HOSTNAME $$DB_PORT; do sleep 1; done &&
+        python manage.py migrate &&
+        python manage.py collectstatic --no-input &&
+        (python manage.py createadmin || true)
+      "
+    env_file:
+      - ./.env
+    environment:
+      - DJANGO_MODE=development
+      - DB_DEV_ENGINE=postgres
+      - CELERY_BROKER_URL=redis://:${REDIS_PASSWORD:-}@redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://:${REDIS_PASSWORD:-}@redis:6379/1
+    volumes:
+      - .:/code
+      - static:/code/static
+    depends_on:
+      init-volumes:
+        condition: service_completed_successfully
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - epicurrents
+
+  web:
+    build:
+      context: .
+      target: runtime
+      args: *build-args
+    # Unprivileged: web serves untrusted uploads and federation traffic;
+    # an in-process compromise must not land as in-container root.
+    user: "1000:1000"
+    command: python manage.py runserver 0.0.0.0:8000
+    env_file:
+      - ./.env
+    environment:
+      - DJANGO_MODE=development
+      - DB_DEV_ENGINE=postgres
+      - RECORDINGS_UPLOAD_PATH=/data/recordings
+      - RECORDINGS_STAGING_PATH=/data/staging
+      - CELERY_BROKER_URL=redis://:${REDIS_PASSWORD:-}@redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://:${REDIS_PASSWORD:-}@redis:6379/1
+      # Uploads and staging are subdirectories of the same media-data
+      # mount so the staging→permanent move is an atomic same-filesystem
+      # rename. App-level subdirectories, not compose `subpath:` — see
+      # the volume layout note above for why subpath is off-limits.
+      - MEDIA_UPLOAD_PATH=/data/media/uploads
+      - MEDIA_STAGING_PATH=/data/media/staging
+    ports:
+      # Loopback-only binding so the dev box stays unreachable from the
+      # LAN.  docker-compose.prod.yml overlays a public binding for
+      # production deploys.
+      - "127.0.0.1:${HOST_PORT:-8000}:8000"
+    # Probes /api/v1/ready, not /health: a container that is running but whose
+    # database or cache has gone away answers /health with complete confidence,
+    # which is exactly the wedged-but-alive state this exists to catch. The
+    # image ships no curl, so the request goes through the interpreter that is
+    # already there. start_period covers Django's boot; the failure threshold
+    # is deliberately loose so a single slow response does not flap the state.
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >
+          python -c "import urllib.request,sys;
+          sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/api/v1/ready', timeout=5).status == 200 else 1)"
+      interval: 15s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    volumes:
+      - .:/code
+      - static:/code/static
+      - recordings-data:/data/recordings
+      - staging-data:/data/staging
+      - media-data:/data/media
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    networks:
+      - epicurrents
+
+  celery:
+    build:
+      context: .
+      target: runtime
+      args: *build-args
+    user: "1000:1000"
+    entrypoint: []
+    working_dir: /code
+    # --concurrency is pinned rather than left to celery's default, which is the
+    # host's CPU count. Each child can be running a whole-recording job, so the
+    # pool size multiplies peak memory: the container's ceiling is concurrency x
+    # the largest single job, which under the default would grow with the host
+    # rather than with the workload. Work beyond the pool queues, so the
+    # conservative direction costs throughput and nothing else. Sizing rule,
+    # including how this has to agree with CELERY_MEM_LIMIT, in docs/operations.md.
+    command: celery -A epicurrents worker -l info --concurrency=${CELERY_CONCURRENCY:-2}
+    env_file:
+      - ./.env
+    environment:
+      - DJANGO_MODE=development
+      - DB_DEV_ENGINE=postgres
+      - PYTHONPATH=/code
+      - RECORDINGS_UPLOAD_PATH=/data/recordings
+      - RECORDINGS_STAGING_PATH=/data/staging
+      - MEDIA_UPLOAD_PATH=/data/media/uploads
+      - MEDIA_STAGING_PATH=/data/media/staging
+      - CELERY_BROKER_URL=redis://:${REDIS_PASSWORD:-}@redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://:${REDIS_PASSWORD:-}@redis:6379/1
+    volumes:
+      - .:/code
+      - recordings-data:/data/recordings
+      - staging-data:/data/staging
+      - media-data:/data/media
+      - celery-data:/data/celery
+    # `inspect ping` is scoped to this container's own node (`-d celery@<hostname>`)
+    # rather than broadcast: an unscoped ping succeeds as long as *some* worker on
+    # the broker answers, so a wedged container would keep reporting healthy on a
+    # sibling's reply. The interval is loose because each probe loads Django.
+    healthcheck:
+      test: ["CMD-SHELL", "celery -A epicurrents inspect ping -d celery@$$(hostname) --timeout 10 > /dev/null"]
+      interval: 60s
+      timeout: 20s
+      retries: 3
+      start_period: 60s
+    depends_on:
+      init-volumes:
+        condition: service_completed_successfully
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    networks:
+      - epicurrents
+
+  borg:
+    image: ghcr.io/borgmatic-collective/borgmatic:2.1.3
+    entrypoint: ["/bin/sh", "/etc/borgmatic.d/entrypoint.sh"]
+    restart: unless-stopped
+    environment:
+      - BORG_PASSPHRASE=${BORG_PASSPHRASE}
+      - BORG_REMOTE_REPO=${BORG_REMOTE_REPO:-}
+      # Healthchecks-compatible ping URL (healthchecks.io, a self-hosted
+      # instance, or anything that speaks the same GET-to-a-URL protocol).
+      # Unset means backup failures reach the container log and nowhere else,
+      # and a stopped stack reports nothing at all — the emitter warns.
+      - BORG_MONITOR_URL=${BORG_MONITOR_URL:-}
+      # Attaches the run's log tail to each ping. Off by default — the monitor is
+      # a third-party destination and the failure signal alone needs no content.
+      - BORG_MONITOR_SEND_LOGS=${BORG_MONITOR_SEND_LOGS:-}
+      # StrictHostKeyChecking=yes is the safe default. Operators using
+      # remote backup pre-populate the host key (see .env.example for the
+      # ssh-keyscan command). The previous default `accept-new` silently
+      # accepted any key the SSH client hadn't cached, including changed
+      # keys on previously-seen hosts, which means a DNS hijack or server
+      # replacement after first connect routed backups to an attacker.
+      #
+      # -i is not optional: id_borg is not one of the filenames ssh tries by
+      # itself, so without it the mounted key is never offered and the remote
+      # refuses a connection the operator has configured correctly in every
+      # other respect. UpdateHostKeys=no silences a per-connection warning —
+      # ssh wants to rewrite known_hosts, which is a read-only bind mount, and
+      # the rename fails with "Cross-device link" on every run.
+      - BORG_RSH=${BORG_RSH:-ssh -i /root/.ssh/id_borg -o StrictHostKeyChecking=yes -o UpdateHostKeys=no}
+      # Selects the local repository tier. The borg service takes an explicit
+      # env list rather than env_file, so a variable the emitter reads is
+      # invisible to it until named here — and the emitter would then quietly
+      # use its default while .env says otherwise.
+      - BACKUP_LOCAL_ENABLED=${BACKUP_LOCAL_ENABLED:-}
+      # Stable by construction. The borgmatic default embeds {hostname}, which
+      # in a container is its ID and changes on every recreate — and since the
+      # prune glob is derived from the same format, retention would only ever
+      # match the current container's archives.
+      - BORG_ARCHIVE_PREFIX=${BORG_ARCHIVE_PREFIX:-epicurrents}
+      - BACKUP_INTERVAL=${BACKUP_INTERVAL:-86400}
+      - BACKUP_KEEP_DAILY=${BACKUP_KEEP_DAILY:-7}
+      - BACKUP_KEEP_WEEKLY=${BACKUP_KEEP_WEEKLY:-4}
+      - BACKUP_KEEP_MONTHLY=${BACKUP_KEEP_MONTHLY:-6}
+      # libpq credentials reach pg_dump via env, not via the borgmatic YAML
+      # config. Keeps the password out of any on-disk YAML so a config-file
+      # injection can't escalate to a credential leak.
+      - PGUSER=${DB_USERNAME}
+      - PGPASSWORD=${DB_PASSWORD}
+    volumes:
+      - recordings-data:/data/recordings:ro
+      - media-data:/data/media:ro
+      - borg-data:/backup
+      - ./borgmatic:/etc/borgmatic.d:ro
+      - ${BORG_SSH_KEY_PATH:-/dev/null}:/root/.ssh/id_borg:ro
+      # The remote's host key. Mounting it is what makes StrictHostKeyChecking
+      # usable at all: the container has no other route to a known_hosts file,
+      # so the ssh-keyscan step in .env.example was writing to a file nothing
+      # ever read, and every remote backup failed host key verification. The
+      # /dev/null default is an empty known_hosts, which fails closed — the
+      # correct outcome for a deployment that has not populated it.
+      - ${BORG_SSH_KNOWN_HOSTS_PATH:-/dev/null}:/root/.ssh/known_hosts:ro
+    depends_on:
+      init-volumes:
+        condition: service_completed_successfully
+      db:
+        condition: service_healthy
+    networks:
+      - epicurrents
+
+  # On-demand counterpart to the borg service for file restores. The
+  # backup service mounts the data volumes read-only by design; this one
+  # mounts them read-write under /restore so `borg extract` (which writes
+  # relative to the working directory) lands restored files directly on
+  # the volumes. The /restore subtree mirrors the archive layout
+  # (data/recordings, data/media/uploads) so extraction needs no path
+  # rewriting. Only started explicitly via scripts/restore.sh:
+  #     docker compose run --rm borg-restore borg extract ...
+  borg-restore:
+    image: ghcr.io/borgmatic-collective/borgmatic:2.1.3
+    profiles: ["restore"]
+    entrypoint: []
+    working_dir: /restore
+    environment:
+      - BORG_PASSPHRASE=${BORG_PASSPHRASE}
+      - BORG_REMOTE_REPO=${BORG_REMOTE_REPO:-}
+      - BORG_RSH=${BORG_RSH:-ssh -i /root/.ssh/id_borg -o StrictHostKeyChecking=yes -o UpdateHostKeys=no}
+    volumes:
+      - recordings-data:/restore/data/recordings
+      - media-data:/restore/data/media
+      - borg-data:/backup
+      - ${BORG_SSH_KEY_PATH:-/dev/null}:/root/.ssh/id_borg:ro
+      # The remote's host key. Mounting it is what makes StrictHostKeyChecking
+      # usable at all: the container has no other route to a known_hosts file,
+      # so the ssh-keyscan step in .env.example was writing to a file nothing
+      # ever read, and every remote backup failed host key verification. The
+      # /dev/null default is an empty known_hosts, which fails closed — the
+      # correct outcome for a deployment that has not populated it.
+      - ${BORG_SSH_KNOWN_HOSTS_PATH:-/dev/null}:/root/.ssh/known_hosts:ro
+    networks:
+      - epicurrents
+
+  celery-beat:
+    build:
+      context: .
+      target: runtime
+      args: *build-args
+    user: "1000:1000"
+    entrypoint: []
+    working_dir: /code
+    command: celery -A epicurrents beat -l info --scheduler django_celery_beat.schedulers:DatabaseScheduler
+    env_file:
+      - ./.env
+    environment:
+      - DJANGO_MODE=development
+      - DB_DEV_ENGINE=postgres
+      - PYTHONPATH=/code
+      - CELERY_BROKER_URL=redis://:${REDIS_PASSWORD:-}@redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://:${REDIS_PASSWORD:-}@redis:6379/1
+    volumes:
+      - .:/code
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    networks:
+      - epicurrents
+
+  # ── test ───────────────────────────────────────────────────────────────────
+  # On-demand container for running the pytest suite against the live image.
+  # Gated behind the ``test`` profile so plain ``docker compose up`` never
+  # starts it. Invoke explicitly:
+  #
+  #     docker compose run --rm test                     # full suite
+  #     docker compose run --rm test federation/tests/   # one app
+  #     docker compose run --rm test -v -k auth          # pytest args
+  #
+  # No depends_on — the test settings (epicurrents/settings/test_platform.py)
+  # use in-memory SQLite, locmem cache, and CELERY_TASK_ALWAYS_EAGER, so the
+  # db / redis / celery services are not required.  Tests run self-contained.
+  #
+  # SYS_ADMIN + /dev/fuse are present so future integration tests that
+  # actually mount FUSE (the current tests use mocks) work without the
+  # contributor needing to know the magic flags.  No effect on tests that
+  # don't touch FUSE.
+  test:
+    profiles: ["test"]
+    build:
+      context: .
+      target: test
+      args: *build-args
+    # The image now defaults to the unprivileged appuser; the FUSE integration
+    # tests need root alongside SYS_ADMIN and /dev/fuse below.
+    user: "0:0"
+    # DJANGO_MODE cleared so DJANGO_SETTINGS_MODULE from pytest.ini wins
+    # cleanly without firing the conflict warning in settings_mode.py.
+    environment:
+      DJANGO_MODE: ""
+      DJANGO_SETTINGS_MODULE: epicurrents.settings.test_platform
+    volumes:
+      - .:/code
+    working_dir: /code
+    entrypoint: ["pytest"]
+    cap_add:
+      - SYS_ADMIN
+    devices:
+      - /dev/fuse
+    networks:
+      - epicurrents
+
+  # ── test-postgres ────────────────────────────────────────────────────────────
+  # Same suite as ``test`` but against the live Postgres ``db`` service rather
+  # than in-memory SQLite, so database behaviour SQLite can't reproduce
+  # (advisory locks, JSONB, transaction semantics) is exercised. Gated behind
+  # the ``test`` profile. Invoke explicitly:
+  #
+  #     docker compose run --rm test-postgres                  # platform suite
+  #     docker compose run --rm test-postgres --ds=epicurrents.settings.test_postgres path/  # subset
+  #
+  # ``--ds`` on the command line is the highest-precedence settings selector in
+  # pytest-django (above the env var and pytest.ini), so the default command
+  # pins the Postgres settings; pass it again when overriding the command with a
+  # path subset. DB_HOSTNAME / DB_PORT point at the ``db`` service; the rest of
+  # the credentials come from .env. pytest-django creates a throwaway
+  # ``test_<DB_NAME>`` so the dev data in ``db`` is untouched.
+  test-postgres:
+    profiles: ["test"]
+    build:
+      context: .
+      target: test
+      args: *build-args
+    # Root for the same reason as the `test` service: the image now defaults to
+    # the unprivileged appuser, and the FUSE integration tests need root
+    # alongside the SYS_ADMIN capability and /dev/fuse below.
+    user: "0:0"
+    env_file:
+      - ./.env
+    environment:
+      DJANGO_MODE: ""
+      DB_HOSTNAME: db
+      DB_PORT: "5432"
+    volumes:
+      - .:/code
+    working_dir: /code
+    entrypoint: ["pytest"]
+    command:
+      - "--ds=epicurrents.settings.test_postgres"
+    cap_add:
+      - SYS_ADMIN
+    devices:
+      - /dev/fuse
+    depends_on:
+      db:
+        condition: service_healthy
+    networks:
+      - epicurrents
+
+  # ── frontend-build ─────────────────────────────────────────────────────────
+  # On-demand Node.js builder for the platform frontend + viewer.
+  # Gated behind the ``build`` profile so plain ``docker compose up`` never
+  # starts it. Invoke explicitly:
+  #
+  #     docker compose --profile build run --rm frontend-build
+  #
+  # Writes the compiled bundles back to the host via the ``./frontend`` bind
+  # mount; node_modules go to named volumes so the container's linux-x64
+  # binaries don't collide with the host's npm install on macOS/Windows.
+  # Used both as a convenience for developers without Node installed and as
+  # the canonical build step on the deploy host (see scripts/update.sh).
+  frontend-build:
+    profiles: ["build"]
+    image: node:20-bookworm-slim
+    working_dir: /repo/frontend
+    # Runs as root inside the container so npm can write to the named
+    # node_modules volumes (which start out root-owned on a fresh deploy).
+    # The final chown puts the host-visible build outputs back under
+    # 1000:1000 so the bind-mounted dist directories don't end up owned by
+    # root on the deploy host. This shape also works under rootless Podman,
+    # where a `user: "1000:1000"` directive would clash with the user
+    # namespace mapping.
+    environment:
+      # NODE_CA_BUNDLE_PATH points at the host's CA bundle when the deploy
+      # is behind a TLS-intercepting proxy with a private CA (common on
+      # corporate networks; the bundle on RHEL hosts already contains the
+      # corporate CA via `update-ca-trust`). When set, the bundle is
+      # mounted into the container and NODE_EXTRA_CA_CERTS is populated;
+      # when unset, /dev/null is mounted and NODE_EXTRA_CA_CERTS is empty
+      # (no-op for Node). Operators behind a proxy without a system-level
+      # CA can still use NPM_CONFIG_STRICT_SSL=false as an explicit
+      # opt-out — see .env.example.
+      - NODE_EXTRA_CA_CERTS=${NODE_CA_BUNDLE_PATH:+/usr/local/share/ca-cert.crt}
+      - NPM_CONFIG_STRICT_SSL=${NPM_CONFIG_STRICT_SSL:-}
+    # The script uses `sh -ec` so any failing step (npm ci, tsc, vite,
+    # build:viewer) aborts the build with a non-zero exit; only the final
+    # chown is permitted to fail silently (the dist dirs may already be
+    # owned correctly, or absent in unusual partial-build modes). A flat
+    # `... && chown ... || true` chain instead would let `|| true` swallow
+    # earlier failures and ship a clean exit with broken or stale bundles.
+    command:
+      - sh
+      - -ec
+      - |
+        npm ci
+        cd viewer && npm ci && npm run build:tsc-all
+        cd /repo/frontend
+        npm run build:viewer
+        npm run build
+        chown -R 1000:1000 /repo/frontend/dist /repo/frontend/viewer-dist 2>/dev/null || true
+    # The mount layout mirrors the repository rather than mounting frontend/ on
+    # its own, because a project's Vue plugin lives at projects/<name>/frontend/
+    # — a sibling of this directory, not a child. The `#project` alias resolves
+    # `../projects/<name>/frontend/index.ts`, and each project's package.json
+    # reaches back with `../../../frontend/*`, so both sides only agree when the
+    # two directories sit beside each other under a common parent. Mounting
+    # frontend/ alone leaves ../projects outside the container entirely and the
+    # build fails on an alias it cannot resolve.
+    #
+    # projects/ is writable because the frontend postinstall symlinks
+    # node_modules into each project frontend. Those links are relative
+    # (frontend/scripts/link-projects.mjs), so one written here still resolves
+    # on the host.
+    volumes:
+      - ./frontend:/repo/frontend
+      - ./projects:/repo/projects
+      - frontend-node-modules:/repo/frontend/node_modules
+      - frontend-viewer-node-modules:/repo/frontend/viewer/node_modules
+      - ${NODE_CA_BUNDLE_PATH:-/dev/null}:/usr/local/share/ca-cert.crt:ro
+
+  # ── tailscale ────────────────────────────────────────────────────────────────
+  # Registers this deployment as a node on the operator's tailnet and reverse-
+  # proxies tailnet traffic to the web service. Gated behind the ``tailnet``
+  # profile so a plain ``docker compose up`` never starts it; bring it up with
+  # scripts/tailscale-serve.sh (or bootstrap.sh --tailscale-mode serve).
+  #
+  # Inbound by default. Userspace mode has no TUN device, so there is no route
+  # for a sibling container to take, and the host gains no tailnet address.
+  #
+  # TS_OUTBOUND_HTTP_PROXY_LISTEN is the exception, and it is off unless set.
+  # With a listen address (`:1055`) this node also runs an HTTP proxy on the
+  # compose network, and a container pointed at it reaches the tailnet without
+  # any route of its own — the proxy resolves MagicDNS on the client's behalf,
+  # so the client needs no tailnet resolver either. Verified end to end against
+  # a container on an `internal: true` network with no egress whatsoever.
+  #
+  # Two things it does not do, which is why scripts/tailscale-join.sh exists.
+  # It carries HTTP only, so `ssh://` remote Borg is not covered. And a client
+  # must be configured for it explicitly — an HTTP_PROXY environment variable is
+  # not enough for every client (promtail ignores it; see promtail-remote.yaml).
+  #
+  # Userspace networking (TS_USERSPACE=true) keeps the container unprivileged —
+  # no NET_ADMIN, no /dev/net/tun — matching the web service's unprivileged
+  # posture and working under rootless Podman. `tailscale serve` (config below)
+  # proxies the node's HTTPS endpoint to http://web:8000 over the epicurrents
+  # network; WireGuard encrypts the tailnet and Tailscale terminates HTTPS with
+  # its own certificate (enable "HTTPS Certificates" in the tailnet admin
+  # console, and add the node's MagicDNS name to ALLOWED_HOSTS).
+  #
+  # No env_file: only the explicit TS_* vars reach this container, never the
+  # rest of .env. TS_AUTHKEY is intentionally NOT sourced from .env — Tailscale
+  # auth keys are single-use, so persisting one leaves an obsolete secret on
+  # disk. tailscale-serve.sh supplies it only in the `up` process
+  # environment; after first registration the node identity lives in the
+  # tailscale-state volume and no key is needed on restart (${TS_AUTHKEY:-} is
+  # then empty, which the container tolerates because its state is authenticated).
+  #
+  # Image tag is pinned like every other service here; verify/bump against
+  # https://hub.docker.com/r/tailscale/tailscale/tags on update.
+  tailscale:
+    image: tailscale/tailscale:v1.86.2
+    profiles: ["tailnet"]
+    hostname: ${TS_HOSTNAME:-epicurrents}
+    environment:
+      - TS_AUTHKEY=${TS_AUTHKEY:-}
+      - TS_HOSTNAME=${TS_HOSTNAME:-epicurrents}
+      - TS_USERSPACE=true
+      - TS_STATE_DIR=/var/lib/tailscale
+      - TS_SERVE_CONFIG=/config/serve.json
+      # Empty disables the outbound proxy, which is the default. See the note
+      # above before setting it: everything on this network gains tailnet reach.
+      - TS_OUTBOUND_HTTP_PROXY_LISTEN=${TS_OUTBOUND_HTTP_PROXY_LISTEN:-}
+    volumes:
+      - tailscale-state:/var/lib/tailscale
+      - ./tailscale/serve.json:/config/serve.json:ro
+    restart: unless-stopped
+    networks:
+      - epicurrents
+
+volumes:
+  static:
+  postgres-data:
+  redis-data:
+  recordings-data:
+  staging-data:
+  media-data:
+  celery-data:
+  borg-data:
+  frontend-node-modules:
+  frontend-viewer-node-modules:
+  tailscale-state:
+
+networks:
+  epicurrents:
+    name: ${EPICURRENTS_NETWORK_NAME:-epicurrents}

@@ -1,0 +1,76 @@
+# Git
+.git/
+.gitignore
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+env/
+*.egg-info/
+
+# Environment
+.env
+.env.*
+!.env.example
+
+# Logs
+*.log
+logs/
+
+# Deployment script (host tooling, not needed in containers)
+deploy.sh
+
+# Scripts (host tooling, not needed in containers)
+scripts/
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+.claude
+CLAUDE.md
+
+# Frontend
+# Excluded from the Python image's build context — the web image never
+# contains frontend source. At runtime:
+#   - dev: ``.:/code`` bind-mount provides the frontend from the host.
+#   - prod: docker-compose.prod.yml bind-mounts the host's pre-built
+#           frontend/dist and frontend/viewer-dist directories only.
+# The on-demand ``frontend-build`` profile service (Node container)
+# produces those dist directories on the deploy host; it doesn't need the
+# frontend tree to be in the Python image either, since it bind-mounts
+# ./frontend directly via its own volume mapping.
+#
+# Excluding the whole tree here keeps viewer/ (~2 GB with workspace
+# node_modules) and any developer-machine residue under node_external/ out
+# of the Python image.
+frontend/
+
+# SQLite (use proper DB in production)
+*.sqlite3
+
+# Django collected statics (managed separately)
+static/
+staticfiles/
+mediafiles/
+
+# Media-file storage dirs (runtime data, not code). A bare `media/`
+# pattern here would also exclude the `media` Django app and break the
+# production image, which only dev's .:/code bind mount would mask.
+media_uploads/
+media_staging/
+
+# Local test data (real recordings for the smoke tests). Host-only: the test
+# service reaches it through the ``.:/code`` bind mount, so it never needs to be
+# in the build context — and must not be, since baking recordings into an image
+# would ship patient data.
+testdata/
+
+# Deployment-specific documents (filled-in privacy notices, DPO correspondence,
+# operator runbook notes). Host-only: nothing in the image reads them, and they
+# name a real organisation and its open compliance gaps.
+local/

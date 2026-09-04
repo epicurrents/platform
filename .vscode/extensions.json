@@ -1,0 +1,17 @@
+{
+    // Extensions VS Code prompts new contributors to install on first open.
+    // Keep this list short — only extensions that the committed .vscode/settings.json
+    // depends on or that materially improve the in-repo experience for everyone.
+    "recommendations": [
+        // Drives Python lint / format / import-sort behaviour configured in
+        // settings.json; matches the rules enforced by .github/workflows/ci.yml.
+        "charliermarsh.ruff",
+        // Standard Python language support — IntelliSense, debugging, virtual-env
+        // detection.  Most contributors will already have it; included so the
+        // first-time setup prompt is complete.
+        "ms-python.python",
+        // Vue 3 language server.  The frontend is Vue 3 + Vite + TypeScript;
+        // this is the official extension for that stack.
+        "Vue.volar"
+    ]
+}
