@@ -31,7 +31,7 @@ fusepy==3.0.1
 # not built in (a vendor .e converter, for instance) install as separate packages
 # registered through RECORDING_CONVERTERS; anything they need beyond numpy is theirs
 # to declare.
-numpy>=2.5.1,<3
+numpy>=2.5.2,<3
 
 # Server-side scientific computing (compute/). Each carries a next-major cap (as
 # cryptography does above): these are floors, not pins, so without one a new
