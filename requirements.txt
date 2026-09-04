@@ -44,7 +44,7 @@ numpy>=2.5.1,<3
 # scripts/lock-requirements.sh --project. pandas and PyWavelets left here for
 # a project's own requirements that way; scipy and mne stayed, because compute/
 # imports both independently of any project.
-scipy>=1.7.0,<2
+scipy>=1.18.1,<2
 mne>=1.0.0,<2
 
 # DICOM indexing (plugins/dicom/). Plugins are in-tree and EPICURRENTS_PLUGINS is
