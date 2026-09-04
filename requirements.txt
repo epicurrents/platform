@@ -6,7 +6,7 @@ argon2-cffi==25.1.0
 # are fixed in 49.0.0, but 3552 needs 50.0.0, so the floor is 50. (Earlier wheels
 # also statically linked a vulnerable OpenSSL, GHSA-537c-gmf6-5ccf.) Do not lower.
 cryptography>=50.0.0,<51  # used by federation/auth.py (Ed25519) and pywebpush
-django-ninja==1.6.2
+django-ninja==1.7.0
 gunicorn==23.0.0  # production WSGI server; dev compose still uses runserver
 celery==5.6.3
 django-celery-beat==2.9.0
@@ -16,7 +16,7 @@ psycopg2-binary==2.9.12
 pyotp==2.10.0
 python-decouple==3.8
 redis==7.3.0
-pywebpush==2.4.0
+pywebpush==2.5.0
 
 # OpenID Connect external login (user/oidc.py). Used only for ID-token
 # (JWS/JWKS) signature validation; imported lazily so the platform runs
