@@ -119,6 +119,65 @@ def test_grant_recording_and_revoke(trusted_peer, make_superuser):
     assert not AccessRight.objects.filter(pk=grant.pk).exists()
 
 
+def test_grant_accepts_the_hash_a_url_carries(trusted_peer, make_superuser):
+    """The identifier a person has in hand is the stored_name prefix, not content_hash.
+
+    Every URL, viewer link and API path addresses a recording by that prefix, so an
+    operator copying a hash out of the browser has one of those. Rejecting it reads
+    as "no such recording", which is both wrong and hard to argue with.
+    """
+    giver = make_superuser(username="fedadmin_url")
+    recording = baker.make(
+        "recordings.Recording",
+        author=giver,
+        content_hash="content-hash-value",
+        stored_name="AB92C968E943D2A44A234792B76D5AFD.edf",
+    )
+    _run(
+        "federation_grant",
+        peer=str(trusted_peer.pk),
+        giver="fedadmin_url",
+        recording="AB92C968E943D2A44A234792B76D5AFD",
+    )
+
+    grant = AccessRight.objects.get(federated_peer=trusted_peer)
+    assert grant.object_id == str(recording.pk)
+
+
+def test_grant_accepts_a_lowercase_url_hash(trusted_peer, make_superuser):
+    # stored_name is upper-case hex; a hash pasted from a lower-casing source is
+    # still the same recording.
+    giver = make_superuser(username="fedadmin_lower")
+    recording = baker.make(
+        "recordings.Recording",
+        author=giver,
+        content_hash="content-hash-lower",
+        stored_name="CD92C968E943D2A44A234792B76D5AFD.edf",
+    )
+    _run(
+        "federation_grant",
+        peer=str(trusted_peer.pk),
+        giver="fedadmin_lower",
+        recording="cd92c968e943d2a44a234792b76d5afd",
+    )
+    assert AccessRight.objects.get(federated_peer=trusted_peer).object_id == str(recording.pk)
+
+
+def test_grant_still_accepts_a_content_hash(trusted_peer, make_superuser):
+    giver = make_superuser(username="fedadmin_content")
+    recording = _recording(giver, "hash-content-form")
+    _run("federation_grant", peer=str(trusted_peer.pk), giver="fedadmin_content", recording="hash-content-form")
+    assert AccessRight.objects.get(federated_peer=trusted_peer).object_id == str(recording.pk)
+
+
+def test_grant_names_both_forms_when_nothing_matches(trusted_peer, make_superuser):
+    make_superuser(username="fedadmin_missing")
+    with pytest.raises(CommandError) as exc:
+        _run("federation_grant", peer=str(trusted_peer.pk), giver="fedadmin_missing", recording="nothing-here")
+    assert "hash from the recording" in str(exc.value)
+    assert "content_hash" in str(exc.value)
+
+
 def test_grant_wildcard_and_flags(trusted_peer, make_superuser):
     giver = make_superuser(username="fedadmin3")
     _recording(giver, "hash-flags")

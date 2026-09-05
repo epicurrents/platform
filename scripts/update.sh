@@ -299,6 +299,48 @@ esac
 
 info "Updating from $MODE (backup: $([ "$BACKUP" = true ] && echo on || echo off), overlay: production)"
 
+# ── Preflight: the tree must belong to the account the containers run as ──────
+# web, celery, celery-beat and migrate all run as uid/gid 1000 against a bind mount
+# of this directory, so a tree owned by anyone else comes up and then fails on its
+# first write, far from the cause. The way it happens is an archive: tar records
+# the *builder's* uid, and an update applied as root preserves it, so a package
+# built on a laptop can hand a deployment a tree its own account cannot write.
+# Checked here, before anything is touched, rather than discovered later.
+#
+# Linux only, which is what gating on `stat -c` amounts to: Docker Desktop maps
+# ownership inside its own VM, where none of this applies. Fatal in archive mode,
+# which is the case that breaks; a warning in repo mode, where a checkout owned by
+# a developer's own uid is a legitimate arrangement this cannot tell apart.
+
+if DIR_MODE="$(stat -c %a . 2>/dev/null)"; then
+    DIR_UID="$(stat -c %u .)"
+    DIR_GID="$(stat -c %g .)"
+    DIR_MODE="$(printf '%04d' "$DIR_MODE")"
+    TREE_WRITABLE=false
+    if [ "$DIR_UID" = "1000" ] && [ "$(( ${DIR_MODE:1:1} & 2 ))" -ne 0 ]; then
+        TREE_WRITABLE=true
+    fi
+    if [ "$DIR_GID" = "1000" ] && [ "$(( ${DIR_MODE:2:1} & 2 ))" -ne 0 ]; then
+        TREE_WRITABLE=true
+    fi
+    if [ "$(( ${DIR_MODE:3:1} & 2 ))" -ne 0 ]; then
+        TREE_WRITABLE=true
+    fi
+    if [ "$TREE_WRITABLE" = false ]; then
+        if [ "$MODE" = archive ]; then
+            die "$ROOT is not writable by uid 1000, the user every container runs as \
+(owner ${DIR_UID}:${DIR_GID}, mode ${DIR_MODE}). The update would apply and the stack \
+would then fail on its first write. Fix the ownership and re-run:
+    sudo chown -R 1000:1000 $ROOT"
+        else
+            warn "$ROOT is owned by ${DIR_UID}:${DIR_GID} and is not writable by uid 1000,"
+            warn "which every container runs as. If this is a deployment rather than a"
+            warn "development checkout, fix it with: sudo chown -R 1000:1000 $ROOT"
+        fi
+    fi
+fi
+
+
 # ── 0. Snapshot the current code, BEFORE anything overwrites it ───────────────
 # Placement is the whole point. Step 1 rsyncs the new tree over the deployment,
 # so a code snapshot taken with the database in step 2 captures the *new* code

@@ -12,6 +12,9 @@ dry-run, like the bootstrap-script tests.
 """
 
 import gzip as gzlib
+import subprocess
+
+import pytest
 
 from scripts.tests.conftest import SCRIPTS_DIR, make_env, run_script
 
@@ -43,8 +46,56 @@ def _index_of(calls, substring):
 def _deploy(fakebin, tmp_path, **env):
     """Set up a fake deployment root: a .env plus running-container stubs."""
     make_env(tmp_path, **env)
+    # update.sh refuses a tree uid 1000 cannot write, and pytest's tmp_path belongs
+    # to whoever runs the suite. World-writable satisfies the check without needing
+    # a uid the test cannot have — the same escape a real deployment gets.
+    tmp_path.chmod(0o777)
     fakebin.stub("docker", body=DOCKER_PS_RUNNING)
     fakebin.stub("cp", body=REAL_CP)
+
+
+#: The preflight reads ownership with `stat -c`, which is GNU-only — the guard is a
+#: no-op on macOS by design, so its tests are too.
+requires_gnu_stat = pytest.mark.skipif(
+    subprocess.run(["stat", "-c", "%u", "."], capture_output=True, check=False).returncode != 0,
+    reason="the ownership preflight is Linux-only (stat -c)",
+)
+
+
+class TestOwnershipPreflight:
+    """A tree uid 1000 cannot write is a deployment that fails on its first write.
+
+    It arrives that way from an archive built elsewhere: tar records the builder's
+    uid and an update applied as root preserves it. Refusing up front turns a
+    permission error hours later into one sentence before anything is touched.
+    """
+
+    @requires_gnu_stat
+    def test_archive_mode_refuses_a_tree_the_container_user_cannot_write(self, fakebin, tmp_path):
+        _deploy(fakebin, tmp_path)
+        tmp_path.chmod(0o700)
+        result = run_script("update.sh", fakebin, cwd=tmp_path)
+        assert result.returncode != 0
+        assert "not writable by uid 1000" in result.stderr
+        assert "chown -R 1000:1000" in result.stderr
+
+    @requires_gnu_stat
+    def test_repo_mode_warns_but_proceeds(self, fakebin, tmp_path):
+        # A checkout owned by a developer's own uid is a legitimate arrangement the
+        # check cannot tell from a broken deployment, so it says so and continues.
+        _deploy(fakebin, tmp_path)
+        tmp_path.chmod(0o700)
+        result = run_script("update.sh", fakebin, cwd=tmp_path, args=["--from", "repo", "--no-pull"])
+        assert result.returncode == 0, result.stderr
+        # warn() writes to stdout, unlike die().
+        assert "not writable by uid 1000" in result.stdout
+
+    @requires_gnu_stat
+    def test_a_writable_tree_passes(self, fakebin, tmp_path):
+        _deploy(fakebin, tmp_path)
+        result = run_script("update.sh", fakebin, cwd=tmp_path, args=["--from", "repo", "--no-pull"])
+        assert result.returncode == 0, result.stderr
+        assert "not writable by uid 1000" not in result.stdout + result.stderr
 
 
 class TestGuards:

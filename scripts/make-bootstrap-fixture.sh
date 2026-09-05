@@ -70,6 +70,12 @@
 #                        the instance ready to federate. Inert until a peer is
 #                        added, but a posture worth choosing rather than
 #                        inheriting from having named a domain.
+#   --tarball            Also pack <dest> into <dest>.tar.gz, stamped as owned by
+#                        uid/gid 1000 — the uid every container runs as. Ownership
+#                        is why this exists rather than being left to the caller:
+#                        tar records the *builder's* uid, an update rsyncs it onto
+#                        the deployment as root, and the deployment account then
+#                        cannot write its own deployment root.
 #   --network-name NAME  Docker network the package joins. Defaults to the
 #                        destination directory name, which is what keeps a
 #                        package off any other stack on the same host — see the
@@ -100,6 +106,30 @@ info() { printf '\n\033[1;34m==> %s\033[0m\n' "$*"; }
 ok()   { printf '    \033[32m✓\033[0m  %s\n'  "$*"; }
 die()  { printf '\n\033[1;31mERROR:\033[0m %s\n' "$*" >&2; exit 1; }
 
+# Flags that stamp an archive as owned by the deployment account rather than by
+# whoever built it. An archive built on macOS otherwise carries the builder's uid
+# (501 there), update.sh rsyncs it onto the deployment as root, and the account the
+# containers run as is locked out of files in its own tree.
+#
+# 1000 rather than 0, deliberately. update.sh runs as root on a typical host, so
+# root-owned members land as root-owned files and reproduce the same lockout with a
+# different uid. Every container in this stack runs as uid 1000 and prepare-host.sh
+# hands the tree to whoever holds it, so 1000 is the uid the tree has to belong to;
+# extraction by that account itself produces the same result, since tar cannot set
+# ownership unprivileged anyway.
+#
+# The two tar flavours spell this differently. Read to EOF rather than piping into
+# `head` — under `set -o pipefail` an early close kills the producer and the whole
+# substitution fails.
+tar_ownership_flags() {
+    local version
+    version="$(tar --version 2>/dev/null | awk 'NR == 1 { v = $0 } END { print v }')"
+    case "$version" in
+        *GNU*) printf '%s' "--owner=1000 --group=1000 --numeric-owner" ;;
+        *)     printf '%s' "--uid 1000 --gid 1000 --numeric-owner" ;;
+    esac
+}
+
 # ── Arguments ────────────────────────────────────────────────────────────────
 
 DEST=""
@@ -109,6 +139,7 @@ WITH_ALL_PROJECTS=false
 WITH_ALL_PLUGINS=false
 DEMO=false
 DIST=false
+TARBALL=false
 NETWORK_NAME=""
 PROXY_DOMAIN_ARG=""
 ACME_EMAIL_ARG=""
@@ -124,6 +155,7 @@ while [ $# -gt 0 ]; do
         --with-plugins) WITH_ALL_PLUGINS=true ;;
         --demo) DEMO=true ;;
         --dist) DIST=true ;;
+        --tarball) TARBALL=true ;;
         --with-project)
             shift
             [ $# -gt 0 ] || die "--with-project requires a project name."
@@ -1568,17 +1600,38 @@ else
     [ ${#PROJECTS[@]} -gt 0 ] && ok "Projects: ${PROJECTS[*]}"
     [ ${#PLUGINS[@]} -gt 0 ] && ok "Plugins:  ${PLUGINS[*]}"
 fi
+if [ "$TARBALL" = true ]; then
+    info "Packing the archive"
+    ARCHIVE="$DEST.tar.gz"
+    # COPYFILE_DISABLE keeps macOS from storing extended attributes as ._* members,
+    # which GNU tar materialises as real files on the target — enough to make the
+    # archive unrecognisable to update.sh. The ownership flags are the other half:
+    # see tar_ownership_flags.
+    # shellcheck disable=SC2046  # the flag list is meant to word-split.
+    COPYFILE_DISABLE=1 tar -czf "$ARCHIVE" $(tar_ownership_flags) \
+        -C "$(dirname "$DEST")" "$(basename "$DEST")"
+    ok "$ARCHIVE ($(du -h "$ARCHIVE" | cut -f1))"
+fi
+
 echo
 echo "Next:"
 if [ "$DEMO" = true ] || [ "$DIST" = true ]; then
     echo "  cd $DEST && ./start.sh"
     echo
-    echo "  To ship it as an archive that update.sh can apply:"
-    echo "    COPYFILE_DISABLE=1 tar -czf $(basename "$DEST").tar.gz -C $(dirname "$DEST") $(basename "$DEST")"
-    echo
-    echo "  COPYFILE_DISABLE matters only on macOS, where tar stores extended"
-    echo "  attributes as ._* members that GNU tar then materialises as real"
-    echo "  files on the target — enough to make the archive unrecognisable."
+    if [ "$TARBALL" = true ]; then
+        echo "  Ship $(basename "$ARCHIVE") to the deployment's update/ directory,"
+        echo "  then run ./update.sh there."
+    else
+        echo "  To ship it as an archive that update.sh can apply, re-run with --tarball,"
+        echo "  or pack it by hand with the ownership flags this platform needs:"
+        echo "    COPYFILE_DISABLE=1 tar -czf $(basename "$DEST").tar.gz $(tar_ownership_flags) \\"
+        echo "        -C $(dirname "$DEST") $(basename "$DEST")"
+        echo
+        echo "  Both parts matter. COPYFILE_DISABLE keeps macOS extended attributes"
+        echo "  out of the archive, where GNU tar would materialise them as real"
+        echo "  files. The ownership flags stamp the tree as uid 1000, the account"
+        echo "  the containers run as, instead of whoever happened to build it."
+    fi
 else
     echo "  cd $DEST && ./bootstrap-smoke.sh"
 fi

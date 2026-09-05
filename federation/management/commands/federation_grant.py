@@ -9,7 +9,7 @@ from django.utils.dateparse import parse_datetime
 from activity.models import Activity
 from activity.system_activity import with_system_activity
 from federation import services
-from federation.management.commands._cli import resolve_peer, resolve_user
+from federation.management.commands._cli import resolve_peer, resolve_recording, resolve_user
 from federation.services import FederationServiceError
 
 
@@ -22,7 +22,10 @@ class Command(BaseCommand):
             "--giver", required=True, help="Username issuing the grant (needs share rights on the object)."
         )
         target = parser.add_mutually_exclusive_group(required=True)
-        target.add_argument("--recording", help="Recording content_hash to share.")
+        target.add_argument(
+            "--recording",
+            help="Recording to share: the 32-character hash from its URL, or its content_hash.",
+        )
         target.add_argument("--content-type", help="'app_label.model' of the target (with --object-id).")
         parser.add_argument("--object-id", help="Target object primary key (with --content-type).")
         parser.add_argument(
@@ -80,9 +83,7 @@ class Command(BaseCommand):
         if options.get("recording"):
             from recordings.models import Recording
 
-            rec = Recording.objects.filter(content_hash=options["recording"]).first()
-            if rec is None:
-                raise CommandError(f"Recording not found for content_hash: {options['recording']}")
+            rec = resolve_recording(options["recording"])
             return ContentType.objects.get_for_model(Recording), str(rec.pk)
 
         if not options.get("object_id"):

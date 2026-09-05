@@ -450,6 +450,8 @@ scripts/make-bootstrap-fixture.sh ~/epicurrents-demo --demo
 scripts/make-bootstrap-fixture.sh ~/epicurrents-myproject --dist --with-project myproject
 ```
 
+Add `--tarball` to pack the result into `<dest>.tar.gz` at the same time — worth preferring over packing it by hand, since the archive records the ownership the deployment ends up with, and a tarball built with the wrong uid leaves the deployment account unable to write its own tree.
+
 The recipient runs the bundled start script and opens the printed URL; the package's own README walks them through it, and they need only Docker. On a bare Linux server that does not have it, the package's prepare-host.sh installs Docker, creates the uid-1000 account the containers run as and hands the deployment to it — the two things start.sh cannot do for itself, since it has to run as that unprivileged account. It installs Docker from the same [scripts/lib/install-docker.sh](../scripts/lib/install-docker.sh) that [scripts/bootstrap.sh](../scripts/bootstrap.sh) uses, so a packaged deployment and a cloned one get the same engine. `--demo` leaves the signal viewer out (base UI only); `--dist` includes it and activates the chosen project. A package destined for a known address can be assembled for it: `--proxy-domain` with `--acme-email` preconfigures the domain, the certificate contact, the frontend base URL and the host allowlist, so the recipient runs the start script and gets a TLS deployment rather than editing four values by hand. Add `--federation` to also publish the instance URL peers reach it at. Run the script with `--help` for every option, and see [docs/developing.md](developing.md#bootstrap-smoke-fixture) for how the same script also drives the CI smoke fixture.
 
 ## Running tests

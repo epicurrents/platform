@@ -349,7 +349,7 @@ The peer and grant operators below are CLI equivalents of the [API](#api), shari
 | `federation_trust_peer --peer <ref> [--fingerprint <fp>] [--untrust]` | Set the trust flag. With `--fingerprint`, the flip fails unless the stored key matches — turning the documented TOFU check into an enforced one. |
 | `federation_refresh_peer_key --peer <ref>` | Re-fetch the peer's key after a rotation; warns on an unexpected change. |
 | `federation_list_peers` | List peers with trust state and key fingerprints. |
-| `federation_grant --peer <ref> --giver <user> (--recording <hash> \| --content-type <app.model> --object-id <id>) [--remote-user] [--no-read] [--write] [--share] [--apply-middleware] [--expires <iso>]` | Grant a peer (optionally a specific remote user) access to an object. `--giver` must hold share rights on it. |
+| `federation_grant --peer <ref> --giver <user> (--recording <hash> \| --content-type <app.model> --object-id <id>) [--remote-user] [--no-read] [--write] [--share] [--apply-middleware] [--expires <iso>]` | Grant a peer (optionally a specific remote user) access to an object. `--giver` must hold share rights on it. `--recording` takes the 32-character hash a recording's URL carries, or its full `content_hash`. |
 | `federation_renew_grant --grant-id <id> (--expires <iso> \| --no-expiry) [--actor]` | Set or clear a grant's expiry — the CLI side of `PATCH /grants/{id}/`. |
 | `federation_revoke_grant --grant-id <id> [--actor]` | Revoke a grant. |
 | `federation_list_grants [--giver <user>]` | List federation grants (peer, remote user, target, permissions, expiry). |

@@ -10,6 +10,13 @@ Entries are written for the person deciding whether to upgrade, so the ones that
 
 ### Added
 
+- [make-bootstrap-fixture.sh](scripts/make-bootstrap-fixture.sh) gained `--tarball`, which packs the assembled package into
+  `<dest>.tar.gz` in one step, stamped as owned by uid/gid 1000 — the account
+  every container runs as. Packing by hand records the *builder's* uid instead,
+  and since an update applies the archive as root, that uid travels onto the
+  deployment and locks its own account out of the tree. The failure surfaces
+  later as a permission error from a container, far from its cause.
+
 - Federation can run over a private overlay network without turning the SSRF
   guard off. `FEDERATION_ALLOWED_PEER_CIDRS` lists the networks a peer URL may
   resolve to despite not being globally routable — `100.64.0.0/10` and
@@ -220,6 +227,20 @@ Entries are written for the person deciding whether to upgrade, so the ones that
   docs/operations.md → Security headers.
 
 ### Fixed
+
+- `federation_grant --recording` accepts the hash a recording's URL carries, not
+  only its `content_hash`. Those are different strings — the URL and the API
+  address a recording by the 32-character `stored_name` prefix, while
+  `content_hash` fingerprints the bytes — so an operator pasting the hash they
+  had in hand got "Recording not found for content_hash", which reads as "no
+  such recording". Both forms now resolve, and the error names both.
+
+- [update.sh](scripts/update.sh) refuses a deployment tree the container user cannot write, instead
+  of applying the update and leaving the stack to fail on its first write. The
+  usual cause is an archive built elsewhere: tar records the builder's uid, and
+  an update applied as root preserves it. Fatal in archive mode; a warning in
+  repo mode, where a checkout on a developer's own uid is legitimate and
+  indistinguishable from the broken case.
 
 - A distribution or demo package assembled without a project could not build its
   own image. The Dockerfile copies projects/ whether or not one is active — the

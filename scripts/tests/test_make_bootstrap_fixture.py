@@ -11,6 +11,8 @@ import os
 import re
 import shutil
 import subprocess
+import tarfile
+from pathlib import Path
 
 from scripts.tests.conftest import REPO_ROOT, SCRIPTS_DIR, requires_built_frontend, requires_rsync
 
@@ -358,6 +360,27 @@ class TestDistPackage:
         dest = tmp_path / "demo"
         assert _run(dest, "--demo").returncode == 0
         assert "VIEWER_BUNDLED=false" in (dest / "start.sh").read_text()
+
+    def test_tarball_is_owned_by_the_deployment_account(self, tmp_path):
+        # tar records the builder's uid. Applied to a deployment as root, that uid
+        # travels with the files, and the account the containers run as is locked
+        # out of its own tree — with the failure surfacing much later, as a write
+        # error from a container.
+        dest = tmp_path / "dist"
+        assert _run(dest, "--dist", "--tarball").returncode == 0
+        archive = tmp_path / "dist.tar.gz"
+        assert archive.is_file()
+        with tarfile.open(archive) as tf:
+            owners = {(m.uid, m.gid) for m in tf.getmembers()}
+        assert owners == {(1000, 1000)}, f"archive carries foreign ownership: {owners}"
+
+    def test_tarball_carries_no_appledouble_members(self, tmp_path):
+        # macOS stores extended attributes as ._* members that GNU tar materialises
+        # as real files on the target, which update.sh then cannot recognise.
+        dest = tmp_path / "dist"
+        assert _run(dest, "--dist", "--tarball").returncode == 0
+        with tarfile.open(tmp_path / "dist.tar.gz") as tf:
+            assert not [n for n in tf.getnames() if Path(n).name.startswith("._")]
 
     def test_demo_and_dist_mutually_exclusive(self, tmp_path):
         assert _run(tmp_path / "x", "--demo", "--dist").returncode != 0
