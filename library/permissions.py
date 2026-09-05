@@ -155,3 +155,121 @@ def can_read_via_dataset(user, obj, share_token: str | None = None):
     if right is None:
         return ReadAccessTerms(granted=False)
     return ReadAccessTerms(granted=True, apply_middleware=right.apply_middleware)
+
+
+def can_read_via_dataset_federated(peer, remote_user_id: str, obj):
+    """Return ReadAccessTerms when a peer reaches ``obj`` through a shared Dataset.
+
+    The federated counterpart of :func:`can_read_via_dataset`, registered through
+    ``register_federated_read_extension`` in ``library.apps.LibraryConfig.ready()``.
+    It exists separately because a peer has no local user, group membership or
+    share token to match an ``AccessRight`` target against — only the peer row and
+    an opaque remote user id.
+
+    A wildcard grant (``remote_user_id=""``) covers any user from that peer;
+    an exact match covers one. ``apply_middleware`` comes from the dataset's grant
+    row, so a sharer who chose de-identification keeps it on every recording the
+    dataset carries.
+
+    Returns ``None`` when no dataset grant reaches the object, which is how the
+    resolver tells "not mine to grant" from "granted with these terms".
+    """
+    from django.contrib.contenttypes.models import ContentType
+    from django.db.models import Q
+
+    from epicurrents.models import AccessRight
+    from epicurrents.permissions import ReadAccessTerms
+    from library.models import Dataset, DatasetItem
+
+    object_pk = getattr(obj, "pk", None)
+    if object_pk is None or peer is None:
+        return None
+
+    obj_ct = ContentType.objects.get_for_model(obj, for_concrete_model=False)
+    dataset_ids = list(
+        DatasetItem.objects.filter(
+            content_type=obj_ct,
+            object_id=str(object_pk),
+            dataset__deleted_at__isnull=True,
+        ).values_list("dataset_id", flat=True)
+    )
+    if not dataset_ids:
+        return None
+
+    dataset_ct = ContentType.objects.get_for_model(Dataset, for_concrete_model=False)
+    right = (
+        AccessRight.objects.active()
+        .filter(
+            content_type=dataset_ct,
+            object_id__in=[str(did) for did in dataset_ids],
+            can_read=True,
+            federated_peer=peer,
+        )
+        .filter(Q(remote_user_id="") | Q(remote_user_id=remote_user_id))
+        # Exact-user row before the peer-wide wildcard, as the direct-grant
+        # resolver orders them, so the specific grant's terms win.
+        .order_by("-remote_user_id")
+        .only("apply_middleware")
+        .first()
+    )
+    if right is None:
+        return None
+    return ReadAccessTerms(granted=True, apply_middleware=right.apply_middleware)
+
+
+def federated_dataset_visible_terms(peer, remote_user_id: str, content_type):
+    """Objects of *content_type* a peer reaches through datasets shared with it, with terms.
+
+    The listing half of the pair registered with
+    ``register_federated_read_extension``. Two queries — the peer's dataset grants,
+    then the items in those datasets — because listing endpoints resolve hundreds of
+    rows and cannot call the per-object check on each.
+
+    Terms rather than bare ids: ``apply_middleware`` lives on the dataset's grant
+    row, and the federated listing also advertises a download size that depends on
+    whether the bytes are transformed. An item in two shared datasets takes the
+    de-identifying grant, the safe direction and the one the resolver picks among
+    equals.
+
+    Deleted datasets are excluded; the items' own visibility is the caller's
+    business, as it is for directly granted ids.
+    """
+    from django.contrib.contenttypes.models import ContentType
+    from django.db.models import Q
+
+    from epicurrents.models import AccessRight
+    from epicurrents.permissions import ReadAccessTerms
+    from library.models import Dataset, DatasetItem
+
+    if peer is None:
+        return {}
+
+    dataset_ct = ContentType.objects.get_for_model(Dataset, for_concrete_model=False)
+    grants = (
+        AccessRight.objects.active()
+        .filter(content_type=dataset_ct, can_read=True, federated_peer=peer)
+        .filter(Q(remote_user_id="") | Q(remote_user_id=remote_user_id))
+        .values_list("object_id", "apply_middleware")
+    )
+    middleware_by_dataset: dict[int, bool] = {}
+    for object_id, apply_middleware in grants:
+        if not str(object_id).isdigit():
+            continue
+        dataset_pk = int(object_id)
+        middleware_by_dataset[dataset_pk] = middleware_by_dataset.get(dataset_pk, False) or apply_middleware
+    if not middleware_by_dataset:
+        return {}
+
+    terms: dict[str, ReadAccessTerms] = {}
+    items = DatasetItem.objects.filter(
+        dataset_id__in=list(middleware_by_dataset),
+        dataset__deleted_at__isnull=True,
+        content_type=content_type,
+    ).values_list("object_id", "dataset_id")
+    for object_id, dataset_id in items:
+        key = str(object_id)
+        apply_middleware = middleware_by_dataset.get(dataset_id, False)
+        existing = terms.get(key)
+        if existing is None or (apply_middleware and not existing.apply_middleware):
+            terms[key] = ReadAccessTerms(granted=True, apply_middleware=apply_middleware)
+    return terms

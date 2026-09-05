@@ -350,6 +350,162 @@ class TestCanWriteObject:
 
 
 @pytest.mark.django_db
+class TestFederatedReadExtensions:
+    """A peer must be able to reach objects it holds no row of its own on.
+
+    Local read extensions cannot answer for a peer — they take a user, groups and
+    a share token, none of which a peer has — so before this registry existed the
+    federated resolver saw direct rows only. Sharing a dataset with a peer was
+    accepted and conveyed nothing, on the platform's only sharing unit.
+    """
+
+    def _make_peer(self, user, url="https://ext-peer.example.com"):
+        from federation.models import FederatedPeer
+
+        return FederatedPeer.objects.create(url=url, public_key="B" * 43, is_trusted=True, added_by=user)
+
+    def _register(self, check=None, visible_terms=None):
+        """Register a pair, returning an undo that restores what was there before.
+
+        Restores rather than clears: the registry is process-wide and already holds
+        library's dataset extension from ``AppConfig.ready()``, so clearing it here
+        would quietly disarm dataset sharing for every test that ran afterwards.
+        """
+        from epicurrents import permissions as _perm_mod
+        from epicurrents.permissions import register_federated_read_extension
+
+        previous = list(_perm_mod._FEDERATED_READ_EXTENSIONS)
+        register_federated_read_extension(
+            check=check or (lambda peer, remote_user_id, obj: None),
+            visible_terms=visible_terms or (lambda peer, remote_user_id, content_type: {}),
+        )
+
+        def undo():
+            _perm_mod._FEDERATED_READ_EXTENSIONS[:] = previous
+
+        return undo
+
+    def test_extension_grants_when_no_direct_row_exists(self, user):
+        from model_bakery import baker
+
+        from epicurrents.permissions import ReadAccessTerms
+
+        peer = self._make_peer(user)
+        recording = baker.make("recordings.Recording", author=user)
+        undo = self._register(check=lambda p, r, o: ReadAccessTerms(granted=True))
+        try:
+            assert get_federated_read_access_result(peer, "u1", recording).granted is True
+        finally:
+            undo()
+
+    def test_extension_terms_carry_apply_middleware(self, user):
+        # The flag decides whether the peer receives de-identified bytes, so an
+        # extension that grants without carrying it silently serves raw PHI.
+        from model_bakery import baker
+
+        from epicurrents.permissions import ReadAccessTerms
+
+        peer = self._make_peer(user)
+        recording = baker.make("recordings.Recording", author=user)
+        undo = self._register(check=lambda p, r, o: ReadAccessTerms(granted=True, apply_middleware=True))
+        try:
+            assert get_federated_read_access_result(peer, "u1", recording).apply_middleware is True
+        finally:
+            undo()
+
+    def test_a_direct_row_outranks_an_extension(self, user):
+        # The sharer's specific decision about this object wins over anything
+        # inherited, matching how the local resolver orders the two.
+        from model_bakery import baker
+
+        from epicurrents.permissions import ReadAccessTerms
+
+        peer = self._make_peer(user)
+        recording = baker.make("recordings.Recording", author=user)
+        ct = ContentType.objects.get_for_model(recording, for_concrete_model=False)
+        AccessRight.objects.create(
+            content_type=ct,
+            object_id=str(recording.pk),
+            access_giver=user,
+            federated_peer=peer,
+            remote_user_id="",
+            can_read=True,
+            apply_middleware=True,
+        )
+        undo = self._register(check=lambda p, r, o: ReadAccessTerms(granted=True, apply_middleware=False))
+        try:
+            assert get_federated_read_access_result(peer, "u1", recording).apply_middleware is True
+        finally:
+            undo()
+
+    def test_extension_returning_none_denies(self, user):
+        from model_bakery import baker
+
+        peer = self._make_peer(user)
+        recording = baker.make("recordings.Recording", author=user)
+        undo = self._register(check=lambda p, r, o: None)
+        try:
+            assert get_federated_read_access_result(peer, "u1", recording).granted is False
+        finally:
+            undo()
+
+    def test_visibility_gate_precedes_extensions(self, user):
+        # A gate hides the object from every caller; an extension must not be able
+        # to grant past one, as the direct-row path cannot.
+        from model_bakery import baker
+
+        from epicurrents.permissions import ReadAccessTerms
+
+        peer = self._make_peer(user)
+        recording = baker.make("recordings.Recording", author=user, status="failed")
+        undo = self._register(check=lambda p, r, o: ReadAccessTerms(granted=True))
+        try:
+            assert get_federated_read_access_result(peer, "u1", recording).granted is False
+        finally:
+            undo()
+
+    def test_visible_ids_aggregates_registered_extensions(self, user):
+        from epicurrents.permissions import get_federated_visible_ids
+
+        peer = self._make_peer(user)
+        from epicurrents.permissions import ReadAccessTerms
+
+        undo = self._register(
+            visible_terms=lambda p, r, ct: {7: ReadAccessTerms(granted=True), "8": ReadAccessTerms(granted=True)}
+        )
+        try:
+            assert {"7", "8"} <= get_federated_visible_ids(peer, "u1", None)
+        finally:
+            undo()
+
+    def test_visible_ids_is_empty_without_a_peer(self, user):
+        from epicurrents.permissions import ReadAccessTerms, get_federated_visible_ids
+
+        undo = self._register(visible_terms=lambda p, r, ct: {"9": ReadAccessTerms(granted=True)})
+        try:
+            assert get_federated_visible_ids(None, "u1", None) == set()
+        finally:
+            undo()
+
+    def test_registration_is_idempotent(self, user):
+        from epicurrents import permissions as _perm_mod
+        from epicurrents.permissions import register_federated_read_extension
+
+        def check(peer, remote_user_id, obj):
+            return None
+
+        def visible_terms(peer, remote_user_id, content_type):
+            return {}
+
+        previous = list(_perm_mod._FEDERATED_READ_EXTENSIONS)
+        try:
+            register_federated_read_extension(check=check, visible_terms=visible_terms)
+            register_federated_read_extension(check=check, visible_terms=visible_terms)
+            assert len(_perm_mod._FEDERATED_READ_EXTENSIONS) == len(previous) + 1
+        finally:
+            _perm_mod._FEDERATED_READ_EXTENSIONS[:] = previous
+
+
 class TestGetFederatedReadAccessResult:
     """Tests for get_federated_read_access_result."""
 

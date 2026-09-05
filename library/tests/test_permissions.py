@@ -2,6 +2,7 @@
 
 Covers:
 - can_read_via_dataset: dataset-membership inheritance with apply_middleware propagation
+- The same rule for a federated peer, per object and as a listing
 - The author-only collection gate, and the contract that collection-targeted AccessRight rows grant nothing
 """
 
@@ -11,8 +12,13 @@ from model_bakery import baker
 
 from epicurrents.models import AccessRight
 from epicurrents.permissions import ReadAccessTerms, can_read_object, get_read_access_result
+from federation.models import FederatedPeer
 from library.models import Collection, CollectionItem, Dataset, DatasetItem
-from library.permissions import can_read_via_dataset
+from library.permissions import (
+    can_read_via_dataset,
+    can_read_via_dataset_federated,
+    federated_dataset_visible_terms,
+)
 
 
 def _dataset_right(dataset, giver, **kwargs):
@@ -254,3 +260,135 @@ class TestCollectionRowsGrantNothing:
         collection = baker.make(Collection, author=owner)
         assert can_read_collection(other, collection) is False
         assert can_write_collection(other, collection) is False
+
+
+@pytest.fixture
+def peer(db):
+    return FederatedPeer.objects.create(url="https://peer.example.com", public_key="k" * 43, is_trusted=True)
+
+
+class TestDatasetGrantsReachAFederatedPeer:
+    """A dataset shared with a peer has to reach that peer's users.
+
+    It did not: the federated resolver read direct rows only, so a dataset grant
+    was accepted, reported as created, and conveyed nothing — the peer's listing
+    was empty and a per-object request 404'd. Datasets are the platform's only
+    sharing unit, so that was the whole sharing surface for federation.
+    """
+
+    def _shared_dataset(self, user, recording, peer, **right_kwargs):
+        dataset = baker.make(Dataset, author=user)
+        DatasetItem.objects.create(
+            dataset=dataset,
+            content_type=ContentType.objects.get_for_model(recording),
+            object_id=str(recording.pk),
+        )
+        _dataset_right(dataset, user, federated_peer=peer, can_read=True, **right_kwargs)
+        return dataset
+
+    def test_peer_reaches_an_item_of_a_shared_dataset(self, user, peer):
+        recording = baker.make("recordings.Recording", author=user)
+        self._shared_dataset(user, recording, peer)
+        terms = can_read_via_dataset_federated(peer, "", recording)
+        assert terms is not None and terms.granted
+
+    def test_de_identification_survives_the_inheritance(self, user, peer):
+        # The sharer's choice lives on the dataset row. Losing it here serves raw
+        # EDF — patient identification and clinical annotation text — to a peer
+        # that was granted the de-identified form.
+        recording = baker.make("recordings.Recording", author=user)
+        self._shared_dataset(user, recording, peer, apply_middleware=True)
+        assert can_read_via_dataset_federated(peer, "", recording).apply_middleware is True
+
+    def test_a_wildcard_grant_covers_any_remote_user(self, user, peer):
+        recording = baker.make("recordings.Recording", author=user)
+        self._shared_dataset(user, recording, peer)
+        assert can_read_via_dataset_federated(peer, "42", recording).granted
+
+    def test_a_user_scoped_grant_covers_only_that_user(self, user, peer):
+        recording = baker.make("recordings.Recording", author=user)
+        self._shared_dataset(user, recording, peer, remote_user_id="42")
+        assert can_read_via_dataset_federated(peer, "42", recording).granted
+        assert can_read_via_dataset_federated(peer, "43", recording) is None
+
+    def test_another_peer_reaches_nothing(self, user, peer):
+        recording = baker.make("recordings.Recording", author=user)
+        self._shared_dataset(user, recording, peer)
+        other = FederatedPeer.objects.create(url="https://other.example.com", public_key="j" * 43)
+        assert can_read_via_dataset_federated(other, "", recording) is None
+
+    def test_an_unshared_dataset_reaches_nothing(self, user, peer):
+        recording = baker.make("recordings.Recording", author=user)
+        dataset = baker.make(Dataset, author=user)
+        DatasetItem.objects.create(
+            dataset=dataset,
+            content_type=ContentType.objects.get_for_model(recording),
+            object_id=str(recording.pk),
+        )
+        assert can_read_via_dataset_federated(peer, "", recording) is None
+
+    def test_a_trashed_dataset_reaches_nothing(self, user, peer):
+        from django.utils import timezone
+
+        recording = baker.make("recordings.Recording", author=user)
+        dataset = self._shared_dataset(user, recording, peer)
+        dataset.deleted_at = timezone.now()
+        dataset.save(update_fields=["deleted_at"])
+        assert can_read_via_dataset_federated(peer, "", recording) is None
+
+
+class TestFederatedDatasetListing:
+    """The listing half has to answer the same question as the per-object half.
+
+    A listing that disagrees is its own defect: it either advertises objects that
+    then 404, or hides objects the peer can fetch by hash.
+    """
+
+    def _shared(self, user, peer, count=2):
+        dataset = baker.make(Dataset, author=user)
+        recordings = [baker.make("recordings.Recording", author=user) for _ in range(count)]
+        ct = ContentType.objects.get_for_model(recordings[0])
+        for recording in recordings:
+            DatasetItem.objects.create(dataset=dataset, content_type=ct, object_id=str(recording.pk))
+        _dataset_right(dataset, user, federated_peer=peer, can_read=True)
+        return recordings, ct
+
+    def test_lists_every_item_of_a_shared_dataset(self, user, peer):
+        recordings, ct = self._shared(user, peer)
+        assert set(federated_dataset_visible_terms(peer, "", ct)) == {str(r.pk) for r in recordings}
+
+    def test_agrees_with_the_per_object_check(self, user, peer):
+        recordings, ct = self._shared(user, peer)
+        listed = federated_dataset_visible_terms(peer, "", ct)
+        for recording in recordings:
+            assert (str(recording.pk) in listed) is bool(can_read_via_dataset_federated(peer, "", recording))
+
+    def test_carries_the_de_identification_choice(self, user, peer):
+        # The federated listing advertises a download size that depends on this
+        # flag, so a listing that reports the terms wrongly misstates the size.
+        dataset = baker.make(Dataset, author=user)
+        recording = baker.make("recordings.Recording", author=user)
+        ct = ContentType.objects.get_for_model(recording)
+        DatasetItem.objects.create(dataset=dataset, content_type=ct, object_id=str(recording.pk))
+        _dataset_right(dataset, user, federated_peer=peer, can_read=True, apply_middleware=True)
+        assert federated_dataset_visible_terms(peer, "", ct)[str(recording.pk)].apply_middleware is True
+
+    def test_de_identifying_share_wins_when_an_item_is_in_two(self, user, peer):
+        # Among equals the resolver prefers the de-identifying row; the safe
+        # direction, since the reverse serves PHI.
+        recording = baker.make("recordings.Recording", author=user)
+        ct = ContentType.objects.get_for_model(recording)
+        for apply_middleware in (False, True):
+            dataset = baker.make(Dataset, author=user)
+            DatasetItem.objects.create(dataset=dataset, content_type=ct, object_id=str(recording.pk))
+            _dataset_right(dataset, user, federated_peer=peer, can_read=True, apply_middleware=apply_middleware)
+        assert federated_dataset_visible_terms(peer, "", ct)[str(recording.pk)].apply_middleware is True
+
+    def test_lists_nothing_for_another_peer(self, user, peer):
+        _, ct = self._shared(user, peer)
+        other = FederatedPeer.objects.create(url="https://other2.example.com", public_key="h" * 43)
+        assert federated_dataset_visible_terms(other, "", ct) == {}
+
+    def test_lists_nothing_without_a_peer(self, user, peer):
+        _, ct = self._shared(user, peer)
+        assert federated_dataset_visible_terms(None, "", ct) == {}

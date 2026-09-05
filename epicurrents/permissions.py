@@ -70,6 +70,13 @@ READ_PERMISSION_MODEL_NAME = "AccessRight"
 # via register_read_permission_extension() to avoid circular imports.
 _READ_PERMISSION_EXTENSIONS: list = []
 
+# Registry of federated read extensions: pairs of callables that answer the same
+# question for one object and for a listing. Separate from the registry above
+# because the caller shape differs — a peer holds no local user, no groups and no
+# share token, so a local checker cannot answer for one. Register from app.ready()
+# via register_federated_read_extension() to avoid circular imports.
+_FEDERATED_READ_EXTENSIONS: list = []
+
 # Registry of read-visibility gates, keyed by model label ("app.model").
 # Each gate receives (user, obj, share_token) and returns True when the
 # object must be treated as invisible to that caller. Register from
@@ -87,9 +94,10 @@ class ReadAccessTerms:
     content should be piped through the configured middleware pipeline before
     being sent to the recipient.
 
-    Extension-granted access (e.g. via Dataset membership) always yields the
-    default field values (``apply_middleware=False``) because extensions do
-    not have a backing ``AccessRight`` row.
+    Extension-granted access carries the terms of the row the grant came from:
+    Dataset membership resolves the ``AccessRight`` on the dataset and returns
+    its ``apply_middleware``, so a sharer's choice to de-identify survives being
+    inherited. An extension with no backing row leaves the default.
     """
 
     granted: bool
@@ -142,6 +150,78 @@ def register_read_permission_extension(checker) -> None:
     """
     if checker not in _READ_PERMISSION_EXTENSIONS:
         _READ_PERMISSION_EXTENSIONS.append(checker)
+
+
+@dataclass(frozen=True)
+class _FederatedReadExtension:
+    """One extension's two answers: for a single object, and for a listing."""
+
+    check: Any
+    visible_terms: Any
+
+
+def register_federated_read_extension(*, check, visible_terms) -> None:
+    """Register a path by which a peer reaches objects it holds no direct grant on.
+
+    Local read extensions cannot serve here. They take ``(user, obj, share_token)``,
+    and a federated caller has none of those — it is a peer plus an opaque remote
+    user id — so dataset membership and anything like it is invisible to a peer
+    unless something answers in these terms.
+
+    The two callables are registered together because a listing that disagrees with
+    the per-object check is the failure this shape exists to prevent: one grants
+    access nobody can discover, the other advertises objects that then 404.
+
+    ``check(peer, remote_user_id, obj) -> ReadAccessTerms | None``
+        Terms for one object, or ``None`` when this extension does not grant it.
+        Carry ``apply_middleware`` from the row the grant came from — a federated
+        grant de-identifies by default, and dropping the flag while inheriting it
+        serves raw PHI to a peer nobody granted that to.
+
+    ``visible_terms(peer, remote_user_id, content_type) -> Mapping[object id, ReadAccessTerms]``
+        Every object of that content type the peer reaches this way, with the terms
+        it reaches each one on. Listing endpoints resolve many objects at once and
+        cannot afford a per-row ``check``; returning terms rather than bare ids
+        means a caller that needs ``apply_middleware`` — the download-size
+        computation does — gets it from the same query.
+
+    Idempotent — registering the same pair twice has no effect.
+    """
+    extension = _FederatedReadExtension(check=check, visible_terms=visible_terms)
+    if extension not in _FEDERATED_READ_EXTENSIONS:
+        _FEDERATED_READ_EXTENSIONS.append(extension)
+
+
+def get_federated_visible_terms(peer, remote_user_id: str, content_type) -> dict:
+    """Terms on which a peer reaches each *content_type* object, through extensions.
+
+    The listing counterpart to the extension consultation in
+    :func:`get_federated_read_access_result`. Keys are strings, matching the
+    ``AccessRight.object_id`` column the direct-grant query reads.
+
+    Where two extensions reach the same object, the de-identifying terms win. That
+    matches how the direct-row resolver breaks a tie, and errs the safe way: the
+    cost of applying the middleware to a caller who could have had raw bytes is a
+    transformation nobody needed, and the cost of the reverse is PHI.
+
+    Callers still apply their own visibility rules to the rows they resolve — this
+    answers which objects an extension reaches, not whether they may be shown.
+    """
+    terms: dict = {}
+    if peer is None:
+        return terms
+    for extension in _FEDERATED_READ_EXTENSIONS:
+        for object_id, object_terms in extension.visible_terms(peer, remote_user_id, content_type).items():
+            key = str(object_id)
+            existing = terms.get(key)
+            if existing is None or (object_terms.apply_middleware and not existing.apply_middleware):
+                terms[key] = object_terms
+    return terms
+
+
+def get_federated_visible_ids(peer, remote_user_id: str, content_type) -> set[str]:
+    """Ids of *content_type* objects a peer reaches through registered extensions."""
+    return set(get_federated_visible_terms(peer, remote_user_id, content_type))
 
 
 def _resolve_read_permission_model():
@@ -317,6 +397,15 @@ def get_federated_read_access_result(peer, remote_user_id: str, obj) -> ReadAcce
 
     if right is not None:
         return ReadAccessTerms(granted=True, apply_middleware=right.apply_middleware)
+
+    # Extensions last, and only on a miss, mirroring the local resolver: a direct
+    # row is the sharer's specific decision about this object and outranks anything
+    # inherited. Without this loop a peer reaches only objects granted one by one,
+    # which is why sharing a dataset with a peer conveyed nothing at all.
+    for extension in _FEDERATED_READ_EXTENSIONS:
+        terms = extension.check(peer, remote_user_id, obj)
+        if terms is not None and terms.granted:
+            return terms
     return ReadAccessTerms(granted=False)
 
 

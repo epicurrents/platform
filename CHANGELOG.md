@@ -228,6 +228,22 @@ Entries are written for the person deciding whether to upgrade, so the ones that
 
 ### Fixed
 
+- Sharing a Dataset with a federated peer now reaches that peer. It did not:
+  the federated resolver read direct `AccessRight` rows only and consulted no
+  read extension, so `can_read_via_dataset` — the mechanism local dataset
+  sharing runs on — was structurally unreachable for a peer. The grant was
+  accepted and reported as created, the peer's listing came back empty, and a
+  request for a recording in the dataset was refused. Since collections are
+  author-private, datasets are the only sharing unit, so this was the whole
+  container-sharing surface for federation.
+
+  `register_federated_read_extension` is the path that was missing: a per-object
+  check and a `visible_terms` batch answer registered as a pair, because a listing
+  that disagrees with the object endpoint is its own defect. Terms are inherited
+  from the dataset's grant row, `apply_middleware` included, so a sharer's choice
+  to de-identify is not lost on the way through. Item placement inside a dataset
+  is still not carried across; a peer sees a flat list.
+
 - `federation_grant --recording` accepts the hash a recording's URL carries, not
   only its `content_hash`. Those are different strings — the URL and the API
   address a recording by the 32-character `stored_name` prefix, while

@@ -75,6 +75,8 @@ from epicurrents.permissions import (
     can_read_object,
     ensure_can_write_object,
     get_federated_read_access_result,
+    get_federated_visible_ids,
+    get_federated_visible_terms,
     get_read_access_result,
 )
 from federation.audit import log_federation_access
@@ -473,6 +475,17 @@ def _compute_download_sizes_for_peer(recordings, peer, remote_user_id, meta_by_p
         .filter(Q(remote_user_id="") | Q(remote_user_id=remote_user_id))
         .values_list("object_id", flat=True)
     )
+    # Recordings the peer reaches without a row of their own — through a dataset
+    # shared with it — carry the terms of the grant they were inherited from. Left
+    # out, a dataset shared with de-identification on advertises the raw size while
+    # serving transformed bytes, so a peer sizing a download by this field is wrong
+    # by exactly what the pipeline changes.
+    listed_ids = {str(r.pk) for r in recordings}
+    middleware_object_ids |= {
+        object_id
+        for object_id, terms in get_federated_visible_terms(peer, remote_user_id, recording_ct).items()
+        if terms.apply_middleware and object_id in listed_ids
+    }
 
     # Server-side pipeline for the API scope — identical to what download_recording uses.
     pipeline = _build_serve_pipeline()
@@ -1536,6 +1549,12 @@ def list_recordings(
             .filter(Q(expires_at__isnull=True) | Q(expires_at__gt=now))
             .values_list("object_id", flat=True)
         )
+        # Plus whatever the peer reaches without a row of its own — a recording in
+        # a dataset shared with it. Left out, a peer holding a dataset grant is told
+        # it can read nothing, while a per-object request for the same recording
+        # succeeds: the listing and the object endpoint disagreeing about the same
+        # grant is worse than either answer alone.
+        granted_ids |= get_federated_visible_ids(fed_peer, remote_user_id, recording_ct)
         visible = list(
             queryset.filter(pk__in=granted_ids).exclude(status=Recording.Status.FAILED)[offset : offset + limit]
         )

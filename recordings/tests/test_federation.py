@@ -6,7 +6,8 @@ real JWTs in every test, _try_federated_auth is patched to return a
 the federation auth module's own tests.
 
 Coverage:
-- list_recordings:    federated listing, grant filtering, expiry, wildcard remote_user_id, trash denied
+- list_recordings:    federated listing, grant filtering, expiry, wildcard remote_user_id, trash denied,
+                      and recordings reached through a dataset shared with the peer
 - recording_status:   grant required, 403 without grant
 - recording_detail:   grant required, 403 without grant
 - recording_detail_slice: grant required, 403 without grant
@@ -709,3 +710,123 @@ class TestFederatedAudit:
         rows = FederationAuditLog.objects.all()
         assert rows.count() == 1
         assert rows.first().status_code == 404
+
+
+class TestDatasetSharedRecordingsAreServed:
+    """A dataset shared with a peer has to behave like the sharing surface it is.
+
+    Datasets are the platform's only sharing unit — collections are author-private
+    — and the federated paths read direct rows only, so a dataset grant produced an
+    empty listing and a 404 per object while reporting itself as created. These
+    exercise the endpoints rather than the permission layer, because the listing
+    resolves access with its own batch query and could regress on its own.
+    """
+
+    def _share_dataset(self, user, peer, recording, **right_kwargs):
+        from library.models import Dataset, DatasetItem
+
+        dataset = Dataset.objects.create(name="Shared set", author=user)
+        DatasetItem.objects.create(
+            dataset=dataset,
+            content_type=ContentType.objects.get_for_model(recording, for_concrete_model=False),
+            object_id=str(recording.pk),
+        )
+        AccessRight.objects.create(
+            content_type=ContentType.objects.get_for_model(Dataset, for_concrete_model=False),
+            object_id=str(dataset.pk),
+            access_giver=user,
+            federated_peer=peer,
+            remote_user_id="",
+            can_read=True,
+            **right_kwargs,
+        )
+        return dataset
+
+    def test_listing_includes_a_dataset_shared_recording(self, client, user):
+        peer = _make_peer(user)
+        recording = _make_recording(user)
+        self._share_dataset(user, peer, recording)
+        with _as_peer(peer):
+            response = client.get(LIST_URL)
+        assert response.status_code == 200
+        assert [item["hash"] for item in response.json()] == [_hash(recording)]
+
+    def test_detail_serves_a_dataset_shared_recording(self, client, user):
+        peer = _make_peer(user)
+        recording = _make_recording(user)
+        self._share_dataset(user, peer, recording)
+        with _as_peer(peer):
+            response = client.get(DETAIL_URL.format(hash=_hash(recording)))
+        assert response.status_code == 200
+
+    def test_listing_and_detail_agree(self, client, user):
+        # The two paths resolve access differently — a batch query and a per-object
+        # check — so they can disagree, and either direction is a defect.
+        peer = _make_peer(user)
+        shared = _make_recording(user)
+        unshared = _make_recording(user, stored_name="FEDTEST1234567890FEDTEST123456CD.edf")
+        self._share_dataset(user, peer, shared)
+        with _as_peer(peer):
+            listed = {item["hash"] for item in client.get(LIST_URL).json()}
+            shared_status = client.get(DETAIL_URL.format(hash=_hash(shared))).status_code
+            unshared_status = client.get(DETAIL_URL.format(hash=_hash(unshared))).status_code
+        assert listed == {_hash(shared)}
+        assert shared_status == 200
+        # 403 rather than 404: an ungranted recording is refused by the resolver,
+        # which is a different shape from the FAILED-hidden 404 elsewhere in this
+        # module.
+        assert unshared_status == 403
+
+    def test_download_size_reflects_the_inherited_de_identification(self, user):
+        """The advertised size has to follow the terms the recording is served on.
+
+        A peer sizes a transfer by this field. With the default size-preserving
+        pipeline the two answers coincide, which is precisely why this asserts
+        against a pipeline that changes size — otherwise the gap only appears on a
+        deployment running a project's own signal middleware, against real data.
+        """
+        from unittest.mock import patch
+
+        from recordings.api.v1.ninja import _compute_download_sizes_for_peer
+        from recordings.models import RecordingMeta
+
+        peer = _make_peer(user)
+        inherited = _make_recording(user)
+        self._share_dataset(user, peer, inherited, apply_middleware=True)
+        meta = RecordingMeta.objects.create(
+            content_type=ContentType.objects.get_for_model(inherited, for_concrete_model=False),
+            object_id=str(inherited.pk),
+            format="edf",
+            duration=1.0,
+            data_record_count=1,
+            data_record_duration=1.0,
+            signal_count=1,
+        )
+
+        class _HalvingPipeline:
+            is_empty = False
+            is_size_preserving = False
+            has_signal_middleware = False
+
+            def compute_output_size(self, file_size, header_size):
+                return file_size // 2
+
+        with patch("recordings.api.v1.ninja._build_serve_pipeline", return_value=_HalvingPipeline()):
+            sizes = _compute_download_sizes_for_peer(
+                [inherited],
+                peer,
+                "user42",
+                {inherited.pk: meta},
+            )
+        assert sizes[inherited.pk] == inherited.file_size // 2
+
+    def test_a_dataset_shared_recording_is_not_listed_for_another_peer(self, client, user):
+        peer = _make_peer(user)
+        recording = _make_recording(user)
+        self._share_dataset(user, peer, recording)
+        other = FederatedPeer.objects.create(
+            url="https://other-peer.example.com", public_key="C" * 43, is_trusted=True, added_by=user
+        )
+        with _as_peer(other):
+            response = client.get(LIST_URL)
+        assert response.json() == []

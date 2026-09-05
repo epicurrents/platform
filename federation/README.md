@@ -183,6 +183,10 @@ Federation grants are not a separate model — they're rows in the core `AccessR
 | `apply_middleware` | When `True`, served EDF/BDF content passes through the configured middleware pipeline before transmission. |
 | `expires_at` | Optional, same as regular grants. |
 
+
+**Container grants cross too.** A `can_read` grant on a Dataset reaches every recording the dataset holds, for the peer it names — the federated counterpart of local dataset inheritance, registered by library through `register_federated_read_extension`. Direct rows still win: a per-object grant on a recording carries its own terms, and only a miss falls through to the dataset. Placement within the dataset is not carried; the peer sees a flat list.
+
+Before that registration existed the federated resolver read direct rows only, so a dataset grant was created, reported, and conveyed nothing — an empty listing for the peer and a refusal per object. Datasets being the platform's only sharing unit, that was the whole container-sharing surface.
 ## API
 
 Mounted at `/api/v1/federation/`. Full request/response detail in [api/v1/ninja.py](api/v1/ninja.py).

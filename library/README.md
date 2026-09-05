@@ -193,6 +193,10 @@ Registered in [apps.py](apps.py) `ready()`:
 
 ```python
 register_read_permission_extension(can_read_via_dataset)
+register_federated_read_extension(
+    check=can_read_via_dataset_federated,
+    visible_terms=federated_dataset_visible_terms,
+)
 ```
 
 Consulted only when no direct `AccessRight` row matches the caller and the target object (the early-return rule in `get_read_access_result` — see [epicurrents/README.md](../epicurrents/README.md#permissions)).
@@ -200,6 +204,14 @@ Consulted only when no direct `AccessRight` row matches the caller and the targe
 ### `can_read_via_dataset`
 
 Grants read on `obj` when `obj` is a member of a non-deleted `Dataset` for which the caller (user, group, or supplied share token) holds an active `can_read` `AccessRight`. The returned `ReadAccessTerms.apply_middleware` reflects the matching Dataset right's `apply_middleware` flag, so EDF files served through dataset-inherited reads honour the sharer's anonymisation choice. Write is never inherited.
+
+### `can_read_via_dataset_federated` and `federated_dataset_visible_terms`
+
+The same rule for a federated peer, registered as a pair through `register_federated_read_extension`. A separate implementation is not duplication: the local checker matches an `AccessRight` against a user, their groups or a share token, and a peer has none of those — only a peer row and an opaque remote user id. A wildcard grant (`remote_user_id=""`) covers every user from that peer, an exact one covers a single user, and `apply_middleware` comes from the dataset's grant row exactly as in the local path.
+
+The `visible_terms` half answers for listing endpoints, which resolve access for many rows at once with a batch query rather than a per-object check. It returns terms rather than bare ids because the federated listing also advertises a download size, which depends on whether the bytes are transformed on the way out. Both halves register together because the failure that matters is disagreement: a listing that omits what the object endpoint serves hides shared data, and one that includes what the object endpoint refuses advertises 404s.
+
+Placement inside a dataset is not carried across federation yet — `DatasetItem.folder` describes a tree on the owning side, while a peer sees a flat list. A recipient expecting a layout (BIDS, say) has to rebuild it from names.
 
 No collection counterpart exists: collections grant nothing on their items, and `TestCollectionRowsGrantNothing` in [tests/test_permissions.py](tests/test_permissions.py) pins that a stale collection-targeted `AccessRight` row stays inert.
 
