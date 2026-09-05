@@ -60,6 +60,12 @@ The only outbound HTTP call from the federation app is `fetch_peer_public_key` �
 
 **Override for dev.** Local-to-local federation testing (e.g. two Django dev instances on the same host) needs `http://localhost:...` to work.  Set `FEDERATION_ALLOW_PRIVATE_PEER_URLS=True` in `.env` to disable the guard.  **Never enable in production** — that re-opens the SSRF vector against a compromised superuser account.
 
+**Carve-out for a private overlay.** A deployment whose peers are reachable only over a network it is itself on — a tailnet, a site-to-site VPN — is in a different position from a dev box: the addresses are not public, but they are also not arbitrary. `FEDERATION_ALLOWED_PEER_CIDRS` takes a comma-separated list of networks whose addresses the guard admits, leaving every other non-public address refused. `100.64.0.0/10,fd7a:115c:a1e0::/48` is the pair a Tailscale tailnet resolves into. Entries must be network addresses (`100.64.0.0/10`, not `100.64.0.1/10`), and a default route is refused outright — listing one disables the guard rather than narrowing it, which is what the boolean above is for. Malformed entries raise `ImproperlyConfigured` at the first peer fetch rather than silently admitting or refusing anything.
+
+The two settings compose the way their names suggest: the boolean short-circuits the guard entirely and the CIDR list only widens what counts as acceptable. NAT64 translation prefixes are rejected under both, since a prefix that maps onto arbitrary IPv4 targets is never a network anyone owns.
+
+One thing the name understates: `check_url_is_safe` is the shared entry point for outbound URLs anywhere in the platform, so a carve-out made for federation applies to every caller of it, not only to peer fetches.
+
 **Known limitation.** The guard does not defend against DNS rebinding (TOCTOU between the resolution here and the connection made by `urllib.request.urlopen`).  Closing that gap requires pinning the resolved IP for the urllib call, which is non-trivial — see [Future enhancements](#future-enhancements).
 
 ## Peer deletion
@@ -366,6 +372,7 @@ The peer and grant operators below are CLI equivalents of the [API](#api), shari
 | `FEDERATION_PEER_DOWNLOAD_RATE_LIMIT` | `60` | Maximum federated download requests per peer per minute. Set to `0` to disable. |
 | `FEDERATION_PEER_INBOUND_RATE_LIMIT` | `600` | Maximum `inbound_check_object` requests per peer per minute. Set to `0` to disable. |
 | `FEDERATION_ALLOW_PRIVATE_PEER_URLS` | `False` | Dev-only escape hatch — when `True`, the SSRF guard does not reject peer URLs resolving to private IPs. **Never enable in production.** |
+| `FEDERATION_ALLOWED_PEER_CIDRS` | `""` | Comma-separated networks the SSRF guard admits despite not being globally routable — the carve-out a deployment federating over a tailnet or VPN uses instead of the boolean above. See [Outbound URL safety](#outbound-url-safety-ssrf-guard). |
 
 Leave all three of `FEDERATION_PUBLIC_KEY`, `FEDERATION_PRIVATE_KEY`, `FEDERATION_INSTANCE_URL` blank to disable federation entirely. The well-known endpoint returns `404` in that case.
 

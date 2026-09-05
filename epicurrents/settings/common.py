@@ -592,6 +592,15 @@ FEDERATION_PEER_INBOUND_RATE_LIMIT = config(
 # IPs by default.  Set to True in dev environments where you legitimately
 # need to federate against a localhost peer — NEVER enable in production.
 FEDERATION_ALLOW_PRIVATE_PEER_URLS = config("FEDERATION_ALLOW_PRIVATE_PEER_URLS", default=False, cast=bool)
+# The surgical form of the override above: networks a peer URL may resolve to
+# despite not being globally routable. A deployment federating over a private
+# overlay — a tailnet, a site-to-site VPN — lists that network and keeps the
+# guard on for every other address, where the boolean above turns it off for all
+# of them. Comma-separated CIDRs; "100.64.0.0/10,fd7a:115c:a1e0::/48" is the
+# pair a Tailscale tailnet needs. Default empty, so the guard is unchanged until
+# a deployment says otherwise. NAT64 translation prefixes are refused whatever
+# is listed here.
+FEDERATION_ALLOWED_PEER_CIDRS = config("FEDERATION_ALLOWED_PEER_CIDRS", default="", cast=Csv())
 
 # Global per-identity request-rate throttle on the REST API surface (see
 # epicurrents/throttle.py). Keyed per authenticated user / share token /

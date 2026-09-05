@@ -10,6 +10,21 @@ Entries are written for the person deciding whether to upgrade, so the ones that
 
 ### Added
 
+- Federation can run over a private overlay network without turning the SSRF
+  guard off. `FEDERATION_ALLOWED_PEER_CIDRS` lists the networks a peer URL may
+  resolve to despite not being globally routable — `100.64.0.0/10` and
+  `fd7a:115c:a1e0::/48` for a Tailscale tailnet — and every other non-public
+  address stays refused. The alternative was `FEDERATION_ALLOW_PRIVATE_PEER_URLS`,
+  which disables the guard for all of them and is documented as never for
+  production, so a deployment whose peers are reachable only over its own
+  overlay had to choose between federating and keeping the guard.
+
+  Empty by default, so a deployment that does not set it is unchanged. Entries
+  must be network addresses, and a default route is refused: listing one
+  disables the guard rather than narrowing it. NAT64 translation prefixes stay
+  refused whatever is listed. The guard is shared, so the carve-out reaches
+  every caller of `check_url_is_safe`, not only peer fetches.
+
 - The viewer's source-localisation tool works in the platform SPA. It never
   could: the lead-field provider is what tells the viewer where lead fields
   live, and only the per-project viewer build supplied one, so the SPA — which

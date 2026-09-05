@@ -415,6 +415,50 @@ _NAT64_PREFIXES = (
 )
 
 
+#: Prefix lengths that would reopen the guard wholesale rather than carve a hole in it.
+#: Listing a default route is how "allow the one network I federate over" turns into
+#: "allow anything" by accident, so it is refused with a pointer at the blunt override
+#: that says the same thing out loud.
+_DEFAULT_ROUTES = (ipaddress.ip_network("0.0.0.0/0"), ipaddress.ip_network("::/0"))
+
+
+def _allowed_peer_networks() -> tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ...]:
+    """Parse ``FEDERATION_ALLOWED_PEER_CIDRS`` into networks the guard will admit.
+
+    Re-parsed on every call rather than cached. Peer checks are rare — registering a
+    peer, refreshing a key — and a module-level cache would outlive a settings change
+    in the same process, which is the opposite of what an operator narrowing the list
+    expects.
+
+    Raises:
+        ImproperlyConfigured: an entry is not a CIDR, carries host bits, or is a
+            default route.
+    """
+    from django.conf import settings
+    from django.core.exceptions import ImproperlyConfigured
+
+    networks = []
+    for entry in getattr(settings, "FEDERATION_ALLOWED_PEER_CIDRS", ()) or ():
+        entry = entry.strip()
+        if not entry:
+            continue
+        try:
+            network = ipaddress.ip_network(entry)
+        except ValueError as exc:
+            raise ImproperlyConfigured(
+                f"FEDERATION_ALLOWED_PEER_CIDRS entry {entry!r} is not a CIDR: {exc}. "
+                "Give the network address rather than a host inside it (100.64.0.0/10, not 100.64.0.1/10)."
+            ) from exc
+        if network in _DEFAULT_ROUTES:
+            raise ImproperlyConfigured(
+                f"FEDERATION_ALLOWED_PEER_CIDRS entry {entry!r} is a default route, which disables the "
+                "SSRF guard entirely. List the network you federate over, or set "
+                "FEDERATION_ALLOW_PRIVATE_PEER_URLS=True if that is really what you mean."
+            )
+        networks.append(network)
+    return tuple(networks)
+
+
 def _check_url_is_safe(url: str) -> None:
     """Reject URLs that resolve to non-globally-routable addresses.
 
@@ -451,6 +495,10 @@ def _check_url_is_safe(url: str) -> None:
     except socket.gaierror as exc:
         raise ValueError(f"DNS lookup failed for {host}: {exc}") from exc
 
+    # Parsed before the loop so a malformed setting fails on its own terms rather than
+    # once per resolved address, and so the error names the setting rather than the URL.
+    allowed_networks = _allowed_peer_networks()
+
     for info in infos:
         addr = info[4][0]
         # Strip IPv6 zone identifier if present (e.g. "fe80::1%eth0").
@@ -462,12 +510,18 @@ def _check_url_is_safe(url: str) -> None:
         # ``is_global`` is True only for globally-routable IPs.  Excludes
         # private (RFC 1918 / RFC 4193), loopback, link-local, multicast,
         # reserved, and unspecified.
-        if not ip.is_global:
-            raise ValueError(f"URL {url} resolves to non-public address {addr} — refusing to fetch (SSRF guard).")
+        if not ip.is_global and not any(ip in network for network in allowed_networks):
+            raise ValueError(
+                f"URL {url} resolves to non-public address {addr} — refusing to fetch (SSRF guard). "
+                "Add its network to FEDERATION_ALLOWED_PEER_CIDRS if this peer is reachable only over a "
+                "private network this deployment is on."
+            )
         # NAT64 prefixes report ``is_global=True`` in the stdlib, but a
         # local NAT64 gateway translates them onto arbitrary IPv4 targets
         # — including RFC 1918 space — so they re-open the hole the
         # is_global check closes. No legitimate peer URL resolves here.
+        # Checked after the allowlist and never exempted by it: a listed CIDR
+        # says "this network is mine", which a translation prefix never is.
         if any(ip in prefix for prefix in _NAT64_PREFIXES):
             raise ValueError(f"URL {url} resolves to NAT64-translated address {addr} — refusing to fetch (SSRF guard).")
 
@@ -480,6 +534,11 @@ def check_url_is_safe(url: str) -> None:
     logic lives in one place. Delegates to ``_check_url_is_safe``; the
     ``FEDERATION_ALLOW_PRIVATE_PEER_URLS`` development override applies
     here too, which lets dev environments target localhost services.
+
+    ``FEDERATION_ALLOWED_PEER_CIDRS`` applies here as well, despite naming
+    peers: the guard is shared, so a deployment that carves out its overlay
+    network for federation carves it out for every caller of this function.
+    Worth knowing before adding one — the setting reads narrower than it is.
 
     Raises:
         ValueError: hostname missing, DNS lookup failed, or any resolved

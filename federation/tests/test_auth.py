@@ -5,6 +5,7 @@ import time
 from unittest.mock import MagicMock, patch
 
 import pytest
+from django.core.exceptions import ImproperlyConfigured
 
 from federation.auth import (
     _b64_decode,
@@ -707,6 +708,93 @@ class TestSsrfGuard:
         Dev-environment escape hatch — never to be set in production.
         """
         settings.FEDERATION_ALLOW_PRIVATE_PEER_URLS = True
+        _check_url_is_safe("https://127.0.0.1/x")  # no exception
+
+
+class TestSsrfAllowedCidrs:
+    """``FEDERATION_ALLOWED_PEER_CIDRS`` widens the guard for named networks only.
+
+    A deployment federating over a tailnet or a VPN has peers at addresses that are
+    private but not arbitrary. The blunt boolean turns the guard off for every
+    address; this list turns it off for the networks an operator names and leaves
+    the rest of the SSRF surface — metadata endpoints, loopback, the RFC 1918 space
+    a compromised superuser would aim at — refused exactly as before.
+    """
+
+    #: A Tailscale tailnet address: inside 100.64.0.0/10, so ``is_global`` is False.
+    TAILNET_V4 = "100.79.150.119"
+    TAILNET_CIDR = "100.64.0.0/10"
+
+    def test_tailnet_address_rejected_by_default(self, settings):
+        # The setting's default must change nothing, or every deployment that never
+        # heard of it quietly gains a hole.
+        settings.FEDERATION_ALLOW_PRIVATE_PEER_URLS = False
+        settings.FEDERATION_ALLOWED_PEER_CIDRS = []
+        with pytest.raises(ValueError, match="non-public address"):
+            _check_url_is_safe(f"https://{self.TAILNET_V4}/x")
+
+    def test_listed_network_is_admitted(self, settings):
+        settings.FEDERATION_ALLOW_PRIVATE_PEER_URLS = False
+        settings.FEDERATION_ALLOWED_PEER_CIDRS = [self.TAILNET_CIDR]
+        _check_url_is_safe(f"https://{self.TAILNET_V4}/x")  # no exception
+
+    def test_listing_one_network_does_not_admit_another(self, settings):
+        settings.FEDERATION_ALLOW_PRIVATE_PEER_URLS = False
+        settings.FEDERATION_ALLOWED_PEER_CIDRS = [self.TAILNET_CIDR]
+        for addr in ("10.0.0.1", "192.168.1.1", "127.0.0.1", "169.254.169.254"):
+            with pytest.raises(ValueError, match="non-public address"):
+                _check_url_is_safe(f"https://{addr}/x")
+
+    def test_ipv6_network_is_admitted(self, settings):
+        # A tailnet answers on both families, so a v4-only carve-out silently fails
+        # over whichever name resolves to the ULA first.
+        settings.FEDERATION_ALLOW_PRIVATE_PEER_URLS = False
+        settings.FEDERATION_ALLOWED_PEER_CIDRS = ["fd7a:115c:a1e0::/48"]
+        _check_url_is_safe("https://[fd7a:115c:a1e0::1]/x")  # no exception
+
+    def test_nat64_refused_even_when_listed(self, settings):
+        # A translation prefix maps onto arbitrary IPv4 targets, so it is never a
+        # network an operator owns — listing it must not buy anything.
+        settings.FEDERATION_ALLOW_PRIVATE_PEER_URLS = False
+        settings.FEDERATION_ALLOWED_PEER_CIDRS = ["64:ff9b::/96", "64:ff9b:1::/48"]
+        with pytest.raises(ValueError, match="NAT64"):
+            _check_url_is_safe("https://[64:ff9b::a00:1]/x")
+        with pytest.raises(ValueError, match="NAT64"):
+            _check_url_is_safe("https://[64:ff9b:1::a00:1]/x")
+
+    def test_malformed_entry_is_reported_not_ignored(self, settings):
+        settings.FEDERATION_ALLOW_PRIVATE_PEER_URLS = False
+        settings.FEDERATION_ALLOWED_PEER_CIDRS = ["not-a-network"]
+        with pytest.raises(ImproperlyConfigured, match="not a CIDR"):
+            _check_url_is_safe(f"https://{self.TAILNET_V4}/x")
+
+    def test_host_bits_are_reported(self, settings):
+        # 100.64.0.1/10 reads as "this host" and means "this whole /10". Refusing it
+        # is what keeps the two readings from diverging silently.
+        settings.FEDERATION_ALLOW_PRIVATE_PEER_URLS = False
+        settings.FEDERATION_ALLOWED_PEER_CIDRS = ["100.64.0.1/10"]
+        with pytest.raises(ImproperlyConfigured, match="not a CIDR"):
+            _check_url_is_safe(f"https://{self.TAILNET_V4}/x")
+
+    def test_default_route_is_refused(self, settings):
+        settings.FEDERATION_ALLOW_PRIVATE_PEER_URLS = False
+        settings.FEDERATION_ALLOWED_PEER_CIDRS = ["0.0.0.0/0"]
+        with pytest.raises(ImproperlyConfigured, match="default route"):
+            _check_url_is_safe("https://127.0.0.1/x")
+        settings.FEDERATION_ALLOWED_PEER_CIDRS = ["::/0"]
+        with pytest.raises(ImproperlyConfigured, match="default route"):
+            _check_url_is_safe("https://127.0.0.1/x")
+
+    def test_public_addresses_are_unaffected(self, settings):
+        settings.FEDERATION_ALLOW_PRIVATE_PEER_URLS = False
+        settings.FEDERATION_ALLOWED_PEER_CIDRS = [self.TAILNET_CIDR]
+        _check_url_is_safe("https://1.1.1.1/x")  # no exception
+
+    def test_boolean_override_short_circuits_the_list(self, settings):
+        # Ordering, asserted so it stays deliberate: the boolean already means
+        # "allow anything", so a malformed list behind it is never parsed.
+        settings.FEDERATION_ALLOW_PRIVATE_PEER_URLS = True
+        settings.FEDERATION_ALLOWED_PEER_CIDRS = ["not-a-network"]
         _check_url_is_safe("https://127.0.0.1/x")  # no exception
 
 
