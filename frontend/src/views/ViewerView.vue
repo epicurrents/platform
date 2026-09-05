@@ -22,6 +22,7 @@ import { plugin as pluginsPlugin } from '#plugins/active'
 import { waitForEventBus } from '#projects/eventBus'
 import { getViewerConfig } from '#api/viewerConfig'
 import { applyViewerSettingsOverrides, VIEWER_USER_SETTINGS_PATH } from '#lib/viewerConfig'
+import { leadFieldProvider } from '#viewer/leadFields'
 
 // The overlay panel comes from the active project if it defines one, otherwise
 // from the first enabled plugin that does. A page hosts a single overlay.
@@ -336,6 +337,19 @@ onMounted(async () => {
             pluginsPlugin.extraSetup ?? {},
             plugin.extraSetup ?? {},
         )
+        // Tell the EEG module where lead fields come from. The viewer holds no URLs of its
+        // own, so its source-localisation tool reports itself unavailable unless a host
+        // supplies a provider. Merged after the assign above rather than declared in the
+        // literal, because that assign is shallow: a plugin or project contributing its own
+        // `modules` key would otherwise replace this one wholesale.
+        const withModules = setup as { modules?: Record<string, unknown> }
+        const modules = withModules.modules ?? {}
+        const eegConfig = modules.eeg
+        modules.eeg = {
+            ...(typeof eegConfig === 'object' && eegConfig !== null ? eegConfig : {}),
+            leadFieldProvider,
+        }
+        withModules.modules = modules
         // Create the global Epicurrents object if not available.
         if (typeof window.__EPICURRENTS__ === 'undefined') {
             window.__EPICURRENTS__ = {

@@ -18,6 +18,12 @@
       "#root/*": ["./*"],
       /* Viewer sub-packages — must appear before the catch-all "#*" below. */
       "#epicurrents/*": ["./viewer/epicurrents/*"],
+      /* The interface package, which is not installed into node_modules — the viewer builds
+       * resolve it through their own vite aliases, so type-checking needs its own mapping.
+       * Targets are the declarations the package emits (scripts/build-types.mjs); the imports
+       * themselves are type-only, so no bundler alias is needed alongside these. */
+      "@epicurrents/interface": ["./viewer/interface/dist/setups/index"],
+      "@epicurrents/interface/modules/*": ["./viewer/interface/dist/app/modules/*/index"],
       /* Viewer utility packages (workspace siblings of epicurrents/*). */
       "scoped-event-bus/*": ["./viewer/util/scoped-event-bus/*"],
       "scoped-event-log": ["./viewer/util/scoped-event-log/dist/index"],

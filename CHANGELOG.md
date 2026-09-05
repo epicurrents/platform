@@ -10,6 +10,20 @@ Entries are written for the person deciding whether to upgrade, so the ones that
 
 ### Added
 
+- The viewer's source-localisation tool works in the platform SPA. It never
+  could: the lead-field provider is what tells the viewer where lead fields
+  live, and only the per-project viewer build supplied one, so the SPA — which
+  loads the builder's full edition — reported every montage as unavailable
+  before looking one up. `ViewerView` now passes the provider in the setup it
+  hands to the viewer.
+
+  That needed the interface package to publish declarations, which it also never
+  did: its `exports` map named `dist/index.d.ts` and no such file was emitted.
+  It now emits them for every subpath, so a host can name `SetupContext`,
+  `LeadFieldProvider` and the rest instead of reaching into a file path or
+  casting. Details, and the two traps in how they are produced, are in the
+  interface package's README.
+
 - `manage.py vendor_pyodide` populates the self-hosted Pyodide runtime the
   viewer's Python analysis tools load from `/vendor/pyodide/<version>/`. The
   tree had no producer: it was described in the settings and the operations
