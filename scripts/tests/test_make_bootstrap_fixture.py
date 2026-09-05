@@ -8,6 +8,7 @@ behaviour is covered by asserting the excludes on the cheaper default copy.
 """
 
 import os
+import shutil
 import subprocess
 
 from scripts.tests.conftest import REPO_ROOT, SCRIPTS_DIR, requires_built_frontend, requires_rsync
@@ -38,6 +39,59 @@ def _run(dest, *args):
         capture_output=True,
         text=True,
     )
+
+
+def _copied_projects(dest):
+    """Return the project trees under a package's projects/, ignoring the package marker.
+
+    projects/ always exists in an assembled package, so "no project was copied"
+    is a statement about its contents rather than its presence.
+    """
+    root = dest / "projects"
+    if not root.is_dir():
+        return []
+    return sorted(child.name for child in root.iterdir() if child.is_dir())
+
+
+def _stub_path(tmp_path, **stubs):
+    """Build a directory of stub executables and return a PATH that finds them first.
+
+    The generated start.sh probes the host before it builds anything, so a test aimed
+    at a later check has to answer those probes rather than inherit whatever the
+    machine running the suite happens to have installed.
+    """
+    bindir = tmp_path / "stubbin"
+    bindir.mkdir(exist_ok=True)
+    for name, body in stubs.items():
+        stub = bindir / name
+        stub.write_text("#!/bin/sh\n" + body + "\n")
+        stub.chmod(0o755)
+    return f"{bindir}:/usr/bin:/bin"
+
+
+# Answers the two docker probes and fails anything else with a marker, so a test can
+# tell "reached the build" from "stopped at a check" without a daemon anywhere.
+_DOCKER_STUB = """
+case "$1 $2" in
+    "compose version") echo "Docker Compose version v2.29.0"; exit 0 ;;
+esac
+case "$1" in
+    version) echo "28.1.1"; exit 0 ;;
+esac
+echo "STUB-DOCKER $*" >&2
+exit 9
+"""
+
+
+def _stat_stub(uid, gid, mode):
+    return f"""
+case "$2" in
+    %a) echo {mode} ;;
+    %u) echo {uid} ;;
+    %g) echo {gid} ;;
+esac
+exit 0
+"""
 
 
 def _activated_plugins(runner_body):
@@ -79,7 +133,7 @@ class TestDefaultFixture:
         dest = tmp_path / "fx"
         assert _run(dest).returncode == 0
         assert not (dest / "frontend").exists()
-        assert not (dest / "projects").exists()
+        assert _copied_projects(dest) == []
         assert not (dest / "plugins").exists()
         assert not list(dest.rglob("__pycache__"))
         assert not list(dest.rglob("*.pyc"))
@@ -95,6 +149,37 @@ class TestDefaultFixture:
         assert _activated_plugins(body) == []
         assert "WITH_FRONTEND=false" in body
         assert (dest / "FIXTURE_README.md").is_file()
+
+
+class TestProjectsPackageMarker:
+    """projects/ ships in every package, because the bundled Dockerfile copies it."""
+
+    def test_marker_ships_without_a_project(self, tmp_path):
+        dest = tmp_path / "fx"
+        assert _run(dest).returncode == 0
+        assert (dest / "projects" / "__init__.py").is_file()
+        assert _copied_projects(dest) == []
+
+    def test_every_dockerfile_copy_source_is_in_the_package(self, tmp_path):
+        # The general form of the bug the marker fixes: BuildKit rejects a COPY whose
+        # source is absent from the context, reporting it as a checksum error naming
+        # an internal ref, so the assembled tree looks correct right up until an
+        # operator's first build. Asserted on the default mode because --demo and
+        # --dist only add to it, and every COPY source here is a backend path.
+        dest = tmp_path / "fx"
+        assert _run(dest).returncode == 0
+        missing = []
+        for line in (dest / "Dockerfile").read_text().splitlines():
+            stripped = line.strip()
+            if not stripped.startswith("COPY "):
+                continue
+            words = stripped.split()[1:]
+            if any(w.startswith("--from=") for w in words):
+                # Sourced from an earlier build stage, not from the package.
+                continue
+            sources = [w for w in words[:-1] if not w.startswith("--")]
+            missing += [src for src in sources if src != "." and not (dest / src).exists()]
+        assert not missing, f"Dockerfile copies paths the package does not ship: {missing}"
 
 
 class TestWithProject:
@@ -199,7 +284,7 @@ class TestDemoPackage:
         assert not (dest / "frontend" / "src").exists()
         assert not (dest / "bootstrap-smoke.sh").exists()
         assert not (dest / "FIXTURE_README.md").exists()
-        assert not (dest / "projects").exists()
+        assert _copied_projects(dest) == []
         assert not (dest / "plugins").exists()
 
     def test_incompatible_with_frontend_project_and_plugin_flags(self, tmp_path):
@@ -228,7 +313,7 @@ class TestDistPackage:
         dest = tmp_path / "dist"
         assert _run(dest, "--dist").returncode == 0
         assert (dest / "frontend" / "viewer-dist" / "epicurrents-lib.umd.js").is_file()
-        assert not (dest / "projects").exists()
+        assert _copied_projects(dest) == []
         assert not (dest / "plugins").exists()
         assert 'ACTIVE_PROJECT=""' in (dest / "start.sh").read_text()
 
@@ -375,6 +460,319 @@ class TestDistTailnet:
         )
         assert result.returncode != 0
         assert "tailscale-join.sh" in result.stderr
+
+
+@requires_built_frontend
+class TestStartShPreflight:
+    """start.sh checks the host before it builds; each of these fails late otherwise."""
+
+    def _start(self, dest, path, extra_env=None):
+        env = {"PATH": path, "HOME": str(dest)}
+        env.update(extra_env or {})
+        return subprocess.run(
+            ["bash", str(dest / "start.sh")],
+            check=False,
+            cwd=str(dest),
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+
+    def test_refuses_when_docker_is_absent(self, tmp_path):
+        dest = tmp_path / "dist"
+        assert _run(dest, "--dist").returncode == 0
+        empty = tmp_path / "emptybin"
+        empty.mkdir()
+        result = self._start(dest, f"{empty}:/usr/bin:/bin")
+        assert result.returncode != 0
+        assert "docker is not installed" in result.stderr
+
+    def test_refuses_a_package_without_the_projects_directory(self, tmp_path):
+        # The image build copies projects/ whether or not a project is active, and
+        # BuildKit reports a missing COPY source as a checksum error naming an
+        # internal ref — a message with nothing in it to act on, arriving after the
+        # operator has already installed Docker and started a build.
+        dest = tmp_path / "dist"
+        assert _run(dest, "--dist").returncode == 0
+        shutil.rmtree(dest / "projects")
+        result = self._start(dest, _stub_path(tmp_path, docker=_DOCKER_STUB))
+        assert result.returncode != 0
+        assert "no projects/ directory" in result.stderr
+        assert "STUB-DOCKER" not in result.stderr, "the build started despite the incomplete package"
+
+    def test_refuses_a_tree_the_container_user_cannot_write(self, tmp_path):
+        # Every service runs as 1000:1000 against a bind mount of the deployment, so
+        # a root-owned tree — what extracting a package as root produces — brings the
+        # stack up and then fails on its first write, far from the cause. stat and
+        # getent are stubbed so the decision is exercised on any host; getent's
+        # presence is what the script uses to mean "Linux".
+        dest = tmp_path / "dist"
+        assert _run(dest, "--dist").returncode == 0
+        path = _stub_path(
+            tmp_path,
+            docker=_DOCKER_STUB,
+            getent="exit 0",
+            stat=_stat_stub(uid=0, gid=0, mode=755),
+        )
+        result = self._start(dest, path)
+        assert result.returncode != 0
+        assert "not writable by uid 1000" in result.stderr
+        assert "chown -R 1000:1000" in result.stderr
+        assert "STUB-DOCKER" not in result.stderr, "the build started on an unwritable tree"
+
+    def test_accepts_a_tree_owned_by_the_container_user(self, tmp_path):
+        # The negative case above passes vacuously if the check refuses everything.
+        dest = tmp_path / "dist"
+        assert _run(dest, "--dist").returncode == 0
+        path = _stub_path(
+            tmp_path,
+            docker=_DOCKER_STUB,
+            getent="exit 0",
+            stat=_stat_stub(uid=1000, gid=1000, mode=755),
+        )
+        result = self._start(dest, path)
+        assert "not writable by uid 1000" not in result.stderr
+        assert "STUB-DOCKER" in result.stderr, "preflight stopped before the build"
+
+    def test_refuses_to_run_as_root(self, tmp_path):
+        # A tree already handed to uid 1000 is writable by uid 1000, so the
+        # ownership check passes for root too — root can write anywhere. The .env
+        # this would then generate belongs to root, inside a tree the deployment
+        # account and the containers both need to write. id is stubbed because the
+        # suite does not run as root.
+        dest = tmp_path / "dist"
+        assert _run(dest, "--dist").returncode == 0
+        path = _stub_path(
+            tmp_path,
+            docker=_DOCKER_STUB,
+            getent="exit 0",
+            stat=_stat_stub(uid=1000, gid=1000, mode=755),
+            id='case "$1" in -u) echo 0 ;; -g) echo 0 ;; *) echo "uid=0(root)" ;; esac',
+        )
+        result = self._start(dest, path)
+        assert result.returncode != 0
+        assert "Do not run this as root" in result.stderr
+        assert "prepare-host.sh" in result.stderr
+        assert "STUB-DOCKER" not in result.stderr, "the build started under root"
+
+    def test_accepts_a_world_writable_tree_it_does_not_own(self, tmp_path):
+        # Ownership is a proxy; writability is the property. A tree owned by root but
+        # world-writable is one uid 1000 can write, and refusing it would be wrong.
+        dest = tmp_path / "dist"
+        assert _run(dest, "--dist").returncode == 0
+        path = _stub_path(
+            tmp_path,
+            docker=_DOCKER_STUB,
+            getent="exit 0",
+            stat=_stat_stub(uid=0, gid=0, mode=777),
+        )
+        result = self._start(dest, path)
+        assert "not writable by uid 1000" not in result.stderr
+        assert "STUB-DOCKER" in result.stderr
+
+    def test_refuses_a_docker_engine_below_the_compose_floor(self, tmp_path):
+        # 24 accepts the volume subpath syntax in these compose files and mounts the
+        # wrong thing, so the floor is a refusal rather than a warning.
+        dest = tmp_path / "dist"
+        assert _run(dest, "--dist").returncode == 0
+        old_docker = _DOCKER_STUB.replace('echo "28.1.1"', 'echo "24.0.7"')
+        result = self._start(dest, _stub_path(tmp_path, docker=old_docker))
+        assert result.returncode != 0
+        assert "Docker Engine 25+" in result.stderr
+
+
+@requires_built_frontend
+class TestPrepareHost:
+    """The root-run half of a deployment, which start.sh deliberately cannot do."""
+
+    def test_bundles_the_script_and_the_shared_installer(self, tmp_path):
+        dest = tmp_path / "dist"
+        assert _run(dest, "--dist").returncode == 0
+        prepare = dest / "prepare-host.sh"
+        assert prepare.is_file()
+        assert os.access(prepare, os.X_OK), "prepare-host.sh must be executable"
+        assert (dest / "lib" / "install-docker.sh").is_file()
+
+    def test_installer_is_the_repository_copy_verbatim(self, tmp_path):
+        # The point of bundling rather than generating is that a packaged
+        # deployment and a cloned one install the same engine from the same
+        # repository with the same version floor. A copy that has drifted from the
+        # one bootstrap.sh sources gives that up while still looking bundled.
+        dest = tmp_path / "dist"
+        assert _run(dest, "--dist").returncode == 0
+        bundled = (dest / "lib" / "install-docker.sh").read_bytes()
+        assert bundled == (SCRIPTS_DIR / "lib" / "install-docker.sh").read_bytes()
+
+    def test_bootstrap_sources_the_same_installer(self, tmp_path):
+        # The other half of that property, and the direction that rots quietly:
+        # bootstrap.sh could grow its own inline install again and every test here
+        # would still pass.
+        body = (SCRIPTS_DIR / "bootstrap.sh").read_text()
+        assert 'lib/install-docker.sh"' in body
+        assert "install_docker_engine" in body
+        assert "docker-ce docker-ce-cli" not in body, "bootstrap.sh has re-inlined the package list"
+
+    def test_prepare_host_sources_the_bundled_installer(self, tmp_path):
+        dest = tmp_path / "dist"
+        assert _run(dest, "--dist").returncode == 0
+        body = (dest / "prepare-host.sh").read_text()
+        assert ". ./lib/install-docker.sh" in body
+        assert "docker-ce docker-ce-cli" not in body
+
+    def test_refuses_to_run_unprivileged(self, tmp_path):
+        # The suite does not run as root, so this is the branch reachable here —
+        # and it is the one an operator hits by forgetting sudo.
+        dest = tmp_path / "dist"
+        assert _run(dest, "--dist").returncode == 0
+        result = subprocess.run(
+            ["bash", str(dest / "prepare-host.sh")],
+            check=False,
+            cwd=str(dest),
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode != 0
+        assert "Run this as root" in result.stderr
+        assert "start.sh" in result.stderr, "the refusal should say which script is the unprivileged one"
+
+    def test_a_flag_without_its_value_says_so(self, tmp_path):
+        # `shift 2` past the end of the argument list fails under set -e, so the
+        # script exited on the shift with nothing printed — indistinguishable from
+        # a crash, for a typo.
+        dest = tmp_path / "dist"
+        assert _run(dest, "--dist").returncode == 0
+        for script, flag in (("prepare-host.sh", "--user"), ("start.sh", "--tailscale-mode")):
+            result = subprocess.run(
+                ["bash", str(dest / script), flag],
+                check=False,
+                cwd=str(dest),
+                capture_output=True,
+                text=True,
+            )
+            assert result.returncode != 0
+            assert f"{flag} needs a value" in result.stderr, f"{script} {flag} failed silently"
+
+    def test_documents_its_flags(self, tmp_path):
+        dest = tmp_path / "dist"
+        assert _run(dest, "--dist").returncode == 0
+        helped = subprocess.run(
+            ["bash", str(dest / "prepare-host.sh"), "--help"],
+            check=False,
+            cwd=str(dest),
+            capture_output=True,
+            text=True,
+        )
+        assert helped.returncode == 0, helped.stderr
+        assert "--user" in helped.stdout
+        assert "--no-sudoers" in helped.stdout
+
+    # ── The privileged path ──────────────────────────────────────────────────
+    # Everything above tests what the script refuses to do, because the suite is
+    # not root and the real run creates accounts. These stub the privileged
+    # binaries and log the calls instead, which is the only way to reach the two
+    # things the script exists for: the account resolution, and the ordering that
+    # decides whether a partial run leaves the tree owned by root.
+
+    def _root_env(self, fakebin, uid_1000_owner=None, groups="sudo"):
+        """Make prepare-host.sh believe it is root on a Debian server.
+
+        ``uid_1000_owner`` is the account ``getent passwd 1000`` reports, or None
+        for an image where the uid is still free — the one input the account
+        resolution branches on. ``groups`` is what that account already belongs
+        to, which is what decides whether usermod is called.
+        """
+        fakebin.stub(
+            "id",
+            body=f"""
+case "${{1:-}}" in
+    -u) echo 0 ;;
+    -nG) echo "{groups}" ;;
+    *) echo "uid=0(root) gid=0(root)" ;;
+esac
+""",
+        )
+        owner = f'echo "{uid_1000_owner}:x:1000:1000::/home/{uid_1000_owner}:/bin/bash"' if uid_1000_owner else "exit 2"
+        fakebin.stub(
+            "getent",
+            body=f"""
+case "$1 $2" in
+    "passwd 1000") {owner} ;;
+    "group docker") echo "docker:x:999:" ;;
+    passwd*) echo "$2:x:1000:1000::/home/$2:/bin/bash" ;;
+esac
+""",
+        )
+        fakebin.stub("adduser")
+
+    def _prepare(self, dest, fakebin, *args):
+        return subprocess.run(
+            ["bash", str(dest / "prepare-host.sh"), *args],
+            check=False,
+            cwd=str(dest),
+            env={"PATH": f"{fakebin.path}:/usr/bin:/bin", "HOME": str(dest), "LC_ALL": "C"},
+            capture_output=True,
+            text=True,
+        )
+
+    def test_an_existing_uid_1000_account_wins_over_the_requested_name(self, tmp_path, fakebin):
+        # Ubuntu cloud images ship a uid-1000 account. Creating a second one there
+        # would silently give it 1001, and every container runs as 1000 against a
+        # bind mount of the deployment — so the uid decides which account is used,
+        # and --user does not.
+        dest = tmp_path / "dist"
+        assert _run(dest, "--dist").returncode == 0
+        self._root_env(fakebin, uid_1000_owner="ubuntu")
+
+        result = self._prepare(dest, fakebin, "--user", "epicurrents", "--no-sudoers")
+
+        assert result.returncode == 0, result.stderr
+        assert not fakebin.has_call("adduser"), "created a second account beside the uid-1000 holder"
+        assert fakebin.has_call("chown -R ubuntu:ubuntu ."), fakebin.calls()
+        assert fakebin.has_call("usermod -aG docker ubuntu"), fakebin.calls()
+        # The summary names the account either way, so the assertion is on the
+        # explanation: an operator who passed --user and got something else needs to
+        # be told why, or the script looks like it ignored them.
+        assert "uid 1000 already belongs to" in result.stdout, result.stdout
+
+    def test_creates_the_deployment_account_at_uid_1000_when_the_uid_is_free(self, tmp_path, fakebin):
+        # The other half of the same decision: on an image with no uid-1000 account
+        # the uid is requested explicitly rather than left to the next free one.
+        dest = tmp_path / "dist"
+        assert _run(dest, "--dist").returncode == 0
+        self._root_env(fakebin, uid_1000_owner=None)
+
+        result = self._prepare(dest, fakebin, "--user", "deployer", "--no-sudoers")
+
+        assert result.returncode == 0, result.stderr
+        created = [c for c in fakebin.calls() if c.startswith("adduser")]
+        assert len(created) == 1, fakebin.calls()
+        assert "--uid 1000" in created[0], created[0]
+        assert created[0].endswith("deployer"), created[0]
+        assert fakebin.has_call("chown -R deployer:deployer ."), fakebin.calls()
+
+    def test_hands_the_tree_over_before_the_steps_that_can_fail(self, tmp_path, fakebin):
+        # Handing the package to the deployment account is the half start.sh cannot
+        # do for itself, so it must not sit behind steps that legitimately fail on a
+        # given image: a host with no /etc/sudoers.d, or none of the SSH keys the
+        # next step wants to copy, still has to end up with the tree handed over
+        # rather than owned by root. Asserted twice — the chown lands with the sudo
+        # step switched off, and it precedes both later sections in the script,
+        # which is where a reordering would show up.
+        dest = tmp_path / "dist"
+        assert _run(dest, "--dist").returncode == 0
+        self._root_env(fakebin, uid_1000_owner="ubuntu", groups="ubuntu docker")
+
+        result = self._prepare(dest, fakebin, "--no-sudoers")
+
+        assert result.returncode == 0, result.stderr
+        assert fakebin.has_call("chown -R ubuntu:ubuntu ."), fakebin.calls()
+        assert not fakebin.has_call("usermod"), "re-added an account already in the docker group"
+
+        # Anchored on the code rather than on the section headings: the comment
+        # recording the original fix names /etc/sudoers.d too, and matching that
+        # would compare the wrong two positions.
+        body = (dest / "prepare-host.sh").read_text()
+        assert body.index("chown -R") < body.index('echo "==> SSH access') < body.index("[ ! -d /etc/sudoers.d ]")
 
 
 class TestGuards:

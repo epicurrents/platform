@@ -231,15 +231,21 @@ jobs:
         run: docker compose down -v || true
 
   bootstrap-fixture-smoke:
-    # Assembles the minimal bootstrap fixture (Docker config + backend apps
-    # only — no frontend, no projects) and runs its bring-up smoke end to end.
-    # Where stack-smoke proves the full repo comes up, this proves the BACKEND
-    # is self-sufficient: if a backend path quietly grows a dependency on the
-    # frontend or a project plugin, stack-smoke still passes but this fails.
-    # Same heavy image build as stack-smoke (no cross-job cache yet — see the
-    # caching note on stack-smoke).
+    # Two packages out of the same assembly script, brought up in sequence.
+    #
+    # First the minimal bootstrap fixture (Docker config + backend apps only — no
+    # frontend, no projects). Where stack-smoke proves the full repo comes up,
+    # this proves the BACKEND is self-sufficient: if a backend path quietly grows
+    # a dependency on the frontend or a project plugin, stack-smoke still passes
+    # but this fails.
+    #
+    # Then a --demo package, for the runner a recipient actually uses. The two
+    # share this job rather than splitting: same checkout, same warm daemon, and
+    # the marginal cost is one more build instead of another runner. Heavy either
+    # way (no cross-job cache yet — see the caching note on stack-smoke).
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # Two image builds now, so the single-build budget no longer covers it.
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
         with:
@@ -256,6 +262,70 @@ jobs:
       - name: Tear down (safety net)
         if: always()
         working-directory: ${{ runner.temp }}/fixture
+        run: docker compose down -v || true
+
+      # ── The packaged path ──────────────────────────────────────────────────
+      # The steps above build the CI-fixture mode, whose runner is
+      # bootstrap-smoke.sh. Everything a recipient actually touches lives in the
+      # --demo / --dist modes instead — start.sh, its host preflight — and had no
+      # CI at all, so a break there stayed invisible until someone unpacked a
+      # package.
+      #
+      # The claim here is narrower than it looks: this proves the package's own
+      # runner brings the platform up, not that anything renders. --dist cannot be
+      # assembled on a runner (it needs frontend/viewer-dist, gitignored until
+      # `npm run setup` runs inside the builder submodule), and a real
+      # frontend/dist needs `npm run build`, whose vue-tsc half is the reason the
+      # frontend job stops at vitest — so the UI is a stub file that exists only
+      # to satisfy the mode's guard.
+      - name: Assemble a demo package
+        run: |
+          mkdir -p frontend/dist
+          echo '<!doctype html><title>stub</title>' > frontend/dist/index.html
+          scripts/make-bootstrap-fixture.sh "$RUNNER_TEMP/demo" --demo
+      - name: The preflight refuses a tree the container user cannot write
+        # The runner is uid 1001 and its temp dir is not group- or world-writable,
+        # which is exactly the shape the check exists to catch — on a real Linux
+        # host, where the unit tests can only stub stat. It runs before anything is
+        # built, so this costs seconds; the timeout bounds the case where the check
+        # regressed and start.sh went on to build the image instead.
+        working-directory: ${{ runner.temp }}/demo
+        run: |
+          set +e
+          out="$(timeout 120 ./start.sh 2>&1)"
+          rc=$?
+          set -e
+          echo "$out"
+          if [ "$rc" -eq 0 ]; then
+            echo "::error::start.sh accepted a tree uid 1000 cannot write"
+            exit 1
+          fi
+          if [ "$rc" -eq 124 ]; then
+            echo "::error::start.sh got past the ownership check and started building"
+            exit 1
+          fi
+          echo "$out" | grep -q "not writable by uid 1000" \
+            || { echo "::error::start.sh refused, but not for the ownership reason"; exit 1; }
+      - name: Make the package writable by the container user
+        # A real deployment gets this from prepare-host.sh, which hands the tree to
+        # uid 1000 and leaves you to run start.sh as that account. A runner cannot
+        # become uid 1000 — it is 1001, and only that user is in the docker group —
+        # so the world-writable shape stands in. It is the check's other accepted
+        # branch, and the containers can write either way.
+        run: sudo chmod -R a+rwX "$RUNNER_TEMP/demo"
+      - name: Run the packaged start.sh
+        # preflight -> build -> init_env -> up web + celery + celery-beat -> health.
+        # Exits non-zero when the health endpoint never answers, and leaves the
+        # stack running, which is what the teardown below is for.
+        working-directory: ${{ runner.temp }}/demo
+        run: ./start.sh
+      - name: Dump demo package logs on failure
+        if: failure()
+        working-directory: ${{ runner.temp }}/demo
+        run: docker compose logs --no-color --tail=400 || true
+      - name: Tear down the demo package
+        if: always()
+        working-directory: ${{ runner.temp }}/demo
         run: docker compose down -v || true
 
   frontend:

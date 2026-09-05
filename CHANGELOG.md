@@ -65,6 +65,21 @@ Entries are written for the person deciding whether to upgrade, so the ones that
   `scripts/backup.sh` / `scripts/restore.sh` resolve which repository to act on
   instead of assuming `/backup`.
 
+- Distribution and demo packages carry a prepare-host.sh for the case they did
+  not previously cover: a bare Linux server with no Docker, where you are root
+  and nothing else exists yet. Run once as root, it installs Docker Engine,
+  creates the account the deployment runs as, puts it in the docker group,
+  copies root's SSH keys across and hands the package over.
+
+  The account is resolved by uid rather than by name, because every service runs
+  as uid 1000 against a bind mount of the deployment: an image that already has
+  a uid-1000 account is used as-is, since creating a second one would give it
+  1001 and produce a tree the containers cannot write.
+
+  It installs Docker from scripts/lib/install-docker.sh, the same file
+  bootstrap.sh sources, so a packaged deployment and a cloned one cannot drift onto
+  different engines or a different version floor.
+
 ### Changed
 
 - **`AccessRight` now enforces one row per `(object, target)` grant** — three partial unique constraints (user target, group target, `(federated_peer, remote_user_id)` pair, declared on `AccessRight.Meta`). A project or plugin that bare-creates a grant a matching row already covers gets an `IntegrityError` where it previously got a silent duplicate; switch to `get_or_create` or answer 409 the way the core grant endpoints now do. The read resolvers also order multi-target matches deterministically (direct user row over group rows, exact federated user over the peer wildcard, de-identifying row among equals), so which grant's `apply_middleware` wins no longer depends on database row order.
@@ -111,6 +126,32 @@ Entries are written for the person deciding whether to upgrade, so the ones that
   `CONTENT_SECURITY_POLICY` before trusting the new default: neither
   configuration was covered by the tuning pass. Procedure in
   docs/operations.md → Security headers.
+
+### Fixed
+
+- A distribution or demo package assembled without a project could not build its
+  own image. The Dockerfile copies projects/ whether or not one is active — the
+  stage that reads a project's requirements resolves an absent lock at build
+  time, which is what keeps "no project" a supported configuration — and
+  BuildKit fails a COPY whose source is missing from the context, reporting it
+  as a checksum error naming an internal ref. Packages now always ship the
+  projects/__init__.py package marker.
+
+  Rebuild any package assembled before this. An existing one is repairable in
+  place: `mkdir -p projects` and copy the platform's own projects/__init__.py
+  beside it.
+
+- The start.sh in a distribution or demo package checks the host before it
+  builds — Docker present, Compose v2 rather than the v1 binary, Engine 25 or
+  newer, the package's own projects/ directory, and the deployment directory
+  writable by uid 1000, which is the user every container runs as. Each of these
+  previously surfaced minutes into a build as a message about something else,
+  and the ownership one not until the stack was up and failing its first write.
+
+  On Linux it also refuses to run as root, which the ownership check alone does
+  not catch: root can write a tree owned by anyone, and the .env generated under
+  it then belongs to root inside a directory the deployment account and the
+  containers both need to write.
 
 ## [0.1.0] — 2026-08-28
 

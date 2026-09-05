@@ -8,7 +8,10 @@
 # and the projects/ and plugins/ trees are excluded by default: the base platform
 # imports none of them when EPICURRENTS_PROJECT and EPICURRENTS_PLUGINS are
 # blank, and a backend bring-up does not need the frontend bundles. Pass
-# --with-frontend, --with-project and/or --with-plugin to include them.
+# --with-frontend, --with-project and/or --with-plugin to include them. The
+# projects/__init__.py package marker is the one exception, and always ships —
+# the bundled Dockerfile copies projects/ unconditionally, so a package without
+# it cannot build its own image.
 #
 # Projects and plugins are both add-on trees merged into settings and URLs at
 # boot, and are copied by the same rules; they differ in cardinality. Exactly one
@@ -310,9 +313,6 @@ if [ ${#PROJECTS[@]} -gt 0 ]; then
             "$REPO_ROOT/projects/$p/" "$DEST/projects/$p/"
         ok "projects/$p/"
     done
-    # projects/ is a Python package; ensure the package marker is present so the
-    # active project imports as projects.<name>.
-    [ -f "$REPO_ROOT/projects/__init__.py" ] && cp -p "$REPO_ROOT/projects/__init__.py" "$DEST/projects/__init__.py"
     if [ ${#PROJECTS[@]} -eq 1 ]; then
         ACTIVE_PROJECT="${PROJECTS[0]}"
         ok "Active project: $ACTIVE_PROJECT"
@@ -320,6 +320,21 @@ if [ ${#PROJECTS[@]} -gt 0 ]; then
         ok "${#PROJECTS[@]} projects copied; none auto-activated (set EPICURRENTS_PROJECT yourself)"
     fi
 fi
+
+# projects/ is a Python package, and its marker ships even when no project does.
+# The bundled Dockerfile copies the tree unconditionally, in a stage that resolves
+# an absent project lock at build time — which is how "no project" stays a
+# supported configuration. A COPY whose source is missing from the build context
+# fails before any of that runs, so a package built without a project could not
+# build its own image. Only the marker is needed: rsync and git alike drop an
+# empty directory, and it is also what an active project imports as
+# projects.<name>.
+info "Copying the projects package marker"
+mkdir -p "$DEST/projects"
+[ -f "$REPO_ROOT/projects/__init__.py" ] \
+    || die "projects/__init__.py is missing from the repository; the package cannot build without it."
+cp -p "$REPO_ROOT/projects/__init__.py" "$DEST/projects/__init__.py"
+ok "projects/__init__.py"
 
 # ACTIVE_PLUGINS is the comma-separated EPICURRENTS_PLUGINS value the generated
 # runner writes into .env. Every copied plugin is listed: unlike the single active
@@ -383,13 +398,22 @@ USAGE
 TS_AUTHKEY_ARG=""
 TS_HOSTNAME_ARG=""
 TS_MODE="join"
+# `shift 2` on a flag given as the last argument shifts past the end, which fails
+# under set -e and exits with no message at all — so the count is checked first
+# and the complaint names the flag.
+need_value() {
+    if [ "$2" -lt 2 ]; then
+        echo "$1 needs a value." >&2
+        exit 1
+    fi
+}
 while [ $# -gt 0 ]; do
     case "$1" in
-        --tailscale-authkey)    TS_AUTHKEY_ARG="${2:-}"; shift 2 ;;
+        --tailscale-authkey)    need_value "$1" $#; TS_AUTHKEY_ARG="$2"; shift 2 ;;
         --tailscale-authkey=*)  TS_AUTHKEY_ARG="${1#*=}"; shift ;;
-        --tailscale-hostname)   TS_HOSTNAME_ARG="${2:-}"; shift 2 ;;
+        --tailscale-hostname)   need_value "$1" $#; TS_HOSTNAME_ARG="$2"; shift 2 ;;
         --tailscale-hostname=*) TS_HOSTNAME_ARG="${1#*=}"; shift ;;
-        --tailscale-mode)       TS_MODE="${2:-}"; shift 2 ;;
+        --tailscale-mode)       need_value "$1" $#; TS_MODE="$2"; shift 2 ;;
         --tailscale-mode=*)     TS_MODE="${1#*=}"; shift ;;
         -h|--help)              usage; exit 0 ;;
         *) echo "Unknown argument: $1 (try --help)" >&2; exit 1 ;;
@@ -411,6 +435,139 @@ if [ -n "$TS_AUTHKEY_ARG" ] && [ ! -f "$TS_SCRIPT" ]; then
     echo "distribution, not a demo. Install Tailscale on the host yourself, or" >&2
     echo "use a distribution package." >&2
     exit 1
+fi
+
+# ── Preflight ────────────────────────────────────────────────────────────────
+# Each of these is a condition that otherwise surfaces minutes later as a message
+# about something else — a BuildKit checksum error naming a ref, a permission
+# denied inside a migration — with a half-built deployment already on the disk.
+# The order is dependency order: no daemon check can run before docker exists.
+
+if ! command -v docker >/dev/null 2>&1; then
+    echo "docker is not installed. This package needs Docker with Compose v2 and" >&2
+    echo "nothing else — no Python, Node or database." >&2
+    if [ -f ./prepare-host.sh ]; then
+        echo "On a fresh Linux server, run the host preparation first:" >&2
+        echo "    sudo ./prepare-host.sh" >&2
+        echo "It installs Docker and creates the account this deployment runs as." >&2
+    else
+        echo "Install Docker Engine: https://docs.docker.com/engine/install/" >&2
+    fi
+    exit 1
+fi
+
+# Compose v1 is a separate `docker-compose` binary and cannot read this package's
+# compose files, so its presence is not a substitute for the plugin.
+if ! docker compose version >/dev/null 2>&1; then
+    echo "docker is installed but 'docker compose' is not. Compose v2 ships as the" >&2
+    echo "docker-compose-plugin package; the standalone docker-compose v1 binary" >&2
+    echo "cannot read these compose files." >&2
+    exit 1
+fi
+
+DOCKER_VERSION="$(docker version --format '{{.Server.Version}}' 2>/dev/null || true)"
+if [ -z "$DOCKER_VERSION" ]; then
+    echo "The Docker daemon is not reachable. Check that it is running, and that" >&2
+    echo "this user is in the docker group — group membership applies only to a" >&2
+    echo "new login session, so it needs a fresh login after usermod." >&2
+    exit 1
+fi
+# The same floor bootstrap.sh enforces: below 25 the volume subpath syntax in the
+# compose files is accepted and then mounts the wrong thing.
+case "${DOCKER_VERSION%%.*}" in
+    ""|*[!0-9]*)
+        echo "Warning: cannot parse the Docker Engine version ($DOCKER_VERSION); continuing." >&2
+        ;;
+    *)
+        if [ "${DOCKER_VERSION%%.*}" -lt 25 ]; then
+            echo "Docker Engine 25+ is required for volume subpath support (found $DOCKER_VERSION)." >&2
+            exit 1
+        fi
+        ;;
+esac
+
+# The image build copies projects/ whether or not a project is active — the stage
+# that reads a project's requirements resolves an absent lock at build time, which
+# is what keeps "no project" a supported configuration. BuildKit fails a COPY
+# whose source is missing from the context before reaching any of that, and
+# reports it as a checksum error naming an internal ref, which points nowhere.
+if [ ! -d projects ]; then
+    echo "This package has no projects/ directory. The image build copies it" >&2
+    echo "whether or not a project is active, so the build cannot start." >&2
+    echo "The package was assembled incorrectly — rebuild it with" >&2
+    echo "scripts/make-bootstrap-fixture.sh." >&2
+    exit 1
+fi
+
+# web, celery, celery-beat and migrate all run as uid/gid 1000:1000 against a bind
+# mount of this directory, so it has to be writable by that uid regardless of who
+# launches the stack. Extracting a package as root produces a tree that is not,
+# and the deployment then comes up and fails on its first write — far from the
+# cause. Linux only: Docker Desktop maps ownership inside its own VM, where none
+# of this applies, and `getent` is the same Linux probe bootstrap.sh uses.
+if command -v getent >/dev/null 2>&1; then
+    # Two different questions, and the ownership check below answers only the
+    # second. A tree already handed to uid 1000 is writable by uid 1000, so it
+    # passes that check no matter who invokes this — including root, who can write
+    # anywhere. The .env generated below belongs to the invoking user, so a root
+    # run leaves a root-owned .env inside a tree the deployment account and the
+    # containers both need to write, and nothing fails until much later.
+    if [ "$(id -u)" -eq 0 ]; then
+        echo "Do not run this as root. The deployment runs as uid 1000, and the .env" >&2
+        echo "this generates belongs to whoever invokes it — as root that is a file" >&2
+        echo "neither the account nor the containers can write." >&2
+        if [ -f ./prepare-host.sh ]; then
+            echo "If the host is not prepared yet, that is the script to run as root:" >&2
+            echo "    sudo ./prepare-host.sh" >&2
+            echo "It creates the account and hands this directory over; then log in as" >&2
+            echo "that account and run this script there." >&2
+        else
+            echo "Log in as the account owning this directory and run it there." >&2
+        fi
+        exit 1
+    fi
+
+    DIR_MODE="$(stat -c %a . 2>/dev/null || true)"
+    # Numeric before arithmetic: a stat that answered something unexpected would
+    # otherwise abort the script inside printf or $(( )) under set -e, turning a
+    # check that exists to produce a clear message into a cryptic failure of its
+    # own. An unreadable mode means the check does not run, not that the run stops.
+    case "$DIR_MODE" in
+        ""|*[!0-7]*) DIR_MODE="" ;;
+    esac
+    if [ -n "$DIR_MODE" ]; then
+        DIR_UID="$(stat -c %u .)"
+        DIR_GID="$(stat -c %g .)"
+        # Zero-pad so the owner / group / other digits sit at fixed offsets whether
+        # or not stat reported a leading setuid digit.
+        DIR_MODE="$(printf "%04d" "$DIR_MODE")"
+        WRITABLE=false
+        if [ "$DIR_UID" = "1000" ] && [ "$(( ${DIR_MODE:1:1} & 2 ))" -ne 0 ]; then
+            WRITABLE=true
+        fi
+        if [ "$DIR_GID" = "1000" ] && [ "$(( ${DIR_MODE:2:1} & 2 ))" -ne 0 ]; then
+            WRITABLE=true
+        fi
+        if [ "$(( ${DIR_MODE:3:1} & 2 ))" -ne 0 ]; then
+            WRITABLE=true
+        fi
+        if [ "$WRITABLE" = false ]; then
+            echo "$(pwd) is not writable by uid 1000, which is the user every" >&2
+            echo "container runs as (owner ${DIR_UID}:${DIR_GID}, mode ${DIR_MODE})." >&2
+            echo "The stack would start and then fail on its first write." >&2
+            if [ -f ./prepare-host.sh ]; then
+                echo "Run the host preparation, which hands the package to that account:" >&2
+                echo "    sudo ./prepare-host.sh" >&2
+                echo "Or fix the ownership yourself:" >&2
+            else
+                echo "Fix the ownership and run this again:" >&2
+            fi
+            echo "    sudo chown -R 1000:1000 $(pwd)" >&2
+            echo "Then run this script as the account holding uid 1000, so the .env" >&2
+            echo "it generates belongs to the same user." >&2
+            exit 1
+        fi
+    fi
 fi
 
 # Two modes, chosen by whether .env names a domain — the same rule bootstrap.sh
@@ -646,6 +803,197 @@ START
     chmod +x "$DEST/start.sh"
     ok "start.sh"
 
+    # The Docker install is defined once, in scripts/lib/install-docker.sh, and
+    # bundled rather than reproduced here: bootstrap.sh sources the same file, so
+    # a repository deployment and a packaged one cannot drift onto different
+    # engines or a different version floor.
+    info "Writing prepare-host.sh"
+    mkdir -p "$DEST/lib"
+    cp -p "$REPO_ROOT/scripts/lib/install-docker.sh" "$DEST/lib/install-docker.sh"
+    {
+        echo '#!/usr/bin/env bash'
+        echo "# Generated by make-bootstrap-fixture.sh — do not edit by hand."
+        cat <<'PREPARE'
+
+# prepare-host.sh — one-time preparation of a fresh Linux server. Run as root,
+# once, before ./start.sh.
+#
+# Two things stand between an unpacked package and a deployment, and both need
+# root: Docker has to exist, and the files have to belong to the account the
+# containers run as. start.sh can do neither, because it must run AS that
+# unprivileged account — it writes .env as whoever invokes it, and every service
+# runs as uid 1000 against a bind mount of this directory. A root-run start.sh
+# would produce exactly the tree its own preflight refuses.
+#
+# Idempotent: run it again after changing anything and it will report what is
+# already in place rather than redoing it.
+#
+# Usage:
+#   sudo ./prepare-host.sh [--user NAME] [--no-sudoers]
+#
+#   --user NAME    Account to create and hand the deployment to. Default
+#                  "epicurrents". Ignored when uid 1000 is already taken — see
+#                  the account section below.
+#   --no-sudoers   Skip the passwordless-sudo drop-in for that account.
+set -euo pipefail
+cd "$(dirname "$0")"
+
+DEPLOY_USER="epicurrents"
+WRITE_SUDOERS=true
+KEY_WARNING=false
+# `shift 2` on a flag given as the last argument shifts past the end, which fails
+# under set -e and exits with no message at all — so the count is checked first
+# and the complaint names the flag.
+need_value() {
+    if [ "$2" -lt 2 ]; then
+        echo "$1 needs a value." >&2
+        exit 1
+    fi
+}
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --user)       need_value "$1" $#; DEPLOY_USER="$2"; shift 2 ;;
+        --user=*)     DEPLOY_USER="${1#*=}"; shift ;;
+        --no-sudoers) WRITE_SUDOERS=false; shift ;;
+        -h|--help)    sed -n '3,24p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        *) echo "Unknown argument: $1 (try --help)" >&2; exit 1 ;;
+    esac
+done
+
+if [ -z "$DEPLOY_USER" ]; then
+    echo "--user needs an account name." >&2
+    exit 1
+fi
+
+if [ "$(id -u)" -ne 0 ]; then
+    echo "Run this as root: sudo ./prepare-host.sh" >&2
+    echo "It installs packages and creates an account, neither of which an" >&2
+    echo "unprivileged user can do. ./start.sh is the one you run afterwards," >&2
+    echo "as the account created here, and never as root." >&2
+    exit 1
+fi
+
+if ! command -v apt-get >/dev/null 2>&1; then
+    echo "This script targets Debian/Ubuntu servers and found no apt-get." >&2
+    echo "On macOS or Windows install Docker Desktop and run ./start.sh directly;" >&2
+    echo "there is no separate deployment account to create there." >&2
+    exit 1
+fi
+
+echo "==> Installing Docker Engine…"
+# shellcheck source=/dev/null
+. ./lib/install-docker.sh
+install_docker_engine
+DOCKER_VERSION="$(require_docker_engine_version)"
+echo "    Docker Engine ${DOCKER_VERSION}"
+
+# The deployment account is whoever holds uid 1000, and the name is negotiable
+# where the uid is not: every service in the compose file runs as 1000:1000
+# against a bind mount of this directory, so a tree owned by any other uid is one
+# the containers cannot write. On an image that already has a uid-1000 account —
+# Ubuntu cloud images ship one — creating a second account would silently give it
+# 1001 and produce that exact tree, which is why an existing holder wins here
+# rather than the name passed in.
+echo "==> Resolving the deployment account…"
+EXISTING_1000="$(getent passwd 1000 | cut -d: -f1 || true)"
+if [ -n "$EXISTING_1000" ]; then
+    if [ "$EXISTING_1000" != "$DEPLOY_USER" ]; then
+        echo "    uid 1000 already belongs to '${EXISTING_1000}'; using that account."
+        echo "    (The containers run as uid 1000, so the uid decides, not the name.)"
+    else
+        echo "    ${EXISTING_1000} already holds uid 1000."
+    fi
+    DEPLOY_USER="$EXISTING_1000"
+else
+    echo "    Creating ${DEPLOY_USER} with uid 1000…"
+    adduser --disabled-password --gecos "" --uid 1000 "$DEPLOY_USER"
+fi
+
+DEPLOY_HOME="$(getent passwd "$DEPLOY_USER" | cut -d: -f6)"
+
+echo "==> Docker group…"
+# The group normally arrives with the docker-ce package, but an engine installed
+# some other way may not have created it, and usermod against a group that does
+# not exist aborts the run three lines before the chown that matters.
+if ! getent group docker >/dev/null 2>&1; then
+    groupadd docker
+    echo "    Created the docker group."
+fi
+if id -nG "$DEPLOY_USER" | tr " " "\n" | grep -qx docker; then
+    echo "    ${DEPLOY_USER} is already in the docker group."
+else
+    usermod -aG docker "$DEPLOY_USER"
+    echo "    Added ${DEPLOY_USER} to the docker group."
+fi
+
+# Ownership before the conveniences below, and not after. Handing the package to
+# the deployment account is the half of this script start.sh cannot do for
+# itself, so it must not be reachable only by way of steps that can legitimately
+# fail on a given image — an earlier version put it last, and a missing
+# /etc/sudoers.d aborted the run with the tree still owned by root.
+echo "==> Handing the package to ${DEPLOY_USER}…"
+chown -R "${DEPLOY_USER}:${DEPLOY_USER}" .
+echo "    $(pwd) is now owned by ${DEPLOY_USER}."
+
+# Without this the account created above cannot be logged into at all on a server
+# reached only by key, and the operator is left with a deployment user they can
+# only become via `su` from the root session they happen to still hold.
+echo "==> SSH access…"
+if [ -s "${DEPLOY_HOME}/.ssh/authorized_keys" ]; then
+    echo "    ${DEPLOY_USER} already has authorized_keys."
+elif [ -s /root/.ssh/authorized_keys ]; then
+    install -d -m 700 -o "$DEPLOY_USER" -g "$DEPLOY_USER" "${DEPLOY_HOME}/.ssh"
+    install -m 600 -o "$DEPLOY_USER" -g "$DEPLOY_USER" \
+        /root/.ssh/authorized_keys "${DEPLOY_HOME}/.ssh/authorized_keys"
+    echo "    Copied root's authorized_keys to ${DEPLOY_USER}."
+else
+    KEY_WARNING=true
+    echo "    No keys found to copy." >&2
+fi
+
+# --disabled-password leaves nothing for sudo to prompt on, so an unattended
+# `sudo` as this account waits for a password that can never be typed. Absent
+# /etc/sudoers.d means sudo itself is not installed, which is a normal state for
+# a minimal image and not a reason to stop.
+if [ "$WRITE_SUDOERS" = true ]; then
+    echo "==> Sudo…"
+    if [ ! -d /etc/sudoers.d ]; then
+        echo "    sudo is not installed; skipping the passwordless-sudo drop-in."
+    elif [ -f "/etc/sudoers.d/${DEPLOY_USER}" ]; then
+        echo "    /etc/sudoers.d/${DEPLOY_USER} already exists."
+    else
+        echo "${DEPLOY_USER} ALL=(ALL) NOPASSWD:ALL" > "/etc/sudoers.d/${DEPLOY_USER}"
+        chmod 440 "/etc/sudoers.d/${DEPLOY_USER}"
+        echo "    Wrote /etc/sudoers.d/${DEPLOY_USER} (passwordless sudo)."
+    fi
+fi
+
+echo
+echo "================================================================"
+echo " Host prepared"
+echo "================================================================"
+echo
+echo "  Docker:      ${DOCKER_VERSION}"
+echo "  Account:     ${DEPLOY_USER} (uid 1000, docker group)"
+echo "  Deployment:  $(pwd)"
+echo
+echo "  Next, as ${DEPLOY_USER} rather than root — group membership applies"
+echo "  only to a new session, so log in again rather than using su:"
+echo
+echo "      ssh ${DEPLOY_USER}@<this host>"
+echo "      cd $(pwd) && ./start.sh"
+if [ "$KEY_WARNING" = true ]; then
+    echo
+    echo "  WARNING: ${DEPLOY_USER} has no authorized_keys and root had none to"
+    echo "  copy, so that ssh will not let you in. Give the account a way to log"
+    echo "  in before you close this session."
+fi
+echo "================================================================"
+PREPARE
+    } > "$DEST/prepare-host.sh"
+    chmod +x "$DEST/prepare-host.sh"
+    ok "prepare-host.sh + lib/install-docker.sh"
+
     # Bundle the in-place updater so a deployed distribution can update itself
     # from a newer archive (archive mode is the only mode that works without a
     # git checkout). update.sh detects this layout via the root-level compose file.
@@ -737,7 +1085,28 @@ each step.
 ## What you need
 
 - **Docker** with Docker Compose v2 — Docker Desktop on macOS/Windows, or Docker
-  Engine on Linux. Nothing else: no Python, Node, or database to install.
+  Engine on Linux. Engine 25 or newer. Nothing else: no Python, Node, or
+  database to install.
+- On Linux, **a normal user account, not root**. Every container runs as uid
+  1000 against this directory, so the deployment has to belong to the account
+  that runs it. A tree unpacked as root is one the containers cannot write.
+
+## Prepare the host (fresh Linux server)
+
+On a server with no Docker — a new cloud VM, where you are root and nothing else
+exists yet — run this once, as root:
+
+```bash
+sudo ./prepare-host.sh
+```
+
+It installs Docker Engine, creates the `epicurrents` account with uid 1000 and
+puts it in the docker group, copies root's SSH keys across so you can log in as
+it, and hands this directory over. Then log in as that account rather than using
+`su`, because docker group membership applies only to a new session.
+
+Skip this on macOS or Windows: install Docker Desktop and go straight to the next
+step. Skip it too on a server that already has Docker and an account to run under.
 
 ## Start it
 

@@ -450,7 +450,7 @@ scripts/make-bootstrap-fixture.sh ~/epicurrents-demo --demo
 scripts/make-bootstrap-fixture.sh ~/epicurrents-myproject --dist --with-project myproject
 ```
 
-The recipient runs the bundled start script and opens the printed URL; the package's own README walks them through it, and they need only Docker. `--demo` leaves the signal viewer out (base UI only); `--dist` includes it and activates the chosen project. Run the script with `--help` for every option, and see [docs/developing.md](developing.md#bootstrap-smoke-fixture) for how the same script also drives the CI smoke fixture.
+The recipient runs the bundled start script and opens the printed URL; the package's own README walks them through it, and they need only Docker. On a bare Linux server that does not have it, the package's prepare-host.sh installs Docker, creates the uid-1000 account the containers run as and hands the deployment to it — the two things start.sh cannot do for itself, since it has to run as that unprivileged account. It installs Docker from the same [scripts/lib/install-docker.sh](../scripts/lib/install-docker.sh) that [scripts/bootstrap.sh](../scripts/bootstrap.sh) uses, so a packaged deployment and a cloned one get the same engine. `--demo` leaves the signal viewer out (base UI only); `--dist` includes it and activates the chosen project. Run the script with `--help` for every option, and see [docs/developing.md](developing.md#bootstrap-smoke-fixture) for how the same script also drives the CI smoke fixture.
 
 ## Running tests
 

@@ -56,6 +56,8 @@ cd "$SCRIPT_DIR/.."
 
 # shellcheck source=scripts/lib/progress.sh
 . "$SCRIPT_DIR/lib/progress.sh"
+# shellcheck source=scripts/lib/install-docker.sh
+. "$SCRIPT_DIR/lib/install-docker.sh"
 
 # Base compose for setup steps that need the dev .:/code bind-mount (init_env
 # writes .env back to the host through it). Prod overlay only for the final
@@ -186,50 +188,21 @@ step_git() {
 run_step git step_git
 
 # ── 2. Docker Engine ─────────────────────────────────────────────────────────
-# Volume subpath support requires Engine 25+.
+# The install itself lives in lib/install-docker.sh, shared with the
+# prepare-host.sh that ships in a distribution package so both paths install the
+# same engine from the same repository. What stays here is this script's own
+# framing: the step renderer, and the fact that a missing apt-get is fatal on the
+# server this script targets.
 
 step_docker() {
-    if command -v docker &>/dev/null; then
-        ok "already installed: $(docker --version 2>/dev/null || sudo docker --version)"
-    else
-        if ! command -v apt-get &>/dev/null; then
-            die "Docker Engine 25+ not found and apt-get is unavailable. \
-Install Docker manually and re-run."
-        fi
-        info "Installing Docker Engine from Docker's official repository"
-
-        sudo apt-get update -y -qq
-        sudo apt-get install -y -qq ca-certificates curl gnupg lsb-release
-
-        sudo install -m 0755 -d /etc/apt/keyrings
-        curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
-            | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
-        sudo chmod a+r /etc/apt/keyrings/docker.gpg
-
-        # shellcheck disable=SC1091
-        CODENAME="$(. /etc/os-release && echo "$VERSION_CODENAME")"
-        ARCH="$(dpkg --print-architecture)"
-        echo \
-            "deb [arch=${ARCH} signed-by=/etc/apt/keyrings/docker.gpg] \
-https://download.docker.com/linux/ubuntu ${CODENAME} stable" \
-            | sudo tee /etc/apt/sources.list.d/docker.list >/dev/null
-
-        sudo apt-get update -y -qq
-        sudo apt-get install -y \
-            docker-ce docker-ce-cli containerd.io \
-            docker-buildx-plugin docker-compose-plugin
-
-        sudo systemctl enable --now docker
+    if ! install_docker_engine; then
+        die "Docker Engine ${DOCKER_MIN_MAJOR}+ is required. See the message above."
     fi
-
-    DOCKER_SERVER_VERSION="$(sudo docker version --format '{{.Server.Version}}' 2>/dev/null \
-        || docker version --format '{{.Server.Version}}' 2>/dev/null)"
-    DOCKER_MAJOR="${DOCKER_SERVER_VERSION%%.*}"
-    if [ "${DOCKER_MAJOR:-0}" -lt 25 ]; then
-        die "Docker Engine 25+ is required for volume subpath support (found ${DOCKER_SERVER_VERSION}). \
-Upgrade Docker and re-run this script."
+    local version
+    if ! version="$(require_docker_engine_version)"; then
+        die "Upgrade Docker and re-run this script."
     fi
-    step_note "Docker Engine ${DOCKER_SERVER_VERSION}"
+    step_note "Docker Engine ${version}"
 }
 run_step docker step_docker
 
