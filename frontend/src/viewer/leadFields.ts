@@ -131,8 +131,13 @@ const fetchStatic = async (
 }
 
 /**
- * Look the montage up through the compute API. Resolves to null on 404 — no lead field has been
- * computed for these parameters — and rejects on any other failure.
+ * Look the montage up through the compute API. Resolves to null when the API has nothing for this
+ * caller, and rejects on any other failure.
+ *
+ * Three statuses mean "nothing here", not "broken". 404 is the plain miss: no lead field has been
+ * computed for these parameters. 401 and 403 are the public viewer, which is auth-free by design
+ * and can never reach these endpoints — treating those as failures would offer its users a retry
+ * that cannot succeed, where the honest answer is that the montage is unavailable on this server.
  */
 const fetchFromApi = async (
     montageName: string,
@@ -143,7 +148,7 @@ const fetchFromApi = async (
     const base  = `/compute/api/v1/eeg/leadfield/${encodeURIComponent(montageName)}/`
     // Metadata first: it carries the channel names, so a miss costs nothing beyond this request.
     const metaResp = await fetch(`${base}${query}`, { credentials: 'same-origin' })
-    if (metaResp.status === 404) {
+    if (metaResp.status === 404 || metaResp.status === 401 || metaResp.status === 403) {
         return null
     }
     if (!metaResp.ok) {

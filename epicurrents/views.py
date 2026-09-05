@@ -118,6 +118,14 @@ def vendor_view(request, path=""):
 # mode pointing there has to say so.
 _DEFAULT_LIB_FILE = "epicurrents-lib.umd.cjs"
 
+# The platform's lead-field provider, built by ``frontend/vite.config.leadfields.ts``
+# into ``viewer-dist/`` and served by ``viewer_view`` above. The public viewer page
+# is the only surface that runs no platform JavaScript of its own: its SETUP is
+# JSON, and a provider is a function, so without this script the source-
+# localisation tool reports every montage as unavailable. Absent on a deployment
+# built before the script existed, where the tag 404s and the page loads without it.
+_LEAD_FIELD_SCRIPT = "/viewer/epicurrents-leadfields.js"
+
 _PUBLIC_VIEWER_TEMPLATE = """<!doctype html>
 <html lang="en">
 <head>
@@ -130,6 +138,7 @@ _PUBLIC_VIEWER_TEMPLATE = """<!doctype html>
 <body>
 <div id="epicurrents-viewer"></div>
 <script>window.__EPICURRENTS__={{EVENT_BUS:null,RUNTIME:null,SETUP:{setup}}};</script>
+<script src="{lead_fields}"></script>
 <script src="{lib}{lib_file}"></script>
 <script>window.Epicurrents&&window.Epicurrents.createEpicurrentsApp&&window.Epicurrents.createEpicurrentsApp();</script>
 </body>
@@ -153,6 +162,7 @@ def public_viewer_view(request, mode=""):
         lib=config["lib_path"],
         lib_file=config.get("lib_file", _DEFAULT_LIB_FILE),
         setup=json.dumps(config["setup"]),
+        lead_fields=_LEAD_FIELD_SCRIPT,
     )
     response = HttpResponse(html, content_type="text/html; charset=utf-8")
     response["Cross-Origin-Opener-Policy"] = "same-origin"

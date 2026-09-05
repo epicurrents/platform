@@ -6,7 +6,7 @@ Vue 3 + TypeScript frontend scaffolded with Vite.
 
 - `npm run dev` starts the Vite development server.
 - `npm run build` runs type-checking then creates a production build.
-- `npm run build:viewer` builds the viewer's full edition from the `viewer/` submodule into `viewer-dist/`, then the platform-side base bundle ([vite.config.base.ts](vite.config.base.ts)); it needs the submodule's packages built first (`npm run setup` inside `viewer/`, or `scripts/rebuild-frontend.sh --viewer`).
+- `npm run build:viewer` builds the viewer's full edition from the `viewer/` submodule into `viewer-dist/`, then the platform-side base bundle ([vite.config.base.ts](vite.config.base.ts)) and the public viewer's lead-field provider ([vite.config.leadfields.ts](vite.config.leadfields.ts)); it needs the submodule's packages built first (`npm run setup` inside `viewer/`, or `scripts/rebuild-frontend.sh --viewer`).
 - `npm run test` runs the vitest suite; `npm run test:watch` keeps it running.
 - `npm run preview` serves the built app locally.
 - `npm run link:projects` symlinks `node_modules` into each project frontend; `postinstall` runs it for you.

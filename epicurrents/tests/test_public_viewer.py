@@ -24,7 +24,7 @@ import pytest
 from django.conf import settings
 from django.test import RequestFactory, override_settings
 
-from epicurrents.views import public_viewer_view
+from epicurrents.views import _LEAD_FIELD_SCRIPT, public_viewer_view
 
 
 def _rendered_setup(body: str) -> dict:
@@ -108,6 +108,32 @@ def test_unknown_mode_404():
     assert public_viewer_view(request, mode="bogus").status_code == 404
 
 
+@override_settings(ENABLE_PUBLIC_VIEWER=True)
+def test_lead_field_script_loads_before_the_lib(client):
+    # The page is the only viewer surface that runs no platform JavaScript of its
+    # own — its SETUP is JSON, and a lead-field provider is a function, so nothing
+    # in PUBLIC_VIEWER_MODES can carry one. This script is how it arrives, and
+    # order is the contract: after the SETUP declaration, so there is an object to
+    # write into, and before the lib, so the viewer reads a SETUP that already has
+    # the provider rather than one amended behind it.
+    body = client.get("/viewer/public").content.decode()
+    mode = settings.PUBLIC_VIEWER_MODES["public"]
+    setup_at = body.index("SETUP:")
+    script_at = body.index(f'<script src="{_LEAD_FIELD_SCRIPT}">')
+    lib_at = body.index(f"{mode['lib_path']}{mode['lib_file']}")
+    assert setup_at < script_at < lib_at
+
+
+@override_settings(ENABLE_PUBLIC_VIEWER=True)
+def test_lead_field_script_is_same_origin(client):
+    # It loads inside a COEP: require-corp document, so it has to come from this
+    # origin and carry CORP — which viewer_view gives every file it serves out of
+    # viewer-dist. A CDN URL here would be blocked with nothing in any server log.
+    assert _LEAD_FIELD_SCRIPT.startswith("/")
+    assert "://" not in _LEAD_FIELD_SCRIPT
+    assert _LEAD_FIELD_SCRIPT in client.get("/viewer/public").content.decode()
+
+
 @override_settings(
     ENABLE_PUBLIC_VIEWER=True,
     PUBLIC_VIEWER_MODES={
@@ -139,3 +165,7 @@ def test_project_overridable_mode():
     # overriding the viewer opts out of the platform's whole setup, vendored
     # Pyodide root included, and has to restate whatever it still wants.
     assert "pyodideAssetPath" not in _rendered_setup(body)
+    # The lead-field script is not part of the mode config, so an overriding
+    # project keeps it without restating anything. It is the one piece of the page
+    # a project cannot accidentally opt out of by replacing the setup.
+    assert _LEAD_FIELD_SCRIPT in body
