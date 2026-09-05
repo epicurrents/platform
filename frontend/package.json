@@ -39,7 +39,7 @@
     "@vue/tsconfig": "^0.9.1",
     "esbuild": "^0.28.2",
     "jsdom": "^30.0.1",
-    "tsconfig-replace-paths": "^0.0.18",
+    "tsconfig-replace-paths": "^1.0.0",
     "typescript": "~5.9.3",
     "vite": "^8.2.1",
     "vite-plugin-cross-origin-isolation": "^0.1.6",
