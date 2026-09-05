@@ -843,6 +843,92 @@ class TestNetworkName:
         assert any("Docker network" in l for l in lines[max(0, index - 4) : index])
 
 
+@requires_built_frontend
+class TestDeploymentDomain:
+    """One domain reaches four keys, and a recipient has no way of knowing that."""
+
+    @staticmethod
+    def _env(dest):
+        values = {}
+        for line in (dest / ".env.example").read_text().splitlines():
+            match = re.match(r"^([A-Z_]+)=(.*)$", line)
+            if match:
+                values[match.group(1)] = match.group(2)
+        return values
+
+    def _demo(self, dest, *args):
+        return _run(dest, "--demo", *args)
+
+    def test_a_domain_reaches_every_key_that_needs_it(self, tmp_path):
+        dest = tmp_path / "pkg"
+        result = self._demo(dest, "--proxy-domain", "eeg.example.com", "--acme-email", "ops@example.com")
+        assert result.returncode == 0, result.stderr
+        env = self._env(dest)
+        assert env["PROXY_DOMAIN"] == "eeg.example.com"
+        assert env["PROXY_ACME_EMAIL"] == "ops@example.com"
+        assert env["FRONTEND_URL"] == "https://eeg.example.com"
+
+    def test_the_host_allowlist_is_appended_to_not_replaced(self, tmp_path):
+        # The web container health-checks itself over loopback, so a list without
+        # 127.0.0.1 turns every probe into a 400 DisallowedHost and the container
+        # reports unhealthy while serving traffic normally.
+        dest = tmp_path / "pkg"
+        assert self._demo(dest, "--proxy-domain", "eeg.example.com", "--acme-email", "o@e.com").returncode == 0
+        hosts = self._env(dest)["ALLOWED_HOSTS"].split(",")
+        assert "eeg.example.com" in hosts
+        assert "127.0.0.1" in hosts
+        assert "localhost" in hosts
+
+    def test_federation_stays_off_unless_asked_for(self, tmp_path):
+        # init_env generates the keypair, so the instance URL is the piece that
+        # completes the trio. Naming a domain must not be what turns an
+        # inter-instance auth surface on.
+        dest = tmp_path / "pkg"
+        assert self._demo(dest, "--proxy-domain", "eeg.example.com", "--acme-email", "o@e.com").returncode == 0
+        assert self._env(dest)["FEDERATION_INSTANCE_URL"] == ""
+
+    def test_federation_sets_the_instance_url_from_the_domain(self, tmp_path):
+        dest = tmp_path / "pkg"
+        result = self._demo(dest, "--proxy-domain", "eeg.example.com", "--acme-email", "o@e.com", "--federation")
+        assert result.returncode == 0, result.stderr
+        assert self._env(dest)["FEDERATION_INSTANCE_URL"] == "https://eeg.example.com"
+
+    def test_a_package_without_the_flag_ships_the_defaults(self, tmp_path):
+        dest = tmp_path / "pkg"
+        assert self._demo(dest).returncode == 0
+        env = self._env(dest)
+        assert "PROXY_DOMAIN" not in env, "the proxy pair should stay commented out"
+        assert env["FRONTEND_URL"] == "http://localhost:5173"
+        assert env["FEDERATION_INSTANCE_URL"] == ""
+
+    def test_a_domain_without_a_certificate_contact_is_refused(self, tmp_path):
+        # The stack refuses to start with a domain and no ACME contact, so a
+        # package assembled that way cannot boot at all. Better caught here than
+        # on the server it was carried to.
+        result = self._demo(tmp_path / "pkg", "--proxy-domain", "eeg.example.com")
+        assert result.returncode != 0
+        assert "--acme-email" in result.stderr
+
+    def test_a_url_where_a_hostname_belongs_is_refused(self, tmp_path):
+        # FRONTEND_URL is built as https://<domain>, so a scheme here doubles up.
+        result = self._demo(tmp_path / "pkg", "--proxy-domain", "https://eeg.example.com", "--acme-email", "o@e.com")
+        assert result.returncode != 0
+        assert "bare hostname" in result.stderr
+
+    def test_federation_without_a_domain_is_refused(self, tmp_path):
+        result = self._demo(tmp_path / "pkg", "--federation")
+        assert result.returncode != 0
+        assert "--proxy-domain" in result.stderr
+
+    def test_the_flags_are_refused_where_nothing_would_act_on_them(self, tmp_path):
+        # The default fixture ships bootstrap-smoke.sh, which brings the stack up
+        # locally and never consults PROXY_DOMAIN. Accepting the flag there would
+        # write keys no runner reads.
+        result = _run(tmp_path / "pkg", "--proxy-domain", "eeg.example.com", "--acme-email", "o@e.com")
+        assert result.returncode != 0
+        assert "--demo" in result.stderr
+
+
 class TestGuards:
     """Argument and destination guards."""
 

@@ -65,6 +65,23 @@ Entries are written for the person deciding whether to upgrade, so the ones that
   `scripts/backup.sh` / `scripts/restore.sh` resolve which repository to act on
   instead of assuming `/backup`.
 
+- Distribution and demo packages can be assembled for a domain:
+  `--proxy-domain` with `--acme-email` fills `PROXY_DOMAIN`, the certificate
+  contact, `FRONTEND_URL`, and appends the host to `ALLOWED_HOSTS` rather than
+  replacing it. The allowlist matters more than it looks: the web container
+  health-checks itself over loopback, so a list that lost `127.0.0.1` would
+  report unhealthy while serving traffic normally.
+
+  The two flags are required together, because a package carrying a domain and
+  no certificate contact cannot start at all — better refused at assembly than
+  discovered on the server it was carried to.
+
+  `--federation` additionally sets `FEDERATION_INSTANCE_URL` from the same
+  domain, and is off by default. `init_env` already generates the keypair, so
+  the instance URL is the piece that completes the trio and leaves the instance
+  ready to federate; that is a posture worth choosing rather than inheriting
+  from having named a domain.
+
 - Distribution and demo packages carry a prepare-host.sh for the case they did
   not previously cover: a bare Linux server with no Docker, where you are root
   and nothing else exists yet. Run once as root, it installs Docker Engine,

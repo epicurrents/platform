@@ -55,6 +55,21 @@
 #                        plus --with-project NAME and/or --with-plugin NAME to
 #                        activate them. Generates a human start.sh + README.md.
 #                        Excludes --with-frontend.
+#   --proxy-domain DOMAIN  Preconfigure the package for a domain: PROXY_DOMAIN,
+#                        FRONTEND_URL, and the host-header allowlist, which is
+#                        appended to rather than replaced. A bare hostname, no
+#                        scheme. Requires --acme-email, because the stack refuses
+#                        to start with a domain and no certificate contact, and
+#                        --demo or --dist, since only their start.sh acts on it.
+#   --acme-email ADDRESS Certificate-authority contact for --proxy-domain. Expiry
+#                        warnings go there, which on an unmonitored deployment is
+#                        the only notice before a certificate lapses.
+#   --federation         Also set FEDERATION_INSTANCE_URL from --proxy-domain.
+#                        Off by default: init_env already generates the keypair,
+#                        so filling the URL is what completes the trio and leaves
+#                        the instance ready to federate. Inert until a peer is
+#                        added, but a posture worth choosing rather than
+#                        inheriting from having named a domain.
 #   --network-name NAME  Docker network the package joins. Defaults to the
 #                        destination directory name, which is what keeps a
 #                        package off any other stack on the same host — see the
@@ -95,6 +110,9 @@ WITH_ALL_PLUGINS=false
 DEMO=false
 DIST=false
 NETWORK_NAME=""
+PROXY_DOMAIN_ARG=""
+ACME_EMAIL_ARG=""
+FEDERATION=false
 PROJECTS=()
 PLUGINS=()
 
@@ -121,6 +139,17 @@ while [ $# -gt 0 ]; do
             [ $# -gt 0 ] || die "--network-name requires a name."
             NETWORK_NAME="$1"
             ;;
+        --proxy-domain)
+            shift
+            [ $# -gt 0 ] || die "--proxy-domain requires a hostname."
+            PROXY_DOMAIN_ARG="$1"
+            ;;
+        --acme-email)
+            shift
+            [ $# -gt 0 ] || die "--acme-email requires an address."
+            ACME_EMAIL_ARG="$1"
+            ;;
+        --federation) FEDERATION=true ;;
         # Print the header comment as the usage text: from line 2 up to the first
         # line that is not a comment, so adding options above never needs a line
         # number here (the old fixed range had drifted into the code below it).
@@ -331,6 +360,60 @@ sed "s|^EPICURRENTS_NETWORK_NAME=.*|EPICURRENTS_NETWORK_NAME=${NETWORK_NAME}|" \
     "$DEST/.env.example" > "$DEST/.env.example.tmp" \
     && mv "$DEST/.env.example.tmp" "$DEST/.env.example"
 ok "Docker network: $NETWORK_NAME"
+
+# ── Deployment domain ────────────────────────────────────────────────────────
+# One domain, four keys, and a recipient who has no way of knowing that. Naming
+# it here rather than in a README step means the package either arrives
+# consistent or does not arrive at all.
+#
+# ALLOWED_HOSTS is appended to, never replaced: the web container health-checks
+# itself over loopback, so a list without 127.0.0.1 makes every probe a 400 and
+# the container reports unhealthy while serving traffic normally.
+
+# Rewrite one key in the package's .env.example, whether it ships commented out
+# (the proxy pair) or with a value. No sed -i, since BSD and GNU disagree about
+# its argument, and the substitution is in place so each key keeps the comment
+# block that documents it.
+set_env_key() {
+    local key="$1" value="$2" file="$DEST/.env.example"
+    grep -qE "^#* *${key}=" "$file" \
+        || die "${key} is missing from .env.example; the package would ship without it."
+    sed "s|^#* *${key}=.*|${key}=${value}|" "$file" > "$file.tmp" && mv "$file.tmp" "$file"
+}
+
+if [ -n "$PROXY_DOMAIN_ARG" ] || [ -n "$ACME_EMAIL_ARG" ]; then
+    [ "$DEMO" = true ] || [ "$DIST" = true ] \
+        || die "--proxy-domain / --acme-email apply to --demo or --dist; the default fixture ships no start.sh to act on them."
+    [ -n "$PROXY_DOMAIN_ARG" ] || die "--acme-email needs --proxy-domain."
+    [ -n "$ACME_EMAIL_ARG" ] \
+        || die "--proxy-domain needs --acme-email; the stack refuses to start without a certificate contact."
+    case "$PROXY_DOMAIN_ARG" in
+        *://*|*/*|*" "*)
+            die "--proxy-domain takes a bare hostname, not a URL (got '$PROXY_DOMAIN_ARG')." ;;
+    esac
+    case "$ACME_EMAIL_ARG" in
+        *@*.*) ;;
+        *) die "--acme-email does not look like an address (got '$ACME_EMAIL_ARG')." ;;
+    esac
+
+    info "Preconfiguring the deployment domain"
+    set_env_key PROXY_DOMAIN "$PROXY_DOMAIN_ARG"
+    set_env_key PROXY_ACME_EMAIL "$ACME_EMAIL_ARG"
+    set_env_key FRONTEND_URL "https://$PROXY_DOMAIN_ARG"
+
+    HOSTS="$(grep -E '^ALLOWED_HOSTS=' "$DEST/.env.example" | head -1 | cut -d= -f2-)"
+    case ",$HOSTS," in
+        *",$PROXY_DOMAIN_ARG,"*) ok "ALLOWED_HOSTS already lists $PROXY_DOMAIN_ARG" ;;
+        *) set_env_key ALLOWED_HOSTS "${HOSTS},${PROXY_DOMAIN_ARG}" ;;
+    esac
+    ok "Domain: $PROXY_DOMAIN_ARG (ACME contact $ACME_EMAIL_ARG)"
+fi
+
+if [ "$FEDERATION" = true ]; then
+    [ -n "$PROXY_DOMAIN_ARG" ] || die "--federation needs --proxy-domain; the instance URL is built from it."
+    set_env_key FEDERATION_INSTANCE_URL "https://$PROXY_DOMAIN_ARG"
+    ok "Federation instance URL: https://$PROXY_DOMAIN_ARG"
+fi
 
 info "Copying backend app trees"
 for d in "${PLATFORM_DIRS[@]}"; do
