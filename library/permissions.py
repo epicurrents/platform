@@ -291,7 +291,4 @@ def federated_dataset_visible_terms(peer, remote_user_id: str, content_type):
         key = str(object_id)
         if rank_by_object.get(key, (-1, -1)) < rank:
             rank_by_object[key] = rank
-    return {
-        key: ReadAccessTerms(granted=True, apply_middleware=bool(rank[1]))
-        for key, rank in rank_by_object.items()
-    }
+    return {key: ReadAccessTerms(granted=True, apply_middleware=bool(rank[1])) for key, rank in rank_by_object.items()}

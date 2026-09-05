@@ -314,9 +314,7 @@ class TestDatasetGrantsReachAFederatedPeer:
         # silently reverse this precedence and pass every other test here.
         recording = baker.make("recordings.Recording", author=user)
         dataset = self._shared_dataset(user, recording, peer, apply_middleware=True)
-        _dataset_right(
-            dataset, user, federated_peer=peer, can_read=True, remote_user_id="u1", apply_middleware=False
-        )
+        _dataset_right(dataset, user, federated_peer=peer, can_read=True, remote_user_id="u1", apply_middleware=False)
         terms = can_read_via_dataset_federated(peer, "u1", recording)
         assert terms is not None and terms.apply_middleware is False
 
@@ -427,9 +425,7 @@ class TestFederatedDatasetListing:
             DatasetItem.objects.create(dataset=dataset, content_type=ct, object_id=str(recording.pk))
         _dataset_right(first, user, federated_peer=peer, can_read=True, apply_middleware=False)
         _dataset_right(second, user, federated_peer=peer, can_read=True, apply_middleware=True)
-        _dataset_right(
-            first, user, federated_peer=peer, can_read=True, remote_user_id="u1", apply_middleware=False
-        )
+        _dataset_right(first, user, federated_peer=peer, can_read=True, remote_user_id="u1", apply_middleware=False)
         for remote_user_id in ("", "u1"):
             listed = federated_dataset_visible_terms(peer, remote_user_id, ct)[str(recording.pk)]
             per_object = can_read_via_dataset_federated(peer, remote_user_id, recording)
@@ -445,9 +441,7 @@ class TestFederatedDatasetListing:
         dataset = baker.make(Dataset, author=user)
         DatasetItem.objects.create(dataset=dataset, content_type=ct, object_id=str(recording.pk))
         _dataset_right(dataset, user, federated_peer=peer, can_read=True, apply_middleware=True)
-        _dataset_right(
-            dataset, user, federated_peer=peer, can_read=True, remote_user_id="u1", apply_middleware=False
-        )
+        _dataset_right(dataset, user, federated_peer=peer, can_read=True, remote_user_id="u1", apply_middleware=False)
         assert federated_dataset_visible_terms(peer, "u1", ct)[str(recording.pk)].apply_middleware is False
         assert federated_dataset_visible_terms(peer, "", ct)[str(recording.pk)].apply_middleware is True
 
