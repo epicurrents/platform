@@ -24,7 +24,7 @@ The two security entries below were gated on the evidence host, which is now in 
 
 ### 🟡 Medium
 - Federation — carry a dataset's folder structure to the peer, so a recipient expecting a layout (BIDS) receives one (`DatasetItem.folder` already describes the tree on the owning side; the federated listing and the FUSE mount are what flatten it)
-- Infra — a deployment-local compose overlay the deploy scripts honour, for pins and tweaks that must survive an update (explicit `-f` flags suppress Docker's automatic `docker-compose.override.yml`, so today there is nowhere for them to live)
+- Infra — a deployment-local compose overlay the deploy scripts honour, for pins and tweaks that must survive an update (explicit `-f` flags suppress the override file Docker would otherwise load on its own, so today there is nowhere for them to live)
 - Compute — ship pre-generated lead fields as PWA-cached static files (backend, deploy wiring, service-worker rules and the SPA's fetch all shipped; what remains is confirming the caching behaviour against a deployment that serves the generated tree)
 - Viewer — finish the worker settings auto-sync
 - Additional getting-started scenarios
