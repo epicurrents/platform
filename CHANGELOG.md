@@ -82,6 +82,23 @@ Entries are written for the person deciding whether to upgrade, so the ones that
 
 ### Changed
 
+- A distribution or demo package joins a Docker network named after its own
+  directory instead of the shared `epicurrents` one, and `--network-name`
+  overrides that when joining an existing network is the point.
+
+  The compose file names its network rather than letting compose scope it per
+  project, so that an externally-managed container can join a predictable one.
+  The cost is that the name is host-wide: two stacks sharing it also share the
+  alias `db`, so a package reaches whichever database answers first — on a
+  machine running a development checkout, that can be the live one. Nothing
+  fails loudly, because each deployment generates its own password; where two
+  share credentials, migrations apply to the wrong database and report success.
+
+  Deriving the default from the destination makes a package isolated because it
+  was built that way, rather than because whoever ran it remembered to ask. An
+  already-assembled package keeps whatever its own `.env` names — rebuild it, or
+  set `EPICURRENTS_NETWORK_NAME` there, if it shares a host with another stack.
+
 - **`AccessRight` now enforces one row per `(object, target)` grant** — three partial unique constraints (user target, group target, `(federated_peer, remote_user_id)` pair, declared on `AccessRight.Meta`). A project or plugin that bare-creates a grant a matching row already covers gets an `IntegrityError` where it previously got a silent duplicate; switch to `get_or_create` or answer 409 the way the core grant endpoints now do. The read resolvers also order multi-target matches deterministically (direct user row over group rows, exact federated user over the peer wildcard, de-identifying row among equals), so which grant's `apply_middleware` wins no longer depends on database row order.
 
 - The default `BORG_RSH` now passes `-i /root/.ssh/id_borg`. Without it the

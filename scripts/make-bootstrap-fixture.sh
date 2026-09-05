@@ -55,6 +55,20 @@
 #                        plus --with-project NAME and/or --with-plugin NAME to
 #                        activate them. Generates a human start.sh + README.md.
 #                        Excludes --with-frontend.
+#   --network-name NAME  Docker network the package joins. Defaults to the
+#                        destination directory name, which is what keeps a
+#                        package off any other stack on the same host — see the
+#                        note below. Pass a name to join an existing network on
+#                        purpose.
+#
+# On the network default: the compose file names its network, rather than letting
+# compose scope it to the project, so an externally-managed container can join a
+# predictable one. That makes the name a host-wide identifier, and two stacks
+# sharing it share the alias `db` — a package then reaches whichever database
+# answers first, which on a developer machine can be the live one. It is refused
+# only because each deployment generates its own password. Deriving the default
+# from the destination gives every package its own network without anyone having
+# to remember to ask for one.
 #
 # After it runs: cd into <dest> and run ./start.sh (--demo / --dist) or
 # ./bootstrap-smoke.sh (default), or the docker compose `test` / `test-postgres`
@@ -80,6 +94,7 @@ WITH_ALL_PROJECTS=false
 WITH_ALL_PLUGINS=false
 DEMO=false
 DIST=false
+NETWORK_NAME=""
 PROJECTS=()
 PLUGINS=()
 
@@ -100,6 +115,11 @@ while [ $# -gt 0 ]; do
             shift
             [ $# -gt 0 ] || die "--with-plugin requires a plugin name."
             PLUGINS+=("$1")
+            ;;
+        --network-name)
+            shift
+            [ $# -gt 0 ] || die "--network-name requires a name."
+            NETWORK_NAME="$1"
             ;;
         # Print the header comment as the usage text: from line 2 up to the first
         # line that is not a comment, so adding options above never needs a line
@@ -270,6 +290,47 @@ for f in "${ROOT_FILES[@]}"; do
     cp -p "$REPO_ROOT/$f" "$DEST/$f"
 done
 ok "${#ROOT_FILES[@]} root files"
+
+# ── Docker network name ──────────────────────────────────────────────────────
+# The compose file names its network instead of letting compose scope it to the
+# project, so that an externally-managed container can join a predictable one.
+# The cost is that the name is host-wide: two stacks sharing it also share the
+# alias `db`, and a package then reaches whichever database answers first, which
+# on a developer machine can be the live one. Nothing fails loudly, because the
+# passwords differ per deployment; where they match, migrations apply to the
+# wrong database and report success.
+#
+# So the default is derived from the destination rather than inherited. A package
+# is isolated because it was built that way, not because whoever ran it
+# remembered to ask. --network-name overrides it for the case where joining an
+# existing network is the point.
+if [ -n "$NETWORK_NAME" ]; then
+    case "$NETWORK_NAME" in
+        [A-Za-z0-9]*) ;;
+        *) die "--network-name must start with a letter or digit (got '$NETWORK_NAME')." ;;
+    esac
+    case "$NETWORK_NAME" in
+        *[!A-Za-z0-9_.-]*) die "--network-name may contain only letters, digits and _ . - (got '$NETWORK_NAME')." ;;
+    esac
+else
+    # printf rather than echo: the newline basename appends is outside tr's
+    # keep-set and would otherwise become part of the name.
+    NETWORK_NAME="$(printf '%s' "$(basename "$DEST")" | tr -c 'A-Za-z0-9_.-' '-' | sed 's/^[^A-Za-z0-9]*//')"
+    # Falling back to the shared default here would hand the package exactly the
+    # network this derivation exists to keep it off, and silently. A destination
+    # that sanitises away leaves nothing safe to guess, so ask instead.
+    [ -n "$NETWORK_NAME" ] \
+        || die "Cannot derive a Docker network name from '$(basename "$DEST")'; pass --network-name NAME."
+fi
+info "Setting the Docker network name"
+grep -q '^EPICURRENTS_NETWORK_NAME=' "$DEST/.env.example" \
+    || die "EPICURRENTS_NETWORK_NAME is missing from .env.example; the package would silently join the default network."
+# No sed -i: BSD and GNU disagree about its argument, and rewriting in place
+# keeps the key beside the comment that documents it.
+sed "s|^EPICURRENTS_NETWORK_NAME=.*|EPICURRENTS_NETWORK_NAME=${NETWORK_NAME}|" \
+    "$DEST/.env.example" > "$DEST/.env.example.tmp" \
+    && mv "$DEST/.env.example.tmp" "$DEST/.env.example"
+ok "Docker network: $NETWORK_NAME"
 
 info "Copying backend app trees"
 for d in "${PLATFORM_DIRS[@]}"; do

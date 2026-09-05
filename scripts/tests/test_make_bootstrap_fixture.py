@@ -8,6 +8,7 @@ behaviour is covered by asserting the excludes on the cheaper default copy.
 """
 
 import os
+import re
 import shutil
 import subprocess
 
@@ -773,6 +774,73 @@ esac
         # would compare the wrong two positions.
         body = (dest / "prepare-host.sh").read_text()
         assert body.index("chown -R") < body.index('echo "==> SSH access') < body.index("[ ! -d /etc/sudoers.d ]")
+
+
+class TestNetworkName:
+    """Every package gets its own Docker network unless one is asked for by name."""
+
+    @staticmethod
+    def _network(dest):
+        for line in (dest / ".env.example").read_text().splitlines():
+            if line.startswith("EPICURRENTS_NETWORK_NAME="):
+                return line.split("=", 1)[1]
+        return None
+
+    def test_default_is_derived_from_the_destination(self, tmp_path):
+        dest = tmp_path / "pkg-alpha"
+        assert _run(dest).returncode == 0
+        assert self._network(dest) == "pkg-alpha"
+
+    def test_two_packages_do_not_share_a_network(self, tmp_path):
+        # The property the default exists for. The compose file names its network
+        # rather than letting compose scope it per project, so a shared name means a
+        # shared `db` alias: a package reaches whichever database answers, and only
+        # a password mismatch stops it migrating one it does not own.
+        first, second = tmp_path / "alpha", tmp_path / "beta"
+        assert _run(first).returncode == 0
+        assert _run(second).returncode == 0
+        assert self._network(first) != self._network(second)
+
+    def test_an_explicit_name_wins(self, tmp_path):
+        dest = tmp_path / "pkg"
+        assert _run(dest, "--network-name", "shared-net").returncode == 0
+        assert self._network(dest) == "shared-net"
+
+    def test_a_destination_docker_would_reject_is_sanitised(self, tmp_path):
+        # Docker network names take letters, digits and _ . - only, so a directory
+        # name that is fine on a filesystem can produce one compose cannot create.
+        dest = tmp_path / "demo pkg (2)"
+        assert _run(dest).returncode == 0
+        name = self._network(dest)
+        assert name is not None
+        assert re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", name), name
+
+    def test_a_destination_that_sanitises_away_is_refused(self, tmp_path):
+        # Fail closed rather than falling back to the shared default, which would
+        # hand the package the one network the derivation exists to keep it off,
+        # and say nothing about it.
+        dest = tmp_path / "..."
+        result = _run(dest)
+        assert result.returncode != 0
+        assert "--network-name" in result.stderr
+
+    def test_an_invalid_explicit_name_is_refused(self, tmp_path):
+        # Refused rather than sanitised: a name that came from a person is a request,
+        # and quietly joining a different network than the one asked for is the same
+        # class of surprise this default exists to prevent.
+        dest = tmp_path / "pkg"
+        result = _run(dest, "--network-name", "bad name!")
+        assert result.returncode != 0
+        assert "--network-name" in result.stderr
+
+    def test_the_key_keeps_its_documentation(self, tmp_path):
+        # The rewrite substitutes in place rather than dropping and appending the
+        # key, which would separate it from the comment block explaining it.
+        dest = tmp_path / "pkg"
+        assert _run(dest).returncode == 0
+        lines = (dest / ".env.example").read_text().splitlines()
+        index = next(i for i, l in enumerate(lines) if l.startswith("EPICURRENTS_NETWORK_NAME="))
+        assert any("Docker network" in l for l in lines[max(0, index - 4) : index])
 
 
 class TestGuards:
