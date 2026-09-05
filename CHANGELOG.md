@@ -10,6 +10,31 @@ Entries are written for the person deciding whether to upgrade, so the ones that
 
 ### Added
 
+- `manage.py vendor_pyodide` populates the self-hosted Pyodide runtime the
+  viewer's Python analysis tools load from `/vendor/pyodide/<version>/`. The
+  tree had no producer: it was described in the settings and the operations
+  guide as vendored at deploy, but nothing in the repository created it, so a
+  deployment that had not had it placed there by hand failed at the first
+  request for the interpreter — visibly only in a browser console.
+
+  It vendors the runtime core plus the closure of what the viewer loads (26 of
+  the distribution's 354 packages, ~47 MiB) and writes a pruned
+  `pyodide-lock.json` matching what is on disk. mne comes from PyPI, since
+  Pyodide un-bundled it after 0.28. `--check` verifies an existing tree without
+  downloading. `bootstrap.sh` runs it; `update.sh` runs `--check` and
+  re-vendors only on failure, which also repairs a restored snapshot — the tree
+  is excluded from the update rsync and, unlike `static/`, nothing else
+  regenerates it.
+
+- Both deploy scripts now produce the whole vendored asset tree, not half of it:
+  `generate_compute_static` runs alongside the Pyodide vendoring, so the
+  pre-computed lead fields the viewer's source-localisation tool prefers are
+  present on a deployment rather than only on a machine where someone had run
+  the generator by hand. It needs a migrated database, so `bootstrap.sh` runs it
+  after the stack is up; `update.sh` runs it after migrations. A deployment
+  without it still worked — the tool falls back to the compute API — but
+  computed each montage per request and lost offline use.
+
 - Art. 15 subject access export: `manage.py export_user --username <name>`
   produces a plain-text document listing everything the platform holds about one
   person, as the mirror of `erase_user`. `--format json` gives the machine-readable

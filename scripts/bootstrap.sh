@@ -147,12 +147,14 @@ else
         progress_step ohif "Initialise OHIF viewer submodule"
     fi
     progress_step frontend "Build frontend bundles"
+    progress_step pyodide  "Vendor the Pyodide runtime"
     progress_step borg     "Initialise Borg backup repositories"
     if [ "$START" = true ]; then
         if [ -n "$ACTIVE_PROJECT" ]; then
             progress_step activate "Activate project ($ACTIVE_PROJECT)"
         fi
         progress_step up "Start the stack (production overlay)"
+        progress_step leadfields "Generate the static lead fields"
         if [ -n "$TS_AUTHKEY_ARG" ]; then
             if [ "$TS_MODE" = "serve" ]; then
                 progress_step tailnet "Publish the UI on the tailnet" direct
@@ -487,6 +489,20 @@ step_frontend() {
 }
 run_step frontend step_frontend
 
+# ── 7a. Vendor the Pyodide runtime ───────────────────────────────────────────
+# The viewer's Python analysis tools load their interpreter from the deployment's
+# own origin (/vendor/pyodide/<version>/), so the runtime and the wheels it needs
+# have to be on disk before anything can use them. Not shipped in the repo or the
+# image: the tree is version-pinned, gitignored and ~47 MiB. Idempotent, so a
+# re-run costs a hash check. The step is fatal on failure rather than skipped —
+# a deployment missing this tree looks completely healthy and fails only in a
+# browser console, the day someone opens the analysis panel.
+
+step_pyodide() {
+    $COMPOSE run --rm --no-deps -T web python manage.py vendor_pyodide
+}
+run_step pyodide step_pyodide
+
 # ── 8. Initialise Borg backup repo (idempotent) ──────────────────────────────
 # borg info exits 0 if the repo already exists; otherwise we initialise with
 # the repokey encryption mode using the auto-generated BORG_PASSPHRASE in .env.
@@ -592,8 +608,25 @@ step_tailnet() {
     fi
 }
 
+# ── 9a. Static lead fields ───────────────────────────────────────────────────
+# The other half of the vendored asset tree: pre-computed lead fields the viewer's
+# source-localisation tool fetches instead of asking the compute API per montage,
+# which is also what makes them service-worker cacheable and available offline.
+# Unlike the Pyodide runtime these are computed rather than downloaded — a couple
+# of seconds — so there is no reason to skip a run. It reads and writes the
+# LeadFieldCache table, so it belongs after the stack is up and migrated; a
+# --no-start deployment generates them with its own first `compose run`. Run
+# through the overlay the stack is running under, not the base file, so the
+# command sees the deployment's settings rather than the base file's development
+# defaults.
+
+step_leadfields() {
+    $COMPOSE_PROD run --rm --no-deps -T web python manage.py generate_compute_static
+}
+
 if [ "$START" = true ]; then
     run_step up step_up
+    run_step leadfields step_leadfields
     if [ -n "$TS_AUTHKEY_ARG" ]; then
         run_step tailnet step_tailnet
     fi

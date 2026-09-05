@@ -96,6 +96,29 @@ class TestSharedTail:
         assert fakebin.has_call("manage.py migrate")
         assert fakebin.has_call("manage.py collectstatic")
 
+    def test_vendored_assets_are_produced_after_migrations(self, fakebin, tmp_path):
+        # Both halves of frontend/vendor. Nothing else regenerates the tree — it is
+        # excluded from this script's rsync — so a deployment that loses it (a fresh
+        # host, a restored snapshot) gets it back only here. Both generators read the
+        # migrated schema, which fixes their position after step 5.
+        _deploy(fakebin, tmp_path)
+        result = run_script("update.sh", fakebin, cwd=tmp_path, args=["--from", "repo", "--no-pull"])
+        assert result.returncode == 0, result.stderr
+        calls = fakebin.calls()
+        migrate_i = _index_of(calls, "manage.py migrate")
+        pyodide_i = _index_of(calls, "manage.py vendor_pyodide")
+        leadfield_i = _index_of(calls, "manage.py generate_compute_static")
+        assert -1 < migrate_i < pyodide_i, "the Pyodide check must follow migrations"
+        assert -1 < migrate_i < leadfield_i, "lead-field generation must follow migrations"
+
+    def test_the_pyodide_tree_is_only_vendored_when_the_check_fails(self, fakebin, tmp_path):
+        # The check is a local hash sweep and the vendoring is a 47 MiB download, so an
+        # update that finds a good tree must not re-fetch it.
+        _deploy(fakebin, tmp_path)
+        run_script("update.sh", fakebin, cwd=tmp_path, args=["--from", "repo", "--no-pull"])
+        vendoring = [call for call in fakebin.calls() if "vendor_pyodide" in call and "--check" not in call]
+        assert not vendoring, f"expected no re-vendoring when --check passes, got {vendoring}"
+
     def test_no_backup_skips_the_dump(self, fakebin, tmp_path):
         _deploy(fakebin, tmp_path)
         result = run_script(

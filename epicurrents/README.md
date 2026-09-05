@@ -250,6 +250,33 @@ Write access is gated on **staff** (`is_staff` or `is_superuser`), not superuser
 
 The staff editor dry-validates the overrides before saving. Since validity depends on the live settings tree (which spans both the interface and core layers and only exists after a viewer loads its modules), the editor launches a hidden, data-less viewer instance and runs each field through the same `setFieldValue` the applier uses. An unknown field or a wrong-typed value is reported up front and blocks the save, rather than being silently dropped at viewer launch. If the hidden viewer cannot launch, the editor saves without validation rather than blocking.
 
+## Vendored browser assets
+
+`VENDOR_DIR` (default `frontend/vendor`) holds version-pinned assets the browser loads directly, served at `/vendor/<path>` by [views.py](views.py) `vendor_view`. The tree is gitignored, generated at deploy, and served rather than bundled — it is not part of `collectstatic` or the Vite build. `vendor_view` tags each response with `Cross-Origin-Resource-Policy` so the files load under the viewer's `COEP: require-corp` isolation, and caches the version-pinned files as `immutable` while letting `pyodide-lock.json` revalidate.
+
+Two producers write into it, and [bootstrap.sh](../scripts/bootstrap.sh) and [update.sh](../scripts/update.sh) run both: `vendor_pyodide` for the Python interpreter, and `generate_compute_static` ([compute/](../compute/management/commands/generate_compute_static.py)) for the pre-computed lead fields. They differ in kind — one downloads a pinned distribution, the other computes from the platform's own MNE install — which is why one is skipped when a hash check passes and the other simply runs.
+
+### The Pyodide runtime
+
+The viewer's analysis tools run Python in the browser, and the interpreter comes from the deployment's own origin — `pyodideAssetPath` in `PUBLIC_VIEWER_MODES` names `/vendor/pyodide/<version>/`, and the production CSP allows no third-party origin, so a CDN fallback is refused rather than silently taken.
+
+`vendor_pyodide` populates that path with the runtime core and only the wheels the viewer loads: the closure of numpy, scipy and matplotlib, plus mne and whatever mne needs that the distribution lacks. That is 26 packages out of the distribution's 354, around 47 MiB. It writes a pruned `pyodide-lock.json` describing exactly what is on disk — a full lock over a partial tree would let `loadPackage` name a wheel that was never downloaded, turning a resolution error into a 404.
+
+mne is resolved from PyPI because Pyodide un-bundled it after 0.28. Only pure-Python wheels are accepted; a dependency needing compilation has to come from the distribution, and one that satisfies neither aborts the run rather than being dropped to surface later as an `ImportError` in someone's browser.
+
+Two things follow from the path carrying a version. Setting `pyodideAssetPath` at all commits the runtime to self-hosted package resolution — every package must resolve from that folder's lock — so pointing it at an upstream CDN takes the same branch against a lock with no mne and fails. And the version string appears in three places: this setting and the two frontend entry points that seed the viewer SETUP. The command reads the setting and warns when a frontend file disagrees, because a mismatch is otherwise invisible until the browser requests a path nothing populated.
+
+`--check` verifies an existing tree against its own lock (every file present, every hash matching, no dependency the lock omits) and downloads nothing. [scripts/update.sh](../scripts/update.sh) runs it on every update and re-vendors only when it fails — the tree is excluded from the update rsync so each deployment keeps its own copy, which also means a fresh host or a restored snapshot arrives with nothing to serve.
+
+### Static lead fields
+
+`generate_compute_static` writes pre-computed lead fields to `/vendor/leadfields/` for the viewer's source-localisation tool, which prefers them over the compute API: a manifest fetch plus a blob, no metadata round-trip, and cacheable by the service worker so the tool works offline. Blob filenames carry a content hash, so a regenerated field that has not changed keeps its name and every cached copy stays valid.
+
+The consequence of an absent bundle is milder than a missing interpreter: [leadFields.ts](../frontend/src/viewer/leadFields.ts) falls back to `/compute/api/v1/eeg/leadfield/`, so the tool works but computes per montage against the database and loses offline use. A montage missing from both sources reports itself as unavailable rather than failing.
+
+Generation reads and writes `LeadFieldCache`, so unlike the Pyodide vendoring it needs a migrated database and cannot run before migrations. It takes seconds, so both deploy paths run it unconditionally — which is also the only way a change to the generator's montages or grid parameters reaches a deployment.
+
+
 ## Management commands
 
 All commands run inside the Docker stack (`docker compose run --rm web python manage.py <command>`) so they target PostgreSQL, not the host SQLite dev DB. Running them on the host while the Docker stack is up applies migrations to the wrong database and breaks the stack.
@@ -262,6 +289,8 @@ All commands run inside the Docker stack (`docker compose run --rm web python ma
 | `activate_project <name> [--fresh]` | Restore `_archived_<name>_*` tables (default) and run `migrate`; or clear migration history and start fresh. `EPICURRENTS_PROJECT` must equal `<name>`. |
 | `deactivate_project` | Rename live tables of the currently-active project to `_archived_<name>_*`. `EPICURRENTS_PROJECT` must match the currently-active project. |
 | `remove_project_data <name>` | Irreversibly drop `_archived_<name>_*` tables. Prompts for confirmation. `EPICURRENTS_PROJECT` is not required. |
+| `vendor_pyodide [--check] [--pyodide-version V] [--package NAME[==VERSION]] [--force]` | Download the self-hosted Pyodide runtime and the wheel closure the viewer loads into `VENDOR_DIR`, and write a pruned lock. Idempotent. Run by [bootstrap.sh](../scripts/bootstrap.sh) and, when the tree fails `--check`, by [update.sh](../scripts/update.sh). |
+| `generate_compute_static` | Regenerate the compute-side vendored assets (lead-field blobs plus their manifest); lives in [compute/](../compute/management/commands/generate_compute_static.py). Needs a migrated database. Run by both deploy scripts. |
 | `sync_prod_to_dev` | Copy data from production database to the development database via an intermediate JSON dump. Excludes contenttypes, auth.permission, admin.logentry, sessions.session by default. |
 
 For the recommended end-to-end project-switch flow use [scripts/switch_project.sh](../scripts/switch_project.sh) — it sequences deactivate → env edits → activate → frontend rebuild → restart and keeps `db` and `redis` running throughout.

@@ -50,8 +50,11 @@ onMounted(() => {
     // Serve Pyodide's runtime (wasm, stdlib, packages) from our own origin
     // rather than the jsdelivr CDN, so the installed app's compute works offline
     // and the assets are same-origin cacheable by the service worker. Overrides
-    // the viewer's CDN default (setups/index.ts `pyodideAssetPath`); the pinned
-    // "full" distribution is vendored at deploy under /vendor/pyodide/314.0.2/.
+    // the viewer's SETUP default, which is empty and means "use the interpreter
+    // service's own pinned upstream distribution"; the pinned "full" distribution
+    // is vendored at deploy under /vendor/pyodide/314.0.2/. A value here also
+    // makes every package resolve from that folder's pyodide-lock.json, which the
+    // vendoring step extends with mne.
     // Merged (not replaced) so a viewer-seeded SETUP keeps its other fields.
     setViewerSetup({
         ...getViewerSetup(),

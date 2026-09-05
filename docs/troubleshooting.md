@@ -416,6 +416,40 @@ Walk through the chain:
 
 `ENABLE_CROSS_ORIGIN_ISOLATION` is off by default because `COEP: require-corp` rejects any cross-origin subresource that doesn't send `Cross-Origin-Resource-Policy` — an embed scenario that relies on third-party resources without CORP would break. Audit your deployment's external fetches before enabling.
 
+### Analysis tools fail with "Failed to fetch dynamically imported module: .../vendor/pyodide/<version>/pyodide.mjs"
+
+The Python interpreter is served from the deployment's own origin, from a tree that is generated at deploy rather than shipped: it is gitignored, roughly 47 MiB, and excluded from the update rsync so each deployment keeps its own copy. A fresh host, a restored snapshot, or a working checkout that has never run `bootstrap.sh` therefore has nothing at that path, and the import 404s.
+
+Vendor it:
+
+```
+docker compose run --rm --no-deps web python manage.py vendor_pyodide
+```
+
+The command is idempotent, so it is safe to run against a tree that is merely incomplete. `--check` reports what is wrong without downloading.
+
+If the error names a **different version** than the one you just vendored, the frontend and the backend disagree. The version appears in three places — `PUBLIC_VIEWER_MODES` in [epicurrents/settings/common.py](../epicurrents/settings/common.py), [frontend/index.html](../frontend/index.html) and [frontend/src/App.vue](../frontend/src/App.vue) — and the command warns when the frontend files name a version other than the one it is vendoring. Bring them into step and rebuild the frontend.
+
+A later failure — the runtime loads, then package installation fails on mne — means the tree was built for a different package set. Re-run without `--check`; the pruned lock and the wheels on disk are written together, so they cannot disagree after a successful run.
+
+### Source localisation is slow, or unavailable offline
+
+The tool prefers a pre-computed lead field from `/vendor/leadfields/` and falls back to the compute API when the bundle is absent, so a deployment missing it works but computes each montage per request against the database, and the service worker has nothing to cache for offline use. Check whether the manifest is being served:
+
+```
+curl -s -o /dev/null -w '%{http_code}\n' https://your-host/vendor/leadfields/manifest.json
+```
+
+A 404 means the bundle was never generated on this deployment. Generate it — the stack must be up and migrated, since the generator also refreshes the rows the compute API serves from:
+
+```
+docker compose run --rm --no-deps web python manage.py generate_compute_static
+```
+
+It takes seconds. Blob filenames carry a content hash, so regenerating a field that has not changed keeps its name and does not invalidate a cached copy.
+
+If the tool reports a montage as unavailable rather than being slow, neither source has it: the montage is outside the generated set (the default is `standard_1020`) and outside what the compute API will compute on demand.
+
 ## When your issue isn't here
 
 1. **Capture context.** Run `scripts/logs.sh <service> 500 > issue.log` for the service involved and include it when asking for help.

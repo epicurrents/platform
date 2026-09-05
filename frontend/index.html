@@ -35,12 +35,14 @@
               logThreshold: 'WARN',
               modules: {},
               // Same-origin, matching src/App.vue and the public viewer's
-              // PUBLIC_VIEWER_MODES setup in epicurrents/settings/common.py. It was a
-              // jsdelivr URL pinned to Pyodide 0.25.0 while the deployment vendors
-              // 314.0.2, so the two disagreed on both the origin and the version: any
-              // path reaching this value before App.vue's override would have fetched a
-              // nine-major-versions-old runtime from a third party. Kept in step with
-              // the other two by hand — the version appears in three files.
+              // PUBLIC_VIEWER_MODES setup in epicurrents/settings/common.py. Seeded
+              // here as well as in App.vue because a path that reaches the viewer
+              // before App.vue's override would otherwise take the interpreter
+              // service's own upstream default and fetch the runtime from a third
+              // party. The value also selects self-hosted package resolution, so it
+              // must name a folder whose pyodide-lock.json the deploy step extended
+              // with mne. Kept in step with the other two by hand — the version
+              // appears in three files.
               pyodideAssetPath: '/vendor/pyodide/314.0.2/',
               scope: 'local',
               signalCacheMaxSize: 1000,

@@ -46,6 +46,37 @@ class TestBootstrapShSecondPass:
         assert fakebin.has_call("docker-compose.prod.yml")
         assert fakebin.has_call("up -d")
 
+    def test_vendored_assets_are_produced(self, fakebin, tmp_path):
+        # frontend/vendor is gitignored, absent from the image and excluded from the
+        # update rsync, so a deployment gets it here or not at all. The interpreter half
+        # fails only in a browser console when it is missing, which is why it is a step
+        # rather than something an operator is told to remember.
+        make_env(tmp_path)
+        result = run_script(BOOTSTRAP, fakebin, cwd=tmp_path)
+        assert result.returncode == 0, result.stderr
+        assert fakebin.has_call("manage.py vendor_pyodide")
+        assert fakebin.has_call("manage.py generate_compute_static")
+
+    def test_lead_fields_are_generated_after_the_stack_is_up(self, fakebin, tmp_path):
+        # The generator reads and writes LeadFieldCache, so it needs the schema the
+        # stack's migrate service applies; running it earlier hits a missing table.
+        make_env(tmp_path)
+        result = run_script(BOOTSTRAP, fakebin, cwd=tmp_path)
+        assert result.returncode == 0, result.stderr
+        calls = fakebin.calls()
+        up = next(i for i, call in enumerate(calls) if "up -d" in call and "db" not in call.split("up -d")[1])
+        leadfields = next(i for i, call in enumerate(calls) if "generate_compute_static" in call)
+        assert up < leadfields, f"expected the stack up at {up} before generation at {leadfields}"
+
+    def test_no_start_skips_lead_fields_but_still_vendors_the_runtime(self, fakebin, tmp_path):
+        # Without a stack there is no database to generate against, but the Pyodide
+        # download needs none, so it must not be skipped along with it.
+        make_env(tmp_path)
+        result = run_script(BOOTSTRAP, fakebin, cwd=tmp_path, args=["--no-start"])
+        assert result.returncode == 0, result.stderr
+        assert fakebin.has_call("manage.py vendor_pyodide")
+        assert not fakebin.has_call("manage.py generate_compute_static")
+
     def test_proxy_overlay_added_when_proxy_domain_is_set(self, fakebin, tmp_path):
         make_env(tmp_path, PROXY_DOMAIN="eeg.example.com")
         result = run_script(BOOTSTRAP, fakebin, cwd=tmp_path)
