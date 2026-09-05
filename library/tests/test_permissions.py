@@ -292,6 +292,34 @@ class TestDatasetGrantsReachAFederatedPeer:
         terms = can_read_via_dataset_federated(peer, "", recording)
         assert terms is not None and terms.granted
 
+    @pytest.mark.parametrize("creation_order", [(False, True), (True, False)])
+    def test_de_identifying_share_wins_when_an_item_is_in_two(self, user, peer, creation_order):
+        # The listing half already resolves this overlap toward de-identification.
+        # This half decides what the byte-serving endpoints actually send, so the
+        # two disagreeing means a peer is told the recording is de-identified and
+        # handed the raw file. Both creation orders, because the defect this
+        # covers was the absence of any tie-break at all: with none, the answer is
+        # whichever row the database returns first, and one order passes by luck.
+        recording = baker.make("recordings.Recording", author=user)
+        for apply_middleware in creation_order:
+            self._shared_dataset(user, recording, peer, apply_middleware=apply_middleware)
+        terms = can_read_via_dataset_federated(peer, "", recording)
+        assert terms is not None and terms.apply_middleware is True
+
+    def test_an_exact_user_grant_still_outranks_a_wildcard(self, user, peer):
+        # The de-identifying preference is a tie-break among equals, not an
+        # override: a grant naming this user is the sharer deciding about them
+        # specifically, and it wins whichever way it is set. Pinned because the
+        # obvious fix for the case above — sort by apply_middleware first — would
+        # silently reverse this precedence and pass every other test here.
+        recording = baker.make("recordings.Recording", author=user)
+        dataset = self._shared_dataset(user, recording, peer, apply_middleware=True)
+        _dataset_right(
+            dataset, user, federated_peer=peer, can_read=True, remote_user_id="u1", apply_middleware=False
+        )
+        terms = can_read_via_dataset_federated(peer, "u1", recording)
+        assert terms is not None and terms.apply_middleware is False
+
     def test_de_identification_survives_the_inheritance(self, user, peer):
         # The sharer's choice lives on the dataset row. Losing it here serves raw
         # EDF — patient identification and clinical annotation text — to a peer
@@ -382,6 +410,45 @@ class TestFederatedDatasetListing:
             dataset = baker.make(Dataset, author=user)
             DatasetItem.objects.create(dataset=dataset, content_type=ct, object_id=str(recording.pk))
             _dataset_right(dataset, user, federated_peer=peer, can_read=True, apply_middleware=apply_middleware)
+        assert federated_dataset_visible_terms(peer, "", ct)[str(recording.pk)].apply_middleware is True
+
+    def test_reports_the_terms_the_per_object_check_will_apply(self, user, peer):
+        # Agreement on presence is not enough. The listing advertises a download
+        # size computed from apply_middleware, and the per-object check decides
+        # what the bytes are, so a disagreement here is a peer told one thing and
+        # served another. Both overlap shapes: two datasets at the same
+        # specificity, and one dataset where an exact-user row overrides the
+        # wildcard.
+        recording = baker.make("recordings.Recording", author=user)
+        ct = ContentType.objects.get_for_model(recording)
+        first = baker.make(Dataset, author=user)
+        second = baker.make(Dataset, author=user)
+        for dataset in (first, second):
+            DatasetItem.objects.create(dataset=dataset, content_type=ct, object_id=str(recording.pk))
+        _dataset_right(first, user, federated_peer=peer, can_read=True, apply_middleware=False)
+        _dataset_right(second, user, federated_peer=peer, can_read=True, apply_middleware=True)
+        _dataset_right(
+            first, user, federated_peer=peer, can_read=True, remote_user_id="u1", apply_middleware=False
+        )
+        for remote_user_id in ("", "u1"):
+            listed = federated_dataset_visible_terms(peer, remote_user_id, ct)[str(recording.pk)]
+            per_object = can_read_via_dataset_federated(peer, remote_user_id, recording)
+            assert per_object is not None
+            assert listed.apply_middleware is per_object.apply_middleware
+
+    def test_an_exact_user_grant_outranks_the_wildcard_on_the_same_dataset(self, user, peer):
+        # Same precedence the per-object half applies, asserted on the listing so
+        # the two cannot drift: an exact row is the sharer deciding about this
+        # user, and folding it together with the wildcard loses that decision.
+        recording = baker.make("recordings.Recording", author=user)
+        ct = ContentType.objects.get_for_model(recording)
+        dataset = baker.make(Dataset, author=user)
+        DatasetItem.objects.create(dataset=dataset, content_type=ct, object_id=str(recording.pk))
+        _dataset_right(dataset, user, federated_peer=peer, can_read=True, apply_middleware=True)
+        _dataset_right(
+            dataset, user, federated_peer=peer, can_read=True, remote_user_id="u1", apply_middleware=False
+        )
+        assert federated_dataset_visible_terms(peer, "u1", ct)[str(recording.pk)].apply_middleware is False
         assert federated_dataset_visible_terms(peer, "", ct)[str(recording.pk)].apply_middleware is True
 
     def test_lists_nothing_for_another_peer(self, user, peer):

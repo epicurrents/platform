@@ -385,6 +385,28 @@ class TestFederatedReadExtensions:
 
         return undo
 
+    def test_the_de_identifying_extension_wins_when_two_reach_the_same_object(self, user):
+        # Registration order is whatever order AppConfig.ready() ran in, so
+        # deciding the tie by it would make what a peer receives depend on
+        # INSTALLED_APPS. The listing beside this resolves the same overlap toward
+        # de-identification; disagreeing would advertise a de-identified object
+        # and then serve the raw bytes.
+        from model_bakery import baker
+
+        from epicurrents.permissions import ReadAccessTerms
+
+        peer = self._make_peer(user)
+        recording = baker.make("recordings.Recording", author=user)
+        undo_raw = self._register(check=lambda p, r, o: ReadAccessTerms(granted=True, apply_middleware=False))
+        undo_clean = self._register(check=lambda p, r, o: ReadAccessTerms(granted=True, apply_middleware=True))
+        try:
+            terms = get_federated_read_access_result(peer, "u1", recording)
+            assert terms.granted is True
+            assert terms.apply_middleware is True
+        finally:
+            undo_clean()
+            undo_raw()
+
     def test_extension_grants_when_no_direct_row_exists(self, user):
         from model_bakery import baker
 

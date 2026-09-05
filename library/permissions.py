@@ -206,9 +206,16 @@ def can_read_via_dataset_federated(peer, remote_user_id: str, obj):
             federated_peer=peer,
         )
         .filter(Q(remote_user_id="") | Q(remote_user_id=remote_user_id))
-        # Exact-user row before the peer-wide wildcard, as the direct-grant
-        # resolver orders them, so the specific grant's terms win.
-        .order_by("-remote_user_id")
+        # Two tiers, as the direct-grant resolver orders them. An exact-user row
+        # comes before the peer-wide wildcard, so the specific grant's terms win
+        # whichever way it is set. Among rows of equal specificity the
+        # de-identifying one wins — and unlike the direct-grant resolver, this
+        # query spans every dataset holding the object, so equal-specificity ties
+        # are ordinary here rather than impossible: one recording in two datasets
+        # shared with the same peer produces two wildcard rows. Without the
+        # second key the database's row order picks between them, and picking the
+        # raw one serves the peer a file the sharer de-identified for them.
+        .order_by("-remote_user_id", "-apply_middleware")
         .only("apply_middleware")
         .first()
     )
@@ -249,27 +256,42 @@ def federated_dataset_visible_terms(peer, remote_user_id: str, content_type):
         AccessRight.objects.active()
         .filter(content_type=dataset_ct, can_read=True, federated_peer=peer)
         .filter(Q(remote_user_id="") | Q(remote_user_id=remote_user_id))
-        .values_list("object_id", "apply_middleware")
+        .values_list("object_id", "remote_user_id", "apply_middleware")
     )
-    middleware_by_dataset: dict[int, bool] = {}
-    for object_id, apply_middleware in grants:
+    # Each grant is ranked the way the per-object query sorts: specificity first,
+    # de-identification second. Comparing the ranks reproduces that ordering here
+    # rather than restating it as a different rule, which is what let the two
+    # halves disagree — the listing folded a dataset's wildcard and exact-user
+    # rows together toward de-identification, where the per-object half lets the
+    # exact row win outright. A peer then saw a size computed one way and
+    # received bytes decided the other.
+    rank_by_dataset: dict[int, tuple[int, int]] = {}
+    for object_id, grant_user_id, apply_middleware in grants:
         if not str(object_id).isdigit():
             continue
         dataset_pk = int(object_id)
-        middleware_by_dataset[dataset_pk] = middleware_by_dataset.get(dataset_pk, False) or apply_middleware
-    if not middleware_by_dataset:
+        rank = (1 if grant_user_id else 0, 1 if apply_middleware else 0)
+        if rank_by_dataset.get(dataset_pk, (-1, -1)) < rank:
+            rank_by_dataset[dataset_pk] = rank
+    if not rank_by_dataset:
         return {}
 
-    terms: dict[str, ReadAccessTerms] = {}
+    # An object in several shared datasets takes the highest-ranked of their
+    # grants, which is the row the per-object query's `.first()` would return.
+    rank_by_object: dict[str, tuple[int, int]] = {}
     items = DatasetItem.objects.filter(
-        dataset_id__in=list(middleware_by_dataset),
+        dataset_id__in=list(rank_by_dataset),
         dataset__deleted_at__isnull=True,
         content_type=content_type,
     ).values_list("object_id", "dataset_id")
     for object_id, dataset_id in items:
+        rank = rank_by_dataset.get(dataset_id)
+        if rank is None:
+            continue
         key = str(object_id)
-        apply_middleware = middleware_by_dataset.get(dataset_id, False)
-        existing = terms.get(key)
-        if existing is None or (apply_middleware and not existing.apply_middleware):
-            terms[key] = ReadAccessTerms(granted=True, apply_middleware=apply_middleware)
-    return terms
+        if rank_by_object.get(key, (-1, -1)) < rank:
+            rank_by_object[key] = rank
+    return {
+        key: ReadAccessTerms(granted=True, apply_middleware=bool(rank[1]))
+        for key, rank in rank_by_object.items()
+    }

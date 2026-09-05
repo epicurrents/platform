@@ -402,11 +402,21 @@ def get_federated_read_access_result(peer, remote_user_id: str, obj) -> ReadAcce
     # row is the sharer's specific decision about this object and outranks anything
     # inherited. Without this loop a peer reaches only objects granted one by one,
     # which is why sharing a dataset with a peer conveyed nothing at all.
+    #
+    # Every extension is consulted rather than the first grant returned, because
+    # two of them reaching the same object is a tie, and the de-identifying terms
+    # win it — the same rule get_federated_visible_terms applies to the listing
+    # beside this. Returning early would decide the tie by registration order,
+    # which is the order AppConfig.ready() happened to run in, and would let the
+    # listing advertise a de-identified object this path then serves raw.
+    granted = None
     for extension in _FEDERATED_READ_EXTENSIONS:
         terms = extension.check(peer, remote_user_id, obj)
-        if terms is not None and terms.granted:
-            return terms
-    return ReadAccessTerms(granted=False)
+        if terms is None or not terms.granted:
+            continue
+        if granted is None or (terms.apply_middleware and not granted.apply_middleware):
+            granted = terms
+    return granted if granted is not None else ReadAccessTerms(granted=False)
 
 
 def can_read_object(user: Any, obj: Any, share_token: str | None = None) -> bool:
