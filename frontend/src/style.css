@@ -49,11 +49,18 @@ wa-icon.inline {
 }
 
 .nav-brand {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--wa-space-xs);
   font-weight: 700;
   font-size: var(--wa-font-size-m);
   color: var(--wa-color-text-normal);
   text-decoration: none;
   margin-right: var(--wa-space-xs);
+}
+
+.nav-brand__logo {
+  --logo-size: 1.75rem;
 }
 
 .nav-links {

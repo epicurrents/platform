@@ -2,6 +2,7 @@
 import { computed, onMounted, onUnmounted } from 'vue'
 import { RouterLink, RouterView, useRoute, useRouter } from 'vue-router'
 import ToastStack from '#root/viewer/interface/src/app/ToastStack.vue'
+import AppLogo from '#components/AppLogo.vue'
 import { t } from '#i18n'
 import { showToast } from '#lib/toast'
 import { getViewerSetup, setViewerSetup } from '#lib/viewerGlobal'
@@ -168,7 +169,10 @@ async function logout () {
 
 <template>
     <nav v-if="showNavigation" class="app-nav">
-        <RouterLink class="nav-brand" to="/">Epicurrents</RouterLink>
+        <RouterLink class="nav-brand" to="/">
+            <AppLogo class="nav-brand__logo" :stroke-width="12" />
+            Epicurrents
+        </RouterLink>
         <div class="nav-links">
             <RouterLink v-for="link in navLinks"
                 :key="link.id"
