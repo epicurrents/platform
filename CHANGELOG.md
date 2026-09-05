@@ -40,6 +40,10 @@ Entries are written for the person deciding whether to upgrade, so the ones that
   is excluded from the update rsync and, unlike `static/`, nothing else
   regenerates it.
 
+  Both generators run in a `vendor` compose service rather than in `web`, which
+  mounts the tree read-only: web serves the interpreter every viewer session
+  executes, so it is deliberately the one container that cannot rewrite it.
+
 - Both deploy scripts now produce the whole vendored asset tree, not half of it:
   `generate_compute_static` runs alongside the Pyodide vendoring, so the
   pre-computed lead fields the viewer's source-localisation tool prefers are

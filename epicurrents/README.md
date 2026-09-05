@@ -256,6 +256,8 @@ The staff editor dry-validates the overrides before saving. Since validity depen
 
 Two producers write into it, and [bootstrap.sh](../scripts/bootstrap.sh) and [update.sh](../scripts/update.sh) run both: `vendor_pyodide` for the Python interpreter, and `generate_compute_static` ([compute/](../compute/management/commands/generate_compute_static.py)) for the pre-computed lead fields. They differ in kind — one downloads a pinned distribution, the other computes from the platform's own MNE install — which is why one is skipped when a hash check passes and the other simply runs.
 
+Both run in the `vendor` compose service rather than in `web`. Production mounts this tree into web read-only — web serves the interpreter every viewer session executes, so a write path from the request-handling container would reach every visitor's browser — which leaves web the one container that cannot populate it. The `vendor` service carries the same image, settings and database with that single mount inverted, sits behind a compose profile so `up` never starts it, and runs as root because the bind is a host directory Docker creates on first use, owned by root.
+
 ### The Pyodide runtime
 
 The viewer's analysis tools run Python in the browser, and the interpreter comes from the deployment's own origin — `pyodideAssetPath` in `PUBLIC_VIEWER_MODES` names `/vendor/pyodide/<version>/`, and the production CSP allows no third-party origin, so a CDN fallback is refused rather than silently taken.
@@ -289,8 +291,8 @@ All commands run inside the Docker stack (`docker compose run --rm web python ma
 | `activate_project <name> [--fresh]` | Restore `_archived_<name>_*` tables (default) and run `migrate`; or clear migration history and start fresh. `EPICURRENTS_PROJECT` must equal `<name>`. |
 | `deactivate_project` | Rename live tables of the currently-active project to `_archived_<name>_*`. `EPICURRENTS_PROJECT` must match the currently-active project. |
 | `remove_project_data <name>` | Irreversibly drop `_archived_<name>_*` tables. Prompts for confirmation. `EPICURRENTS_PROJECT` is not required. |
-| `vendor_pyodide [--check] [--pyodide-version V] [--package NAME[==VERSION]] [--force]` | Download the self-hosted Pyodide runtime and the wheel closure the viewer loads into `VENDOR_DIR`, and write a pruned lock. Idempotent. Run by [bootstrap.sh](../scripts/bootstrap.sh) and, when the tree fails `--check`, by [update.sh](../scripts/update.sh). |
-| `generate_compute_static` | Regenerate the compute-side vendored assets (lead-field blobs plus their manifest); lives in [compute/](../compute/management/commands/generate_compute_static.py). Needs a migrated database. Run by both deploy scripts. |
+| `vendor_pyodide [--check] [--pyodide-version V] [--package NAME[==VERSION]] [--force]` | Download the self-hosted Pyodide runtime and the wheel closure the viewer loads into `VENDOR_DIR`, and write a pruned lock. Idempotent. Run by [bootstrap.sh](../scripts/bootstrap.sh) and, when the tree fails `--check`, by [update.sh](../scripts/update.sh), in the `vendor` service rather than `web` — see [vendored browser assets](#vendored-browser-assets). |
+| `generate_compute_static` | Regenerate the compute-side vendored assets (lead-field blobs plus their manifest); lives in [compute/](../compute/management/commands/generate_compute_static.py). Needs a migrated database. Run by both deploy scripts, in the `vendor` service rather than `web` — see [vendored browser assets](#vendored-browser-assets). |
 | `sync_prod_to_dev` | Copy data from production database to the development database via an intermediate JSON dump. Excludes contenttypes, auth.permission, admin.logentry, sessions.session by default. |
 
 For the recommended end-to-end project-switch flow use [scripts/switch_project.sh](../scripts/switch_project.sh) — it sequences deactivate → env edits → activate → frontend rebuild → restart and keeps `db` and `redis` running throughout.

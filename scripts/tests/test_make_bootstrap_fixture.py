@@ -328,6 +328,37 @@ class TestDistPackage:
         assert not (dest / "plugins" / "dicom" / "ohif-viewer").exists()
         assert _activated_plugins((dest / "start.sh").read_text()) == ["dicom"]
 
+    def test_start_sh_vendors_the_browser_assets_through_the_writer(self, tmp_path):
+        # A distribution deployment never runs bootstrap.sh — start.sh is its only
+        # bring-up path, so the vendored tree is populated here or not at all. The
+        # writer is the `vendor` service because production mounts that tree into
+        # web read-only.
+        dest = tmp_path / "dist"
+        assert _run(dest, "--dist").returncode == 0
+        runner = (dest / "start.sh").read_text()
+        assert "VIEWER_BUNDLED=true" in runner
+        for command in ("vendor_pyodide", "generate_compute_static"):
+            assert f"python manage.py {command}" in runner
+            assert f"web python manage.py {command}" not in runner
+        assert runner.count("--profile vendor run --rm --no-deps -T vendor") == 2
+
+    def test_vendoring_waits_for_the_stack(self, tmp_path):
+        # The lead-field generator reads and writes LeadFieldCache, so it needs the
+        # schema the stack's migrate service applies on the way up.
+        dest = tmp_path / "dist"
+        assert _run(dest, "--dist").returncode == 0
+        lines = (dest / "start.sh").read_text().splitlines()
+        ready = next(i for i, line in enumerate(lines) if "Waiting for the platform to become ready" in line)
+        vendoring = next(i for i, line in enumerate(lines) if "manage.py generate_compute_static" in line)
+        assert ready < vendoring, "lead fields cannot be generated before the database is up"
+
+    def test_demo_package_does_not_vendor(self, tmp_path):
+        # No viewer in a demo, so nothing would load the interpreter those ~47 MiB
+        # buy, and a naive first run should not spend the download on it.
+        dest = tmp_path / "demo"
+        assert _run(dest, "--demo").returncode == 0
+        assert "VIEWER_BUNDLED=false" in (dest / "start.sh").read_text()
+
     def test_demo_and_dist_mutually_exclusive(self, tmp_path):
         assert _run(tmp_path / "x", "--demo", "--dist").returncode != 0
 

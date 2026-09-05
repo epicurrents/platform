@@ -67,6 +67,24 @@ services:
       - ./frontend/dist:/code/frontend/dist:ro
       - ./frontend/viewer-dist:/code/frontend/viewer-dist:ro
 
+  # The writer for the vendored asset tree; the service itself is defined in
+  # docker-compose.yml. web mounts that tree read-only below, so in a production
+  # deployment this is the only container that can populate it.
+  vendor:
+    # Root, unlike everything else here, because the bind below is a host
+    # directory Docker creates on first use — as root, on a fresh deployment —
+    # and an unprivileged writer then fails on a tree it cannot enter. What it
+    # writes is world-readable and served read-only, so the ownership costs
+    # nothing at serve time; update.sh already excludes this tree from its code
+    # snapshot because the containers write it as root.
+    user: "0:0"
+    environment:
+      - DJANGO_MODE=production
+    # No /code bind: production runs the code baked into the image, as web does.
+    # The one mount is the tree this service exists to write.
+    volumes: !override
+      - ./frontend/vendor:/code/frontend/vendor
+
   web:
     <<: *production-runtime
     # gunicorn replaces ``manage.py runserver``, which Django explicitly

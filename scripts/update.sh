@@ -506,7 +506,11 @@ fi
 # ── 3. Build the image ────────────────────────────────────────────────────────
 
 info "Building Docker images"
-"${COMPOSE[@]}" build
+# --profile vendor so the one-shot writer used in steps 6a and 6b is built here
+# with everything else. Its image is the same one web runs, so this costs a cache
+# hit and a tag; left out, the build happens inside step 6a instead, where a
+# failure reads as a vendoring failure.
+"${COMPOSE[@]}" --profile vendor build
 ok "Images built"
 
 # ── 4. Stop application services (so nothing races the schema change) ─────────
@@ -534,12 +538,15 @@ ok "Static files collected"
 # snapshot, or a version bump in settings all arrive here with nothing to serve.
 # The check is a local hash sweep, so the common case costs a second and the
 # vendoring runs only when it has to.
+#
+# This step and the next write through the `vendor` service: web mounts the tree
+# read-only in production, so it is the one container that cannot populate it.
 
-if "${COMPOSE[@]}" run --rm --no-deps -T web python manage.py vendor_pyodide --check > /dev/null 2>&1; then
+if "${COMPOSE[@]}" --profile vendor run --rm --no-deps -T vendor python manage.py vendor_pyodide --check > /dev/null 2>&1; then
     ok "Pyodide runtime present"
 else
     info "Vendoring the Pyodide runtime"
-    "${COMPOSE[@]}" run --rm --no-deps -T web python manage.py vendor_pyodide
+    "${COMPOSE[@]}" --profile vendor run --rm --no-deps -T vendor python manage.py vendor_pyodide
     ok "Pyodide runtime vendored"
 fi
 
@@ -552,7 +559,7 @@ fi
 # the LeadFieldCache rows the compute API serves from), which step 5 has ensured.
 
 info "Generating static lead fields"
-"${COMPOSE[@]}" run --rm --no-deps -T web python manage.py generate_compute_static
+"${COMPOSE[@]}" --profile vendor run --rm --no-deps -T vendor python manage.py generate_compute_static
 ok "Static lead fields generated"
 
 # ── 7. Recreate the application containers ────────────────────────────────────

@@ -497,9 +497,12 @@ run_step frontend step_frontend
 # re-run costs a hash check. The step is fatal on failure rather than skipped —
 # a deployment missing this tree looks completely healthy and fails only in a
 # browser console, the day someone opens the analysis panel.
+#
+# Written through the `vendor` service rather than `web`: production mounts the
+# tree into web read-only, so web is the one container that cannot populate it.
 
 step_pyodide() {
-    $COMPOSE run --rm --no-deps -T web python manage.py vendor_pyodide
+    $COMPOSE_PROD --profile vendor run --rm --no-deps -T vendor python manage.py vendor_pyodide
 }
 run_step pyodide step_pyodide
 
@@ -618,10 +621,10 @@ step_tailnet() {
 # --no-start deployment generates them with its own first `compose run`. Run
 # through the overlay the stack is running under, not the base file, so the
 # command sees the deployment's settings rather than the base file's development
-# defaults.
+# defaults. Same writer service as step 7a, for the same reason.
 
 step_leadfields() {
-    $COMPOSE_PROD run --rm --no-deps -T web python manage.py generate_compute_static
+    $COMPOSE_PROD --profile vendor run --rm --no-deps -T vendor python manage.py generate_compute_static
 }
 
 if [ "$START" = true ]; then

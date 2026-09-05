@@ -423,8 +423,11 @@ The Python interpreter is served from the deployment's own origin, from a tree t
 Vendor it:
 
 ```
-docker compose run --rm --no-deps web python manage.py vendor_pyodide
+docker compose -f docker-compose.yml -f docker-compose.prod.yml \
+    --profile vendor run --rm --no-deps vendor python manage.py vendor_pyodide
 ```
+
+The `vendor` service rather than `web`, and the production overlay rather than the base file: web mounts the tree read-only, so the same command in it fails on a read-only filesystem. In a development checkout `docker compose --profile vendor run --rm --no-deps vendor python manage.py vendor_pyodide` is the same thing without the overlay.
 
 The command is idempotent, so it is safe to run against a tree that is merely incomplete. `--check` reports what is wrong without downloading.
 
@@ -443,7 +446,8 @@ curl -s -o /dev/null -w '%{http_code}\n' https://your-host/vendor/leadfields/man
 A 404 means the bundle was never generated on this deployment. Generate it — the stack must be up and migrated, since the generator also refreshes the rows the compute API serves from:
 
 ```
-docker compose run --rm --no-deps web python manage.py generate_compute_static
+docker compose -f docker-compose.yml -f docker-compose.prod.yml \
+    --profile vendor run --rm --no-deps vendor python manage.py generate_compute_static
 ```
 
 It takes seconds. Blob filenames carry a content hash, so regenerating a field that has not changed keeps its name and does not invalidate a cached copy.

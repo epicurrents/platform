@@ -177,6 +177,46 @@ services:
     networks:
       - epicurrents
 
+  # ── vendor ─────────────────────────────────────────────────────────────────
+  # One-shot writer for the vendored asset tree (frontend/vendor/, served at
+  # /vendor/): the Pyodide runtime `vendor_pyodide` downloads and the lead-field
+  # blobs `generate_compute_static` computes. Behind the `vendor` profile so a
+  # plain `docker compose up` never starts it, and carrying no command of its
+  # own — every caller names the one it wants:
+  #
+  #     docker compose --profile vendor run --rm --no-deps vendor \
+  #         python manage.py vendor_pyodide
+  #
+  # A service of its own rather than `web` because production mounts that tree
+  # into web read-only on purpose: web serves the interpreter every viewer
+  # session executes, so a write path from the request-handling container is
+  # where an in-process compromise becomes code running in a visitor's browser.
+  # The overlay inverts that one mount here and nowhere else, which gives the
+  # deploy scripts a writer without giving the serving tier one. Callers:
+  # scripts/bootstrap.sh (steps 7a, 9a) and scripts/update.sh (steps 6a, 6b).
+  vendor:
+    profiles: ["vendor"]
+    build:
+      context: .
+      target: runtime
+      args: *build-args
+    # Unprivileged like migrate: in a checkout the tree being written is the
+    # developer's own, and root-owned output there is a nuisance to clean up.
+    # The production overlay makes the opposite choice for the opposite reason.
+    user: "1000:1000"
+    entrypoint: []
+    working_dir: /code
+    env_file:
+      - ./.env
+    environment:
+      - DJANGO_MODE=development
+      - DB_DEV_ENGINE=postgres
+    volumes:
+      - .:/code
+      - static:/code/static
+    networks:
+      - epicurrents
+
   web:
     build:
       context: .

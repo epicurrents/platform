@@ -23,7 +23,7 @@ The two security entries below were gated on the evidence host, which is now in 
 - User — account and group management UI (the API at `/api/v1/user/admin/` shipped 2026-08-25 as the first half of replacing the Django admin and the SPA has no client for it; scope, the decisions the API already enforces, and the traps a client will hit are in the entry)
 
 ### 🟡 Medium
-- Compute — ship pre-generated lead fields as PWA-cached static files (backend done; frontend SW + fetch pending)
+- Compute — ship pre-generated lead fields as PWA-cached static files (backend, deploy wiring, service-worker rules and the SPA's fetch all shipped; what remains is confirming the caching behaviour against a deployment that serves the generated tree)
 - Viewer — finish the worker settings auto-sync
 - Additional getting-started scenarios
 - Recordings — contract tests + load-bearing flag for `preservation.write_original` byte integrity
