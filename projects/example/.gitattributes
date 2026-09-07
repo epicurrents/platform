@@ -1,0 +1,13 @@
+# LF everywhere, matching the platform: the deployment target is a Linux
+# container, so CRLF has no upside — it only bloats diffs when a whole-file
+# rewrite normalizes endings as a side effect. text=auto lets git
+# content-detect binaries (EDF fixtures, images) and leave them untouched.
+#
+# This file exists because attribute rules do not cross a repository boundary.
+# Once this template is copied to projects/<yourname>/ and given its own git
+# repository, the platform root's .gitattributes no longer reaches it, and a
+# Windows clone would check out CRLF while the platform checkout stays LF.
+* text=auto eol=lf
+
+# shellcheck rejects CR after a shebang (SC1017).
+*.sh text eol=lf

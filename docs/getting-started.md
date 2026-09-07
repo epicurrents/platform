@@ -298,11 +298,11 @@ cd projects/<yourname>
 git init && git add . && git commit -m "initial commit"
 ```
 
+The copy carries its own `.gitignore` and `.gitattributes`, which is what makes that `git add .` safe: the platform's rules stop at the repository boundary, so without them the first commit would pick up `__pycache__` and the `frontend/node_modules` symlink, and a Windows clone would check the tree out as CRLF. The platform ignores `projects/` in turn, so your repository does not appear in its `git status` at all.
+
 Once it has a remote, set `EPICURRENTS_PROJECT_REPO` in `.env` on any other deployment and [`bootstrap.sh`](../scripts/bootstrap.sh) clones it for you. On this machine you already have the directory, so bootstrap leaves it as it is.
 
 This is what keeps one deployment from carrying another's project: the code for a project you do not run is not on the machine, rather than present and unreferenced.
-
-> The platform does not yet ignore `projects/`, because the projects that predate this arrangement are still tracked there. Until they move out, `git status` in the platform shows your nested repository as an untracked entry, and `git add -A` records it as a submodule reference rather than as files. Neither is harmful; leave it unstaged.
 
 ### 2. Edit `apps.py`
 
@@ -483,6 +483,15 @@ DJANGO_SETTINGS_MODULE=projects.<yourname>.settings_test pytest projects/<yourna
 ```
 
 The `DJANGO_SETTINGS_MODULE` override is needed because the platform's `pytest.ini` defaults to `epicurrents.settings.test_platform`, which doesn't have your project's models in `INSTALLED_APPS`. See [`projects/example/settings_test.py`](../projects/example/settings_test.py) for the scaffolded settings file to copy.
+
+Frontend specs need no override — `npm run test` in [frontend/](../frontend/) collects `projects/*/frontend/**/*.{test,spec}.ts` alongside the platform's own. One case needs a declaration from you. A spec that imports viewer code, directly or through a module that does, cannot be loaded at all until the viewer submodule has been built, and the failure happens at import time, before anything in the spec could skip itself. List those files so the runner can leave them out on a machine without the build:
+
+```json
+// projects/<yourname>/frontend/package.json
+"epicurrents": { "viewerDependentTests": ["__tests__/annotations.test.ts"] }
+```
+
+Paths are relative to your `frontend/` directory and name files rather than globs, so a path that no longer exists is reported instead of matching nothing. Declaring a spec that does not need the viewer costs only that spec on an unbuilt checkout; omitting one that does means it fails there instead of being skipped.
 
 ## Common first-day questions
 

@@ -36,6 +36,17 @@ ENV/
 /media_uploads/
 /media_staging/
 
+# Project plugins. A deployment's real project is its own git repository nested
+# here (`projects/local/.git` and so on), so the platform must not track it: a
+# project carries deployment-specific content and a history its own operators
+# own. Everything under projects/ is therefore ignored, with the package marker
+# and the scaffolded template re-included by name — the /* form is required,
+# since git cannot re-include a path inside an excluded directory. Adding a new
+# project needs no change here; publishing one as part of the platform does.
+/projects/*
+!/projects/__init__.py
+!/projects/example/
+
 # Project lifecycle state — per-deployment archive registry written by the
 # activate_project / deactivate_project commands. Regenerated when missing
 # (project_loader.get_project_state returns {} if absent); not source.

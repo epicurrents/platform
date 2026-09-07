@@ -1,6 +1,11 @@
 # Git
 .git/
 .gitignore
+# Nested repositories. A deployment's project is its own checkout under
+# projects/, which the Dockerfile copies wholesale — and the pattern above is
+# anchored at the context root, so it does not reach projects/<name>/.git.
+# Without this the project's entire object store is baked into every image.
+**/.git/
 
 # Python
 __pycache__/

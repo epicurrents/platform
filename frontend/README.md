@@ -54,7 +54,7 @@ The mock handler lives in [mocks.ts](mocks.ts) (project root, compiled by Vite a
 
 ## Project and Plugin Extensions
 
-Project-specific frontend modules live under `src/projects/<name>/` and are
+Project-specific frontend modules live at `projects/<name>/frontend/` and are
 selected at build time via `VITE_PROJECT` (see [src/projects/active.ts](src/projects/active.ts)).
 Exactly one project is active per build.
 
@@ -94,6 +94,8 @@ Example, for a project supplying a session list:
 Base and project icon registries are merged in `src/main.ts`. If a project icon
 name already exists in `src/icons.ts`, the base icon wins and the project
 entry is ignored to prevent accidental overrides.
+
+A project's specs are collected by `npm run test` from the same directory, and a project declares in its `frontend/package.json` which of them import viewer build output — `"epicurrents": { "viewerDependentTests": [...] }`, read by [project-specs.ts](project-specs.ts). Those files cannot be loaded until the viewer submodule is built, and the runner has to know which they are before it collects them. The declaration lives with the project because the platform does not track one.
 
 When multiple variants of the same icon are needed, keep the default registry
 for one variant and register others under `iconLibraries` (project plugin).

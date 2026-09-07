@@ -508,6 +508,8 @@ Apply whenever a request is rejected for a security reason: 401, 403, 429, signa
 
 One project is active per deployment, controlled by `EPICURRENTS_PROJECT=<name>` in `.env`. The project layer is designed for one active project per deployment; switching projects exists to support development and onboarding new deployments and is not intended as a runtime operation in production. Structure, settings merge rules, lifecycle commands (`activate_project` / `deactivate_project` / `remove_project_data`), and the recommended switch workflow (`scripts/switch_project.sh`) are documented in [epicurrents/README.md](epicurrents/README.md#project-loader); the scaffolded template lives at [projects/example/](projects/example/).
 
+**A project is its own git repository, and the platform does not track it.** `/projects/*` is ignored, with only `__init__.py` and the [projects/example/](projects/example/) template re-included, so `projects/<name>/` holds a nested checkout with its own history and remote. Two consequences to keep in mind when working in one: ignore and attribute rules do not cross the boundary, so a project needs its own `.gitignore` and `.gitattributes` rather than inheriting the platform root's; and the platform's CI does not see the project, so its tests run from its own repository. Adding a project needs no change to the platform's ignore file — publishing one as part of the platform does.
+
 **Two URL slots** are available to the active project:
 
 - `urls.py` — Django Ninja API patterns, mounted at `/project/api/v1/` (existing).

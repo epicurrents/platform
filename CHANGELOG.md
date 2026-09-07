@@ -68,6 +68,12 @@ Entries are written for the person deciding whether to upgrade, so the ones that
 
 ### Changed
 
+- The platform no longer tracks `projects/`, so a deployment's project is a nested checkout carrying its own history rather than a directory in the platform's working tree. `projects/example/` stays tracked as the scaffolded template.
+
+  An existing project needs nothing done to it, but it does need two files of its own. Ignore and attribute rules stop at a repository boundary, so without a `.gitignore` and `.gitattributes` inside the project, `git add .` there stages `__pycache__` and the `frontend/node_modules` symlink, and a Windows clone checks the tree out as CRLF. The template ships a pair to copy. A nested `.git` is excluded from the Docker build context too — `COPY projects/` met a `.git/` pattern anchored at the context root, so a project's entire object store reached every image.
+
+  The frontend test runner no longer names a project either. A project lists the specs that cannot load without a built viewer in its own `frontend/package.json`, under `epicurrents.viewerDependentTests`, and a path that does not resolve raises rather than silently excluding nothing.
+
 - A distribution or demo package joins a Docker network named after its own directory instead of the shared `epicurrents` one, and `--network-name` overrides that when joining an existing network is the point.
 
   The compose file names its network rather than letting compose scope it per project, so that an externally-managed container can join a predictable one. The cost is that the name is host-wide: two stacks sharing it also share the alias `db`, so a package reaches whichever database answers first — on a machine running a development checkout, that can be the live one. Nothing fails loudly, because each deployment generates its own password; where two share credentials, migrations apply to the wrong database and report success.

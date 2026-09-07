@@ -1,0 +1,32 @@
+# Ignore rules do not cross a repository boundary. Once this template is copied
+# to projects/<yourname>/ and given its own git repository, the platform root's
+# .gitignore no longer reaches it, and `git add .` in the project would stage
+# build residue.
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Symlink to the platform's frontend/node_modules, created by
+# `npm run link:projects` so this project's Vue plugin can resolve the
+# platform's dependencies from outside frontend/.
+frontend/node_modules
+
+# Environment variables
+.env
+.env.*
+!.env.example
+
+# Logs
+*.log
+
+# pytest / coverage
+.*_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# OS
+.DS_Store
+Thumbs.db

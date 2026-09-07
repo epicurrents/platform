@@ -4,6 +4,7 @@ import { defineConfig, configDefaults } from 'vitest/config'
 import vue from '@vitejs/plugin-vue'
 import tsconfigPaths from 'vite-tsconfig-paths'
 import { buildAliases } from './build-aliases'
+import { viewerDependentProjectSpecs } from './project-specs'
 
 /*
  * Some specs import viewer code (`scoped-event-log`, `#epicurrents/*`), which the
@@ -21,16 +22,17 @@ const builtViewer = fileURLToPath(new URL('./viewer/util/scoped-event-log/dist/i
 const hasBuiltViewer = existsSync(builtViewer)
 
 // Specs that import viewer build output, directly or transitively. None in the
-// platform today; a project whose specs do belongs on this list.
-const viewerDependentTests: string[] = []
+// platform itself; a project declares its own in its frontend's package.json,
+// so that the list stays in the repository that owns the files.
+const viewerDependentTests = viewerDependentProjectSpecs()
 
 if (!hasBuiltViewer) {
-    console.warn(
-        '\n[vitest] Built viewer not found at frontend/viewer/util/scoped-event-log/dist/.\n' +
-            `[vitest] SKIPPING ${viewerDependentTests.length} viewer-dependent spec file(s): ` +
-            `${viewerDependentTests.join(', ')}.\n` +
-            '[vitest] Run `npm run setup` in frontend/viewer to build it and include them.\n'
-    )
+    const consequence = viewerDependentTests.length
+        ? `[vitest] SKIPPING ${viewerDependentTests.length} viewer-dependent spec file(s): ` +
+          `${viewerDependentTests.join(', ')}.\n` +
+          '[vitest] Run `npm run setup` in frontend/viewer to build it and include them.\n'
+        : '[vitest] No checked-out project declares a viewer-dependent spec, so none is skipped.\n'
+    console.warn('\n[vitest] Built viewer not found at frontend/viewer/util/scoped-event-log/dist/.\n' + consequence)
 }
 
 export default defineConfig({
