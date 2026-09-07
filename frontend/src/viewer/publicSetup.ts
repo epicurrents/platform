@@ -112,14 +112,6 @@ if (!setup) {
     // `viewer/base.ts`. A non-object `modules` is a config error, but writing a property onto a
     // primitive is a silent no-op in a non-strict bundle, so substituting one is what keeps it
     // from presenting as "the script ran and source localisation is still unavailable".
-    //
-    // Worth knowing before adding to this: the interface merges a host's SETUP over its own with
-    // a shallow `Object.assign` (`interface/src/setups/index.ts`), so a host that writes `modules`
-    // at all replaces the interface's default `modules` wholesale — today that costs the built-in
-    // 'EKG cascade' montage for the `default:10-20` setup. Every platform host does it (the SPA's
-    // `ViewerView.vue` and `viewer/base.ts` both assign `modules`), so this page is not a special
-    // case, and the fix belongs in the interface's merge rather than in a copy of its defaults
-    // here — a copy would drift the moment the viewer changed one.
     const existingModules = setup.modules
     const modules = typeof existingModules === 'object' && existingModules !== null
         ? existingModules as Record<string, unknown>

@@ -258,6 +258,14 @@ Write access is gated on **staff** (`is_staff` or `is_superuser`), not superuser
 
 The staff editor dry-validates the overrides before saving. Since validity depends on the live settings tree (which spans both the interface and core layers and only exists after a viewer loads its modules), the editor launches a hidden, data-less viewer instance and runs each field through the same `setFieldValue` the applier uses. An unknown field or a wrong-typed value is reported up front and blocks the save, rather than being silently dropped at viewer launch. If the hidden viewer cannot launch, the editor saves without validation rather than blocking.
 
+### Trend epoch lengths
+
+`eeg.trends.<type>.epochLength` is the one viewer setting whose shipped default is not a value but a request. The viewer ships it as `0`, which asks it to derive an epoch length from the length of the recording being viewed — 2 s for a routine EEG, 5 s past 45 minutes, 10 s past an hour and a half, and beyond roughly five and a half hours a length that holds the epoch count near 2000 whatever the recording's duration. A short excerpt is therefore summarised finely and a multi-day recording coarsely, without either being configured.
+
+Naming the field from either layer — a mode's `setup.modules.eeg.trends` or a viewer-config override — pins it at that value for every recording, and the derivation never overrides it. That is what `0` buys: settings reach the viewer already merged, so an absent key and a deliberate default cannot be told apart, and a derivation that triggered on absence would silently beat a value a deployment had chosen. Writing `0` back returns the field to deriving.
+
+The floor is two seconds and no derivation goes below it, because EEG activity worth seeing on a trend routinely lasts longer than a second and a shorter epoch splits such an event across two of them. A deployment is not stopped from pinning something shorter, but the spectrogram will not resolve its one-bin-per-Hz output below a one-second epoch.
+
 ## Vendored browser assets
 
 `VENDOR_DIR` (default `frontend/vendor`) holds version-pinned assets the browser loads directly, served at `/vendor/<path>` by [views.py](views.py) `vendor_view`. The tree is gitignored, generated at deploy, and served rather than bundled — it is not part of `collectstatic` or the Vite build. `vendor_view` tags each response with `Cross-Origin-Resource-Policy` so the files load under the viewer's `COEP: require-corp` isolation, and caches the version-pinned files as `immutable` while letting `pyodide-lock.json` revalidate.
