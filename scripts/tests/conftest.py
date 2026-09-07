@@ -252,9 +252,12 @@ def stage_script(script_name: str, cwd: Path) -> Path:
     if lib_dir.is_dir():
         shutil.copytree(lib_dir, target_scripts / "lib", dirs_exist_ok=True)
     # Empty install-dev-tools.sh as a safety net for cases where a test
-    # forgets to set SKIP_DEV_TOOLS_INSTALL=1.
-    (target_scripts / "install-dev-tools.sh").write_text("#!/bin/sh\nexit 0\n")
-    (target_scripts / "install-dev-tools.sh").chmod(0o755)
+    # forgets to set SKIP_DEV_TOOLS_INSTALL=1. Skipped when it is itself the
+    # script under test, or the safety net would overwrite the subject with the
+    # stub and every assertion would run against a script that does nothing.
+    if script_name != "install-dev-tools.sh":
+        (target_scripts / "install-dev-tools.sh").write_text("#!/bin/sh\nexit 0\n")
+        (target_scripts / "install-dev-tools.sh").chmod(0o755)
     return target
 
 
