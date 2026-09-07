@@ -12,10 +12,15 @@ the platform build moved from ``/viewer/base/`` to ``/viewer/`` and gained a
 self-hosted ``pyodideAssetPath``, and the assertions went stale while the view
 stayed correct. What is worth pinning is not the literal path — that is a build
 layout detail, and the Pyodide path carries a version that will be bumped — but
-that the page hands the viewer *exactly* what settings configured, and that the
-shipped mode's asset roots are same-origin. Both survive a rebuild; a literal
-does not. The override test still uses literals, since there the mode is
+that the page hands the viewer everything settings configured, unchanged, and
+that the shipped mode's asset roots are same-origin. Both survive a rebuild; a
+literal does not. The override test still uses literals, since there the mode is
 declared in the test itself.
+
+The rendered blob is a superset of the mode's ``setup``, not a copy of it: the
+view derives ``assetPath`` from ``lib_path``, and the platform's half of the
+setup arrives from ``frontend/src/viewer/publicSetup.ts`` once the browser runs
+the script tag, which no server-side test can see. Its own specs live beside it.
 """
 
 import json
@@ -24,7 +29,7 @@ import pytest
 from django.conf import settings
 from django.test import RequestFactory, override_settings
 
-from epicurrents.views import _LEAD_FIELD_SCRIPT, public_viewer_view
+from epicurrents.views import _PUBLIC_SETUP_SCRIPT, public_viewer_view
 
 
 def _rendered_setup(body: str) -> dict:
@@ -65,10 +70,27 @@ def test_enabled_serves_public_mode(client):
     assert f"{mode['lib_path']}{mode['lib_file']}" in body
     assert f"{mode['lib_path']}epicurrents-lib.css" in body
     assert "createEpicurrentsApp()" in body
-    # The setup blob is passed through verbatim — the viewer boots from settings,
-    # so anything the view drops or rewrites is a bug caught here rather than a
-    # surprise in the browser.
-    assert _rendered_setup(body) == mode["setup"]
+    # Everything the mode declares is passed through unchanged — the viewer boots
+    # from settings, so anything the view drops or rewrites is a bug caught here
+    # rather than a surprise in the browser. The rendered blob is a superset: the
+    # view derives assetPath (below), and the rest of the setup arrives from
+    # publicSetup.ts after this HTML is parsed, so it cannot appear here.
+    rendered = _rendered_setup(body)
+    assert rendered.items() >= mode["setup"].items()
+
+
+@pytest.mark.django_db
+@override_settings(ENABLE_PUBLIC_VIEWER=True)
+def test_asset_path_is_derived_from_the_lib_path(client):
+    # The viewer resolves its own assets against assetPath, and they sit beside the
+    # lib it was loaded from, so the two are the same value by construction. Deriving
+    # it means a mode cannot half-move: pointing lib_path at a per-project build while
+    # forgetting assetPath would otherwise leave the viewer fetching another build's
+    # assets.
+    mode = settings.PUBLIC_VIEWER_MODES["public"]
+    assert "assetPath" not in mode["setup"]
+    setup = _rendered_setup(client.get("/viewer/public").content.decode())
+    assert setup["assetPath"] == mode["lib_path"]
 
 
 @pytest.mark.django_db
@@ -100,6 +122,21 @@ def test_trailing_slash_serves_public_mode(client):
     assert f"{mode['lib_path']}{mode['lib_file']}" in response.content.decode()
 
 
+@override_settings(
+    ENABLE_PUBLIC_VIEWER=True,
+    PUBLIC_VIEWER_MODES={"bare": {"lib_path": "/viewer/base/"}},
+)
+def test_mode_without_a_setup_key():
+    # The platform's half of the setup arrives from publicSetup.ts, so a mode that
+    # overrides none of it is just a lib_path. Requiring an empty dict beside it
+    # would be a 500 for the ordinary minimal configuration.
+    request = RequestFactory().get("/viewer/bare")
+    response = public_viewer_view(request, mode="bare")
+    assert response.status_code == 200
+    # The derivation still runs, so the page is not left without an asset root.
+    assert _rendered_setup(response.content.decode()) == {"assetPath": "/viewer/base/"}
+
+
 @override_settings(ENABLE_PUBLIC_VIEWER=True)
 def test_unknown_mode_404():
     # The URL route matches only configured keys, so an unknown mode reaches the
@@ -109,29 +146,29 @@ def test_unknown_mode_404():
 
 
 @override_settings(ENABLE_PUBLIC_VIEWER=True)
-def test_lead_field_script_loads_before_the_lib(client):
+def test_public_setup_script_loads_before_the_lib(client):
     # The page is the only viewer surface that runs no platform JavaScript of its
     # own — its SETUP is JSON, and a lead-field provider is a function, so nothing
-    # in PUBLIC_VIEWER_MODES can carry one. This script is how it arrives, and
-    # order is the contract: after the SETUP declaration, so there is an object to
-    # write into, and before the lib, so the viewer reads a SETUP that already has
-    # the provider rather than one amended behind it.
+    # in PUBLIC_VIEWER_MODES can carry one. This script is how the platform's half
+    # of the setup arrives, and order is the contract: after the SETUP declaration,
+    # so there is an object to fill in, and before the lib, so the viewer reads a
+    # finished SETUP rather than one amended behind it.
     body = client.get("/viewer/public").content.decode()
     mode = settings.PUBLIC_VIEWER_MODES["public"]
     setup_at = body.index("SETUP:")
-    script_at = body.index(f'<script src="{_LEAD_FIELD_SCRIPT}">')
+    script_at = body.index(f'<script src="{_PUBLIC_SETUP_SCRIPT}">')
     lib_at = body.index(f"{mode['lib_path']}{mode['lib_file']}")
     assert setup_at < script_at < lib_at
 
 
 @override_settings(ENABLE_PUBLIC_VIEWER=True)
-def test_lead_field_script_is_same_origin(client):
+def test_public_setup_script_is_same_origin(client):
     # It loads inside a COEP: require-corp document, so it has to come from this
     # origin and carry CORP — which viewer_view gives every file it serves out of
     # viewer-dist. A CDN URL here would be blocked with nothing in any server log.
-    assert _LEAD_FIELD_SCRIPT.startswith("/")
-    assert "://" not in _LEAD_FIELD_SCRIPT
-    assert _LEAD_FIELD_SCRIPT in client.get("/viewer/public").content.decode()
+    assert _PUBLIC_SETUP_SCRIPT.startswith("/")
+    assert "://" not in _PUBLIC_SETUP_SCRIPT
+    assert _PUBLIC_SETUP_SCRIPT in client.get("/viewer/public").content.decode()
 
 
 @override_settings(
@@ -165,7 +202,12 @@ def test_project_overridable_mode():
     # overriding the viewer opts out of the platform's whole setup, vendored
     # Pyodide root included, and has to restate whatever it still wants.
     assert "pyodideAssetPath" not in _rendered_setup(body)
-    # The lead-field script is not part of the mode config, so an overriding
-    # project keeps it without restating anything. It is the one piece of the page
-    # a project cannot accidentally opt out of by replacing the setup.
-    assert _LEAD_FIELD_SCRIPT in body
+    # A mode that names assetPath keeps it; the derivation only fills a gap. Here
+    # the two agree anyway, which is the point — a project pointing lib_path at its
+    # own build gets a matching assetPath whether it restates one or not.
+    assert _rendered_setup(body)["assetPath"] == "/viewer/course/"
+    # The setup script is not part of the mode config, so an overriding project
+    # keeps it without restating anything. It is the one piece of the page a
+    # project cannot accidentally opt out of by replacing the setup — which also
+    # means the lead-field provider survives a project override.
+    assert _PUBLIC_SETUP_SCRIPT in body

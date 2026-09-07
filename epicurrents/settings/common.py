@@ -486,12 +486,16 @@ EEG_MAINS_HZ = config(
     cast=lambda v: float(v) if str(v).strip().lower() not in ("", "none") else None,
 )
 
-# Per-mode config for the public viewer: each mode names a viewer lib to load
-# and a fixed SETUP (no platform data, no URL params). The active project's
-# ``settings.py`` may add a mode or override "public" via the dict-merge in
-# ``epicurrents.project_loader`` — e.g. a "project" mode pointing ``lib_path``
-# at the full standalone ``/viewer/`` with the project's own ``activeModules``
-# and extra setup. Keys here also drive the route regex in ``epicurrents.urls``.
+# Per-mode config for the public viewer: each mode names a viewer lib to load and
+# the deployment's half of its SETUP (no platform data, no URL params). The other
+# half is platform-owned and lives in ``frontend/src/viewer/publicSetup.ts``, which
+# the page loads before the lib; anything a mode names here wins over that file's
+# defaults. Its docstring carries the rule for which half owns what.
+#
+# The active project's ``settings.py`` may add a mode or override "public" via the
+# dict-merge in ``epicurrents.project_loader`` — e.g. a "project" mode pointing
+# ``lib_path`` at its own per-project viewer build with extra setup. Keys here also
+# drive the route regex in ``epicurrents.urls``.
 PUBLIC_VIEWER_MODES = {
     "public": {
         "lib_path": "/viewer/",
@@ -500,16 +504,18 @@ PUBLIC_VIEWER_MODES = {
         # and get the .umd.cjs default those builds emit.
         "lib_file": "epicurrents-lib.umd.js",
         "setup": {
-            "activeModules": ["eeg"],
-            "assetPath": "/viewer/",
+            # Pairs with the container element in ``_PUBLIC_VIEWER_TEMPLATE`` — the
+            # viewer looks for ``#epicurrents-<containerId>``, so the two have to
+            # agree and this is the half a mode can change. ``assetPath`` is not
+            # here: it is always ``lib_path`` and ``public_viewer_view`` derives it.
             "containerId": "viewer",
-            "logThreshold": "WARN",
             # Serve Pyodide's runtime from our own origin instead of the jsdelivr
             # CDN (the viewer's default), so the installed app's compute works
             # offline and is cacheable by the service worker. The version-pinned
-            # "full" distribution is vendored at this path at deploy time.
+            # "full" distribution is vendored at this path at deploy time, and
+            # ``manage.py vendor_pyodide`` reads the version back out of this value
+            # — which is why it stays here rather than moving into the script.
             "pyodideAssetPath": "/vendor/pyodide/314.0.2/",
-            "useSAB": True,
         },
     },
 }
