@@ -300,7 +300,9 @@ git init && git add . && git commit -m "initial commit"
 
 The copy carries its own `.gitignore` and `.gitattributes`, which is what makes that `git add .` safe: the platform's rules stop at the repository boundary, so without them the first commit would pick up `__pycache__` and the `frontend/node_modules` symlink, and a Windows clone would check the tree out as CRLF. The platform ignores `projects/` in turn, so your repository does not appear in its `git status` at all.
 
-Once it has a remote, set `EPICURRENTS_PROJECT_REPO` in `.env` on any other deployment and [`bootstrap.sh`](../scripts/bootstrap.sh) clones it for you. On this machine you already have the directory, so bootstrap leaves it as it is.
+Name the repository `project-<name>`, which is how projects are named in the epicurrents org so that they group together rather than scattering among the viewer packages. The repository name and `EPICURRENTS_PROJECT` are separate things: the latter is the Django app label, which keys the project's migration history and every one of its table names, so keep it short and treat it as fixed once the tables exist.
+
+Once it has a remote, set `EPICURRENTS_PROJECT_REPO` in `.env` on any other deployment and [`bootstrap.sh`](../scripts/bootstrap.sh) clones it for you — a bare name is resolved against the org, so the repository name is the whole of the value. On this machine you already have the directory, so bootstrap leaves it as it is.
 
 This is what keeps one deployment from carrying another's project: the code for a project you do not run is not on the machine, rather than present and unreferenced.
 

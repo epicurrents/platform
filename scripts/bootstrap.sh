@@ -328,7 +328,7 @@ fi
 # that a private project can be reached however the deployment already
 # authenticates:
 #
-#   myproject                       -> https://github.com/epicurrents/myproject
+#   project-myproject               -> https://github.com/epicurrents/project-myproject
 #   someorg/thing                   -> https://github.com/someorg/thing
 #   https://host/org/thing.git      -> used as-is (any scheme)
 #   git@host:org/thing.git          -> used as-is (scp-style SSH)
@@ -336,9 +336,10 @@ fi
 #
 # Bare names expand to HTTPS on the epicurrents org because that is what every
 # submodule in .gitmodules and both clone lines in the getting-started guide
-# already use; a deployment that authenticates by SSH key gives the full
-# git@ form instead. Leaving the variable unset is not an error on its own —
-# the base platform runs without a project — but it is one when
+# already use, and project repositories there are named project-<name>; a
+# deployment that authenticates by SSH key gives the full git@ form instead.
+# Leaving the variable unset is not an error on its own — the base platform
+# runs without a project — but it is one when
 # EPICURRENTS_PROJECT names a project that is not already on disk.
 
 resolve_project_repo() {
