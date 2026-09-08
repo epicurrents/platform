@@ -31,16 +31,29 @@ to EDF, and returns either the EDF path alone or a two-tuple
 structured event/metadata extracted during conversion (saved as a "Source
 events" annotation when present).
 
-The built-in converter maps ``.csv`` (tabular signal data) to EDF. Converters
-for vendor formats install as separate packages and register here. Override or
-extend via ``RECORDING_CONVERTERS``::
+The one built-in converter maps ``.csv`` (tabular signal data) to EDF. The
+platform carries no vendor-specific conversion code: a converter for a
+proprietary format is a separate program the deployment describes here, run
+through :mod:`recordings.converters.command`. Override or extend via
+``RECORDING_CONVERTERS``::
 
     RECORDING_CONVERTERS = {
         # Disable the built-in .csv converter:
         ".csv": None,
-        # Register a converter for another format:
-        ".e": "mysite.converters.nicolet.convert",
+        # An in-process converter for another format:
+        ".ncs": "mysite.converters.ncs.convert",
+        # An external program, described rather than imported:
+        ".e": {
+            "command": ["{python}", "-m", "nicolet_e2edf.nicolet.cli",
+                        "--in", "{input}", "--out", "{output}", "--json-sidecar"],
+            "requires": "nicolet_e2edf",
+        },
     }
+
+Registering here is the only step: ``converter_extensions()`` reports the
+registered set, ``converter_extensions(available_only=True)`` narrows it to the
+converters actually installed, and ``import_recordings`` asks for the latter
+rather than keeping a list of its own.
 
 Pre / post conversion hooks
 ---------------------------
@@ -212,6 +225,69 @@ def get_pipeline(label: str) -> RecordingPipeline:
     return value
 
 
+def normalise_extension(ext: str) -> str:
+    """Return *ext* lower-cased with a leading dot, the form converter keys are stored in."""
+    return ext.lower() if ext.startswith(".") else f".{ext.lower()}"
+
+
+def converter_extensions(*, available_only: bool = False) -> set[str]:
+    """Return every file extension a converter is currently registered for.
+
+    The union of the built-in registry and ``RECORDING_CONVERTERS``, minus any extension the
+    setting disables with a ``None`` value — the same resolution :func:`get_converter` applies,
+    expressed as a set so a caller can ask *which* files are convertible rather than probing
+    one extension at a time. With *available_only*, converters whose program is not
+    installed are left out as well — what a deployment can run, rather than what it has
+    declared.
+
+    Resolve this at call time rather than at import. ``RECORDING_CONVERTERS`` is assembled by
+    the plugin loader from ``common < plugins < project < .env``, so a set captured at module
+    import would miss every converter a project or plugin registers.
+    """
+    from django.conf import settings
+
+    configured = getattr(settings, "RECORDING_CONVERTERS", {})
+    extensions = set(_BUILTIN_CONVERTERS)
+    for key, value in configured.items():
+        normalised = normalise_extension(key)
+        if value is None:
+            extensions.discard(normalised)
+        else:
+            extensions.add(normalised)
+    if not available_only:
+        return extensions
+    return {extension for extension in extensions if converter_available(extension)}
+
+
+def converter_available(ext: str) -> bool:
+    """Report whether the converter registered for *ext* can actually run.
+
+    An external converter is a separate program a deployment installs, so registration and
+    installation are two acts and either can happen without the other. A registered but
+    absent converter would otherwise be collected by file discovery and fail on every file
+    — the shape of drift this registry exists to prevent.
+
+    Only a command spec can answer; a dotted-path converter is assumed available, since it
+    was resolved by importing it.
+    """
+    from django.conf import settings
+
+    from recordings.converters import command
+
+    key = normalise_extension(ext)
+    value = getattr(settings, "RECORDING_CONVERTERS", {}).get(key)
+    if isinstance(value, dict):
+        return command.is_available(value)
+    try:
+        return get_converter(key) is not None
+    except (ImportError, AttributeError) as error:
+        # A dotted path that does not resolve is a mis-registration, not a reason to abort
+        # a bulk import: discovery leaves the extension alone and reports it, and an upload
+        # of that format still fails loudly through get_converter.
+        logger.warning("Converter registered for %s cannot be imported: %s", key, error)
+        return False
+
+
 def get_converter(ext: str):
     """Return a converter callable for *ext*, or ``None`` if none is registered.
 
@@ -219,8 +295,7 @@ def get_converter(ext: str):
 
     1. ``RECORDING_CONVERTERS`` setting (if defined) — overrides built-ins.
        A ``None`` value explicitly disables a built-in converter.
-    2. Built-in converters (currently ``.csv`` via
-       ``recordings.converters.csv2edf.convert``).
+    2. Built-in converters, listed in ``_BUILTIN_CONVERTERS``.
 
     *ext* is normalised to lower-case with a leading dot before lookup.
 
@@ -230,7 +305,7 @@ def get_converter(ext: str):
     """
     from django.conf import settings
 
-    key = ext.lower() if ext.startswith(".") else f".{ext.lower()}"
+    key = normalise_extension(ext)
 
     configured: dict = getattr(settings, "RECORDING_CONVERTERS", {})
     if key in configured:
@@ -242,6 +317,13 @@ def get_converter(ext: str):
 
     if value is None:
         return None
+
+    if isinstance(value, dict):
+        # A command spec: an external program the deployment describes rather than a
+        # converter the platform imports. See recordings.converters.command.
+        from recordings.converters import command
+
+        return command.build(value)
 
     if isinstance(value, str):
         module_path, attr = value.rsplit(".", 1)

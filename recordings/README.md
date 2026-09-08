@@ -169,7 +169,7 @@ After conversion, `Recording.stored_name`, `file_extension`, `file_hash`, `file_
 |---|---|---|
 | `.csv` | Tabular signal data to EDF via a registry of per-format subconverters | [converters/csv2edf.py](converters/csv2edf.py) |
 
-Converters for vendor formats (Nicolet/Nervus `.e`, for instance) are separate packages registered through `RECORDING_CONVERTERS`; the platform carries no vendor-specific conversion code. A converter that emits a JSON sidecar has it saved as an `Annotation` named `"Source events"` (the generic name used for sidecar-derived events from any converter). A converter that would emit more than one EDF for one input should raise `ConversionError` and fail the task rather than pick a segment.
+Converters for vendor formats are separate programs the deployment describes in `RECORDING_CONVERTERS`; the platform carries no vendor-specific conversion code at all, and names no vendor package. See External converters below. A converter that emits a JSON sidecar has it saved as an `Annotation` named `"Source events"` (the generic name used for sidecar-derived events from any converter). A converter that would emit more than one EDF for one input should raise `ConversionError` and fail the task rather than pick a segment.
 
 ### Registering or disabling converters
 
@@ -177,22 +177,92 @@ Set `RECORDING_CONVERTERS` in settings:
 
 ```python
 RECORDING_CONVERTERS = {
-    # Disable the built-in .e converter — uploads with .e extension fail.
-    ".e": None,
-    # Register a custom converter for another format.
+    # Disable the built-in .csv converter — uploads with a .csv extension fail.
+    ".csv": None,
+    # An in-process converter for another format.
     ".ncs": "mysite.converters.ncs.convert",
-    # Or a direct callable.
+    # A direct callable.
     ".smr": my_smr_converter,
+    # An external program — see External converters below.
+    ".e": {"command": ["{python}", "-m", "nicolet_e2edf.nicolet.cli",
+                       "--in", "{input}", "--out", "{output}", "--json-sidecar"],
+           "requires": "nicolet_e2edf"},
 }
 ```
 
 `get_converter(ext)` lookup order:
 
-1. `RECORDING_CONVERTERS` if defined. `None` value explicitly disables.
-2. Built-in registry (`.e` and `.csv` at present).
+1. `RECORDING_CONVERTERS` if defined. A `None` value explicitly disables; a dict is an [external command](#format-converters) rather than an import path.
+2. Built-in registry (`.csv` at present).
 3. Returns `None` — no conversion, pass through to EDF processing.
 
 Extensions are normalised to lowercase with a leading dot before lookup.
+
+`converter_extensions()` answers the same question as a set: which extensions a converter is registered for, honouring a `None` disable exactly as `get_converter` does. File discovery in [import_recordings](management/commands/import_recordings.py) calls it instead of holding its own list, so registering a converter makes its format bulk-importable with no second edit. Resolve it at call time — `RECORDING_CONVERTERS` is assembled by the plugin loader from `common < plugins < project < .env`, so a set captured at import misses every converter a project or plugin registers.
+
+The two lists were maintained separately once and drifted in both directions: `.csv` had a working converter that bulk import never reached, while `.e` was collected for a converter the platform does not ship, failing per file. `converter_extensions(available_only=True)` narrows it further to converters whose program is actually installed, which is what discovery uses. Files it passes over are reported by extension and count, separating "the converter is not installed" from "nothing handles this", so an operator never sees a bare "0 files".
+
+### External converters
+
+The platform carries no vendor-specific conversion code. A converter for a proprietary format is a separate program, developed and licensed on its own terms, and [converters/command.py](converters/command.py) is how one is driven: a deployment describes the command, and the platform runs it without knowing what format it reads.
+
+```python
+RECORDING_CONVERTERS = {
+    ".zip": {
+        "command": ["{python}", "-m", "natus2edf", "--in", "{input}",
+                    "--out", "{output}", "--json-sidecar"],
+        "requires": "natus2edf",
+    },
+}
+```
+
+`{python}` is the interpreter running the platform, `{input}` the source file, `{output}` a scratch directory. `requires` names an importable module whose absence means the converter is not installed; `timeout` bounds the run, defaulting to an hour.
+
+The contract the command must meet is small: write exactly one `.edf` into the output directory, and, if it emits events, a `.json` sidecar beside it under the same stem in the shape [sidecar.py](converters/sidecar.py) validates. Two EDFs is refused rather than guessed at — a multi-segment recording has to be split deliberately, not reduced to whichever file sorted first.
+
+A subprocess rather than an import, and the licence is the sharpest reason. [nicolet-e2edf](https://github.com/urh92/e2edfconverter) is GPLv3: importing it would combine it with the platform and carry its copyleft across, where running it as a separate program at arm's length does not. Installing one into the same environment is not combination either — the platform never imports a converter, and `requires` is checked with `importlib.util.find_spec`, which locates a module without executing it. The practical benefits come free with it: the converter's dependencies cannot collide with the platform's, and a crash in it is an exit status rather than a dead worker.
+
+`requires` is what lets file discovery tell a converter that is registered from one that is installed. Registering and installing are two acts, and a deployment that did only the first would otherwise have `import_recordings` collect those files and fail every one. `converter_extensions(available_only=True)` reports what can actually run, and the skip report names the two cases separately because the remedies differ.
+
+Nothing raised by a command converter names the source file. Converters are handed the path and echo it back in their diagnostics, and an ingest failure is logged with `exc_info` into a permanent stream, so that output is scrubbed of the path and length-bounded before it is quoted.
+
+**Vendoring a converter.** Everything below [converters/](converters/) is git-ignored except the modules the platform ships, so a converter checkout lives there without the platform tracking it:
+
+```bash
+git clone git@github.com:epicurrents/converter-natus2edf.git recordings/converters/natus2edf
+pip install ./recordings/converters/natus2edf
+```
+
+Name the target directory explicitly: the repository and the package are not always called the same thing, and the install path has to match what the directory is called.
+
+Two converters are known to work this way, neither required and neither named by the platform:
+
+| Format | Converter | Licence |
+|---|---|---|
+| Natus / Xltek NeuroWorks studies | [converter-natus2edf](https://github.com/epicurrents/converter-natus2edf) | Apache-2.0 |
+| Nicolet / Nervus `.e` | [e2edfconverter](https://github.com/urh92/e2edfconverter) | **GPLv3** |
+
+**Getting a converter into a container.** A converter checkout is excluded from the Docker build context as well as from git, so the image never carries one by default — which keeps a copyleft converter out of every image build, and out of the distribution obligations that would come with it.
+
+`docker exec` is not a route, and it is worth saying why since it is the obvious thing to try: the image has no `git`, it runs as a non-root user so `pip install` cannot write to site-packages, and anything installed into a running container is lost the next time it is recreated — which an update does. Development is the exception, because the dev compose file bind-mounts the repository at `/code`; production runs the code baked into the image and has no such mount.
+
+Two routes that survive a rebuild:
+
+1. **Un-ignore it for your own build.** Delete the `recordings/converters/*` line from [.dockerignore](../.dockerignore) and add the install to the `runtime` stage of [Dockerfile](../Dockerfile). The image then carries the converter, and its licence travels with any image you distribute. Both files are tracked, so an update can clobber the edit — the deployment-local overlay entry in [ROADMAP.md](../ROADMAP.md) is the standing gap here.
+
+2. **Build a downstream image.** Leave the platform's files alone and layer on top, which keeps the converter out of the platform image and inside yours:
+
+    ```dockerfile
+    FROM <your-platform-image>
+    USER root
+    COPY recordings/converters/e2edfconverter /opt/converters/e2edfconverter
+    RUN pip install --no-cache-dir /opt/converters/e2edfconverter
+    USER appuser
+    ```
+
+    Copy the checkout in rather than cloning it, so the build needs no `git` and no network. Point the compose service's `build` at this file through an overlay.
+
+Neither is required to develop against a converter: the dev stack's `/code` mount means a checkout under `recordings/converters/` is already inside the container, and `pip install ./recordings/converters/<name>` in the running service picks it up until the container is recreated.
 
 ### CSV subconverters
 
@@ -392,7 +462,7 @@ Arguments:
 
 | Flag | Default | Notes |
 |---|---|---|
-| `source_path` | — | Directory containing EDF/BDF (and convertible `.e`) files. |
+| `source_path` | — | Directory containing EDF/BDF files, plus anything an installed converter handles — the command asks the registry rather than carrying its own list. |
 | `--username` | — | Required. Owner of all created `Recording` rows. |
 | `--pipeline` | `import` | Pipeline label. Must exist in `RECORDING_PIPELINES` or be a built-in. |
 | `--structure` | `recursive` | `recursive` mirrors subdirs as Collections; `recursive-flat` scans subdirs without creating Collections; `flat` scans only the top level. |
@@ -401,6 +471,8 @@ Arguments:
 | `--resume` / `--discard` | — | Required when an `in_progress` job already exists. Mutually exclusive. |
 
 The command shares its EDF processing path with the upload Celery task — `_save_edf_results`, `_save_sidecar_events`, `_annotation_hash`, `_determine_modality` in [tasks.py](tasks.py) are private helpers but are imported by this command. Renaming or removing any of them requires updating the command in the same commit.
+
+A converter that reads a multi-file study is registered on the one extension that identifies it — a Natus study on its `.stc` segment table, for instance — so a tree of unpacked studies imports one recording per study rather than one per segment file. The remaining files are read by the converter as siblings and are never enumerated as recordings in their own right.
 
 Mount the source directory into the container at `RECORDINGS_IMPORT_PATH` (default `recordings_import/`) so the command can read it.
 

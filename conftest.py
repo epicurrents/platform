@@ -58,8 +58,36 @@ def _foreign_settings_trees() -> list[str]:
     return trees
 
 
+def _vendored_converter_trees() -> list[str]:
+    """Converter checkouts vendored under ``recordings/converters/``.
+
+    A converter for a proprietary format is a separate repository the deployment clones
+    into the tree and the platform does not track. It brings its own test suite, written
+    against its own conventions and its own fixtures, and a bare ``pytest`` would sweep
+    those up: the platform's suite would then report a third-party project's failures as
+    its own, and its pass count would depend on which converters happen to be checked out.
+
+    Written against the cause rather than as a list of names, like the trees above: every
+    directory here is a foreign checkout by construction, since the ignore rule in
+    ``.gitignore`` admits nothing else. A converter cloned tomorrow is covered the day it
+    lands.
+
+    Naming a path explicitly still collects it, so a maintainer can run a converter's suite
+    on purpose — from its own directory, where its configuration applies.
+    """
+    root = Path(__file__).parent / "recordings" / "converters"
+    if not root.is_dir():
+        return []
+    return [
+        f"recordings/converters/{child.name}"
+        for child in sorted(root.glob("*"))
+        if child.is_dir() and not child.name.startswith((".", "__"))
+    ]
+
+
 collect_ignore = [
     *_foreign_settings_trees(),
+    *_vendored_converter_trees(),
 ]
 
 

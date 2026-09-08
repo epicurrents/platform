@@ -56,6 +56,7 @@ import logging
 import os
 import shutil
 import uuid
+from collections import Counter
 from pathlib import Path
 
 from django.conf import settings
@@ -65,10 +66,11 @@ from django.utils import timezone
 
 logger = logging.getLogger(__name__)
 
+# The formats read without conversion. Everything else this command imports is whatever the
+# converter registry says is convertible, asked for at run time rather than listed here — a
+# copy of that list drifts, and did: .csv had a working converter this command never reached,
+# while .e was collected here for a converter the platform does not ship.
 _EDF_EXTENSIONS = {".edf", ".bdf"}
-# Extensions that require conversion to EDF before processing.
-_CONVERTIBLE_EXTENSIONS = {".e"}
-_HANDLED_EXTENSIONS = _EDF_EXTENSIONS | _CONVERTIBLE_EXTENSIONS
 
 
 class Command(BaseCommand):
@@ -287,6 +289,8 @@ class Command(BaseCommand):
                 job_file.save(update_fields=["status", "error", "processed_at"])
                 failed += 1
                 self.stdout.write(self.style.ERROR(f"  FAILED   {job_file.relative_path}: {exc}"))
+                # The source path is logged deliberately: an operator triaging a failed bulk import
+                # needs to know which file to fix, while some filenames may be patient-derived.
                 logger.exception("import_recordings: failed to process %s", abs_path)
 
         job.status = ImportJob.Status.COMPLETED
@@ -302,13 +306,64 @@ class Command(BaseCommand):
     # ------------------------------------------------------------------
 
     def _collect_files(self, source_path: Path, structure: str) -> list[Path]:
-        from recordings.models import ImportJob
+        """Return the importable files under *source_path*, reporting what was passed over.
 
-        if structure == ImportJob.Structure.FLAT:
-            files = [p for p in source_path.iterdir() if p.is_file() and p.suffix.lower() in _HANDLED_EXTENSIONS]
-        else:
-            files = [p for p in source_path.rglob("*") if p.is_file() and p.suffix.lower() in _HANDLED_EXTENSIONS]
+        Importable means EDF/BDF plus whatever the converter registry currently handles.
+        Resolving that here rather than at import time is what lets a converter registered by
+        a project or plugin be seen, since those settings are merged after this module loads.
+        """
+        from recordings.models import ImportJob
+        from recordings.pipelines import converter_extensions
+
+        # What can actually run, not merely what is declared: a converter is a separate
+        # program a deployment installs, and registering one without installing it would
+        # otherwise collect files that fail one by one.
+        usable = converter_extensions(available_only=True)
+        declared = converter_extensions()
+        handled = _EDF_EXTENSIONS | usable
+        candidates = (
+            source_path.iterdir() if structure == ImportJob.Structure.FLAT else source_path.rglob("*")
+        )
+
+        files = []
+        skipped: Counter[str] = Counter()
+        for path in candidates:
+            if not path.is_file():
+                continue
+            suffix = path.suffix.lower()
+            if suffix in handled:
+                files.append(path)
+            elif suffix:
+                skipped[suffix] += 1
+
+        self._report_skipped(skipped, declared - usable)
         return sorted(files)
+
+    def _report_skipped(self, skipped: Counter, uninstalled: set[str]) -> None:
+        """Name the extensions that were passed over, so an empty run is never unexplained.
+
+        An operator pointing this command at a tree of an unsupported format would otherwise
+        see "0 files" and no reason for it. The two reasons are worth separating because the
+        remedies differ: install the converter, or convert the files first. Beyond that no
+        attempt is made to guess why an extension is unhandled, since telling "a converter
+        could exist for this" from "this is not signal data" would need a hardcoded format
+        list, which this command deliberately does not keep.
+        """
+        if not skipped:
+            return
+        by_size = sorted(skipped.items(), key=lambda item: (-item[1], item[0]))
+        absent = [(suffix, count) for suffix, count in by_size if suffix in uninstalled]
+        unknown = [(suffix, count) for suffix, count in by_size if suffix not in uninstalled]
+        if absent:
+            listed = ", ".join(f"{suffix} ({count})" for suffix, count in absent)
+            self.stdout.write(
+                self.style.WARNING(f"  Skipped, the registered converter is not installed: {listed}")
+            )
+        if unknown:
+            listed = ", ".join(f"{suffix} ({count})" for suffix, count in unknown)
+            self.stdout.write(
+                self.style.WARNING(f"  Skipped, no converter registered for the extension: {listed}")
+            )
 
     # ------------------------------------------------------------------
     # Collection tree
@@ -480,6 +535,7 @@ class Command(BaseCommand):
                 try:
                     save_sidecar_events(recording, sidecar_data_from_converter)
                 except Exception as exc:
+                    # Source path logged deliberately; see the failure log in handle().
                     logger.warning(
                         "import_recordings: failed to save Nicolet sidecar events for %s: %s",
                         abs_path,
@@ -558,6 +614,7 @@ class Command(BaseCommand):
                         content=sidecar_content,
                     )
                 except Exception as exc:
+                    # Source path logged deliberately; see the failure log in handle().
                     logger.warning(
                         "import_recordings: ignoring bad sidecar for %s: %s",
                         abs_path,

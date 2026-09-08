@@ -26,6 +26,7 @@ The two security entries below were gated on the evidence host, which is now in 
 - Federation — carry a dataset's folder structure to the peer, so a recipient expecting a layout (BIDS) receives one (`DatasetItem.folder` already describes the tree on the owning side; the federated listing and the FUSE mount are what flatten it)
 - Infra — a deployment-local compose overlay the deploy scripts honour, for pins and tweaks that must survive an update (explicit `-f` flags suppress the override file Docker would otherwise load on its own, so today there is nowhere for them to live)
 - Compute — ship pre-generated lead fields as PWA-cached static files (backend, deploy wiring, service-worker rules and the SPA's fetch all shipped; what remains is confirming the caching behaviour against a deployment that serves the generated tree)
+- Recordings — widen Natus / Xltek coverage beyond the verified headbox (the reader shipped; one headbox, one ERD schema and full-rate-only files are the verified surface, and everything outside it fails closed rather than guessing)
 - Viewer — finish the worker settings auto-sync
 - Additional getting-started scenarios
 - Recordings — contract tests + load-bearing flag for `preservation.write_original` byte integrity
@@ -296,6 +297,24 @@ Cursor over `(created_at, id)` (descending). Query param `?before=<iso-timestamp
 5. Convert the annotations list endpoints to the same cursor-pagination response shape, *without* the batched helper (single-target read check already short-circuits the N+1). Same frontend-coordination story as step 3.
 
 **Tests to add (new):** helper returns only matching pks; respects the `permission` argument; honours direct-row `apply_middleware=False` correctly (does *not* call extensions for grants that have an explicit AccessRight row). Activity / library tests get rewritten to assert pagination boundaries (last cursor returns empty page) and per-row visibility.
+
+---
+
+## 🟡 Recordings — widen Natus / Xltek coverage beyond the verified headbox
+
+The reader shipped 2026-09-07 as two standalone pieces, with nothing about the format in the platform: `natus2edf`, a package whose command-line interface the platform drives through its external-converter mechanism, and `@epicurrents/natus-reader` for the viewer. Both were written from the format's observable behaviour rather than from either of the two unlicensed public implementations, and the package's PROVENANCE.md records how each layout was established and why that record exists. Web uploads arrive zipped; `import_recordings` reads unpacked studies through the `.stc` segment table. The viewer reads lazily — each `.etc` block re-anchors every channel on an absolute value, so a block decodes without walking the stream from its start.
+
+What is deliberately narrow is the *verified* surface, because the alternative to refusing is returning signal data that looks entirely plausible and is wrong:
+
+- **One headbox.** Only EEG32 (type 1) ships a channel map, confirmed against a real recording by its posterior alpha gradient. Every other amplifier falls back to positional `MISC_<n>` labels. Adding one means obtaining its channel order and per-channel conversion from vendor documentation or a verified recording — **not** from a third-party table, which is the provenance line this package holds. The DC-coupled inputs some headboxes mix in take a different conversion factor from the EEG inputs, so `Headbox.scale_for` already takes a channel index for the case.
+- **One ERD schema.** Schema 9 with 8-bit deltas. Earlier schemas move header fields, and the reader refuses rather than guessing.
+- **No mixed sampling rates.** A file whose channels run at divided rates carries a rate-selection byte and a channel subset per packet; decoding it as full-rate desynchronises the stream, so it is refused. Supporting it is a decoder change, not a header change.
+
+Three smaller follow-ups. The decode is a Python loop — about 5 s for a 24-minute 32-channel study, so a multi-hour study is minutes of Celery time; the packet layout is scan-then-decode and would vectorise if that becomes a problem. The viewer package is registered in the builder's [scripts/env.mjs](frontend/viewer/scripts/env.mjs) as non-public but is not wired into the EEG module's registrars, so nothing can open a study in the viewer yet; it also ships no worker, so decoding would run on the main thread. And a converter checkout is excluded from both git and the Docker build context, so CI and image builds never carry one: the platform's own tests exercise the external-converter mechanism against a stub rather than any real converter, and a deployment that wants one inside its containers opts in through its own image, which recordings/README.md describes. That opt-in edits tracked files, so it is another instance of the deployment-local overlay gap above.
+
+### Not in scope
+
+Video. The `.vtc` / `.vt2` files index the synchronised video streams and the reader ignores them; the platform has no video-alongside-signal concept to attach them to, and `media` attachments are the shape that would serve it if it ever earns the work.
 
 ---
 

@@ -75,6 +75,29 @@ media_staging/
 # would ship patient data.
 testdata/
 
+# Format-converter checkouts. A converter for a proprietary format is a separate
+# repository the operator clones in and the platform does not track, and it is
+# kept out of the image for the same reason it is kept out of the code: one of
+# the two known ones is GPLv3, so baking it in would make every image build a
+# distribution of it, with the obligations that carries — for a component the
+# platform never imports and most deployments do not use. Excluding it also
+# keeps ~12 MB out of the image.
+#
+# A deployment that wants a converter available inside its containers opts in
+# deliberately, which is the point. See recordings/README.md → External
+# converters for the two ways, and note that neither is `docker exec`: the
+# image has no git, runs as a non-root user, and anything installed into a
+# running container is lost the next time it is recreated.
+#
+# Written as exclude-then-re-include rather than as the `*/` form the .gitignore
+# rule uses, because Docker does not share git's "directories only" meaning for a
+# trailing slash: it cleans the pattern, and `converters/*/` becomes
+# `converters/*`, which drops the platform's own converter modules and leaves an
+# image that cannot import them.
+recordings/converters/*
+!recordings/converters/*.py
+
+
 # Deployment-specific documents (filled-in privacy notices, DPO correspondence,
 # operator runbook notes). Host-only: nothing in the image reads them, and they
 # name a real organisation and its open compliance gaps.

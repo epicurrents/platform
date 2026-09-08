@@ -47,6 +47,16 @@ ENV/
 !/projects/__init__.py
 !/projects/example/
 
+# Format converters that are their own repositories. A converter for a vendor
+# format is developed and released separately and vendored here as a nested
+# checkout, installed from its local path (see requirements-local.txt), so the
+# platform must not track it. Only directories are excluded, which leaves the
+# converters the platform does ship — csv2edf.py, sidecar.py, and the thin
+# adapters that bridge to an external package — tracked as the modules they are.
+# Shipping a converter as a package rather than a module would need it
+# re-included by name here, in the /* form the projects rule explains.
+/recordings/converters/*/
+
 # Project lifecycle state — per-deployment archive registry written by the
 # activate_project / deactivate_project commands. Regenerated when missing
 # (project_loader.get_project_state returns {} if absent); not source.
