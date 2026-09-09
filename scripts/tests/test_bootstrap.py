@@ -211,15 +211,22 @@ esac
         assert "boom: simulated build failure" in (tmp_path / "bootstrap.log").read_text()
 
 
-class TestEnvDollarGuard:
-    """docker compose interpolates .env, including the copy it hands a container
-    through env_file, so an unescaped `$` in a value is read as a variable
-    reference and replaced with nothing. `smtp$ecret99` arrives as `smtp`.
+class TestEnvValueGuard:
+    """Two characters take the tail off a .env value with nothing reporting it.
 
-    init_env no longer generates such a value, but an operator pasting an SMTP
-    password or an external credential still can, and the failure is silent on
-    both sides. The guard runs on the second pass — the first time bootstrap
-    sees .env as the operator left it.
+    `$` is read as a variable reference by compose — including in the copy it
+    hands a container through env_file — and replaced with nothing, so
+    `smtp$ecret99` arrives as `smtp`. A `#` preceded by whitespace opens a
+    comment, so `hunter2 #old` arrives as `hunter2`.
+
+    init_env generates neither, but an operator pasting an SMTP password or an
+    external credential still can, and the failure is silent on both sides. The
+    guard runs on the second pass — the first time bootstrap sees .env as the
+    operator left it.
+
+    What must *not* be flagged has its own cases below, and they carry the
+    weight: a guard that refuses a correct file is one an operator learns to
+    work around.
     """
 
     def test_a_clean_env_is_not_flagged(self, fakebin, tmp_path):
@@ -252,5 +259,38 @@ class TestEnvDollarGuard:
         make_env_example(tmp_path)
         env = make_env(tmp_path)
         env.write_text(env.read_text() + "# costs $5 per month\n")
+        result = run_script(BOOTSTRAP, fakebin, cwd=tmp_path)
+        assert result.returncode == 0, result.stderr
+
+    def test_a_space_before_a_hash_stops_the_run_and_names_the_line(self, fakebin, tmp_path):
+        make_env_example(tmp_path)
+        make_env(tmp_path, EMAIL_HOST_PASSWORD="hunter2 #old one")
+        result = run_script(BOOTSTRAP, fakebin, cwd=tmp_path)
+        assert result.returncode != 0, "a value the parser would cut must not reach the stack"
+        combined = result.stdout + result.stderr
+        assert "EMAIL_HOST_PASSWORD" in combined, "the operator has to be told which value"
+
+    def test_a_hash_inside_a_value_is_allowed(self, fakebin, tmp_path):
+        """`ab#cd` is passed through whole by compose and by every other reader
+        here. Refusing it would reject a perfectly good password, which is a
+        worse failure than the legibility it would buy."""
+        make_env_example(tmp_path)
+        make_env(tmp_path, EMAIL_HOST_PASSWORD="hunter2#old")
+        result = run_script(BOOTSTRAP, fakebin, cwd=tmp_path)
+        assert result.returncode == 0, result.stderr
+
+    def test_a_quoted_value_may_contain_a_spaced_hash(self, fakebin, tmp_path):
+        """Quoting is the format's own way of saying the `#` is part of the
+        value, and the parser honours it."""
+        make_env_example(tmp_path)
+        make_env(tmp_path, EMAIL_HOST_PASSWORD='"hunter2 #old one"')
+        result = run_script(BOOTSTRAP, fakebin, cwd=tmp_path)
+        assert result.returncode == 0, result.stderr
+
+    def test_an_empty_value_with_a_trailing_comment_is_allowed(self, fakebin, tmp_path):
+        """There is no tail to lose, and .env.example is written in this style."""
+        make_env_example(tmp_path)
+        env = make_env(tmp_path)
+        env.write_text(env.read_text() + "BORG_REMOTE_REPO= # set when backing up off-host\n")
         result = run_script(BOOTSTRAP, fakebin, cwd=tmp_path)
         assert result.returncode == 0, result.stderr

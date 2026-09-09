@@ -103,6 +103,8 @@ Open `.env` in your editor and fill in:
 
 Most other variables have sensible defaults.
 
+Two characters need care in any value you paste in here, because each takes the tail off it and nothing reports the loss. A `$` is read by docker compose as a variable reference and replaced with nothing, so `smtp$ecret99` reaches the application as `smtp` — double it (`$$`) when the credential genuinely contains one. A `#` opens a comment wherever whitespace precedes it, so `hunter2 #old` arrives as `hunter2` — quote the whole value to keep it. A `#` *inside* a value, as in `hunter2#old`, is passed through whole and needs nothing done to it. The second bootstrap pass refuses to continue on either and names the line, so a mistake here stops the run instead of reaching a container and authenticating with half a password.
+
 > If you already have the project checked out — a developer working on it, or a deployment restored from a backup — put it at `projects/<name>/` and leave `EPICURRENTS_PROJECT_REPO` blank. Bootstrap only clones when the directory is missing, and never touches one that exists.
 
 > You don't need to run `activate_project` for a fresh deployment — that command exists for *switching* between projects on an already-running deployment (see [`scripts/switch_project.sh`](../scripts/switch_project.sh)). On a first-time install, simply having `EPICURRENTS_PROJECT` set in `.env` is enough; the `migrate` service picks it up on the first `up -d`.

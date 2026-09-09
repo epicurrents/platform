@@ -73,6 +73,24 @@ docker compose run --rm init-volumes
 
 This sets `1000:1000` ownership on the `recordings-data`, `staging-data`, `media-data`, `celery-data`, and `static` volumes (mounted at `/recordings`, `/staging`, `/media`, `/celery`, `/static`) so the unprivileged container user can write to them. Postgres manages the ownership of its own volume.
 
+### Bootstrap stops with "Refusing to continue with values that would not survive the trip to the container"
+
+A value in `.env` would reach the application shortened, and [`scripts/bootstrap.sh`](../scripts/bootstrap.sh) names the offending line rather than letting it through. Two characters cause it, and the message says which one it found.
+
+An unescaped `$` is read by docker compose as a variable reference and replaced with nothing, since the name it accidentally forms is unset. A `#` with whitespace before it opens a comment, so everything from there on is dropped. Both fail in the same direction — the stack comes up, and the application authenticates with a value nobody can see is wrong:
+
+```bash
+# In .env — each of these arrives as "hunter2":
+EMAIL_HOST_PASSWORD=hunter2$ecret
+EMAIL_HOST_PASSWORD=hunter2 #old one
+
+# Fixed — double the $, or quote the whole value:
+EMAIL_HOST_PASSWORD=hunter2$$ecret
+EMAIL_HOST_PASSWORD="hunter2 #old one"
+```
+
+A `#` inside a value (`hunter2#old`) is passed through whole and is not flagged. If the credential is one you control, the simplest fix is to choose a value without either character — which is what `init_env` does for every secret it generates.
+
 ### Celery worker exits immediately
 
 Almost always either Redis isn't reachable or the migrations haven't completed. Inspect:

@@ -96,6 +96,12 @@ Entries are written for the person deciding whether to upgrade, so the ones that
 
   A deployment whose project views reach an external origin, or one running the dicom plugin, should set `CSP_REPORT_ONLY=True` for a cycle and extend `CONTENT_SECURITY_POLICY` before trusting the new default: neither configuration was covered by the tuning pass. Procedure in docs/operations.md → Security headers.
 
+- [bootstrap.sh](scripts/bootstrap.sh) refuses a `.env` holding a value with a space before a `#`, and `init_env` no longer generates a secret containing one at all.
+
+  A `#` opens a comment in the .env format wherever whitespace precedes it, so `hunter2 #old` reaches the application as `hunter2` with nothing reporting the loss — the same silent shortening the `$` guard already covered, which is why it now sits beside it. Only the spaced form is refused: a `#` inside a value is passed through whole and stays legal, and a quoted value is left alone, since quoting is the format's own way of keeping one. A deployment carrying such a value is stopped on its next bootstrap run with the line named, instead of going on authenticating with the shortened half.
+
+  Generated secrets are the cosmetic half of the same rule. Nothing was truncating them — a generated secret is one unbroken token — but `.env` is the file an operator copies a credential out of by eye, and a value that appears to end early invites a mistyped one. Secrets already in a `.env` keep working and need no regeneration.
+
 ### Fixed
 
 - The project's git hooks install on Windows. `install-dev-tools.sh` linked them into `.git/hooks/` with `ln -s`, which Git for Windows materialises as a plain file holding the target path — no shebang, so git refused every commit with `cannot spawn .git/hooks/pre-commit: No such file or directory`, naming a file that plainly exists. It now writes a small shim that execs the tracked hook, which behaves the same on all three platforms and needs no symlink support.

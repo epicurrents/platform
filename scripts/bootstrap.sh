@@ -257,42 +257,67 @@ if [ "$FIRST_RUN" = true ]; then
     export REDIS_PASSWORD="bootstrap-placeholder"
 fi
 
-# ── Unescaped `$` in .env values ─────────────────────────────────────────────
-# docker compose interpolates .env, and the copy it hands a container through
-# `env_file` goes through the same pass, so a `$` in a value is read as a
-# variable reference and replaced — with nothing, since the name it forms is
-# unset. `smtp$ecret99` reaches the application as `smtp`.
+# ── .env values that arrive shortened ────────────────────────────────────────
+# Two characters carry meaning in a .env value, and both lose the tail of it
+# without anything saying so: compose is silent, and the application
+# authenticates with a value it has no way to know was cut.
 #
-# init_env no longer generates such a value, but nothing stops an operator
-# pasting one: an SMTP password, an external database credential, a remote borg
-# repository URL. The failure is silent on both sides — compose says nothing,
-# and the application authenticates with a value it has no way to know is
-# truncated — so this is checked here, on the second pass, which is the first
-# time bootstrap sees the file as the operator left it.
+# `$` — compose interpolates .env, and the copy it hands a container through
+# `env_file` goes through the same pass, so a `$` is read as a variable
+# reference and replaced with nothing, the name it forms being unset.
+# `smtp$ecret99` reaches the application as `smtp`.
 #
-# `$$` is compose's escape and is left alone: a deployment that genuinely needs
-# a literal `$` in a credential it does not control has no other option, and
-# the value reaching the container is then correct.
-step_env_dollar_guard() {
-    local offenders
+# ` #` — a `#` opens a comment where whitespace precedes it, so `hunter2 #old`
+# arrives as `hunter2`. A `#` *inside* a value is kept, and `ab#cd` is passed
+# through whole by every reader here, so it is deliberately not flagged;
+# init_env declines to generate one, but for legibility rather than for this.
+#
+# init_env generates neither, but nothing stops an operator pasting one: an SMTP
+# password, an external database credential, a remote borg repository URL. Both
+# are checked on the second pass, the first time bootstrap sees the file as the
+# operator left it.
+#
+# Two escapes are honoured rather than flagged, because each is how the format
+# itself says "I meant this literally": `$$` for a dollar, and quoting the whole
+# value for a hash. A deployment stuck with a credential it does not control
+# needs both.
+step_env_value_guard() {
+    local dollars hashes
     # Values only — a `$` in a comment is not interpolated into anything. The
     # second pattern strips escaped `$$` first so only unescaped ones remain.
-    offenders="$(grep -nE '^[A-Za-z_][A-Za-z0-9_]*=' .env \
+    dollars="$(grep -nE '^[A-Za-z_][A-Za-z0-9_]*=' .env \
         | sed 's/\$\$//g' \
         | grep -E '^[0-9]+:[A-Za-z_][A-Za-z0-9_]*=[^=]*\$' \
         | cut -d: -f1,2 || true)"
-    if [ -n "$offenders" ]; then
+    if [ -n "$dollars" ]; then
         printf '\n'
         warn "These .env values contain an unescaped \$, which docker compose will strip:"
-        printf '%s\n' "$offenders" | sed 's/^/    line /'
+        printf '%s\n' "$dollars" | sed 's/^/    line /'
         printf '\n'
         printf 'The application receives a shortened value and nothing reports it. Either\n' >&2
         printf 'choose a value without a $, or double it ($$) so compose passes one through.\n' >&2
         die "Refusing to continue with values that would not survive the trip to the container."
     fi
+    # The character class after `=` does two jobs. It excludes a value opening
+    # with a quote, since quoting is the format's own way of keeping a `#`, and
+    # refusing that would refuse a correct file. And by requiring one
+    # non-blank character first it lets `KEY= # note` past — an empty value with
+    # a comment beside it, which has no tail to lose.
+    hashes="$(grep -nE '^[A-Za-z_][A-Za-z0-9_]*=[[:space:]]*[^[:space:]"'"'"'].*[[:space:]]#' .env \
+        | cut -d: -f1,2 || true)"
+    if [ -n "$hashes" ]; then
+        printf '\n'
+        warn "These .env values have a space before a #, which starts a comment:"
+        printf '%s\n' "$hashes" | sed 's/^/    line /'
+        printf '\n'
+        printf 'Everything from the # onward is dropped and the application receives only\n' >&2
+        printf 'what precedes it, with nothing reporting the loss. Either remove the space\n' >&2
+        printf 'before the #, or quote the whole value so it is kept.\n' >&2
+        die "Refusing to continue with values that would not survive the trip to the container."
+    fi
 }
 if [ "$FIRST_RUN" = false ]; then
-    step_env_dollar_guard
+    step_env_value_guard
 fi
 
 # ── 4. Submodules ────────────────────────────────────────────────────────────

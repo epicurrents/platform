@@ -23,12 +23,15 @@ def _random_passphrase(words: int = 5) -> str:
     return "-".join("".join(secrets.choice(alphabet) for _ in range(8)) for _ in range(words))
 
 
-# docker compose interpolates the .env it loads, and the copy it hands a
-# container through ``env_file`` goes through the same pass. A ``$`` in a
-# generated secret is therefore read as a variable reference and replaced —
-# with nothing, since the name it accidentally forms is unset. The container
-# receives a value the file does not contain, and this command prints the one
-# that never reaches anything.
+# Two characters are kept out of every value this command writes. They look
+# like one rule in the file and are not the same rule underneath.
+#
+# ``$`` is the one that corrupts. docker compose interpolates the .env it loads,
+# and the copy it hands a container through ``env_file`` goes through the same
+# pass, so a ``$`` in a generated secret is read as a variable reference and
+# replaced — with nothing, since the name it accidentally forms is unset. The
+# container receives a value the file does not contain, and this command prints
+# the one that never reaches anything.
 #
 # Being mangled *consistently* is not the same as being harmless. db and web
 # agree, because both arrive through compose; what breaks is every reader that
@@ -39,34 +42,61 @@ def _random_passphrase(words: int = 5) -> str:
 # Regenerating rather than escaping (``$$``) keeps the file true for all of
 # those readers at the cost of a couple of bits of entropy. Escaping would only
 # move the discrepancy to whoever reads .env without compose in front of them.
-_COMPOSE_INTERPOLATION_CHAR = "$"
+#
+# ``#`` is the one that misleads. It opens a comment in the .env format, but
+# only where whitespace precedes it — compose hands ``k=ab#cd`` over whole, and
+# so does every reader in this repository — so a generated secret, being one
+# unbroken token, is never truncated by it. It is excluded for what it costs a
+# person instead: .env is the file an operator copies a credential out of by
+# eye, and a value that appears to end where it in fact continues is a support
+# ticket in a file whose whole purpose is to be transcribed accurately. The
+# price is about 0.4 bits of the 146 in a 24-character password.
+#
+# The line drawn is the destination's own syntax — these are the two characters
+# with meaning in a .env file. Nothing here rejects a character merely because
+# some shell elsewhere would want it quoted, or the set would not stop growing.
+_ENV_FILE_METACHARACTERS = "$#"
+
+# Enough draws that exhausting them is not a thing that happens. Django's
+# alphabet carries both characters, so only ~13% of its 50-character keys come
+# out clean and the loop needs ~8 draws on average; at this budget the chance of
+# giving up is around 1e-61, where the 100 that covered ``$`` alone would now
+# leave it near 1e-6.
+_GENERATION_ATTEMPTS = 1000
 
 
-def _compose_safe(generate):
-    """Wrap a secret generator so it cannot return a value compose would rewrite.
+def _env_file_safe(generate):
+    """Wrap a secret generator so it cannot return a value carrying a .env metacharacter.
 
     Applied at the registry rather than inside each generator because the rule
     belongs to the destination — anything written into .env — and not to any one
     source. ``get_random_secret_key`` is Django's, with an alphabet this command
-    does not control and which yields a ``$`` about three times in five.
+    does not control and which yields a ``$`` about three times in five and a
+    ``#`` as often. Drawing again keeps Django authoritative over what a
+    SECRET_KEY is; filtering its alphabet here would move that decision into
+    this file and leave it to drift.
     """
 
     def wrapped() -> str:
-        for _ in range(100):
+        for _ in range(_GENERATION_ATTEMPTS):
             value = generate()
-            if _COMPOSE_INTERPOLATION_CHAR not in value:
+            if not any(char in value for char in _ENV_FILE_METACHARACTERS):
                 return value
-        # Unreachable for any sane alphabet; a loud failure beats writing a
-        # value that will not survive the trip to the container.
-        raise CommandError(f"could not generate a secret without {_COMPOSE_INTERPOLATION_CHAR!r} after 100 attempts")
+        # A loud failure beats writing a value that will not survive the trip to
+        # the container, or one an operator will read the wrong end off.
+        raise CommandError(
+            f"could not generate a secret free of {_ENV_FILE_METACHARACTERS!r} "
+            f"after {_GENERATION_ATTEMPTS} attempts"
+        )
 
     return wrapped
 
 
 def _random_password(length: int = 24) -> str:
-    # `$` is absent by construction rather than filtered by _compose_safe: there
-    # is no reason to draw from a character this command would then reject.
-    alphabet = string.ascii_letters + string.digits + "!@#%^&*"
+    # `$` and `#` are absent by construction rather than filtered by
+    # _env_file_safe: there is no reason to draw from a character this command
+    # would then reject.
+    alphabet = string.ascii_letters + string.digits + "!@%^&*"
     return "".join(secrets.choice(alphabet) for _ in range(length))
 
 
@@ -99,16 +129,16 @@ def _random_hmac_key() -> str:
 # database is part of the stack (the compose `db` service is seeded from the
 # same value Django connects with), not an external service with a pre-existing
 # password — so the platform owns it and generates it like the other secrets.
-# Every entry is wrapped so no generated value can carry a character docker
-# compose would interpolate away — see _compose_safe for what that costs a
-# deployment when it happens.
+# Every entry is wrapped so no generated value can carry a character that means
+# something in a .env file — see _env_file_safe for what each of the two costs a
+# deployment when it slips through.
 _KEY_REPLACEMENTS: dict[str, callable] = {
-    "SECRET_KEY": _compose_safe(get_random_secret_key),
-    "BORG_PASSPHRASE": _compose_safe(_random_passphrase),
-    "ADMIN_PASSWORD": _compose_safe(_random_password),
-    "DB_PASSWORD": _compose_safe(_random_password),
-    "REDIS_PASSWORD": _compose_safe(_random_password),
-    "ACTIVITY_HASH_KEY_V1": _compose_safe(_random_hmac_key),
+    "SECRET_KEY": _env_file_safe(get_random_secret_key),
+    "BORG_PASSPHRASE": _env_file_safe(_random_passphrase),
+    "ADMIN_PASSWORD": _env_file_safe(_random_password),
+    "DB_PASSWORD": _env_file_safe(_random_password),
+    "REDIS_PASSWORD": _env_file_safe(_random_password),
+    "ACTIVITY_HASH_KEY_V1": _env_file_safe(_random_hmac_key),
 }
 
 _VAPID_PUBLIC_KEY = "WEBPUSH_VAPID_PUBLIC_KEY"
