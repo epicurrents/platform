@@ -17,6 +17,7 @@
  * entries win on conflict (see ``main.ts``).
  */
 import add from '@material-symbols/svg-400/outlined/add.svg?raw'
+import admin_panel_settings from '@material-symbols/svg-400/outlined/admin_panel_settings.svg?raw'
 import arrow_back from '@material-symbols/svg-400/outlined/arrow_back.svg?raw'
 import arrow_forward from '@material-symbols/svg-400/outlined/arrow_forward.svg?raw'
 import attach_file from '@material-symbols/svg-400/outlined/attach_file.svg?raw'
@@ -43,6 +44,7 @@ import folder_copy from '@material-symbols/svg-400/outlined/folder_copy.svg?raw'
 import folder_open from '@material-symbols/svg-400/outlined/folder_open.svg?raw'
 import format_list_numbered from '@material-symbols/svg-400/outlined/format_list_numbered.svg?raw'
 import group from '@material-symbols/svg-400/outlined/group.svg?raw'
+import groups from '@material-symbols/svg-400/outlined/groups.svg?raw'
 import home from '@material-symbols/svg-400/outlined/home.svg?raw'
 import info from '@material-symbols/svg-400/outlined/info.svg?raw'
 import key from '@material-symbols/svg-400/outlined/key.svg?raw'
@@ -50,6 +52,7 @@ import light_mode from '@material-symbols/svg-400/outlined/light_mode.svg?raw'
 import link from '@material-symbols/svg-400/outlined/link.svg?raw'
 import lock from '@material-symbols/svg-400/outlined/lock.svg?raw'
 import lock_open from '@material-symbols/svg-400/outlined/lock_open.svg?raw'
+import logout from '@material-symbols/svg-400/outlined/logout.svg?raw'
 import menu_book from '@material-symbols/svg-400/outlined/menu_book.svg?raw'
 import monitor_heart from '@material-symbols/svg-400/outlined/monitor_heart.svg?raw'
 import more_horiz from '@material-symbols/svg-400/outlined/more_horiz.svg?raw'
@@ -70,6 +73,7 @@ import warning from '@material-symbols/svg-400/outlined/warning.svg?raw'
 
 const ICON_SVGS: Record<string, string> = {
     add,
+    admin_panel_settings,
     arrow_back,
     arrow_forward,
     attach_file,
@@ -96,6 +100,7 @@ const ICON_SVGS: Record<string, string> = {
     folder_open,
     format_list_numbered,
     group,
+    groups,
     home,
     info,
     key,
@@ -103,6 +108,7 @@ const ICON_SVGS: Record<string, string> = {
     link,
     lock,
     lock_open,
+    logout,
     menu_book,
     monitor_heart,
     more_horiz,
@@ -163,6 +169,7 @@ const FA_TO_MATERIAL: Record<string, string> = {
     'lock':                        'lock',
     'lock-open':                   'lock_open',
     'moon':                        'dark_mode',
+    'right-from-bracket':          'logout',
     'paperclip':                   'attach_file',
     'pencil':                      'edit',
     'play':                        'play_arrow',
@@ -177,6 +184,8 @@ const FA_TO_MATERIAL: Record<string, string> = {
     'trash':                       'delete',
     'triangle-exclamation':        'warning',
     'user':                        'person',
+    'user-group':                  'groups',
+    'user-shield':                 'admin_panel_settings',
     'users':                       'group',
     'waveform-lines':              'vital_signs',
     'xmark':                       'close',

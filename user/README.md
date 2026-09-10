@@ -93,7 +93,9 @@ Replacing the admin beat the two alternatives — an IP allowlist in front of it
 
 Living under `/api/v1/` is the point. The path matches `_API_PATH_RE`, so every request opens an audited context, every model write inside it lands on the hash chain, and session writes pass the CSRF chokepoint — none of which happened for the same operations through `/admin/`.
 
-No in-app client exists yet: the SPA carries no view, route or API module for these endpoints, so they are driven by hand — a session cookie plus the CSRF token — or the work goes through management commands. The UI is tracked in [ROADMAP.md](../ROADMAP.md) under *User — account and group management UI*.
+The client is the SPA's four `/admin/` routes, reached from the user menu in the nav bar. Staff read and superusers write, which the frontend presents rather than re-decides — see [frontend/README.md → Administration](../frontend/README.md#administration) for what each view holds and the traps a client hits, chiefly the padded role map.
+
+The one endpoint below with no client is `PUT /admin/groups/{id}/members`. Both membership endpoints take a whole-membership replacement, and building that from the group side means listing every user against a roster this API caps — so members past the cap would be dropped by an operator who never saw them. The SPA sets membership from the account side only, where the list being replaced is the group list and is never paged. The endpoint stays for scripted callers, which can page the roster themselves.
 
 | Method | Path | Access | Purpose |
 |---|---|---|---|

@@ -154,7 +154,9 @@ const showNavigation = computed(() => {
 const profileName = computed(() => {
     const firstName = authStore.user?.first_name ?? ''
     const lastName = authStore.user?.last_name ?? ''
-    return `${firstName} ${lastName}`.trim()
+    // The username is the fallback so the menu trigger is never a bare caret on
+    // an account that has no name set.
+    return `${firstName} ${lastName}`.trim() || (authStore.user?.username ?? '')
 })
 
 function navLinkClass (section: string) {
@@ -167,6 +169,21 @@ function navLinkClass (section: string) {
 async function logout () {
     await authStore.logout()
     router.push({ name: 'login' })
+}
+
+/**
+ * Act on a pick from the user menu. Administration is offered to staff and the
+ * route guard holds the same line, so a direct URL is refused the same way.
+ */
+function handleUserMenu (event: Event) {
+    const value = (event as CustomEvent<{ item: { value: string } }>).detail.item.value
+    if (value === 'profile') {
+        router.push({ name: 'profile' })
+    } else if (value === 'admin') {
+        router.push({ name: 'admin-accounts' })
+    } else if (value === 'logout') {
+        logout()
+    }
 }
 </script>
 
@@ -207,22 +224,35 @@ async function logout () {
                     type="checkbox"
                     @click="themeStore.setMode(opt.value)"
                 >
-                    <wa-icon :name="opt.icon" slot="prefix"></wa-icon>
+                    <wa-icon :name="opt.icon" slot="icon"></wa-icon>
                     {{ opt.label }}
                 </wa-dropdown-item>
             </wa-dropdown>
-            <RouterLink :class="navLinkClass('profile')" to="/profile">
-                <wa-icon class="nav-icon" name="user"></wa-icon>
-                {{ profileName }}
-            </RouterLink>
-            <wa-button
-                appearance="filled-outlined"
-                size="s"
-                variant="text"
-                @click="logout"
-            >
-                {{ t('Sign out', SCOPE) }}
-            </wa-button>
+            <!-- User menu -->
+            <wa-dropdown placement="bottom-end" @wa-select="handleUserMenu">
+                <wa-button
+                    appearance="plain"
+                    size="s"
+                    slot="trigger"
+                    with-caret
+                >
+                    <wa-icon name="user" slot="start"></wa-icon>
+                    {{ profileName }}
+                </wa-button>
+                <wa-dropdown-item value="profile">
+                    <wa-icon name="user" slot="icon"></wa-icon>
+                    {{ t('Profile', SCOPE) }}
+                </wa-dropdown-item>
+                <wa-dropdown-item v-if="authStore.isStaff" value="admin">
+                    <wa-icon name="user-shield" slot="icon"></wa-icon>
+                    {{ t('Administration', SCOPE) }}
+                </wa-dropdown-item>
+                <wa-divider></wa-divider>
+                <wa-dropdown-item value="logout" variant="danger">
+                    <wa-icon name="right-from-bracket" slot="icon"></wa-icon>
+                    {{ t('Sign out', SCOPE) }}
+                </wa-dropdown-item>
+            </wa-dropdown>
         </div>
     </nav>
 
@@ -230,8 +260,24 @@ async function logout () {
         <RouterView />
     </div>
 
-    <!-- Global toast stack — backed by the reactive `toasts` array in lib/toast.ts. -->
-    <ToastStack icon-library="default" />
+    <!--
+        Global toast stack — backed by the reactive `toasts` array in lib/toast.ts.
+
+        Wrapped in a viewport-fixed layer rather than dropped in bare. The stack
+        positions itself `absolute`, which the viewer resolves against its own
+        `position: relative` root so that an embedded viewer's callouts stay
+        inside its box. The platform has no such ancestor, so the same rule
+        resolved against the document and left a toast pinned where the page
+        happened to be scrolled — off-screen entirely on a long page. Giving it
+        a fixed containing block keeps it on screen without changing a component
+        the viewer shares.
+    -->
+    <div
+        class="toast-viewport"
+        :class="{ 'toast-viewport--above-banner': deploymentStore.isDevelopmentMode }"
+    >
+        <ToastStack icon-library="default" />
+    </div>
 
     <!--
         Dev-mode banner. Sourced from /api/v1/health.mode; visible only when
@@ -263,6 +309,24 @@ async function logout () {
     flex: 1;
     flex-direction: column;
     min-height: 0;
+}
+
+/* Containing block for the toast stack, which positions itself against its
+   nearest positioned ancestor. Inert to the pointer: the stack already sets
+   `pointer-events: none` on itself and `auto` on each toast, so a full-viewport
+   layer here would otherwise swallow every click on the page behind it. */
+.toast-viewport {
+    inset: 0;
+    pointer-events: none;
+    position: fixed;
+    z-index: 9999;
+}
+
+/* The dev-mode banner is fixed to the bottom edge and the stack sits 1rem above
+   it, so on a dev deployment the two share that strip. Lift the layer by the
+   banner's height while it is showing. */
+.toast-viewport--above-banner {
+    bottom: 1.5rem;
 }
 
 /* Dev-mode banner: pinned to the bottom of the viewport at 1.5rem max

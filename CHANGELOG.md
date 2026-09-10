@@ -10,6 +10,16 @@ Entries are written for the person deciding whether to upgrade, so the ones that
 
 ### Added
 
+- Account and group management has a UI. The API replacing the Django admin's user surface shipped without a client, so the only ways to create an ordinary account were a hand-built request with a session cookie and CSRF token, or a shell on the host — and a deployment maintained by a hosting service has neither. Four routes under `/admin/` now cover the account roster and detail, the group roster and detail, reached from the user menu in the nav bar.
+
+  Group membership is set from the account page, where the list being chosen from is the groups; the group page shows its members as a roll linking back to each account. A deployment has far more users than groups, and the group side would additionally have to build a whole-membership replacement out of a roster the API caps, silently dropping anyone past it.
+
+  Staff read and superusers write, the tier the API already enforced; a staff account sees both rosters with the write controls absent. Refusals are shown as the server reports them rather than re-implemented client-side — the last-active-superuser guard, the grant count blocking a group deletion, the password validators' messages. There is no account-deletion control anywhere, deliberately: `erase_user` is the sanctioned path because it also unlinks owned recording and media files, which FK cascade never does, and the account page points at the command instead.
+
+  Project roles render from `GET /admin/roles` at runtime, so a deployment running a project the frontend has never heard of gets working role management with no frontend change. Roles need no project-supplied frontend code and must not grow an extension point for one.
+
+- The nav bar's profile link and sign-out button are now one user menu, which is what gives administration somewhere to live without adding a top-level nav entry. Sign out is styled as the destructive action it is.
+
 - [make-bootstrap-fixture.sh](scripts/make-bootstrap-fixture.sh) gained `--tarball`, which packs the assembled package into `<dest>.tar.gz` in one step, stamped as owned by uid/gid 1000 — the account every container runs as. Packing by hand records the *builder's* uid instead, and since an update applies the archive as root, that uid travels onto the deployment and locks its own account out of the tree. The failure surfaces later as a permission error from a container, far from its cause.
 
 - Federation can run over a private overlay network without turning the SSRF guard off. `FEDERATION_ALLOWED_PEER_CIDRS` lists the networks a peer URL may resolve to despite not being globally routable — `100.64.0.0/10` and `fd7a:115c:a1e0::/48` for a Tailscale tailnet — and every other non-public address stays refused. The alternative was `FEDERATION_ALLOW_PRIVATE_PEER_URLS`, which disables the guard for all of them and is documented as never for production, so a deployment whose peers are reachable only over its own overlay had to choose between federating and keeping the guard.

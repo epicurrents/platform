@@ -5,6 +5,14 @@ import { createI18n } from 'vue-i18n'
  */
 const messages = {
     en: {
+        AdminAccountView: {
+            // i18n-t entries (required because the custom t() fallback does not apply to <i18n-t>)
+            clear_two_factor_confirm: 'Clear the second factor on {name}? The account signs in with its password alone until it enrols again.',
+        },
+        AdminGroupsView: {
+            // i18n-t entries (required because the custom t() fallback does not apply to <i18n-t>)
+            delete_group_confirm: 'Delete group {name}? Members keep their accounts and lose only what this group conveyed.',
+        },
         CollectionView: {
             // i18n-t entries (required because the custom t() fallback does not apply to <i18n-t>)
             move_to_trash_confirm: 'Move collection {name} and everything in it to the trash? Sub-collections go too, and recordings return to the library root — nothing is deleted, and you can restore it all later.',

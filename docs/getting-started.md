@@ -163,7 +163,7 @@ Once your own account holds a factor, decide whether to require one. `TWO_FACTOR
 
 Neither applies to external (OIDC) logins, where the identity provider owns the second factor. If you configure external login later, set the requirement at the provider instead.
 
-Creating further accounts has no in-app surface yet: use the account endpoints under `/api/v1/user/admin/` ([user/README.md](../user/README.md#account-administration)) or the management commands. A management UI is the first item on [ROADMAP.md](../ROADMAP.md).
+Create further accounts from the administration views in the application: sign in as the admin account, open the user menu in the nav bar and pick *Administration*. The endpoints behind them are documented in [user/README.md](../user/README.md#account-administration) for scripted provisioning.
 
 ### 7. (Optional) Reach the deployment over a tailnet
 

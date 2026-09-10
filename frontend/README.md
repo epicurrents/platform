@@ -36,11 +36,15 @@ Then run `npm run dev` as normal. Log in with any credentials — the mock accep
 - 15 recordings — 12 ready EEG (resting-state, P300, ERP, N-back, SSVEP), 1 EMG, 1 ECoG, 1 pending EEG
 - 2 collections: *Sleep Studies* (2 items, 1 share token), *Epilepsy Cases* (1 item)
 - 2 datasets: *Public EEG Dataset* (2 items, 1 share token), *Research Cohort A* (1 item)
+- 4 accounts and 2 groups for the administration surface, including one deactivated and unnamed account, and one group carrying access grants so a delete is refused
 
 **Behaviour notes:**
 - The pending recording flips to `ready` on its second status poll, exercising the upload-progress UI.
 - Renaming a recording propagates immediately to any collection/dataset items that reference it.
+- `mockuser` is a superuser, which is what makes the staff- and superuser-gated surfaces (administration, viewer settings, annotation export) reachable at all in mock mode.
 - All CRUD is fully in-memory — nothing is persisted between page reloads.
+
+**Project roles.** `MOCK_ROLE_PROVIDERS` at the top of [mocks.ts](mocks.ts) is what `GET /admin/roles` answers with. Its keys and values are deliberately fictional, since a real one sitting in a fixture is how a role the platform must not know quietly becomes load-bearing. Set it to `[]` to exercise the roleless deployment, where no role UI may render at all — that is the shape a dev stack with a project active never shows by eye, and the one most likely to be broken without anyone noticing.
 
 The mock handler lives in [mocks.ts](mocks.ts) (project root, compiled by Vite at dev-server startup). The Vite plugin wiring is in [vite.config.ts](vite.config.ts).
 
@@ -50,6 +54,7 @@ The mock handler lives in [mocks.ts](mocks.ts) (project root, compiled by Vite a
 - State setup (Pinia): [src/stores/index.ts](src/stores/index.ts)
 - i18n setup: [src/i18n/index.ts](src/i18n/index.ts)
 - HTTP client: [src/lib/http.ts](src/lib/http.ts)
+- Timestamp formatting: [src/lib/datetime.ts](src/lib/datetime.ts) — `formatDate` for a date alone, `formatDateTime` where the time of day matters. Both return the raw string for input that will not parse, so a timestamp the platform cannot read stays visible instead of becoming "Invalid Date". Pair either with `<wa-relative-time>` when "how long ago" is the useful part.
 - Vite plugins/config: [vite.config.ts](vite.config.ts)
 
 ## Project and Plugin Extensions
@@ -118,8 +123,39 @@ resolve through the default icon library.
 | `/library/collections/:id` | `CollectionView` | Collection detail — items, access rights |
 | `/datasets` | `DatasetsView` | Dataset list |
 | `/datasets/:id` | `DatasetView` | Dataset detail — items, access rights |
+| `/upload` | `UploadView` | Recording upload |
+| `/viewer` | `ViewerView` | Embedded signal viewer |
+| `/annotations/export` | `AnnotationExportView` | Annotation export (staff) |
+| `/settings/viewer` | `ViewerConfigView` | Viewer settings (staff) |
+| `/admin/accounts` | `AdminAccountsView` | Account roster — search, paging, create (staff) |
+| `/admin/accounts/:id` | `AdminAccountView` | Account detail — fields, groups, password, second factor (staff) |
+| `/admin/groups` | `AdminGroupsView` | Group roster — member and grant counts, create, delete (staff) |
+| `/admin/groups/:id` | `AdminGroupView` | Group detail — rename, roles, member roll (staff) |
 | `/profile` | `ProfileView` | User profile / password change |
 | `/login` | `LoginView` | Login form |
+| `/reset-password` | `ResetPasswordView` | Password reset confirmation |
+
+### Administration
+
+The four `/admin/` routes are the client for the account and group API at `/api/v1/user/admin/`. They are reached from the user menu in the nav bar, not from the main nav, and every one gates on `requiresStaff`.
+
+Staff read, superuser writes — the same tier the API enforces. A staff account that is not a superuser sees both rosters and every detail page with the controls absent, gated in each component on `authStore.isSuperuser`; the route guard has no superuser branch and needs none. Refusals are surfaced as the server reports them rather than pre-checked client-side: the last-active-superuser guard, the grant count blocking a group deletion, the password validators' messages and the duplicate-name conflicts are each decided against server state the client sees stale or not at all.
+
+There is no account deletion control anywhere in the surface. [`erase_user`](../user/README.md#account-erasure-gdpr-art-17) is the sanctioned path because it also unlinks owned recording and media files, which FK cascade never does; the account page points at the command instead of offering a control.
+
+**Membership is written from the account page only.** A deployment has far more users than groups, so assigning groups to a user is a short list of checkboxes while assigning users to a group is an unbounded one. The group page shows its members as a read-only roll linking back to each account. It is also the safer direction. Both membership endpoints take a whole-membership replacement, so a picker built from the capped account roster would drop every member past the cap — people the operator never saw listed — where the group list on an account page is never paged and cannot. [src/api/admin.ts](src/api/admin.ts) wraps only the account-side write for that reason.
+
+Two shapes to know before changing these views. `GET /admin/accounts` returns a bare list with no total, so paging can show "there is more" but not "N of M" — a full page is the entire signal. And there is no single-group read endpoint, so `AdminGroupView` resolves its group out of the group roster, and reads the account roster to name its members; the server caps that at 500, and the view says how many of the group's `member_count` it could show when the two disagree.
+
+### Project roles
+
+Roles belong to groups; accounts inherit them through membership. The platform knows the role *mechanism* — a registry, an endpoint listing what is registered, a selector on the group form, badges on the account page — and must never know any role's *meaning*. No role key, value or label appears anywhere in the frontend, fixtures included.
+
+The consequence worth stating plainly: **roles need no project-supplied frontend code and must not grow an extension point.** No entry in [src/projects/types.ts](src/projects/types.ts), no project component, no registration call. `GET /admin/roles` is the sole authority for which selectors render and what goes in them, read at runtime, so a deployment running an unknown project gets working role management with no frontend change. Wanting a project hook here means something has gone wrong.
+
+The trap is the write. `GroupDetailOut.roles` carries an entry for **every** registered key including the nulls, and `PATCH /admin/groups/{id}` reads an explicit `null` as "clear this role" while leaving an absent key untouched. Seeding a reactive form object from the group payload and submitting it back wholesale — the natural Vue idiom — therefore sends a padded map that clears every role the form did not render. It is harmless only while `/admin/roles` and the group payload agree, and stops being harmless exactly when the roles call fails or returns stale data. Build the payload with `rolesPayload(renderedKeys, values)` from [src/api/admin.ts](src/api/admin.ts), which carries the rendered keys and nothing else and maps the blank option to `null` — an empty string is not among a provider's declared choices and the server rejects it with a 400. Regression coverage in [src/api/admin.test.ts](src/api/admin.test.ts), which asserts on the request body rather than the resulting state, since a state assertion passes in the configuration where the bug is dormant.
+
+A rejected role value aborts the rename with it — the server writes both in one transaction — so `AdminGroupView` saves name and roles together and reports one outcome. Reporting the rename as saved and the role as failed would be untrue.
 
 ## API Modules (`src/api/`)
 
@@ -129,6 +165,7 @@ resolve through the default icon library.
 | `library.ts` | `/api/v1/library/` | Collections, datasets, their items and access rights |
 | `annotations.ts` | `/annotations/api/v1/` | Content-type lookup, annotation CRUD |
 | `user.ts` | `/api/v1/user/` | Login, logout, me, password change |
+| `admin.ts` | `/api/v1/user/admin/` | Account and group administration; `rolesPayload` builds the partial role map |
 | `notifications.ts` | `/api/v1/notifications/` | VAPID key, push subscription |
 
 ## Composables (`src/composables/`)
@@ -141,6 +178,7 @@ resolve through the default icon library.
 
 | Component | Description |
 |---|---|
+| `AdminTabs.vue` | Segmented control switching between the account and group rosters. A route-linked control rather than a `wa-tab-group`, since the two halves are separate pages with their own URLs and tab panels would put both behind one address. Takes `active` (`'accounts' \| 'groups'`). |
 | `AppLogo.vue` | The Epicurrents mark as inline SVG, rendered in the nav brand link. Geometry is a verbatim port of the logo component in the epicurrents.github.io repository; the colouring is not, so the two can be re-synced by copying the paths across. Size is set by the consumer through the `--logo-size` custom property, outline weight through the `strokeWidth` prop. |
 | `CollectionPickerDialog.vue` | Dialog for browsing the Collection hierarchy, creating new collections inline, and selecting a target. Controlled via `:open` prop; emits `select` (with a `PickerSelection`) and `close`. Use when any feature needs the user to pick a collection destination or browse library items. Two modes: `collection` (pick a folder) and `item` (pick a recording inside a folder). Breadcrumb navigation via `wa-breadcrumb`. |
 

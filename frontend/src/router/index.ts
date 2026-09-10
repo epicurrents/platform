@@ -3,6 +3,10 @@ import { t } from '#i18n'
 import { authGuard } from './guard'
 import { plugin } from '#projects/active'
 import { plugin as pluginsPlugin } from '#plugins/active'
+import AdminAccountsView from '#views/AdminAccountsView.vue'
+import AdminAccountView from '#views/AdminAccountView.vue'
+import AdminGroupsView from '#views/AdminGroupsView.vue'
+import AdminGroupView from '#views/AdminGroupView.vue'
 import AnnotationExportView from '#views/AnnotationExportView.vue'
 import CollectionView from '#views/CollectionView.vue'
 import DatasetView from '#views/DatasetView.vue'
@@ -166,6 +170,52 @@ export const router = createRouter({
                 requiresAuth: true,
                 requiresStaff: true,
                 title: 'Export annotations',
+            },
+        },
+        {
+            path: '/admin/accounts',
+            name: 'admin-accounts',
+            component: AdminAccountsView,
+            meta: {
+                navSection: 'admin',
+                requiresAuth: true,
+                requiresStaff: true,
+                title: 'Administration',
+            },
+        },
+        {
+            path: '/admin/accounts/:id',
+            name: 'admin-account',
+            component: AdminAccountView,
+            meta: {
+                navSection: 'admin',
+                requiresAuth: true,
+                requiresStaff: true,
+                // AdminAccountView swaps in the username once loaded.
+                title: 'Account',
+            },
+        },
+        {
+            path: '/admin/groups',
+            name: 'admin-groups',
+            component: AdminGroupsView,
+            meta: {
+                navSection: 'admin',
+                requiresAuth: true,
+                requiresStaff: true,
+                title: 'Administration',
+            },
+        },
+        {
+            path: '/admin/groups/:id',
+            name: 'admin-group',
+            component: AdminGroupView,
+            meta: {
+                navSection: 'admin',
+                requiresAuth: true,
+                requiresStaff: true,
+                // AdminGroupView swaps in the group name once loaded.
+                title: 'Group',
             },
         },
         ...(plugin.routes ?? []),
