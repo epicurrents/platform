@@ -13,6 +13,20 @@
  *   PATCH  /api/v1/user/me
  *   POST   /api/v1/user/me/change-password
  *
+ *   GET    /api/v1/user/admin/roles
+ *   GET    /api/v1/user/admin/accounts
+ *   POST   /api/v1/user/admin/accounts
+ *   GET    /api/v1/user/admin/accounts/{id}
+ *   PATCH  /api/v1/user/admin/accounts/{id}
+ *   POST   /api/v1/user/admin/accounts/{id}/password
+ *   DELETE /api/v1/user/admin/accounts/{id}/2fa
+ *   PUT    /api/v1/user/admin/accounts/{id}/groups
+ *   GET    /api/v1/user/admin/groups
+ *   POST   /api/v1/user/admin/groups
+ *   PATCH  /api/v1/user/admin/groups/{id}
+ *   DELETE /api/v1/user/admin/groups/{id}
+ *   PUT    /api/v1/user/admin/groups/{id}/members
+ *
  *   GET    /annotations/api/v1/content-types
  *
  *   GET    /recordings/api/v1/
@@ -120,8 +134,29 @@ interface MockGroup {
     deleted_at: string | null
 }
 
+/** One row of the administration account roster. */
+interface MockAccount extends MockUser {
+    is_active: boolean
+    date_joined: string
+    last_login: string | null
+    /** Password is never read back; held only so a set-password call has somewhere to land. */
+    password: string
+}
+
+/** An auth group, with the roles it carries and the accounts in it. */
+interface MockAuthGroup {
+    id: number
+    name: string
+    roles: Record<string, string | null>
+    memberIds: number[]
+    /** Access grants targeting this group. Non-zero makes a delete return 409. */
+    grantCount: number
+}
+
 interface MockState {
     user: MockUser
+    accounts: MockAccount[]
+    authGroups: MockAuthGroup[]
     recordings: MockRecording[]
     collections: MockGroup[]
     collectionItems: MockItem[]
@@ -134,6 +169,8 @@ interface MockState {
         ds: number
         item: number
         access: number
+        account: number
+        group: number
     }
 }
 
@@ -141,6 +178,28 @@ interface MockState {
 
 const RECORDING_CT_ID = 42
 const MOCK_USER_ID = 1
+
+/**
+ * Role providers this mock deployment pretends its active project registers.
+ *
+ * The keys, values and labels are deliberately fictional: the platform never
+ * knows a real role's meaning, and a real key sitting in a fixture is how one
+ * quietly becomes load-bearing. Set this to `[]` to exercise the other
+ * deployment shape — the roleless one, where no role UI may render at all,
+ * which is the case a dev stack with a project active never shows by eye.
+ */
+const MOCK_ROLE_PROVIDERS = [
+    {
+        key: 'demo_widget_tier',
+        label: 'Widget tier',
+        choices: [['tier_alpha', 'Tier alpha'], ['tier_beta', 'Tier beta']],
+    },
+    {
+        key: 'demo_colour',
+        label: 'Demo colour',
+        choices: [['puce', 'Puce'], ['chartreuse', 'Chartreuse']],
+    },
+]
 
 /** Tracks which pending recordings have been polled once (to simulate processing). */
 const _pendingFlipped = new Set<string>()
@@ -172,8 +231,10 @@ function buildSeed(): MockState {
         email: 'mock@epicurrents.dev',
         first_name: 'Mock',
         last_name: 'User',
-        is_staff: false,
-        is_superuser: false,
+        // Superuser so the staff- and superuser-gated surfaces (administration,
+        // viewer settings, annotation export) are reachable in mock mode at all.
+        is_staff: true,
+        is_superuser: true,
         is_2fa_enabled: false,
     }
 
@@ -468,15 +529,89 @@ function buildSeed(): MockState {
         { id: 1, _parent_id: 1, access_target_id: null, access_target_group_id: null, public_share_token: 'xyz-public-eeg-dataset', can_read: true, can_write: false, can_share: false, expires_at: null },
     ]
 
+    const accounts: MockAccount[] = [
+        {
+            ...user,
+            is_active: true,
+            date_joined: ago(3600 * 24 * 400),
+            last_login: ago(3600),
+            password: 'mock',
+        },
+        {
+            id: 2,
+            username: 'rkeller',
+            email: 'r.keller@epicurrents.dev',
+            first_name: 'Robin',
+            last_name: 'Keller',
+            is_staff: true,
+            is_superuser: false,
+            is_2fa_enabled: true,
+            is_active: true,
+            date_joined: ago(3600 * 24 * 200),
+            last_login: ago(3600 * 24 * 2),
+            password: 'mock',
+        },
+        {
+            id: 3,
+            username: 'jmoreau',
+            email: 'j.moreau@epicurrents.dev',
+            first_name: 'Jules',
+            last_name: 'Moreau',
+            is_staff: false,
+            is_superuser: false,
+            is_2fa_enabled: false,
+            is_active: true,
+            date_joined: ago(3600 * 24 * 30),
+            last_login: null,
+            password: 'mock',
+        },
+        {
+            // Deactivated and unnamed, so the roster shows both the inactive
+            // marker and the username fallback for a row with no display name.
+            id: 4,
+            username: 'former.account',
+            email: 'former@epicurrents.dev',
+            first_name: '',
+            last_name: '',
+            is_staff: false,
+            is_superuser: false,
+            is_2fa_enabled: false,
+            is_active: false,
+            date_joined: ago(3600 * 24 * 900),
+            last_login: ago(3600 * 24 * 500),
+            password: 'mock',
+        },
+    ]
+
+    const authGroups: MockAuthGroup[] = [
+        {
+            id: 1,
+            name: 'Reviewers',
+            roles: { demo_widget_tier: 'tier_alpha', demo_colour: null },
+            memberIds: [1, 2],
+            // Non-zero, so deleting this group is refused the way the real API refuses it.
+            grantCount: 2,
+        },
+        {
+            id: 2,
+            name: 'Trainees',
+            roles: { demo_widget_tier: null, demo_colour: 'chartreuse' },
+            memberIds: [3],
+            grantCount: 0,
+        },
+    ]
+
     return {
         user,
+        accounts,
+        authGroups,
         recordings,
         collections,
         collectionItems,
         datasets,
         datasetItems,
         datasetAccess,
-        seq: { rec: 17, coll: 3, ds: 3, item: 4, access: 2 },
+        seq: { rec: 17, coll: 3, ds: 3, item: 4, access: 2, account: 5, group: 3 },
     }
 }
 
@@ -530,6 +665,71 @@ function conflict(res: ServerResponse, detail: string): true {
 }
 
 // ─── Serialisation helpers ────────────────────────────────────────────────────
+
+/** Groups an account belongs to, as the reference shape the account payload carries. */
+function groupsOf(accountId: number) {
+    return _state.authGroups
+        .filter(group => group.memberIds.includes(accountId))
+        .map(group => ({ id: group.id, name: group.name }))
+}
+
+/**
+ * One account as `AccountOut`, with roles gathered across every group it is in.
+ *
+ * The value is a list per key because a user inherits a role from each group
+ * carrying it, and several groups may carry the same one — the group form is
+ * single-select, the account display is not.
+ */
+function accountOut(account: MockAccount) {
+    const roles: Record<string, string[]> = {}
+    for (const group of _state.authGroups) {
+        if (!group.memberIds.includes(account.id)) continue
+        for (const [key, value] of Object.entries(group.roles)) {
+            if (value === null) continue
+            roles[key] = [...new Set([...(roles[key] ?? []), value])]
+        }
+    }
+    return {
+        id: account.id,
+        username: account.username,
+        email: account.email,
+        first_name: account.first_name,
+        last_name: account.last_name,
+        is_active: account.is_active,
+        is_staff: account.is_staff,
+        is_superuser: account.is_superuser,
+        is_2fa_enabled: account.is_2fa_enabled,
+        date_joined: account.date_joined,
+        last_login: account.last_login,
+        groups: groupsOf(account.id),
+        roles,
+    }
+}
+
+/** One group as `GroupDetailOut`, with the two counts that decide deletability. */
+function groupOut(group: MockAuthGroup) {
+    return {
+        id: group.id,
+        name: group.name,
+        member_count: group.memberIds.length,
+        grant_count: group.grantCount,
+        roles: { ...group.roles },
+    }
+}
+
+/**
+ * The refusal message when a change would leave no active superuser, or `null`
+ * when it would not. Mirrors the server guard, which is the only thing standing
+ * between an operator and locking everyone out of account administration.
+ */
+function lastSuperuserRefusal(account: MockAccount, nextActive: boolean, nextSuperuser: boolean): string | null {
+    if (!account.is_superuser || !account.is_active) return null
+    if (nextActive && nextSuperuser) return null
+    const remaining = _state.accounts.filter(a => a.is_superuser && a.is_active && a.id !== account.id).length
+    if (remaining > 0) return null
+    return 'This is the last active superuser. Promote another account first, or the deployment loses '
+        + 'access to account administration entirely.'
+}
 
 /** Strip internal _parent_id before sending an item to the client. */
 function itemOut(item: MockItem) {
@@ -676,6 +876,209 @@ export async function handleMock(
     if (path === '/api/v1/user/me/change-password' && method === 'POST') {
         if (!isLoggedIn(req)) return send(res, 401, { detail: 'Authentication credentials were not provided.' })
         return noContent(res)
+    }
+
+    // ── Account administration ────────────────────────────────────────────────
+
+    if (path.startsWith('/api/v1/user/admin/')) {
+        if (!isLoggedIn(req)) return send(res, 401, { detail: 'Authentication credentials were not provided.' })
+        if (!_state.user.is_staff && !_state.user.is_superuser) {
+            return send(res, 403, { detail: 'This requires staff access.' })
+        }
+        // Every write below is superuser-only, matching the real tier split.
+        const isWrite = method !== 'GET'
+        if (isWrite && !_state.user.is_superuser) {
+            return send(res, 403, { detail: 'This requires superuser access.' })
+        }
+        const tail = path.slice('/api/v1/user/admin/'.length)
+
+        if (tail === 'roles' && method === 'GET') {
+            return send(res, 200, MOCK_ROLE_PROVIDERS)
+        }
+
+        if (tail === 'accounts' && method === 'GET') {
+            const url = new URL(path + (req.url?.includes('?') ? req.url.slice(req.url.indexOf('?')) : ''), 'http://mock')
+            const q = (url.searchParams.get('q') ?? '').toLowerCase()
+            const limit = Number(url.searchParams.get('limit') ?? 100)
+            const offset = Number(url.searchParams.get('offset') ?? 0)
+            const matched = _state.accounts.filter(account => {
+                if (!q) return true
+                return [account.username, account.first_name, account.last_name, account.email]
+                    .some(field => field.toLowerCase().includes(q))
+            })
+            return send(res, 200, matched.slice(offset, offset + limit).map(accountOut))
+        }
+
+        if (tail === 'accounts' && method === 'POST') {
+            const body = await readBody(req)
+            const username = String(body.username ?? '').trim()
+            if (!username) return send(res, 400, { detail: 'Username is required.' })
+            if (_state.accounts.some(a => a.username.toLowerCase() === username.toLowerCase())) {
+                return conflict(res, 'An account with that username already exists.')
+            }
+            const password = String(body.password ?? '')
+            if (password.length < 8) {
+                return send(res, 400, { detail: 'This password is too short. It must contain at least 8 characters.' })
+            }
+            const account: MockAccount = {
+                id: _state.seq.account++,
+                username,
+                email: String(body.email ?? ''),
+                first_name: String(body.first_name ?? ''),
+                last_name: String(body.last_name ?? ''),
+                is_active: body.is_active !== false,
+                is_staff: body.is_staff === true,
+                is_superuser: body.is_superuser === true,
+                is_2fa_enabled: false,
+                date_joined: new Date().toISOString(),
+                last_login: null,
+                password,
+            }
+            _state.accounts.push(account)
+            return send(res, 201, accountOut(account))
+        }
+
+        const accountMatch = /^accounts\/(\d+)(\/groups|\/password|\/2fa)?$/.exec(tail)
+        if (accountMatch) {
+            const account = _state.accounts.find(a => a.id === Number(accountMatch[1]))
+            if (!account) return send(res, 404, { detail: 'Account not found.' })
+            const suffix = accountMatch[2] ?? ''
+
+            if (suffix === '' && method === 'GET') {
+                return send(res, 200, accountOut(account))
+            }
+
+            if (suffix === '' && method === 'PATCH') {
+                const body = await readBody(req)
+                const nextActive = body.is_active === undefined ? account.is_active : body.is_active === true
+                const nextSuper = body.is_superuser === undefined ? account.is_superuser : body.is_superuser === true
+                const guard = lastSuperuserRefusal(account, nextActive, nextSuper)
+                if (guard) return conflict(res, guard)
+                if (body.email !== undefined) account.email = String(body.email)
+                if (body.first_name !== undefined) account.first_name = String(body.first_name)
+                if (body.last_name !== undefined) account.last_name = String(body.last_name)
+                if (body.is_staff !== undefined) account.is_staff = body.is_staff === true
+                account.is_active = nextActive
+                account.is_superuser = nextSuper
+                if (account.id === MOCK_USER_ID) {
+                    _state.user.is_staff = account.is_staff
+                    _state.user.is_superuser = account.is_superuser
+                }
+                return send(res, 200, accountOut(account))
+            }
+
+            if (suffix === '/password' && method === 'POST') {
+                const body = await readBody(req)
+                const password = String(body.new_password ?? '')
+                if (password.length < 8) {
+                    return send(res, 400, {
+                        detail: 'This password is too short. It must contain at least 8 characters.',
+                    })
+                }
+                account.password = password
+                return send(res, 200, { status: 'ok' })
+            }
+
+            if (suffix === '/2fa' && method === 'DELETE') {
+                account.is_2fa_enabled = false
+                if (account.id === MOCK_USER_ID) _state.user.is_2fa_enabled = false
+                return send(res, 200, { status: 'reset' })
+            }
+
+            if (suffix === '/groups' && method === 'PUT') {
+                const body = await readBody(req)
+                const groupIds = Array.isArray(body.group_ids) ? (body.group_ids as number[]).map(Number) : null
+                if (groupIds === null) return send(res, 400, { detail: 'group_ids is required.' })
+                const missing = groupIds.filter(id => !_state.authGroups.some(g => g.id === id))
+                if (missing.length) return send(res, 404, { detail: `No such group: ${missing.join(', ')}.` })
+                for (const group of _state.authGroups) {
+                    const shouldHold = groupIds.includes(group.id)
+                    group.memberIds = group.memberIds.filter(id => id !== account.id)
+                    if (shouldHold) group.memberIds.push(account.id)
+                }
+                return send(res, 200, accountOut(account))
+            }
+        }
+
+        if (tail === 'groups' && method === 'GET') {
+            return send(res, 200, _state.authGroups.map(groupOut))
+        }
+
+        if (tail === 'groups' && method === 'POST') {
+            const body = await readBody(req)
+            const name = String(body.name ?? '').trim()
+            if (!name) return send(res, 400, { detail: 'Group name is required.' })
+            if (_state.authGroups.some(g => g.name.toLowerCase() === name.toLowerCase())) {
+                return conflict(res, 'A group with that name already exists.')
+            }
+            const group: MockAuthGroup = {
+                id: _state.seq.group++,
+                name,
+                // Every registered key present with a null, mirroring the real payload —
+                // which is exactly the shape a client must not send straight back.
+                roles: Object.fromEntries(MOCK_ROLE_PROVIDERS.map(p => [p.key, null])),
+                memberIds: [],
+                grantCount: 0,
+            }
+            _state.authGroups.push(group)
+            return send(res, 201, groupOut(group))
+        }
+
+        const groupMatch = /^groups\/(\d+)(\/members)?$/.exec(tail)
+        if (groupMatch) {
+            const group = _state.authGroups.find(g => g.id === Number(groupMatch[1]))
+            if (!group) return send(res, 404, { detail: 'Group not found.' })
+            const suffix = groupMatch[2] ?? ''
+
+            if (suffix === '' && method === 'PATCH') {
+                const body = await readBody(req)
+                const roles = body.roles as Record<string, string | null> | undefined
+                // Validated before anything is written: the real endpoint writes
+                // name and roles in one transaction, so a bad role value must
+                // abort the rename with it rather than half-succeed.
+                if (roles) {
+                    for (const [key, value] of Object.entries(roles)) {
+                        const provider = MOCK_ROLE_PROVIDERS.find(p => p.key === key)
+                        if (!provider) return send(res, 400, { detail: `Unknown role: ${key}.` })
+                        if (value !== null && !provider.choices.some(choice => choice[0] === value)) {
+                            return send(res, 400, { detail: `"${value}" is not a valid value for ${key}.` })
+                        }
+                    }
+                }
+                if (body.name !== undefined) {
+                    const name = String(body.name).trim()
+                    if (!name) return send(res, 400, { detail: 'Group name is required.' })
+                    group.name = name
+                }
+                // Absent keys are left alone; an explicit null clears that role.
+                if (roles) Object.assign(group.roles, roles)
+                return send(res, 200, groupOut(group))
+            }
+
+            if (suffix === '' && method === 'DELETE') {
+                if (group.grantCount) {
+                    return conflict(
+                        res,
+                        `${group.grantCount} access grant(s) still target this group. Revoke them first — deleting `
+                        + 'the group would remove them silently, leaving no record of what access was withdrawn.',
+                    )
+                }
+                _state.authGroups = _state.authGroups.filter(g => g.id !== group.id)
+                return send(res, 200, { status: 'deleted' })
+            }
+
+            if (suffix === '/members' && method === 'PUT') {
+                const body = await readBody(req)
+                const userIds = Array.isArray(body.user_ids) ? (body.user_ids as number[]).map(Number) : null
+                if (userIds === null) return send(res, 400, { detail: 'user_ids is required.' })
+                const missing = userIds.filter(id => !_state.accounts.some(a => a.id === id))
+                if (missing.length) return send(res, 404, { detail: `No such account: ${missing.join(', ')}.` })
+                group.memberIds = [...userIds]
+                return send(res, 200, groupOut(group))
+            }
+        }
+
+        return notFound(res)
     }
 
     // ── Annotation export ─────────────────────────────────────────────────────
