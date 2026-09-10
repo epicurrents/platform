@@ -2,6 +2,7 @@
 import { reactive, ref, onMounted } from 'vue'
 import { useRouter } from 'vue-router'
 import { t } from '#i18n'
+import { formatDate } from '#lib/datetime'
 import { useLibraryStore } from '#stores/library'
 import { deleteCollection } from '#api/library'
 import { listRecordings } from '#api/recordings'
@@ -102,11 +103,6 @@ async function confirmDelete () {
     }
 }
 
-function formatDate (iso: string) {
-    return new Date(iso).toLocaleDateString(undefined, {
-        year: 'numeric', month: 'short', day: 'numeric',
-    })
-}
 </script>
 
 <template>

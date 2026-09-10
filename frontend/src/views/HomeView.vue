@@ -2,6 +2,7 @@
 import { ref, computed, onMounted, onUnmounted } from 'vue'
 import { RouterLink, useRouter } from 'vue-router'
 import { t } from '#i18n'
+import { formatDate } from '#lib/datetime'
 import { useRecordingsStore } from '#stores/recordings'
 import { deleteRecording, recordingName, type Recording } from '#api/recordings'
 import { showToast } from '#lib/toast'
@@ -61,12 +62,6 @@ function formatSize (bytes: number) {
         return `${(bytes / 1024).toFixed(0)} KB`
     }
     return `${(bytes / 1024 / 1024).toFixed(1)} MB`
-}
-
-function formatDate (iso: string) {
-    return new Date(iso).toLocaleDateString(undefined, {
-        year: 'numeric', month: 'short', day: 'numeric',
-    })
 }
 
 function openRecordings (hashes: string[]) {

@@ -2,6 +2,7 @@
 import { ref, onMounted } from 'vue'
 import { useRouter } from 'vue-router'
 import { t } from '#i18n'
+import { formatDate } from '#lib/datetime'
 import CreateDatasetDialog from '#components/CreateDatasetDialog.vue'
 import { useLibraryStore } from '#stores/library'
 import { deleteDataset } from '#api/library'
@@ -76,11 +77,6 @@ async function confirmDelete () {
     }
 }
 
-function formatDate (iso: string) {
-    return new Date(iso).toLocaleDateString(undefined, {
-        year: 'numeric', month: 'short', day: 'numeric',
-    })
-}
 </script>
 
 <template>
