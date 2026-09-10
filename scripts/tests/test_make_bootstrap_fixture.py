@@ -91,9 +91,17 @@ exit 9
 # `docker` that answers every probe by execing podman, so the name in that string is
 # the only thing separating the two runtimes.
 def _podman_stub(version="5.8.2", provider="Docker Compose version v5.1.4"):
+    # `compose version` answers in three lines, as the real thing does: podman
+    # announces the external provider before the version, so the version is not on
+    # line one. A single-line stub let a first-line capture pass the suite while
+    # failing on a real host, so the shape belongs in the fixture.
     return f"""
 case "$1 $2" in
-    "compose version") echo "{provider}"; exit 0 ;;
+    "compose version")
+        echo ">>>> Executing external compose provider \\"/bin/compose-provider\\". <<<<"
+        echo
+        echo "{provider}"
+        exit 0 ;;
 esac
 case "$1" in
     --version) echo "podman version {version}"; exit 0 ;;

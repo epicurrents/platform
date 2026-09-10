@@ -181,8 +181,12 @@ case "$1 $2" in
         echo "5.8.2"
         ;;
     "compose version")
-        # bootstrap-podman.sh greps for "Docker Compose" or "docker-compose"
-        # in the output to verify the v2 backend is wired in.
+        # Three lines, as the real thing prints them: podman announces the
+        # external provider first, so the version is not on line one. A
+        # single-line stub let a `head -1` capture pass the suite while dying on
+        # a real host, so the shape is part of the fixture, not an accident.
+        echo ">>>> Executing external compose provider \"/bin/docker-compose\". <<<<"
+        echo
         echo "Docker Compose version v5.1.4"
         ;;
     "--version "*)

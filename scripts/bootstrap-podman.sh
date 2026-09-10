@@ -209,7 +209,14 @@ ok "podman.socket active"
 
 # Confirm `podman compose` now resolves to docker-compose, not whatever
 # else might be lingering on PATH or pinned via containers.conf.
-PROVIDER="$(podman compose version 2>&1 | head -1)"
+#
+# Two things this line has to survive. Podman prints a banner naming the external
+# provider before the version, so the version is not on the first line — matching
+# line one matches the banner, which happens to contain the provider's path and so
+# gives the right answer for the wrong reason. And piping into `head` closes the
+# pipe while podman is still writing, which under `set -o pipefail` returns 141 and
+# ends the run here with no message at all. Read to EOF and pick the version line.
+PROVIDER="$(podman compose version 2>&1 | awk '/ompose version/ && !v { v = $0 } END { print v }' || true)"
 case "$PROVIDER" in
     *Docker\ Compose*|*docker-compose*)
         ok "podman compose backend: $PROVIDER"

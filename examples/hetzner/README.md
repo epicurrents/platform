@@ -25,6 +25,10 @@ Do not share one firewall between them. The evidence host's rules exist to make 
 
 `*.env` here is gitignored — each holds a read+write API token that can create and destroy servers.
 
+## Testing the bootstrap scripts
+
+The same tooling provisions throwaway instances for validating [scripts/bootstrap.sh](../../scripts/bootstrap.sh) and [scripts/bootstrap-podman.sh](../../scripts/bootstrap-podman.sh) against a real container runtime, which is the tier the mocked tests in [scripts/tests/](../../scripts/tests/) cannot reach. Protocol, gotchas and the verification checklist are in [testing-bootstrap.md](testing-bootstrap.md).
+
 ## Two things that bit us
 
 **Pass every SSH key you will ever want.** Hetzner injects them at creation only. A key missing from that list can afterwards be added only from a session you still hold, and losing all of them means rescue mode. A working key plus a recovery key kept elsewhere is the minimum; a second administrator's key belongs there too if one is ever likely. The script warns when given only one.

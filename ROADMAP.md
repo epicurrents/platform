@@ -17,11 +17,15 @@ Items are grouped by priority. Within a tier the order is loose — re-sort by t
 
 The two security entries below were gated on the evidence host, which is now in place. Ordering rationale in each entry.
 
+- Infrastructure — teach the bootstraps the viewer's package setup, without which no fresh clone can build the frontend (see the entry below)
 - Security — Phase 7 chain-head anchoring, immediately after a successful deployment (not in the first test version, but next: without it the audit trail's tamper-evidence stops at whoever holds `ACTIVITY_HASH_KEYS`, since a host-root attacker can forge rows and re-seal the chain with nothing anywhere to contradict them. The evidence host as built stores backups and logs and detects none of that. A Celery task publishes each shard's `(content_type, sequence_no, after_hash)` on a cadence, signed with a key deliberately **not** `ACTIVITY_HASH_KEYS` so forging rows and forging anchors need two separate thefts; the receiver compares each bundle's previous head against what the chain now claims at that sequence number and emits `audit.anchor_mismatch` on divergence. The design note prefers federated peers as transport — mutual anchoring hosted by an organisation the attacker has not compromised — with the evidence host as transport two; the evidence-host path has no dependency and is what makes this deployable right after the first deployment succeeds)
 - Federation — peer version gating, suspension, and a reason the other side can act on (a peer running a release with a known flaw is a hole in *this* instance's perimeter, since grants let it reach local data. Each side enforces its own `FEDERATION_MINIMUM_PEER_VERSION` rather than negotiating one; the version travels as a claim inside the signed JWT and over an authenticated peer-info endpoint, **not** in `/.well-known/epicurrents-federation.json`, which is unauthenticated and would advertise to the whole internet which release each instance is running. Existing grants are *suspended* with a reason and a timestamp rather than deleted, so an upgrade can restore them; rejection returns a machine-readable reason — `peer_version_unsupported`, the minimum required, and the version seen — which the outdated instance stores and surfaces to its own operator as "peer X suspended this connection, upgrade to Y". Fail closed on an absent or unparseable version. Distinguish this from compromise: version gating catches *outdated*, and revoking an instance known to be compromised is peer revocation, which stays manual until there is a signed advisory channel to distribute. Depends on `epicurrents.version`; follows the evidence host because the suspension and rejection events are among the first things worth shipping off-host)
 - Platform — operator-triggered upgrade for instances without shell access (a deployment maintained by a hosting service has no SSH for its owner, so a suspended federation grant or a security release leaves them unable to act — which is why this follows the version gate rather than preceding it. The constraint that shapes the design: the web application must never hold the capability to execute a host operation, or a web compromise becomes host code execution and the containment model inverts. So the UI writes an audited intent row and nothing more, and a privileged agent outside the web container — a host systemd unit, not a compose service holding `/var/run/docker.sock`, since that socket is root on the host and is on the auditd watch list in the intrusion-detection note — picks it up and invokes `update.sh`. Most of the work already exists there: acquire source, snapshot the database and `.env`, build, stop application services, migrate, collectstatic, recreate, health-check — plus `--rollback`, which restores the snapshot. The agent's job is to choose the source, gate on the health check and call `--rollback` when it fails, not to reimplement any of that. **Archive mode is the vehicle**: a distribution tarball ships prebuilt bundles, so it needs no node and no frontend build on the target, which is what makes an upgrade viable on a small hosted instance. **The gap it must close is verification** — `update.sh` performs none: it checks the file exists and has a docker-compose.yml at its root, then extracts. Correct when a person puts the tarball in ./update/, since that person is the trust decision; unusable when a web request selects it. A detached signature checked before extraction is the missing piece, and it belongs in `update.sh` behind a setting rather than only in the agent, so the manual path gets it too. Note also that step 4 stops the application services: the UI that requested the upgrade goes away mid-run, which is the reason the request has to be a persisted intent row rather than a synchronous call. **Measured on a real deployment 2026-08-29**: the outage is ~17 s and presents as `502` from Caddy rather than a refused connection, because the TLS terminator stays up while only the backend cycles — short enough for a polling client to ride out and reconnect, so the UI can show progress rather than lose the session. No instability followed, so a health gate can accept the first `200` without a settling period. **And the failure path is not `--rollback` alone**: rollback restores the database and `.env`, and warns that it restores neither code nor image. An update carrying migrations that then failed its health check would be rolled back onto new code with an old schema — worse than the failure being recovered from — so the agent must retain the *previous archive* and re-apply it, not just the snapshot. Rollback is otherwise verified working, including its refusal to touch anything when a snapshot is incomplete, and a single-transaction restore that leaves the database unchanged on failure. Superuser plus a second factor to request, rate limited, security-logged; no arbitrary version input, only the pinned channel's latest, or the upgrade endpoint becomes a downgrade-to-vulnerable endpoint. Confirm first that nobody has shell in the target case: if the hosting service maintains the instance, upgrades may simply be their job)
 
 ### 🟡 Medium
+
+- Infrastructure — relabel the checkout for SELinux in [scripts/bootstrap-podman.sh](scripts/bootstrap-podman.sh), or refuse with an explanation: on an Enforcing RHEL host the containers cannot read the bind mount and the run dies on a bare `Permission denied` for `/code/manage.py`
+- Infrastructure — make the first bootstrap pass atomic: it copies `.env.example` to `.env` before `init_env` populates it, so a failure in between leaves a file that makes every later run take the second-pass branch and die on a missing `REDIS_PASSWORD` instead of resuming
 - Federation — carry a dataset's folder structure to the peer, so a recipient expecting a layout (BIDS) receives one (`DatasetItem.folder` already describes the tree on the owning side; the federated listing and the FUSE mount are what flatten it)
 - Infra — a deployment-local compose overlay the deploy scripts honour, for pins and tweaks that must survive an update (explicit `-f` flags suppress the override file Docker would otherwise load on its own, so today there is nowhere for them to live)
 - Compute — ship pre-generated lead fields as PWA-cached static files (backend, deploy wiring, service-worker rules and the SPA's fetch all shipped; what remains is confirming the caching behaviour against a deployment that serves the generated tree)
@@ -1065,6 +1069,40 @@ Mechanical:
 5. Remove the inline reversion comment block at the top of `docker-compose.yml`.
 
 Both shapes work on Docker Engine ≥ 25; the revert simply trades 5 volumes for 1.
+
+---
+
+## 🔴 Infrastructure — no fresh clone can build the frontend
+
+`bootstrap.sh` claims to take a machine from nothing to a running platform, and it cannot: step 7 fails on any host that has not built the viewer before. Found by running it on a clean Ubuntu 24.04 instance, and reproduced identically with pristine `origin/main` scripts, so it is not a consequence of the bootstrap refactor that preceded this entry.
+
+### What happens
+
+`frontend/viewer` is a shell. The submodule carries `package.json`, `scripts/`, `profiles/` and the setup machinery, but **not** `package-lock.json` and **not** the workspace packages (`epicurrents/core`, `util/scoped-event-bus`, the readers and modules). Those are separate repositories, cloned by the viewer's own `npm run setup`. Nothing in the bootstrap path runs it, so the `frontend-build` service's `npm ci` in the viewer directory dies on a lockfile that is not there.
+
+A developer machine hides this: whoever has built the viewer once has the packages on disk, and the submodule update leaves them alone.
+
+### Why it surfaces as the wrong error
+
+The service's script is `sh -ec`, and the comment on it in [docker-compose.yml](docker-compose.yml) says any failing step aborts the build. It does not. The failing command is `cd viewer && npm ci && npm run build:tsc-all`, and POSIX `set -e` ignores a non-zero status from any member of an `&&` list other than the last, so the run continues to `npm run build:viewer` and fails there with:
+
+```
+Error: Vite not found at /repo/frontend/viewer/node_modules/.bin/vite.
+```
+
+which sends the reader after a missing binary rather than a missing checkout. The real message has scrolled past by then.
+
+### The fix
+
+Run the viewer's package setup as part of the build — inside the same container, since the deploy host has no Node. `npm run setup -- --profile full` does fetch the packages and write the lockfile; on the instance where this was diagnosed it then failed building `@epicurrents/interface`, which is a separate problem in the viewer repository and needs settling there first.
+
+Whatever shape the fix takes, the `sh -ec` hole is worth closing at the same time: either split the `&&` chain onto separate lines or make the failure explicit, so the next breakage names itself.
+
+### How this was found, and what else it means
+
+Tier 3, as [the Tier 3 entry](#-testing--container-based-integration-tests-for-the-bootstrap-pipeline-tier-3) anticipated: two throwaway Hetzner instances, one per distro family, protocol in [examples/hetzner/testing-bootstrap.md](examples/hetzner/testing-bootstrap.md). Neither the mocked script tests nor the `bootstrap-fixture-smoke` CI job can see this — the CI job builds a `--demo` package over a stubbed UI bundle and never builds the real frontend.
+
+Note the blast radius is narrower than it looks: a **distribution package** ships prebuilt bundles and never runs this step, so recipients are unaffected. It is the clone-and-bootstrap path that is broken, which is the path a new deployment or a new contributor takes.
 
 ---
 

@@ -693,8 +693,12 @@ else
     # these files rely on, so the provider has to be docker-compose v2 — the same
     # requirement scripts/bootstrap-podman.sh enforces.
     # Read to EOF rather than piping into `head` — under `set -o pipefail` an early
-    # close kills the producer and takes the whole substitution with it.
-    PODMAN_PROVIDER="$(sudo -E podman compose version 2>&1 | awk 'NR == 1 { v = $0 } END { print v }' || true)"
+    # close kills the producer and takes the whole substitution with it. Pick the
+    # version line rather than the first: podman prints a banner naming the external
+    # provider ahead of it, and that banner carries the provider's path, so matching
+    # line one answers correctly for the wrong reason and stops doing so the moment
+    # the banner is reworded.
+    PODMAN_PROVIDER="$(sudo -E podman compose version 2>&1 | awk '/ompose version/ && !v { v = $0 } END { print v }' || true)"
     case "$PODMAN_PROVIDER" in
         *[Dd]ocker\ [Cc]ompose*|*docker-compose*) : ;;
         *)
