@@ -47,7 +47,21 @@ cd "$ROOT"
 # against the plain dev compose, never by updating a remote VM in place. So there
 # is no dev mode here: the overlay is a constant, not a flag. Array form keeps the
 # flags from word-splitting (and shellcheck quiet).
-COMPOSE=(docker compose -f docker-compose.yml -f docker-compose.prod.yml)
+# Docker or Podman, settled the same way the distribution's start.sh settles it:
+# podman-docker installs a `docker` that answers by execing podman, so the name in
+# the version string is the discriminator, not whether the command exists. Podman
+# runs rootful because every service declares `user: "1000:1000"` against a bind
+# mount, and only a rootful runtime maps that uid to the deployment's owner.
+if command -v docker >/dev/null 2>&1 && ! docker --version 2>&1 | grep -qi podman; then
+    CONTAINER_RUNTIME=docker
+    COMPOSE=(docker compose -f docker-compose.yml -f docker-compose.prod.yml)
+elif command -v podman >/dev/null 2>&1; then
+    CONTAINER_RUNTIME=podman
+    COMPOSE=(sudo -E podman compose -f docker-compose.yml -f docker-compose.prod.yml)
+else
+    CONTAINER_RUNTIME=""
+    COMPOSE=(docker compose -f docker-compose.yml -f docker-compose.prod.yml)
+fi
 # The TLS proxy overlay is selected the same way bootstrap.sh selects it — a
 # PROXY_DOMAIN value in .env. This is not cosmetic: a stack brought up with the
 # overlay has to be updated with it too, or `up -d` treats the running caddy
@@ -107,7 +121,7 @@ while [ $# -gt 0 ]; do
 done
 
 [ -f .env ] || die "No .env in $ROOT — initialize the deployment first (./start.sh in a distribution, or 'python manage.py init_env' in a checkout)."
-command -v docker >/dev/null 2>&1 || die "docker is required but not found."
+[ -n "$CONTAINER_RUNTIME" ] || die "No container runtime found — this needs Docker Engine or Podman, either one with Compose v2."
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 

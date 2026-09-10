@@ -79,10 +79,38 @@ case "$1 $2" in
     "compose version") echo "Docker Compose version v2.29.0"; exit 0 ;;
 esac
 case "$1" in
+    --version) echo "Docker version 28.1.1, build abcdefg"; exit 0 ;;
     version) echo "28.1.1"; exit 0 ;;
 esac
 echo "STUB-DOCKER $*" >&2
 exit 9
+"""
+
+# The Podman counterpart, with the same "anything else is the build" marker. Its
+# `--version` string is what the runtime detection reads: podman-docker installs a
+# `docker` that answers every probe by execing podman, so the name in that string is
+# the only thing separating the two runtimes.
+def _podman_stub(version="5.8.2", provider="Docker Compose version v5.1.4"):
+    return f"""
+case "$1 $2" in
+    "compose version") echo "{provider}"; exit 0 ;;
+esac
+case "$1" in
+    --version) echo "podman version {version}"; exit 0 ;;
+    version) echo "{version}"; exit 0 ;;
+esac
+echo "STUB-PODMAN $*" >&2
+exit 9
+"""
+
+
+#: podman-docker's shim: a `docker` that is Podman wearing the other name.
+_PODMAN_DOCKER_SHIM = _podman_stub()
+
+#: sudo, as the Podman path invokes it — strip sudo's own flags, run the rest.
+_SUDO_STUB = """
+while [ "${1#-}" != "$1" ]; do shift; done
+exec "$@"
 """
 
 
@@ -533,14 +561,97 @@ class TestStartShPreflight:
             env=env,
         )
 
-    def test_refuses_when_docker_is_absent(self, tmp_path):
+    def test_refuses_when_no_container_runtime_is_present(self, tmp_path):
         dest = tmp_path / "dist"
         assert _run(dest, "--dist").returncode == 0
         empty = tmp_path / "emptybin"
         empty.mkdir()
         result = self._start(dest, f"{empty}:/usr/bin:/bin")
         assert result.returncode != 0
-        assert "docker is not installed" in result.stderr
+        assert "No container runtime found" in result.stderr
+
+    def test_accepts_a_podman_host_and_drives_compose_rootful(self, tmp_path):
+        # Podman is a supported runtime, not a degraded one: the compose files were
+        # moved off `volume.subpath:` precisely so it works. It runs rootful because
+        # every service declares user 1000:1000 against a bind mount, and only a
+        # rootful runtime maps that uid to the tree's owner — so the marker has to
+        # show compose reached the build *through sudo*.
+        dest = tmp_path / "dist"
+        assert _run(dest, "--dist").returncode == 0
+        path = _stub_path(
+            tmp_path,
+            podman=_podman_stub(),
+            sudo=_SUDO_STUB,
+            getent="exit 0",
+            stat=_stat_stub(uid=1000, gid=1000, mode=755),
+        )
+        result = self._start(dest, path)
+        assert "No container runtime found" not in result.stderr
+        assert "STUB-PODMAN" in result.stderr, "preflight stopped before the build"
+        assert "compose -f docker-compose.yml build web" in result.stderr
+
+    def test_podman_wearing_the_docker_name_is_not_taken_for_docker(self, tmp_path):
+        # podman-docker answers `docker version` with Podman's own number, which the
+        # Docker floor of 25 then rejects — a host that is perfectly able to run this
+        # refused for looking like an ancient Docker. Detection reads the name, so
+        # the shim resolves to the Podman path and its floor instead.
+        dest = tmp_path / "dist"
+        assert _run(dest, "--dist").returncode == 0
+        path = _stub_path(
+            tmp_path,
+            docker=_PODMAN_DOCKER_SHIM,
+            podman=_podman_stub(),
+            sudo=_SUDO_STUB,
+            getent="exit 0",
+            stat=_stat_stub(uid=1000, gid=1000, mode=755),
+        )
+        result = self._start(dest, path)
+        assert "Docker Engine 25+" not in result.stderr
+        assert "STUB-PODMAN" in result.stderr
+
+    def test_refuses_podman_compose_as_the_provider(self, tmp_path):
+        # podman-compose silently ignores parts of the spec these files rely on, so
+        # it is refused at the door rather than midway through a bring-up.
+        dest = tmp_path / "dist"
+        assert _run(dest, "--dist").returncode == 0
+        path = _stub_path(
+            tmp_path,
+            podman=_podman_stub(provider="podman-compose version 1.0.6"),
+            sudo=_SUDO_STUB,
+        )
+        result = self._start(dest, path)
+        assert result.returncode != 0
+        assert "not backed by docker-compose v2" in result.stderr
+        assert "STUB-PODMAN" not in result.stderr, "the build started on the wrong provider"
+
+    def test_refuses_a_podman_below_the_floor(self, tmp_path):
+        dest = tmp_path / "dist"
+        assert _run(dest, "--dist").returncode == 0
+        path = _stub_path(
+            tmp_path,
+            podman=_podman_stub(version="3.4.7"),
+            sudo=_SUDO_STUB,
+        )
+        result = self._start(dest, path)
+        assert result.returncode != 0
+        assert "Podman 4+ is required" in result.stderr
+
+    def test_a_real_docker_wins_over_a_podman_beside_it(self, tmp_path):
+        # Both installed is ordinary on a developer machine. The Docker path is the
+        # one that needs no sudo, so it should be chosen when it is genuinely there.
+        dest = tmp_path / "dist"
+        assert _run(dest, "--dist").returncode == 0
+        path = _stub_path(
+            tmp_path,
+            docker=_DOCKER_STUB,
+            podman=_podman_stub(),
+            sudo=_SUDO_STUB,
+            getent="exit 0",
+            stat=_stat_stub(uid=1000, gid=1000, mode=755),
+        )
+        result = self._start(dest, path)
+        assert "STUB-DOCKER" in result.stderr
+        assert "STUB-PODMAN" not in result.stderr
 
     def test_refuses_a_package_without_the_projects_directory(self, tmp_path):
         # The image build copies projects/ whether or not a project is active, and

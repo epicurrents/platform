@@ -620,46 +620,116 @@ fi
 # Each of these is a condition that otherwise surfaces minutes later as a message
 # about something else — a BuildKit checksum error naming a ref, a permission
 # denied inside a migration — with a half-built deployment already on the disk.
-# The order is dependency order: no daemon check can run before docker exists.
+# The order is dependency order: no daemon check can run before a runtime exists.
+#
+# Two runtimes are supported, both driven by docker-compose v2. Podman is not a
+# lesser path here: the compose files were deliberately moved off `volume.subpath:`
+# to per-domain named volumes because Podman's Docker-API socket drops that option,
+# and the resulting layout was verified end to end on Podman. What separates the two
+# is how compose is invoked, not what the stack can do.
 
-if ! command -v docker >/dev/null 2>&1; then
-    echo "docker is not installed. This package needs Docker with Compose v2 and" >&2
-    echo "nothing else — no Python, Node or database." >&2
+CONTAINER_RUNTIME=""
+if command -v docker >/dev/null 2>&1 && ! docker --version 2>&1 | grep -qi podman; then
+    CONTAINER_RUNTIME=docker
+elif command -v podman >/dev/null 2>&1; then
+    CONTAINER_RUNTIME=podman
+fi
+# podman-docker installs a `docker` that answers every command below by execing
+# podman, so the name in the version string is what tells the two apart — not
+# whether the command exists. Checking that first keeps a host with both from
+# being driven as Docker through a shim.
+
+if [ -z "$CONTAINER_RUNTIME" ]; then
+    echo "No container runtime found. This package needs either Docker Engine or" >&2
+    echo "Podman, each with Compose v2, and nothing else — no Python, Node or" >&2
+    echo "database." >&2
     if [ -f ./prepare-host.sh ]; then
-        echo "On a fresh Linux server, run the host preparation first:" >&2
+        echo "On a fresh Debian/Ubuntu server, run the host preparation first:" >&2
         echo "    sudo ./prepare-host.sh" >&2
         echo "It installs Docker and creates the account this deployment runs as." >&2
+        echo "On RHEL and its rebuilds, follow INSTALL-RHEL.md instead." >&2
     else
         echo "Install Docker Engine: https://docs.docker.com/engine/install/" >&2
     fi
     exit 1
 fi
 
-# Compose v1 is a separate `docker-compose` binary and cannot read this package's
-# compose files, so its presence is not a substitute for the plugin.
-if ! docker compose version >/dev/null 2>&1; then
-    echo "docker is installed but 'docker compose' is not. Compose v2 ships as the" >&2
-    echo "docker-compose-plugin package; the standalone docker-compose v1 binary" >&2
-    echo "cannot read these compose files." >&2
-    exit 1
+if [ "$CONTAINER_RUNTIME" = docker ]; then
+    # Compose v1 is a separate `docker-compose` binary and cannot read this
+    # package's compose files, so its presence is not a substitute for the plugin.
+    if ! docker compose version >/dev/null 2>&1; then
+        echo "docker is installed but 'docker compose' is not. Compose v2 ships as the" >&2
+        echo "docker-compose-plugin package; the standalone docker-compose v1 binary" >&2
+        echo "cannot read these compose files." >&2
+        exit 1
+    fi
+
+    RUNTIME_VERSION="$(docker version --format '{{.Server.Version}}' 2>/dev/null || true)"
+    if [ -z "$RUNTIME_VERSION" ]; then
+        echo "The Docker daemon is not reachable. Check that it is running, and that" >&2
+        echo "this user is in the docker group — group membership applies only to a" >&2
+        echo "new login session, so it needs a fresh login after usermod." >&2
+        exit 1
+    fi
+    # The same floor bootstrap.sh enforces.
+    RUNTIME_FLOOR=25
+    RUNTIME_LABEL="Docker Engine"
+else
+    # Rootful, deliberately. Every service declares `user: "1000:1000"` against a
+    # bind mount of this directory, and only a rootful runtime maps container uid
+    # 1000 to host uid 1000. Rootless Podman remaps it into the invoking user's
+    # subuid range, where the tree this package unpacked as uid 1000 is one the
+    # containers cannot write — the same failure as unpacking as root, arriving
+    # from the opposite direction. So compose runs under sudo even though the
+    # script itself must not.
+    if ! command -v sudo >/dev/null 2>&1; then
+        echo "Podman needs sudo here: the stack runs rootful, because only a rootful" >&2
+        echo "runtime maps the containers' uid 1000 to this directory's owner." >&2
+        exit 1
+    fi
+
+    # `podman compose` is a shim that delegates to whichever compose provider it
+    # finds. podman-compose (the Python one) silently ignores parts of the spec
+    # these files rely on, so the provider has to be docker-compose v2 — the same
+    # requirement scripts/bootstrap-podman.sh enforces.
+    # Read to EOF rather than piping into `head` — under `set -o pipefail` an early
+    # close kills the producer and takes the whole substitution with it.
+    PODMAN_PROVIDER="$(sudo -E podman compose version 2>&1 | awk 'NR == 1 { v = $0 } END { print v }' || true)"
+    case "$PODMAN_PROVIDER" in
+        *[Dd]ocker\ [Cc]ompose*|*docker-compose*) : ;;
+        *)
+            echo "podman compose is not backed by docker-compose v2." >&2
+            echo "Got: ${PODMAN_PROVIDER:-nothing}" >&2
+            echo "Install Docker Inc.'s docker-compose binary and remove podman-compose;" >&2
+            echo "INSTALL-RHEL.md has the commands." >&2
+            exit 1
+            ;;
+    esac
+
+    # `podman --version`, not `podman version --format '{{.Server.Version}}'`. Podman
+    # has no daemon, so there is often no Server section to template against: the
+    # format either errors or yields an empty string, and an empty string here reads
+    # as "not installed" for a runtime that is working fine.
+    RUNTIME_VERSION="$(podman --version 2>/dev/null | awk '{print $NF}' || true)"
+    if [ -z "$RUNTIME_VERSION" ]; then
+        echo "Podman is installed but not answering. Check that the rootful socket is" >&2
+        echo "enabled: sudo systemctl enable --now podman.socket" >&2
+        exit 1
+    fi
+    # Podman 4 is where its Docker-API compose compatibility became usable; the
+    # combination this was verified against is newer (Podman 5.8.2 with
+    # docker-compose 5.1.4 on RHEL 9), and anything in between is expected to work.
+    RUNTIME_FLOOR=4
+    RUNTIME_LABEL="Podman"
 fi
 
-DOCKER_VERSION="$(docker version --format '{{.Server.Version}}' 2>/dev/null || true)"
-if [ -z "$DOCKER_VERSION" ]; then
-    echo "The Docker daemon is not reachable. Check that it is running, and that" >&2
-    echo "this user is in the docker group — group membership applies only to a" >&2
-    echo "new login session, so it needs a fresh login after usermod." >&2
-    exit 1
-fi
-# The same floor bootstrap.sh enforces: below 25 the volume subpath syntax in the
-# compose files is accepted and then mounts the wrong thing.
-case "${DOCKER_VERSION%%.*}" in
+case "${RUNTIME_VERSION%%.*}" in
     ""|*[!0-9]*)
-        echo "Warning: cannot parse the Docker Engine version ($DOCKER_VERSION); continuing." >&2
+        echo "Warning: cannot parse the ${RUNTIME_LABEL} version (${RUNTIME_VERSION}); continuing." >&2
         ;;
     *)
-        if [ "${DOCKER_VERSION%%.*}" -lt 25 ]; then
-            echo "Docker Engine 25+ is required for volume subpath support (found $DOCKER_VERSION)." >&2
+        if [ "${RUNTIME_VERSION%%.*}" -lt "$RUNTIME_FLOOR" ]; then
+            echo "${RUNTIME_LABEL} ${RUNTIME_FLOOR}+ is required (found ${RUNTIME_VERSION})." >&2
             exit 1
         fi
         ;;
@@ -770,7 +840,14 @@ read_env() {
     grep -E "^$1=" .env | head -1 | cut -d= -f2- | tr -d ' "' || true
 }
 
-COMPOSE=(docker compose -f docker-compose.yml)
+# Built from the runtime the preflight settled on. Everything below drives the
+# stack through this one array, so supporting a second runtime is a question of
+# how compose is spelled and nothing further.
+if [ "$CONTAINER_RUNTIME" = podman ]; then
+    COMPOSE=(sudo -E podman compose -f docker-compose.yml)
+else
+    COMPOSE=(docker compose -f docker-compose.yml)
+fi
 PROXY_DOMAIN="$(read_env PROXY_DOMAIN)"
 if [ -n "$PROXY_DOMAIN" ]; then
     COMPOSE+=(-f docker-compose.prod.yml -f docker-compose.proxy.yml)
@@ -1287,9 +1364,12 @@ each step.
 
 ## What you need
 
-- **Docker** with Docker Compose v2 — Docker Desktop on macOS/Windows, or Docker
-  Engine on Linux. Engine 25 or newer. Nothing else: no Python, Node, or
-  database to install.
+- **A container runtime with Docker Compose v2** — Docker Desktop on
+  macOS/Windows, or Docker Engine 25+ / Podman 4+ on Linux. Nothing else: no
+  Python, Node, or database to install. `start.sh` detects which runtime is
+  present and drives it; on Podman it runs the stack rootful through `sudo`,
+  because only a rootful runtime maps the containers' uid 1000 to this
+  directory's owner. On RHEL and its rebuilds, see `INSTALL-RHEL.md`.
 - On Linux, **a normal user account, not root**. Every container runs as uid
   1000 against this directory, so the deployment has to belong to the account
   that runs it. A tree unpacked as root is one the containers cannot write.

@@ -90,6 +90,8 @@ The two security entries below were gated on the evidence host, which is now in 
 - Normalise hex hash convention to lowercase across recordings + annotations
 - Infrastructure — make the web image's entrypoint skip the postgres wait for DB-less commands
 - Infrastructure — revert to single `data` volume + `volume.subpath:` once Podman's Docker-API translates it
+- Infrastructure — bring [scripts/bootstrap-podman.sh](scripts/bootstrap-podman.sh) back level with [scripts/bootstrap.sh](scripts/bootstrap.sh) (see the entry below)
+- Infrastructure — decide whether the Docker Engine floor of 25 still earns its keep now that `volume.subpath:` is gone
 - Recordings — recoverable ingest state machine so a dropped Celery task is re-derivable from `Recording.status` (the broker now persists with an `everysec` fsync window; this closes the remaining second and also covers a worker dying mid-task)
 - Tooling — schedule periodic `phi-exposure` full-surface sweeps (prompt keyword `full-surface`); the per-commit gate stays diff-scoped
 - Compute — move lead-field computation into a Celery task (bounded synchronous computation shipped as the interim guard)
@@ -1064,6 +1066,35 @@ Mechanical:
 5. Remove the inline reversion comment block at the top of `docker-compose.yml`.
 
 Both shapes work on Docker Engine ≥ 25; the revert simply trades 5 volumes for 1.
+
+---
+
+## 🟡 Infrastructure — bring `bootstrap-podman.sh` back level with `bootstrap.sh`
+
+The distribution path now runs on either runtime: the generated start.sh and the bundled [scripts/update.sh](scripts/update.sh) detect Docker or Podman and build their compose invocation to match. The **checkout** path did not come along. [scripts/bootstrap-podman.sh](scripts/bootstrap-podman.sh) has not been touched since the initial release, while [scripts/bootstrap.sh](scripts/bootstrap.sh) has gained five commits, so a Podman checkout deployment silently skips steps a Docker one performs.
+
+### What is missing
+
+Compared step by step against bootstrap.sh, the Podman script has no equivalent of:
+
+- **4c. Clone the active project** — `EPICURRENTS_PROJECT` names a project that is never fetched.
+- **7a. Vendor the Pyodide runtime** — the browser assets the viewer loads at deploy are never staged, so viewer features that need them fail in the browser rather than at bootstrap.
+- **8b. Activate the configured project** — `activate_project` never runs, so the project's migrations are never applied even when its tree is present.
+- **9a. Static lead fields** — never generated.
+- **The TLS proxy overlay** — no `PROXY_DOMAIN` branch, so the stack comes up without its terminator.
+- **The `.env` value guard** against silent truncation by `$` and `#` (commit 4a477f0).
+
+### Why it is worth doing rather than deleting
+
+Podman is not a second-class runtime here — the compose files carry the per-domain volume layout specifically so it works, and the arrangement was verified end to end on Podman 5.8.2 with docker-compose 5.1.4 on RHEL 9. A RHEL site that clones the repository rather than taking a distribution package is the case this script exists for, and it is the case most likely to be an institutional deployment.
+
+### The shape of the fix
+
+The two scripts differ only in how compose is spelled (`sudo -E podman compose` versus `docker compose`) and in the prerequisite install step. Everything between is duplicated prose that has now drifted once and will drift again. Prefer factoring the shared body into `scripts/lib/` with the runtime injected — the same `CONTAINER_RUNTIME` shape update.sh now uses — over hand-porting the six missing steps and leaving two copies to diverge a second time.
+
+### Also worth settling while here
+
+The Docker Engine floor of 25 is justified in both scripts, and in the generated `start.sh`, by `volume.subpath:` support. That option no longer appears in any compose file — only in comments explaining why it was removed. Either the floor has a reason nobody has written down, or it is vestigial and should drop to whatever the compose files actually need.
 
 ---
 

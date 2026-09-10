@@ -98,6 +98,68 @@ class TestOwnershipPreflight:
         assert "not writable by uid 1000" not in result.stdout + result.stderr
 
 
+#: A podman stub shaped like DOCKER_PS_RUNNING, plus the `--version` string that
+#: identifies the runtime. Detection reads that name rather than trusting the command
+#: name, because podman-docker installs a `docker` that is this same binary.
+PODMAN_PS_RUNNING = r"""
+case "$1" in
+    --version) echo "podman version 5.8.2"; exit 0 ;;
+esac
+case "$*" in
+    *" ps "*) echo running ;;
+    *" exec "*) cat >/dev/null 2>&1 || true ;;
+esac
+"""
+
+
+class TestRuntimeDetection:
+    """An update has to drive the same runtime start.sh brought the stack up on.
+
+    Picking the other one does not fail loudly — compose would talk to a daemon that
+    knows nothing of these containers and cheerfully create a second, empty stack.
+    """
+
+    @requires_gnu_stat
+    def test_a_docker_host_drives_docker_compose(self, fakebin, tmp_path):
+        _deploy(fakebin, tmp_path)
+        result = run_script("update.sh", fakebin, cwd=tmp_path, args=["--from", "repo", "--no-pull"])
+        assert result.returncode == 0, result.stderr
+        assert fakebin.has_call("docker compose -f docker-compose.yml")
+        assert not fakebin.has_call("podman compose")
+
+    @requires_gnu_stat
+    def test_a_podman_host_drives_podman_compose_through_sudo(self, fakebin, tmp_path):
+        _deploy(fakebin, tmp_path)
+        fakebin.remove("docker")
+        fakebin.stub("podman", body=PODMAN_PS_RUNNING)
+        result = run_script("update.sh", fakebin, cwd=tmp_path, args=["--from", "repo", "--no-pull"])
+        assert result.returncode == 0, result.stderr
+        # The conftest sudo stub strips sudo's flags and execs the rest, so a call
+        # logged as `podman compose …` is one that arrived through sudo.
+        assert fakebin.has_call("podman compose -f docker-compose.yml")
+        assert fakebin.has_call("sudo -E podman compose")
+
+    @requires_gnu_stat
+    def test_podman_wearing_the_docker_name_is_not_taken_for_docker(self, fakebin, tmp_path):
+        _deploy(fakebin, tmp_path)
+        fakebin.stub("docker", body=PODMAN_PS_RUNNING)
+        fakebin.stub("podman", body=PODMAN_PS_RUNNING)
+        result = run_script("update.sh", fakebin, cwd=tmp_path, args=["--from", "repo", "--no-pull"])
+        assert result.returncode == 0, result.stderr
+        assert fakebin.has_call("sudo -E podman compose")
+
+    def test_no_runtime_at_all_aborts(self, fakebin, tmp_path):
+        # Both, deliberately: the shared fixture stubs podman for the
+        # bootstrap-podman.sh tests, so removing only docker leaves a host that
+        # still has a runtime and this would pass without testing anything.
+        _deploy(fakebin, tmp_path)
+        fakebin.remove("docker")
+        fakebin.remove("podman")
+        result = run_script("update.sh", fakebin, cwd=tmp_path, args=["--from", "repo", "--no-pull"])
+        assert result.returncode != 0
+        assert "No container runtime found" in result.stderr
+
+
 class TestGuards:
     def test_missing_env_aborts(self, fakebin, tmp_path):
         # No .env written → the deployment is uninitialized.
