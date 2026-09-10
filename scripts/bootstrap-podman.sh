@@ -1,33 +1,39 @@
 #!/usr/bin/env bash
 # bootstrap-podman.sh — bring up the Epicurrents platform on a Podman host.
 #
-# Mirrors scripts/bootstrap.sh but targets Podman instead of Docker Engine,
-# backed by docker-compose v2 (Docker Inc.'s Go binary) talking to Podman
-# over its Docker-compatible socket. Primarily exercised on RHEL 9; Rocky /
-# Alma / Fedora paths are stubbed in but less-tested. Runs Podman *rootful*
-# (`sudo podman …`); rootless support is ROADMAP'd alongside the entrypoint
-# refactor.
+# The Podman counterpart to scripts/bootstrap.sh. The two differ in exactly two
+# things: which prerequisites they install, and how compose is spelled — here
+# `sudo -E podman compose`, there `docker compose`. Everything after the
+# prerequisites is the same run, and lives in scripts/lib/bootstrap_plan.sh and
+# scripts/lib/bootstrap_steps.sh so that it cannot drift between the two again.
+# It did drift once: this script sat untouched through six changes to the Docker
+# path and silently stopped cloning the active project, vendoring the Pyodide
+# runtime, activating the project, generating lead fields, selecting the TLS
+# proxy overlay, and guarding .env values against truncation.
 #
-# Why docker-compose v2 and not podman-compose: the project's compose files
-# rely on `volume.subpath` to share one `data` volume across postgres /
-# recordings / staging / celery / borg. podman-compose (Python wrapper)
-# silently ignores `subpath`, which mounts the whole data volume into
-# postgres and breaks initdb. docker-compose v2 speaks the Compose
-# Specification natively, including subpath, and works against the rootful
-# podman socket.
+# Backed by docker-compose v2 (Docker Inc.'s Go binary) talking to Podman over
+# its Docker-compatible socket. Primarily exercised on RHEL 9; Rocky / Alma /
+# Fedora paths are stubbed in but less-tested.
+#
+# Why docker-compose v2 and not podman-compose: podman-compose is a Python
+# reimplementation that silently ignores parts of the Compose specification these
+# files rely on. docker-compose v2 speaks the specification natively and works
+# against the rootful podman socket.
+#
+# Why rootful: every service declares `user: "1000:1000"` against a bind mount of
+# the deployment, and only a rootful runtime maps that uid to the tree's owner.
+# Rootless Podman remaps it into the invoking user's subuid range, where the
+# checkout is one the containers cannot write. So each compose call goes through
+# sudo while the script itself still refuses to run as root.
 #
 # What it does:
 #   1. Verifies it's on a RHEL-family host (RHEL, Rocky, Alma, Fedora).
 #   2. Installs git if missing.
-#   3. Installs Podman if missing.
-#   4. Installs docker-compose v2 as the compose backend, removes any
-#      previously-installed podman-compose, and enables podman.socket.
-#   5. Initialises submodules (viewer + docs).
-#   6. Builds the Python image.
-#   7. Generates .env (first run only) — pauses for the operator to review.
-#   8. Builds the frontend bundles via the on-demand frontend-build service.
-#   9. Initialises the local Borg backup repository (idempotent).
-#  10. Starts the stack using the production compose overlay.
+#   3. Installs Podman, docker-compose v2 as its compose provider, and enables
+#      the rootful podman socket.
+#   4-10. The shared bootstrap run — submodules, project clone, image build,
+#      .env generation, frontend bundles, Pyodide vendoring, Borg repositories,
+#      project activation, stack start, lead fields. See bootstrap_steps.sh.
 #
 # Two-pass on first setup, same as the Docker bootstrap:
 #
@@ -36,57 +42,49 @@
 #   $EDITOR .env                    # review and customise.
 #   ./scripts/bootstrap-podman.sh   # build frontend, init borg, start stack.
 #
-# Flags:
-#   --no-start    Skip starting the stack at the end (steps 1–9 only).
+# Flags: the same set scripts/bootstrap.sh accepts — --no-start and the
+# --tailscale-* trio. See bootstrap_plan.sh.
 #
 # LIMITATIONS:
-#   - Rootful mode only. Rootless support is ROADMAP'd alongside the
-#     entrypoint refactor (search ROADMAP.md for "podman" or "entrypoint").
-#   - Downloads docker-compose v2 from GitHub releases (no RHEL package
-#     ships the upstream binary).
+#   - Rootful mode only, for the reason above.
+#   - Downloads docker-compose v2 from GitHub releases (no RHEL package ships
+#     the upstream binary).
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR/.."
 
-# Rootful Podman: every compose invocation goes through sudo. -E preserves
-# the invoking user's environment so .env writes land with the right
-# ownership when we chown them back below.
+# shellcheck source=scripts/lib/progress.sh
+. "$SCRIPT_DIR/lib/progress.sh"
+# shellcheck source=scripts/lib/bootstrap_plan.sh
+. "$SCRIPT_DIR/lib/bootstrap_plan.sh"
+
+# Rootful Podman: every compose invocation goes through sudo. -E preserves the
+# invoking user's environment so the pre-.env REDIS_PASSWORD placeholder and the
+# rest of the shared steps' exports survive the transition.
 COMPOSE="sudo -E podman compose"
 COMPOSE_PROD="sudo -E podman compose -f docker-compose.yml -f docker-compose.prod.yml"
 
-# ── Helpers ──────────────────────────────────────────────────────────────────
+# The `OS_RELEASE_FILE` env override exists so the script tests can point at a
+# fixture file instead of the host's real /etc/os-release.
+OS_RELEASE_FILE="${OS_RELEASE_FILE:-/etc/os-release}"
 
-bold() { printf '\033[1m%s\033[0m\n' "$*"; }
-info() { printf '\n\033[1;34m==> %s\033[0m\n' "$*"; }
-ok()   { printf '    \033[32m✓\033[0m  %s\n'  "$*"; }
-warn() { printf '    \033[33m!\033[0m  %s\n'  "$*"; }
-die()  { printf '\n\033[1;31mERROR:\033[0m %s\n' "$*" >&2; exit 1; }
+bootstrap_parse_args "$@"
+bootstrap_require_non_root
+bootstrap_env_state
 
-# ── Arguments ────────────────────────────────────────────────────────────────
-
-START=true
-for arg in "$@"; do
-    case "$arg" in
-        --no-start) START=false ;;
-        -h|--help)
-            sed -n '2,46p' "$0" | sed 's/^# \{0,1\}//'
-            exit 0
-            ;;
-        *) die "Unknown argument: $arg (try --help)" ;;
-    esac
-done
-
-# ── 0. Sanity checks ─────────────────────────────────────────────────────────
-
-[ "$(id -u)" -eq 0 ] \
-    && die "Run this script as a regular user, not root. sudo will be used where needed."
+# ── Plan ─────────────────────────────────────────────────────────────────────
+# The three prerequisite steps are this script's own; everything after them is
+# shared with the Docker path.
+progress_step distro "Check the host distribution"      direct
+progress_step git    "Check git"                        direct
+progress_step podman "Check Podman + compose provider"  direct
+bootstrap_plan_common
+bootstrap_begin
 
 # ── 1. Distro detection ──────────────────────────────────────────────────────
 
-# The `OS_RELEASE_FILE` env override exists so the script tests can point
-# at a fixture file instead of the host's real /etc/os-release.
-OS_RELEASE_FILE="${OS_RELEASE_FILE:-/etc/os-release}"
+step_distro() {
 if [ ! -f "$OS_RELEASE_FILE" ]; then
     die "$OS_RELEASE_FILE not found — cannot identify the host distro."
 fi
@@ -113,9 +111,12 @@ Use scripts/bootstrap.sh for Debian/Ubuntu (Docker) instead."
         esac
         ;;
 esac
+}
+run_step distro step_distro
 
 # ── 2. git ───────────────────────────────────────────────────────────────────
 
+step_git() {
 info "Checking git"
 if command -v git &>/dev/null; then
     ok "Already installed: $(git --version)"
@@ -124,9 +125,12 @@ else
     sudo dnf install -y -q git
     ok "Installed: $(git --version)"
 fi
+}
+run_step git step_git
 
-# ── 3. Podman + podman-compose ───────────────────────────────────────────────
+# ── 3. Podman + the compose provider ─────────────────────────────────────────
 
+step_podman() {
 info "Checking Podman"
 
 if command -v podman &>/dev/null; then
@@ -216,129 +220,8 @@ Check /etc/containers/containers.conf and ~/.config/containers/containers.conf \
 for a pinned compose_providers entry."
         ;;
 esac
+}
+run_step podman step_podman
 
-# ── 4. Submodules ────────────────────────────────────────────────────────────
-
-info "Initialising submodules (viewer + docs)"
-git submodule update --init --recursive
-ok "Submodules ready"
-
-# ── 4b. Dev tooling (git hooks + AI-tool symlinks) ───────────────────────────
-
-if [ -z "${SKIP_DEV_TOOLS_INSTALL:-}" ]; then
-    info "Installing dev tooling (git hooks + AI-tool symlinks)"
-    bash scripts/install-dev-tools.sh
-    ok "Dev tooling installed"
-fi
-
-# ── 5. Build the Python image ────────────────────────────────────────────────
-# Needed before init_env can run (init_env executes inside the web image).
-
-info "Building the Python image"
-$COMPOSE build web
-ok "Image built"
-
-# ── 6. Generate .env (first run) ─────────────────────────────────────────────
-# init_env auto-fills SECRET_KEY, BORG_PASSPHRASE, ADMIN_PASSWORD, the VAPID
-# keypair, and the federation Ed25519 keypair. The web image's entrypoint
-# blocks on postgres, so we bypass it with --entrypoint python. (See the
-# 🟢 ROADMAP entry on making the entrypoint DB-aware for the durable fix.)
-#
-# Rootful Podman writes files as root by default; chown back to the
-# invoking user so the operator can edit .env without sudo.
-
-if [ ! -f .env ]; then
-    info "Generating .env with random secrets"
-    $COMPOSE run --rm --no-deps \
-        --entrypoint python \
-        web manage.py init_env
-    sudo chown "$(id -u):$(id -g)" .env
-    ok ".env created at $(pwd)/.env"
-
-    echo
-    bold "================================================================"
-    bold " First-run pause — review .env before continuing"
-    bold "================================================================"
-    echo
-    echo "A new .env has been generated with random secrets. Review and"
-    echo "customise it now — at minimum:"
-    echo
-    echo "  DJANGO_MODE           (default: production)"
-    echo "  EPICURRENTS_PROJECT   (active project name, blank = base platform)"
-    echo "  EPICURRENTS_PLUGINS   (comma-separated plugin names, blank = none)"
-    echo "  DB_NAME / DB_USERNAME / DB_PASSWORD"
-    echo "  ADMIN_USERNAME / ADMIN_EMAIL"
-    echo "  ALLOWED_HOSTS / FRONTEND_URL"
-    echo "  FEDERATION_INSTANCE_URL  (only if enabling federation)"
-    echo "  BORG_REMOTE_REPO         (only if using remote backup)"
-    echo
-    bold "Then re-run this script to complete the bootstrap:"
-    echo "  ./scripts/bootstrap-podman.sh"
-    echo
-    exit 0
-fi
-
-ok ".env present"
-
-# ── 6a. Plugin-conditional submodules ────────────────────────────────────────
-
-ACTIVE_PLUGINS="$(grep -E '^EPICURRENTS_PLUGINS=' .env | head -1 | cut -d= -f2 | tr -d ' "'"'"'' || true)"
-case ",$ACTIVE_PLUGINS," in
-    *,dicom,*)
-        info "Initialising OHIF viewer submodule (required by the dicom plugin)"
-        git submodule update --init --checkout plugins/dicom/ohif-viewer
-        ok "OHIF viewer ready"
-        ;;
-esac
-
-# ── 7. Frontend bundles ──────────────────────────────────────────────────────
-
-info "Building frontend bundles (Node container, ~3–5 min on first run)"
-$COMPOSE --profile build run --rm frontend-build
-ok "Frontend bundles built"
-
-# ── 8. Initialise Borg backup repo (idempotent) ──────────────────────────────
-
-info "Initialising local Borg backup repository"
-# The local tier is optional; a deployment with an append-only remote may keep
-# no second copy on the disk it is protecting. Mirrors scripts/bootstrap.sh.
-if grep -qiE '^BACKUP_LOCAL_ENABLED=(0|false|no|off)[[:space:]]*$' .env 2>/dev/null; then
-    echo "Local Borg repository disabled (BACKUP_LOCAL_ENABLED); skipping init."
-elif $COMPOSE run --rm --entrypoint borg borg info /backup &>/dev/null; then
-    ok "Borg repository already initialised"
-else
-    $COMPOSE run --rm --entrypoint borg borg init --encryption repokey /backup
-    ok "Borg repository initialised"
-fi
-
-# ── 9. Start the stack ───────────────────────────────────────────────────────
-
-if [ "$START" = true ]; then
-    info "Starting the stack (production overlay)"
-    $COMPOSE_PROD up -d
-    ok "Stack is up"
-
-    echo
-    $COMPOSE_PROD ps
-fi
-
-# ── 10. Summary ──────────────────────────────────────────────────────────────
-
-echo
-bold "================================================================"
-bold " Bootstrap complete (Podman)"
-bold "================================================================"
-echo
-
-if [ ! -f "$HOME/.ssh/id_borg" ] && [ ! -f "$HOME/.ssh/id_borg.pub" ]; then
-    echo "Optional — remote Borg backups:"
-    echo "  ssh-keygen -t ed25519 -C 'borg@$(hostname)' -f ~/.ssh/id_borg -N ''"
-    echo "  Then set BORG_SSH_KEY_PATH and BORG_REMOTE_REPO in .env and restart borg."
-    echo
-fi
-
-if [ "$START" = true ]; then
-    HOST_PORT="$(grep -E '^HOST_PORT=' .env | head -1 | cut -d= -f2 | tr -d ' ')"
-    echo "The platform is reachable at:  http://localhost:${HOST_PORT:-8000}/"
-    echo "Tail the logs with:            sudo podman compose logs -f web"
-fi
+# shellcheck source=scripts/lib/bootstrap_steps.sh
+. "$SCRIPT_DIR/lib/bootstrap_steps.sh"

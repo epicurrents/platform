@@ -25,7 +25,9 @@ import pytest
 from scripts.tests.conftest import make_env, make_env_example, run_script
 
 BOOTSTRAP = "bootstrap.sh"
-SCRIPT = Path(__file__).resolve().parent.parent / "bootstrap.sh"
+#: Where `resolve_project_repo` lives. Both bootstrap scripts source this file, so
+#: extracting the resolver from it tests the one every deployment actually runs.
+SCRIPT = Path(__file__).resolve().parent.parent / "lib" / "bootstrap_steps.sh"
 
 
 def resolve(spec: str) -> str:

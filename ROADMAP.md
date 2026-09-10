@@ -90,7 +90,6 @@ The two security entries below were gated on the evidence host, which is now in 
 - Normalise hex hash convention to lowercase across recordings + annotations
 - Infrastructure — make the web image's entrypoint skip the postgres wait for DB-less commands
 - Infrastructure — revert to single `data` volume + `volume.subpath:` once Podman's Docker-API translates it
-- Infrastructure — bring [scripts/bootstrap-podman.sh](scripts/bootstrap-podman.sh) back level with [scripts/bootstrap.sh](scripts/bootstrap.sh) (see the entry below)
 - Infrastructure — decide whether the Docker Engine floor of 25 still earns its keep now that `volume.subpath:` is gone
 - Recordings — recoverable ingest state machine so a dropped Celery task is re-derivable from `Recording.status` (the broker now persists with an `everysec` fsync window; this closes the remaining second and also covers a worker dying mid-task)
 - Tooling — schedule periodic `phi-exposure` full-surface sweeps (prompt keyword `full-surface`); the per-commit gate stays diff-scoped
@@ -1069,32 +1068,23 @@ Both shapes work on Docker Engine ≥ 25; the revert simply trades 5 volumes for
 
 ---
 
-## 🟡 Infrastructure — bring `bootstrap-podman.sh` back level with `bootstrap.sh`
+## ✅ Infrastructure — bring `bootstrap-podman.sh` back level with `bootstrap.sh` (2026-09-10)
 
-The distribution path now runs on either runtime: the generated start.sh and the bundled [scripts/update.sh](scripts/update.sh) detect Docker or Podman and build their compose invocation to match. The **checkout** path did not come along. [scripts/bootstrap-podman.sh](scripts/bootstrap-podman.sh) has not been touched since the initial release, while [scripts/bootstrap.sh](scripts/bootstrap.sh) has gained five commits, so a Podman checkout deployment silently skips steps a Docker one performs.
+Both bootstraps now run the same body. [scripts/lib/bootstrap_plan.sh](scripts/lib/bootstrap_plan.sh) holds the argument parsing, the .env-derived state and the shared tail of the progress plan; [scripts/lib/bootstrap_steps.sh](scripts/lib/bootstrap_steps.sh) holds everything from the point a runtime is available to the closing summary. Each script keeps only its own prerequisites — Docker Engine on one side, Podman plus docker-compose v2 and the rootful socket on the other — and the spelling of `COMPOSE`.
 
-### What is missing
+### What had drifted
 
-Compared step by step against bootstrap.sh, the Podman script has no equivalent of:
+[scripts/bootstrap-podman.sh](scripts/bootstrap-podman.sh) sat untouched from the initial release while [scripts/bootstrap.sh](scripts/bootstrap.sh) gained six steps, so a Podman checkout deployment never cloned its project, vendored the Pyodide runtime, activated the project, generated lead fields, selected the TLS proxy overlay, or had its .env values guarded against silent truncation. It did not fail while skipping them — it succeeded into a deployment missing all six, which is the failure mode worth remembering when the next runtime-specific script is proposed.
 
-- **4c. Clone the active project** — `EPICURRENTS_PROJECT` names a project that is never fetched.
-- **7a. Vendor the Pyodide runtime** — the browser assets the viewer loads at deploy are never staged, so viewer features that need them fail in the browser rather than at bootstrap.
-- **8b. Activate the configured project** — `activate_project` never runs, so the project's migrations are never applied even when its tree is present.
-- **9a. Static lead fields** — never generated.
-- **The TLS proxy overlay** — no `PROXY_DOMAIN` branch, so the stack comes up without its terminator.
-- **The `.env` value guard** against silent truncation by `$` and `#` (commit 4a477f0).
+### Why extraction rather than porting
 
-### Why it is worth doing rather than deleting
+Porting the six steps by hand would have left two copies to diverge a seventh time. The shared body turned out to be almost runtime-agnostic already: of 637 lines in the original script only one referenced Docker in a way that mattered (`newgrp docker`, now behind `${NEEDS_NEWGRP:-false}`, which the Podman path never sets), because everything else already went through `$COMPOSE`. Keep it that way — a bare `docker` call added to bootstrap_steps.sh breaks Podman silently, since compose would still work and only that one call would fail.
 
-Podman is not a second-class runtime here — the compose files carry the per-domain volume layout specifically so it works, and the arrangement was verified end to end on Podman 5.8.2 with docker-compose 5.1.4 on RHEL 9. A RHEL site that clones the repository rather than taking a distribution package is the case this script exists for, and it is the case most likely to be an institutional deployment.
+Regression coverage in [scripts/tests/test_bootstrap_podman.py](scripts/tests/test_bootstrap_podman.py): one test per recovered step, plus the rootful `sudo -E podman compose` spelling and the shared refusal to run as root.
 
-### The shape of the fix
+### Still open
 
-The two scripts differ only in how compose is spelled (`sudo -E podman compose` versus `docker compose`) and in the prerequisite install step. Everything between is duplicated prose that has now drifted once and will drift again. Prefer factoring the shared body into `scripts/lib/` with the runtime injected — the same `CONTAINER_RUNTIME` shape update.sh now uses — over hand-porting the six missing steps and leaving two copies to diverge a second time.
-
-### Also worth settling while here
-
-The Docker Engine floor of 25 is justified in both scripts, and in the generated `start.sh`, by `volume.subpath:` support. That option no longer appears in any compose file — only in comments explaining why it was removed. Either the floor has a reason nobody has written down, or it is vestigial and should drop to whatever the compose files actually need.
+Whether the Docker Engine floor of 25 earns its keep now that `volume.subpath:` is gone from the compose files. It is in the backlog above; it was never a Podman question, and closing it needs someone to decide what the compose files actually require.
 
 ---
 
