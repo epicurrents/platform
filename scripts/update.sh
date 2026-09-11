@@ -588,7 +588,30 @@ info "Collecting static files"
 "${COMPOSE[@]}" run --rm --no-deps web python manage.py collectstatic --no-input
 ok "Static files collected"
 
-# ── 6a. Vendor the Pyodide runtime if it is missing or incomplete ─────────────
+# ── 6a. Install the pinned viewer edition if it drifted ───────────────────────
+# A pull can move frontend/viewer-pin.json, so the check runs every update; it is
+# a local stamp comparison, so the common case costs nothing. An empty pin
+# verifies clean — that is a deployment still building the edition from the
+# checkout, not a broken one.
+#
+# After the image build above, not beside the frontend build: production gives
+# the `vendor` service no /code bind, so it reads the pin baked into the image,
+# and running this earlier would install the edition the *previous* pin named.
+# --user because the production overlay runs the service as root for the Pyodide
+# tree, while viewer-dist is inside the code snapshot a rollback restores with
+# rsync as the deploy user — root-owned files there would survive the rollback.
+
+if "${COMPOSE[@]}" --profile vendor run --rm --no-deps -T --user 1000:1000 vendor \
+        python manage.py vendor_viewer --check > /dev/null 2>&1; then
+    ok "Viewer edition matches the pin"
+else
+    info "Installing the pinned viewer edition"
+    "${COMPOSE[@]}" --profile vendor run --rm --no-deps -T --user 1000:1000 vendor \
+        python manage.py vendor_viewer
+    ok "Viewer edition installed"
+fi
+
+# ── 6b. Vendor the Pyodide runtime if it is missing or incomplete ─────────────
 # The tree is excluded from this script's rsync so a deployment keeps its own
 # copy, which means an update never creates one: a fresh host, a restored
 # snapshot, or a version bump in settings all arrive here with nothing to serve.
@@ -606,7 +629,7 @@ else
     ok "Pyodide runtime vendored"
 fi
 
-# ── 6b. Regenerate the static lead fields ─────────────────────────────────────
+# ── 6c. Regenerate the static lead fields ─────────────────────────────────────
 # The other half of the vendored tree, and computed rather than downloaded, so it
 # runs unconditionally: a couple of seconds, and regenerating is the only way a
 # change to the generator's montages or grid parameters reaches the deployment.

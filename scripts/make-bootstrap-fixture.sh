@@ -345,7 +345,7 @@ if [ "$DIST" = true ]; then
     # The builder edition copied into viewer-dist/ names its UMD bundle .umd.js; the
     # per-project base builds under viewer-dist/<project>/ name theirs .umd.cjs.
     [ -f "$REPO_ROOT/frontend/viewer-dist/epicurrents-lib.umd.js" ] \
-        || die "frontend/viewer-dist is not built. Run 'npm run build:viewer' in frontend/ (or scripts/rebuild-frontend.sh) first."
+        || die "frontend/viewer-dist has no builder edition. Install the pinned one with 'manage.py vendor_viewer', or build it from the viewer checkout with 'npm run build:edition' in frontend/."
 fi
 
 # ── What to copy ─────────────────────────────────────────────────────────────

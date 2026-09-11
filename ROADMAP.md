@@ -218,7 +218,38 @@ Both are viewer-repo work; the platform's interest is the NPM-published build.
 
 The platform will not pin the builder as a submodule long-term. The intended supply of the viewer distributable is a builder-generated edition release — the builder's `<edition>-v<major>.<minor>.<patch>` tags attach the built edition (`epicurrents-lib.*` plus the standalone `index.html`) and its reproducibility manifest to a GitHub release — fetched into `frontend/viewer-dist/` at deploy by a script that pins edition, version and checksum in the tree, and later the npm packages above. The `frontend/viewer` checkout then becomes the development route for building the viewer from source, documented as such rather than required. Until that lands the submodule pin stands and the deploy host builds the viewer from it.
 
-What has to move first is the SPA's build-time coupling to the checkout, which is small and known: the core types imported through the `#epicurrents/core/dist/types` alias (`@epicurrents/core` is on npm and exports every name the SPA uses), the interface's toast helper and `ToastStack` component imported from `viewer/interface/src` together with its `announce` augmentation (`@epicurrents/interface` is not published; the platform was the original home of that code and can carry a copy), and the `scoped-event-log` alias (published at the same version the checkout carries). The prototype base viewer build under `src/viewer/` bundles the interface from source and stays on the checkout route. No edition release exists yet; tagging the first one is the prerequisite for the fetch script to have a target.
+What has to move first is the SPA's build-time coupling to the checkout, which is small and known: the core types imported through the `#epicurrents/core/dist/types` alias (`@epicurrents/core` is on npm and exports every name the SPA uses), the interface's toast helper and `ToastStack` component imported from `viewer/interface/src` together with its `announce` augmentation (`@epicurrents/interface` is not published; the platform was the original home of that code and can carry a copy), and the `scoped-event-log` alias. The prototype base viewer build under `src/viewer/` bundles the interface from source and stays on the checkout route.
+
+### The fetch shipped (2026-09-11); the release it points at does not exist yet
+
+[manage.py vendor_viewer](epicurrents/management/commands/vendor_viewer.py) installs the edition named in [frontend/viewer-pin.json](frontend/viewer-pin.json): one archive per edition, pinned by release tag and SHA-256, verified in memory and only then unpacked. `--check` compares a stamp written inside the destination against the pin and downloads nothing, which is the idiom [scripts/update.sh](scripts/update.sh) already uses for the Pyodide tree. The pin's `artifacts` is a map so a per-project lib can be added as a second entry without reshaping the file, and a `url` key overrides the derived release URL so a candidate can be tested from a `file://` archive before it is tagged.
+
+Three details that are not arbitrary. An archive rather than a list of loose assets, because the edition emits a content-hashed worker chunk: a file list needs re-pinning whenever a chunk name changes, and a file missing from such a list is silently not fetched instead of being an error. The stamp records which files each artifact installed, so an edition bump removes exactly its own predecessor and leaves the per-project libs and the public-setup shim that share the directory alone. And the step runs unprivileged — viewer-dist is inside the code snapshot a rollback restores with rsync as the deploy user, so root-owned files there would leave a tree the rollback cannot overwrite.
+
+**The pin ships empty.** No edition release is tagged, so nothing is fetched and the deploy host still builds the edition from the checkout. Tagging the first one is the remaining prerequisite, and it carries a requirement on the builder's release job: attach `<edition>-v<x.y.z>.tar.gz` plus the reproducibility manifest, not the loose files the tag currently would.
+
+### What the npm packages are actually in (2026-09-11)
+
+Reaching the checkout-free state needs `@epicurrents/interface`, `dicom-reader` and `nic-reader` published — the base build imports the first two and a project overlay the third. That was the whole of the remaining work until the registry was checked, and it is not: every already-published package has diverged from its source **while keeping the same version number**.
+
+| Package | Version, local and npm | npm `gitHead` dates from | Checkout HEAD |
+|---|---|---|---|
+| `@epicurrents/core` | 1.0.3 | 2026-08-04 | 2026-09-09 |
+| `@epicurrents/eeg-module` | 0.1.1-8 | 2024-02-18 | 2026-09-09 |
+| `@epicurrents/edf-reader` | 0.2.0-0 | 2024-03-13 | 2026-09-09 |
+| `scoped-event-log` | 3.2.0 | 2026-06-07 | 2026-07-14 |
+
+So installing `@epicurrents/eeg-module@0.1.1-8` returns early-2024 code while the checkout at that same version is two and a half years newer. Publishing on a better cadence does not close that: a version string has to identify a source state before pinning one means anything, which makes a republish round the prerequisite rather than the three missing packages. Everything else the builder clones sits at `0.0.0` or `0.0.1` and has never been published at all.
+
+The mechanism for keeping it closed is already in the builder rather than needing invention. `manifest.json` records each package's exact commit and npm records `gitHead` for each published version, so at **edition-release time** a package whose manifest commit differs from its published `gitHead` needs a version bump before the edition can be tagged. That fires when a release is cut rather than on every merge, which is what keeps it from becoming a per-tweak tax across twenty packages, and it makes "substantive enough to publish" mechanical while leaving the patch/minor/major call to a human.
+
+### Two drift checks, specified and not built
+
+Both follow from the shape above rather than from anything already broken, and neither is worth building before the first release exists.
+
+**Edition against lockfile.** Once the project lib builds from npm while the public edition comes from a release tarball, one deployment runs two viewers from two supply chains. If those drift it runs two different cores, with no symptom until something behaves differently on one page than the other. Comparing the pinned edition's `manifest.json` package commits against [frontend/package-lock.json](frontend/package-lock.json) catches it, and the platform owns the check because the platform is what ships both.
+
+**Published against source.** The edition-release gate described above, which belongs in the builder's release job.
 
 ---
 

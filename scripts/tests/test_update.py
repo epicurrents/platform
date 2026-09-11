@@ -488,3 +488,36 @@ class TestProxyAssetContinuity:
         health_at = body.index("api/v1/health")
         asset_at = body.index("Verifying the SPA bundle is servable")
         assert health_at < asset_at, "the asset check must follow the health check, not replace it"
+
+
+class TestUpdateShViewerEdition:
+    """The pinned viewer edition is checked every update and fetched only on drift."""
+
+    def test_the_edition_is_checked_after_the_image_is_rebuilt(self, fakebin, tmp_path):
+        # Production gives `vendor` no /code bind, so it reads the pin baked into the
+        # image. Checking before the rebuild would install the edition the *previous*
+        # pin named and never revisit it, which a pull that moves the pin makes routine.
+        _deploy(fakebin, tmp_path)
+        result = run_script("update.sh", fakebin, cwd=tmp_path, args=["--from", "repo", "--no-pull"])
+        assert result.returncode == 0, result.stderr
+        calls = fakebin.calls()
+        check = _index_of(calls, "vendor_viewer --check")
+        build = _index_of(calls, "--profile vendor build")
+        assert check > -1, "the viewer pin must be checked on every update"
+        assert -1 < build < check, f"expected the image build at {build} before the check at {check}"
+
+    def test_the_edition_is_only_fetched_when_the_check_fails(self, fakebin, tmp_path):
+        # The check is a local stamp comparison and the fetch is a multi-megabyte
+        # download, so an update that finds a matching tree must not re-fetch it.
+        _deploy(fakebin, tmp_path)
+        run_script("update.sh", fakebin, cwd=tmp_path, args=["--from", "repo", "--no-pull"])
+        fetches = [call for call in fakebin.calls() if "vendor_viewer" in call and "--check" not in call]
+        assert not fetches, f"expected no re-fetch when --check passes, got {fetches}"
+
+    def test_the_edition_is_installed_unprivileged(self, fakebin, tmp_path):
+        # viewer-dist is inside the code snapshot a rollback restores with rsync as the
+        # deploy user, so root-owned files here would leave a tree it cannot overwrite.
+        _deploy(fakebin, tmp_path)
+        run_script("update.sh", fakebin, cwd=tmp_path, args=["--from", "repo", "--no-pull"])
+        call = next(c for c in fakebin.calls() if "vendor_viewer" in c)
+        assert "--user 1000:1000" in call, call

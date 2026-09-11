@@ -81,9 +81,17 @@ services:
     environment:
       - DJANGO_MODE=production
     # No /code bind: production runs the code baked into the image, as web does.
-    # The one mount is the tree this service exists to write.
+    # The mounts are the trees this service exists to write.
+    #
+    # viewer-dist holds the pinned viewer edition (manage.py vendor_viewer) and is
+    # mounted read-only into web and celery, so this is again the one container
+    # that can populate it. Unlike frontend/vendor it *is* part of update.sh's code
+    # snapshot, and the rollback restores it with rsync as the deploy user — so the
+    # viewer step runs with an explicit `--user 1000:1000` rather than inheriting
+    # the root above, which would leave files a rollback cannot overwrite.
     volumes: !override
       - ./frontend/vendor:/code/frontend/vendor
+      - ./frontend/viewer-dist:/code/frontend/viewer-dist
 
   web:
     <<: *production-runtime

@@ -444,6 +444,8 @@ Build the frontend bundles first — the packages ship them prebuilt, not as sou
 cd frontend && npm run build && npm run build:viewer && cd ..
 ```
 
+A `--dist` package also carries the builder edition, which a deployment installs from a pinned release rather than building. If `frontend/viewer-dist/` has none yet, put one there before packaging — `python manage.py vendor_viewer` for the pinned release, or `npm run build:edition` in `frontend/` to build it from the viewer checkout.
+
 Then assemble the package for your case:
 
 ```bash

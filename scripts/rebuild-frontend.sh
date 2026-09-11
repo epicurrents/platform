@@ -4,8 +4,10 @@
 # Usage:
 #   ./scripts/rebuild-frontend.sh             — assume viewer dist/ is current, build platform only
 #   ./scripts/rebuild-frontend.sh --viewer    — also rebuild the viewer's per-workspace dist outputs
-#                                                via `npm run build:tsc-all` (~1–2 min). Needed after
-#                                                a clean clone or any change to viewer source.
+#                                                via `npm run build:tsc-all` (~1–2 min) and the builder
+#                                                edition from the checkout. Needed after a clean clone
+#                                                or any change to viewer source. Without it the edition
+#                                                stays as the pinned release left it.
 #
 set -euo pipefail
 
@@ -65,6 +67,14 @@ fi
 
 info "Building frontend"
 cd frontend
+# The builder edition is normally installed from a pinned release
+# (manage.py vendor_viewer), so a plain rebuild leaves it alone and only
+# refreshes the per-project libs and the public-setup shim. --viewer is the
+# develop-the-viewer-from-source route, and that is the one case where the
+# edition on disk is stale and has to be rebuilt from the checkout.
+if [ "$REBUILD_VIEWER" = true ]; then
+    npm run build:edition
+fi
 npm run build:viewer
 npm run build
 cd ..

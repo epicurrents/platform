@@ -282,6 +282,29 @@ sync_frontend_project() {
     mv "$tmp" "$fe_env"
 }
 
+# ── 6a. Install the pinned viewer edition ────────────────────────────────────
+# The public viewer page loads a prebuilt edition bundle. Building it here means
+# running the builder's `npm run setup`, which clones every workspace package
+# from its own repository and builds them in dependency order — the step that
+# makes a fresh deploy fragile. frontend/viewer-pin.json names a release asset
+# instead, verified by SHA-256 before it is unpacked.
+#
+# Runs before the frontend build so a fetched edition is in place when the
+# per-project libs are written beside it; neither clears the other's output.
+# An empty pin is not an error — it means this deployment still builds
+# the edition from the checkout, so the step reports that and moves on.
+#
+# The dev compose file, not the production overlay: production gives `vendor` a
+# single writable mount for the Pyodide tree and mounts viewer-dist read-only
+# everywhere, so the overlay's vendor service cannot write this. Running it
+# unprivileged through `.:/code` also keeps the output owned by 1000:1000, the
+# same as the frontend build that writes into the same directory.
+
+step_viewer() {
+    $COMPOSE --profile vendor run --rm --no-deps -T vendor python manage.py vendor_viewer
+}
+run_step viewer step_viewer
+
 step_frontend() {
     sync_frontend_project
     step_note "frontend/.env: VITE_PROJECT=${ACTIVE_PROJECT:-<base>}"

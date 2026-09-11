@@ -6,10 +6,25 @@ Vue 3 + TypeScript frontend scaffolded with Vite.
 
 - `npm run dev` starts the Vite development server.
 - `npm run build` runs type-checking then creates a production build.
-- `npm run build:viewer` builds the viewer's full edition from the `viewer/` submodule into `viewer-dist/`, then the platform-side base bundle ([vite.config.base.ts](vite.config.base.ts)) and the public viewer's platform-owned setup ([vite.config.publicsetup.ts](vite.config.publicsetup.ts)); it needs the submodule's packages built first (`npm run setup` inside `viewer/`, or `scripts/rebuild-frontend.sh --viewer`).
+- `npm run build:viewer` builds the platform-side base bundle ([vite.config.base.ts](vite.config.base.ts)) and the public viewer's platform-owned setup ([vite.config.publicsetup.ts](vite.config.publicsetup.ts)) into `viewer-dist/`; it needs the submodule's packages built first (`npm run setup` inside `viewer/`, or `scripts/rebuild-frontend.sh --viewer`).
+- `npm run build:edition` builds the viewer's full edition from the `viewer/` submodule into the top level of `viewer-dist/`. Only for developing the viewer from source — a deployment installs the edition from a pinned release instead, and `build:viewer` does not run it, so a frontend rebuild leaves that release in place. See [The viewer edition is pinned, not built](#the-viewer-edition-is-pinned-not-built).
 - `npm run test` runs the vitest suite; `npm run test:watch` keeps it running.
 - `npm run preview` serves the built app locally.
 - `npm run link:projects` symlinks `node_modules` into each project frontend; `postinstall` runs it for you.
+
+## The viewer edition is pinned, not built
+
+`viewer-dist/` holds two different viewers plus a shim, and knowing which is which is the thing that saves an afternoon.
+
+| What | Where | Written by | Loaded by |
+|---|---|---|---|
+| Builder edition | `viewer-dist/epicurrents-lib.umd.js` and the chunks beside it | [manage.py vendor_viewer](../epicurrents/management/commands/vendor_viewer.py), from a pinned release | the public viewer page |
+| Per-project lib | `viewer-dist/<project>/epicurrents-lib.umd.cjs` | `npm run build:viewer` | the authenticated SPA |
+| Public-setup shim | `viewer-dist/epicurrents-public-setup.js` | `npm run build:viewer` | the public viewer page |
+
+The edition is fetched rather than built because building it means running the builder's `npm run setup`, which clones every workspace package from its own repository and builds them in dependency order. [frontend/viewer-pin.json](viewer-pin.json) names one archive per edition by release tag and SHA-256; the fetch verifies the checksum before unpacking and records what it installed, so a later edition removes exactly its own files and leaves the other two writers alone. Nothing in this directory may be cleared wholesale — an `rm -rf` or a vite `emptyOutDir` at the top level takes another writer's output with it, and the symptom is a 404 for one viewer while the other keeps working.
+
+While the pin is empty nothing is fetched and the deploy host builds the edition from the checkout, which is the state the platform is in until the builder tags its first edition release.
 
 ## Environment Variables
 

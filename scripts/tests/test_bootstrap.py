@@ -294,3 +294,34 @@ class TestEnvValueGuard:
         env.write_text(env.read_text() + "BORG_REMOTE_REPO= # set when backing up off-host\n")
         result = run_script(BOOTSTRAP, fakebin, cwd=tmp_path)
         assert result.returncode == 0, result.stderr
+
+
+class TestBootstrapViewerEdition:
+    """The pinned viewer edition is installed, and before the frontend build."""
+
+    def test_the_pinned_edition_is_installed(self, fakebin, tmp_path):
+        make_env(tmp_path)
+        result = run_script(BOOTSTRAP, fakebin, cwd=tmp_path)
+        assert result.returncode == 0, result.stderr
+        assert fakebin.has_call("manage.py vendor_viewer")
+
+    def test_the_edition_lands_before_the_frontend_build(self, fakebin, tmp_path):
+        # The frontend build writes the per-project libs into the same directory. The
+        # two do not clear each other, but the edition is what the public viewer
+        # page loads, so it goes in first and a later step only adds beside it.
+        make_env(tmp_path)
+        result = run_script(BOOTSTRAP, fakebin, cwd=tmp_path)
+        assert result.returncode == 0, result.stderr
+        calls = fakebin.calls()
+        viewer = next(i for i, call in enumerate(calls) if "vendor_viewer" in call)
+        frontend = next(i for i, call in enumerate(calls) if "frontend-build" in call)
+        assert viewer < frontend, f"expected the edition at {viewer} before the build at {frontend}"
+
+    def test_the_edition_is_installed_without_the_production_overlay(self, fakebin, tmp_path):
+        # Production gives `vendor` a single writable mount for the Pyodide tree and
+        # mounts viewer-dist read-only, so the overlay's service cannot write this.
+        make_env(tmp_path)
+        result = run_script(BOOTSTRAP, fakebin, cwd=tmp_path)
+        assert result.returncode == 0, result.stderr
+        call = next(c for c in fakebin.calls() if "vendor_viewer" in c)
+        assert "docker-compose.prod.yml" not in call, call

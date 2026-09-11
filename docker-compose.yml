@@ -586,6 +586,14 @@ services:
     # owned correctly, or absent in unusual partial-build modes). A flat
     # `... && chown ... || true` chain instead would let `|| true` swallow
     # earlier failures and ship a clean exit with broken or stale bundles.
+    #
+    # The builder edition is the deployment's only viewer the fetch can supply:
+    # `manage.py vendor_viewer` installs it from the release pinned in
+    # frontend/viewer-pin.json, and bootstrap runs that before this service. The
+    # guard below is the fallback for a deployment whose pin is empty — no
+    # release is tagged yet — where building from the checkout is still the only
+    # source. It keys on the artifact rather than on the pin so a fetched edition
+    # is never rebuilt over, and so this stays correct once the pin is populated.
     command:
       - sh
       - -ec
@@ -593,6 +601,7 @@ services:
         npm ci
         cd viewer && npm ci && npm run build:tsc-all
         cd /repo/frontend
+        if [ ! -s viewer-dist/epicurrents-lib.umd.js ]; then npm run build:edition; fi
         npm run build:viewer
         npm run build
         chown -R 1000:1000 /repo/frontend/dist /repo/frontend/viewer-dist 2>/dev/null || true

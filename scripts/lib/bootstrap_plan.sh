@@ -103,6 +103,7 @@ bootstrap_plan_common() {
         if [ "$DICOM_ENABLED" = true ]; then
             progress_step ohif "Initialise OHIF viewer submodule"
         fi
+        progress_step viewer   "Install the pinned viewer edition"
         progress_step frontend "Build frontend bundles"
         progress_step pyodide  "Vendor the Pyodide runtime"
         progress_step borg     "Initialise Borg backup repositories"
