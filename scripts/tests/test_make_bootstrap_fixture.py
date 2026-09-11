@@ -7,6 +7,7 @@ copy (~200 MB) is deliberately not exercised here; the frontend exclude
 behaviour is covered by asserting the excludes on the cheaper default copy.
 """
 
+import json
 import os
 import re
 import shutil
@@ -1122,3 +1123,156 @@ class TestGuards:
         assert _run(dest).returncode != 0
         assert _run(dest, "--force").returncode == 0
         assert not (dest / "leftover.txt").exists()
+
+
+class TestBundleProvenance:
+    """A package must not ship a UI built for a project it does not carry.
+
+    The builder reads the stamp out of the repository's own frontend/dist, which a
+    test cannot rearrange, so the refusals run against a synthetic repository root:
+    the script resolves REPO_ROOT from its own location, and the provenance check
+    sits above every copy, so a scripts/ + frontend/dist/ pair is the whole tree it
+    needs to reach a verdict.
+    """
+
+    @staticmethod
+    def _fake_repo(tmp_path, project="", plugins=()):
+        root = tmp_path / "repo"
+        (root / "scripts").mkdir(parents=True)
+        shutil.copy2(FIXTURE, root / "scripts" / FIXTURE.name)
+        dist = root / "frontend" / "dist"
+        dist.mkdir(parents=True)
+        (dist / "index.html").write_text("<!doctype html>")
+        if project is not None:
+            (dist / "build-info.json").write_text(
+                json.dumps({"project": project, "plugins": list(plugins)}, indent=4) + "\n"
+            )
+        return root
+
+    @staticmethod
+    def _build(root, dest, *args):
+        return subprocess.run(
+            ["bash", str(root / "scripts" / FIXTURE.name), str(dest), *args],
+            check=False,
+            cwd=str(root),
+            capture_output=True,
+            text=True,
+        )
+
+    def test_a_project_bundle_is_refused_by_a_package_that_carries_none(self, tmp_path):
+        # The reported bug: a base distribution assembled on a checkout with a
+        # project active shipped that project's whole UI — routes, nav links, its
+        # name — in front of a backend configured to run none of it, silently.
+        root = self._fake_repo(tmp_path, project="somecourse")
+        result = self._build(root, tmp_path / "pkg", "--demo")
+        assert result.returncode != 0
+        assert "somecourse" in result.stderr
+        assert "--with-project somecourse" in result.stderr
+
+    def test_a_project_bundle_is_accepted_by_the_package_that_carries_it(self, tmp_path):
+        root = self._fake_repo(tmp_path, project="example")
+        # Reached the copy stage, which the synthetic tree cannot satisfy — the
+        # point is that it got past the provenance check rather than stopping on it.
+        result = self._build(root, tmp_path / "pkg", "--dist", "--with-project", "example")
+        assert "was built for the project" not in result.stderr
+
+    def test_a_project_name_is_matched_whole(self, tmp_path):
+        # A prefix match would let a package carrying one project ship the UI of
+        # another whose name merely starts the same way.
+        root = self._fake_repo(tmp_path, project="course")
+        result = self._build(root, tmp_path / "pkg", "--dist", "--with-project", "coursework")
+        assert result.returncode != 0
+        assert "was built for the project 'course'" in result.stderr
+
+    def test_a_base_bundle_is_accepted_anywhere(self, tmp_path):
+        # The base UI carries no project, so every package can serve it. A project
+        # package built this way is merely missing that project's frontend, which
+        # a project is entitled not to have.
+        root = self._fake_repo(tmp_path, project="")
+        result = self._build(root, tmp_path / "pkg", "--dist", "--with-project", "example")
+        assert "was built for the project" not in result.stderr
+
+    def test_a_compiled_in_plugin_the_package_lacks_is_refused(self, tmp_path):
+        root = self._fake_repo(tmp_path, project="", plugins=("someplugin",))
+        result = self._build(root, tmp_path / "pkg", "--demo")
+        assert result.returncode != 0
+        assert "someplugin" in result.stderr
+
+    def test_an_unstamped_bundle_is_refused(self, tmp_path):
+        # Provenance that cannot be established is not provenance. The remedy is
+        # one command, and the alternative is shipping whatever was lying around.
+        root = self._fake_repo(tmp_path, project=None)
+        result = self._build(root, tmp_path / "pkg", "--demo")
+        assert result.returncode != 0
+        assert "build-info.json" in result.stderr
+        assert "npm run build" in result.stderr
+
+    def test_an_unreadable_stamp_is_refused_rather_than_read_as_base(self, tmp_path):
+        # A truncated file yields an empty project, which is the spelling of "the
+        # base UI" and goes into any package — so reading the value alone would
+        # pass on exactly the stamp that could not be read.
+        root = self._fake_repo(tmp_path, project=None)
+        (root / "frontend" / "dist" / "build-info.json").write_text("{ \"proj")
+        result = self._build(root, tmp_path / "pkg", "--demo")
+        assert result.returncode != 0
+        assert "build-info.json" in result.stderr
+
+    def test_the_builders_own_frontend_env_is_excluded(self):
+        # frontend/.env names the builder's active project, their backend URL and
+        # the hostnames their dev server answers to; the runner writes the
+        # package's own from .env.example at bootstrap. Asserted against the
+        # exclude list rather than by running --with-frontend, which this module
+        # declines to exercise for the size of the copy — so the assertion is on
+        # the rule rather than on a tree, and it fails if the rule is dropped.
+        body = FIXTURE.read_text()
+        excludes = body.split("FRONTEND_EXCLUDES=(", 1)[1].split(")", 1)[0]
+        assert "--exclude '.env'" in excludes
+
+
+@requires_built_frontend
+class TestPackageStatesItsOwnProject:
+    """The package says what it runs instead of inheriting the builder's tree."""
+
+    @staticmethod
+    def _env_value(dest, key):
+        for line in (dest / ".env.example").read_text().splitlines():
+            if line.startswith(f"{key}="):
+                return line.split("=", 1)[1]
+        raise AssertionError(f"{key} missing from the package's .env.example")
+
+    def test_a_base_package_blanks_both_project_keys(self, tmp_path):
+        dest = tmp_path / "demo"
+        assert _run(dest, "--demo").returncode == 0
+        assert self._env_value(dest, "EPICURRENTS_PROJECT") == ""
+        assert self._env_value(dest, "EPICURRENTS_PLUGINS") == ""
+
+    def test_a_project_package_names_it(self, tmp_path):
+        dest = tmp_path / "dist"
+        assert _run(dest, "--dist", "--with-project", "example").returncode == 0
+        assert self._env_value(dest, "EPICURRENTS_PROJECT") == "example"
+
+    def test_a_base_package_ships_no_project_viewer_segment(self, tmp_path):
+        # viewer-dist/<project>/ is named after the project it was built for, so a
+        # sibling segment left over from another build would name it in a package
+        # that carries nothing of it. Asserted as "no segment named after a project
+        # the package lacks" rather than against a fixed list, because the rest of
+        # that tree belongs to vendor_viewer and its layout is the pin's to decide.
+        dest = tmp_path / "dist"
+        assert _run(dest, "--dist").returncode == 0
+        projects = {
+            d.name for d in (REPO_ROOT / "projects").iterdir()
+            if d.is_dir() and d.name != "__pycache__"
+        }
+        segments = {d.name for d in (dest / "frontend" / "viewer-dist").iterdir() if d.is_dir()}
+        assert not segments & projects
+
+    def test_the_builders_own_frontend_env_is_excluded(self):
+        # frontend/.env names the builder's active project, their backend URL and
+        # the hostnames their dev server answers to; the runner writes the
+        # package's own from .env.example at bootstrap. Asserted against the
+        # exclude list rather than by running --with-frontend, which this module
+        # declines to exercise for the size of the copy — so the assertion is on
+        # the rule rather than on a tree, and it fails if the rule is dropped.
+        body = FIXTURE.read_text()
+        excludes = body.split("FRONTEND_EXCLUDES=(", 1)[1].split(")", 1)[0]
+        assert "--exclude '.env'" in excludes

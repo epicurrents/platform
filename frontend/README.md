@@ -21,6 +21,12 @@ Copy `.env.example` to `.env` (or provide equivalent server-side env values).
 
 See [.env.example](.env.example) for defaults.
 
+### What a build says about itself
+
+`VITE_PROJECT` and `VITE_PLUGINS` are baked in at build time, and afterwards nothing in the output names them — a bundle built for a project looks like any other. Every production build therefore writes `dist/build-info.json` naming the project and plugins it was compiled with, and [scripts/make-bootstrap-fixture.sh](../scripts/make-bootstrap-fixture.sh) reads it before assembling a package, refusing one whose UI belongs to a project the package does not carry.
+
+That refusal is the whole reason the file exists, so treat it as part of the build rather than a convenience: a package assembled from an unstamped `dist/` is rejected too, because provenance that cannot be established is not provenance. The stamp ships inside the package, where it also answers "which project is this deployment's UI?" for anyone holding one.
+
 ## Mock dev server
 
 The Vite dev server includes an in-memory mock API that covers all currently implemented endpoints. It lets you work on UI styling and interactions without running Django, Celery, PostgreSQL, or Redis.

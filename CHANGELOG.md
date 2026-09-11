@@ -8,6 +8,14 @@ Entries are written for the person deciding whether to upgrade, so the ones that
 
 ## [Unreleased]
 
+### Fixed
+
+- **A distribution built on a checkout with a project active shipped that project's UI.** `VITE_PROJECT` is baked into the SPA at build time and nothing in the output names it afterwards, so `frontend/dist` from such a checkout is the project's whole frontend — routes, nav links, the project's own name — and the packager copied it into a base distribution verbatim. The package started, `EPICURRENTS_PROJECT` was blank as intended, and the recipient was offered links into API mounts that do not exist. The per-project viewer overlays under `viewer-dist/<project>/` rode along the same way, naming the project in a directory, and `--with-frontend` additionally shipped the builder's own `frontend/.env`.
+
+  Builds now write `frontend/dist/build-info.json` naming the project and plugins they were compiled with, and [make-bootstrap-fixture.sh](scripts/make-bootstrap-fixture.sh) refuses a package whose bundle names a project it does not carry — with the two ways out in the message. A bundle built for no project is the base UI and is accepted anywhere. The viewer overlays are filtered to the segments the package can serve, the builder's `frontend/.env` is no longer copied, and the package's `.env.example` states its own `EPICURRENTS_PROJECT` and `EPICURRENTS_PLUGINS` instead of inheriting whatever the builder's tree said.
+
+  An existing `frontend/dist` predating this carries no stamp and is refused; rebuild it with `npm run build`.
+
 ### Added
 
 - Account and group management has a UI. The API replacing the Django admin's user surface shipped without a client, so the only ways to create an ordinary account were a hand-built request with a session cookie and CSRF token, or a shell on the host — and a deployment maintained by a hosting service has neither. Four routes under `/admin/` now cover the account roster and detail, the group roster and detail, reached from the user menu in the nav bar.

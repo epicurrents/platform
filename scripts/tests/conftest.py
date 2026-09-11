@@ -46,9 +46,16 @@ SCRIPTS_DIR = REPO_ROOT / "scripts"
 # frontend, so make-bootstrap-fixture.sh hard-requires frontend/dist. The
 # pytest-only CI `test` job never builds the frontend, so skip those tests there;
 # they still run locally and anywhere the frontend has been compiled.
+#
+# build-info.json is part of what "built" means here: the builder refuses a bundle
+# whose provenance it cannot establish, so a dist left over from before the build
+# started stamping itself is not a usable one. Skipping rather than failing keeps
+# that a prompt to rebuild instead of a red suite on a stale checkout; the refusal
+# itself is covered against a synthetic repo root in test_make_bootstrap_fixture.
 requires_built_frontend = pytest.mark.skipif(
-    not (REPO_ROOT / "frontend" / "dist" / "index.html").exists(),
-    reason="frontend/dist not built — run 'npm run build' (or scripts/rebuild-frontend.sh)",
+    not (REPO_ROOT / "frontend" / "dist" / "index.html").exists()
+    or not (REPO_ROOT / "frontend" / "dist" / "build-info.json").exists(),
+    reason="frontend/dist not built (or built before build-info.json) — run 'npm run build'",
 )
 
 # The fixture builder copies with rsync, which the platform image deliberately

@@ -130,6 +130,86 @@ tar_ownership_flags() {
     esac
 }
 
+# ── Provenance of the prebuilt bundle ────────────────────────────────────────
+# Vite bakes VITE_PROJECT and VITE_PLUGINS into the SPA at build time, so a
+# package assembled from a prebuilt frontend/dist inherits whatever the builder's
+# checkout happened to have active when it last ran `npm run build`. Building a
+# base distribution on a checkout with a project active is the ordinary way to
+# reach that, and it ships the project's entire UI — its routes, its nav links,
+# its name — inside a package whose backend is configured to run no project.
+# Nothing fails: the package starts, and the recipient is offered links into API
+# mounts that do not exist.
+#
+# frontend/dist/build-info.json is the stamp the build writes about itself, and
+# it is read here rather than frontend/.env because the .env can be edited after
+# a build while the stamp cannot. A bundle may be blank — the base UI, which
+# every package can serve — or name one of the projects this package carries.
+# Anything else is the mismatch above, and it stops the packaging.
+
+# Read one string field out of the flat JSON the build stamps. Deliberately not
+# jq: this is host tooling that must run wherever a developer builds a package.
+# grep reads the file directly rather than feeding a pipeline that stops early —
+# under `set -o pipefail` an early close kills the producer and takes the whole
+# substitution with it, which is the same trap tar_ownership_flags documents.
+bundle_field() {
+    local line
+    line="$(grep -m1 "\"$1\"" "$REPO_ROOT/frontend/dist/build-info.json" || true)"
+    line="${line#*:}"
+    line="${line#*\"}"
+    printf '%s' "${line%%\"*}"
+}
+
+# The stamped plugin list, one per line.
+bundle_plugins() {
+    tr -d ' \n' < "$REPO_ROOT/frontend/dist/build-info.json" \
+        | sed -n 's/.*"plugins":\[\([^]]*\)\].*/\1/p' \
+        | tr ',' '\n' | tr -d '"' | grep -v '^$' || true
+}
+
+# Whether $1 appears in the remaining arguments. A loop rather than a pattern
+# match on a joined string, which would let "edu" match "education".
+contains() {
+    local needle="$1"
+    shift
+    local item
+    for item in "$@"; do
+        [ "$item" = "$needle" ] && return 0
+    done
+    return 1
+}
+
+check_bundle_provenance() {
+    local info_file="$REPO_ROOT/frontend/dist/build-info.json"
+    local bundle_project plugin
+    # An unreadable stamp is refused the same way a missing one is. Reading the
+    # value alone would not do it: a truncated or hand-edited file yields an empty
+    # project, which is the spelling of "the base UI" and goes into any package —
+    # so the check would pass on exactly the file it could not read.
+    if [ ! -f "$info_file" ] || ! grep -q '"project"' "$info_file"; then
+        die "$(printf '%s\n' \
+            "frontend/dist carries no readable build-info.json, so nothing says which project" \
+            "it was built for and the package cannot be shown to match itself. Rebuild the SPA:" \
+            "  cd frontend && npm run build")"
+    fi
+    bundle_project="$(bundle_field project)"
+    if [ -n "$bundle_project" ] && ! contains "$bundle_project" ${PROJECTS[@]+"${PROJECTS[@]}"}; then
+        die "$(printf '%s\n' \
+            "frontend/dist was built for the project '${bundle_project}', which this package" \
+            "does not carry. Shipping it would put that project's whole UI in front of a" \
+            "backend configured to run none of it. Either build the base UI:" \
+            "  blank VITE_PROJECT in frontend/.env, then cd frontend && npm run build" \
+            "or bundle the project the UI expects:" \
+            "  --with-project ${bundle_project}")"
+    fi
+    for plugin in $(bundle_plugins); do
+        contains "$plugin" ${PLUGINS[@]+"${PLUGINS[@]}"} || die "$(printf '%s\n' \
+            "frontend/dist was built with the plugin '${plugin}' compiled in, which this" \
+            "package does not carry. Either drop it from VITE_PLUGINS in frontend/.env and" \
+            "rebuild the SPA, or bundle it with --with-plugin ${plugin}.")"
+    done
+    ok "Bundle built for: ${bundle_project:-<base>}"
+}
+
 # ── Arguments ────────────────────────────────────────────────────────────────
 
 DEST=""
@@ -253,6 +333,7 @@ if [ "$DEMO" = true ] || [ "$DIST" = true ]; then
         || die "--demo / --dist ship the prebuilt frontend/dist, not the source; drop --with-frontend."
     [ -f "$REPO_ROOT/frontend/dist/index.html" ] \
         || die "frontend/dist is not built. Run 'npm run build' in frontend/ (or scripts/rebuild-frontend.sh) first."
+    check_bundle_provenance
 fi
 if [ "$DEMO" = true ]; then
     [ ${#PROJECTS[@]} -eq 0 ] \
@@ -334,7 +415,13 @@ ADDON_EXCLUDES=(
     --exclude 'ohif-viewer'
 )
 # Frontend/JS build artifacts and dependency trees — rebuilt by frontend-build.
+# .env is excluded for a different reason than the rest: it is the builder's own,
+# naming their active project, their backend URL and the hostnames their dev
+# server answers to, and the runner's sync_frontend_project writes the package's
+# own copy from .env.example at bootstrap. Shipping it would hand the recipient a
+# VITE_PROJECT for a project the package does not carry.
 FRONTEND_EXCLUDES=(
+    --exclude '.env'
     --exclude 'node_modules'
     --exclude 'node_external'
     --exclude 'dist'
@@ -473,8 +560,35 @@ if [ "$DEMO" = true ] || [ "$DIST" = true ]; then
 fi
 if [ "$DIST" = true ]; then
     info "Copying compiled viewer (frontend/viewer-dist)"
-    rsync -a "${COMMON_EXCLUDES[@]}" "$REPO_ROOT/frontend/viewer-dist/" "$DEST/frontend/viewer-dist/"
+    # The per-project viewer overlays build into viewer-dist/<project>/, and a
+    # checkout that has built for several holds several. A base distribution must
+    # not ship a directory named after a project it has never heard of — the same
+    # leak the bundle check above refuses in the SPA — so the segments belonging
+    # to projects this package does not carry are left behind.
+    #
+    # Named individually rather than excluding every top-level directory but the
+    # allowed ones. The rest of this tree belongs to `manage.py vendor_viewer`,
+    # which unpacks a pinned edition into whatever layout the release declares,
+    # and a blanket exclude would silently drop a future artifact that arrives in
+    # a subdirectory. Dropping a project segment is visible (the public viewer
+    # 404s on one page); dropping the edition is not.
+    VIEWER_SEGMENTS=()
+    while IFS= read -r _seg; do
+        _seg="$(basename "$_seg")"
+        contains "$_seg" ${PROJECTS[@]+"${PROJECTS[@]}"} \
+            || VIEWER_SEGMENTS+=(--exclude "/$_seg/")
+    done < <(find "$REPO_ROOT/projects" -mindepth 1 -maxdepth 1 -type d ! -name '__pycache__')
+    rsync -a "${COMMON_EXCLUDES[@]}" ${VIEWER_SEGMENTS[@]+"${VIEWER_SEGMENTS[@]}"} \
+        "$REPO_ROOT/frontend/viewer-dist/" "$DEST/frontend/viewer-dist/"
     ok "frontend/viewer-dist ($(du -sh "$DEST/frontend/viewer-dist" | cut -f1))"
+    # The public viewer serves /viewer/<segment>/, so a missing segment is a 404
+    # on that page and nothing anywhere else — worth saying while the build host
+    # is still at hand. `npm run build:viewer` writes the segment for whatever
+    # VITE_PROJECT names, so this is the same "built for something else" as above.
+    for seg in base ${PROJECTS[@]+"${PROJECTS[@]}"}; do
+        [ -d "$DEST/frontend/viewer-dist/$seg" ] \
+            || ok "no viewer-dist/$seg/ — the public viewer has no bundle for that segment"
+    done
 fi
 
 ACTIVE_PROJECT=""
@@ -531,6 +645,17 @@ if [ ${#PLUGINS[@]} -gt 0 ]; then
     ACTIVE_PLUGINS="${ACTIVE_PLUGINS%,}"
     ok "Active plugins: $ACTIVE_PLUGINS"
 fi
+
+# State what the package runs rather than inheriting it. .env.example is copied
+# out of the checkout, where editing it is ordinary, and the generated runner
+# writes these two keys only when there is something to activate — so a base
+# package would otherwise ship whatever the builder's tree happened to say and
+# activate a project it does not even carry, which fails at boot with an import
+# error rather than a sentence anybody can act on.
+info "Recording the package's project and plugins"
+set_env_key EPICURRENTS_PROJECT "$ACTIVE_PROJECT"
+set_env_key EPICURRENTS_PLUGINS "$ACTIVE_PLUGINS"
+ok "EPICURRENTS_PROJECT=${ACTIVE_PROJECT:-<blank>}, EPICURRENTS_PLUGINS=${ACTIVE_PLUGINS:-<blank>}"
 
 # ── Generated runner + docs ───────────────────────────────────────────────────
 # --demo / --dist ship a human start.sh + README.md (bring up and stay up). The

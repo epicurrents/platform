@@ -1,3 +1,5 @@
+import { writeFileSync } from 'node:fs'
+import { resolve } from 'node:path'
 import { defineConfig, loadEnv, type PluginOption } from 'vite'
 import { buildAliases } from './build-aliases'
 import vue from '@vitejs/plugin-vue'
@@ -182,6 +184,33 @@ export default defineConfig(({ mode }) => {
             }
         })
     )
+    // Stamp the bundle with the project and plugins it was compiled against.
+    // Vite bakes both in at build time and nothing in the output says which they
+    // were afterwards, so a package assembled from a prebuilt dist cannot tell a
+    // base bundle from a project one. A base distribution built on a checkout with
+    // a project active then ships that project's UI — its routes, its nav links,
+    // its name — against a backend configured to run none, and says nothing.
+    // scripts/make-bootstrap-fixture.sh reads this file and refuses that package.
+    //
+    // Written to the output directory rather than emitted as a bundle asset: the
+    // emit hooks differ between the Rollup and Rolldown builds Vite has shipped,
+    // and an asset that silently fails to appear is exactly the absence this file
+    // exists to make impossible. It stays out of the precache either way — the
+    // service worker globs js/css/html/ico/png/svg, not json.
+    plugins.push({
+        name: 'epicurrents-build-info',
+        apply: 'build',
+        writeBundle (options) {
+            const stamp = {
+                project: env.VITE_PROJECT || '',
+                plugins: (env.VITE_PLUGINS ?? '').split(',').map(p => p.trim()).filter(Boolean),
+            }
+            writeFileSync(
+                resolve(options.dir ?? 'dist', 'build-info.json'),
+                JSON.stringify(stamp, null, 4) + '\n',
+            )
+        },
+    } satisfies import('vite').Plugin)
     // In-memory mock API — active when VITE_BACKEND_URL=mock.
     // State resets on every full page navigation; see mocks.ts.
     if (useMock) {
