@@ -32,13 +32,35 @@ JWT claims (EdDSA-signed):
 | `aud` | Intended recipient instance URL. |
 | `sub` | Remote user identifier (string PK on the issuing instance). |
 | `iat` / `exp` | Issued-at / expiry in Unix seconds. TTL configurable via `FEDERATION_JWT_TTL` (default `60`). |
-| `jti` | Random UUID4 hex per token. Receiver uses it for replay detection (see below). |
+| `jti` | Random UUID4 hex per token. Receiver uses it for replay detection (see below). Mandatory. |
+| `htm` | HTTP method the token authorises, upper-case. |
+| `htp` | Decoded request path the token authorises. |
+| `bnd` | Digest over the remaining bound request context — today the `Range` header. |
 
 Inbound requests are verified by fetching and caching the peer's public key from its well-known URL. The `exp` and `iat` checks tolerate `DEFAULT_JWT_LEEWAY` seconds (30) of clock skew between peers — without it, a brand-new token from a peer whose clock is one second ahead of this instance's would be rejected as already expired. Set leeway to 0 in tests for strict comparison; the production default is conservative enough to absorb normal NTP-managed skew while staying well below the typical 60 s TTL.
 
 `iat` is the second axis of replay defense: `exp` bounds the validity window the issuer claims, `iat` bounds the window the verifier accepts. `DEFAULT_MAX_JWT_AGE` (60 s) caps how old an inbound token's `iat` can be — a token whose issuer chose a 1-hour TTL is rejected here even though its `exp` claims it should still be valid. Verifier-side bound, not issuer-side trust.
 
-**Replay detection via `jti`.** Each outbound token carries a random `jti`; on receipt, the verifier checks Django's cache for that `jti`, accepts the token if absent (and remembers it for `max_age + leeway` seconds), rejects it as a replay if present. The check is atomic via `cache.add`, which works correctly across gunicorn workers when backed by Redis. Tokens that arrive without a `jti` claim authenticate successfully but produce a `WARNING` log line — backwards-compat for peers that haven't yet upgraded. See [Future enhancements](#future-enhancements) for the migration-to-required plan.
+**Replay detection via `jti`.** Each outbound token carries a random `jti`; on receipt, the verifier checks Django's cache for that `jti`, accepts the token if absent (and remembers it for `max_age + leeway` seconds), rejects it as a replay if present. The check is atomic via `cache.add`, which works correctly across gunicorn workers when backed by Redis.
+
+**A token without `jti` is refused.** This was once accepted with a `WARNING`, as backwards-compat for peers predating the claim. The window protected only pre-release installations — `create_jwt` has emitted `jti` since the initial release commit, so no token this codebase ever minted needed it — while leaving the *sender* to decide whether replay protection ran at all, which an attacker replaying a captured token would decide by stripping the claim.
+
+## Request binding
+
+A token authorises **one request**, not a peer-user pair for a window. `htm`, `htp` and `bnd` are covered by the signature and checked against the request actually received.
+
+Without them a token is an interchangeable bearer credential: anyone who obtains one before it is spent can point it at a different operation on a different object — a full-file download in place of a metadata read — because nothing in the signature says what was asked for. Under TLS that needs an active adversary in the path, which is precisely the assumption the layering elsewhere in this app refuses to make: the network hardens the wire, it is never the authority.
+
+`bnd` covers request context that is in neither the method nor the path but still changes what is served. Today that is the `Range` header, which decides *which bytes* a download returns. It is a digest rather than the values themselves so the claim set stays fixed-size as more context is bound.
+
+Two things are deliberately **not** bound:
+
+- **The absolute URI.** `aud` is already matched literally against the receiver's `FEDERATION_INSTANCE_URL`, so scheme and host are covered without asking the receiving side to reconstruct them from forwarded headers behind the proxy overlay — a reconstruction that fails opaquely (every federated request 401s) when the proxy configuration drifts.
+- **The query string**, for the reason [DPoP](https://www.rfc-editor.org/rfc/rfc9449) omits it: intermediaries rewrite it. Anything in a query that changes what is served belongs in `bnd` instead.
+
+`create_jwt` and `verify_jwt` both take the binding inputs as **required** keyword arguments, following `offload_file_response` in [epicurrents/offload.py](../epicurrents/offload.py): a new call site cannot acquire an unbound token by not thinking about it, because there is no default to fall back to.
+
+**Mint one token per request.** A token is spent by its first use, so reusing one across two requests earns a 200 and then an opaque 401. On the outbound side [fuse_fs.py](fuse_fs.py) mints inside `_http_range`, the single place a federated byte request is issued, which makes the rule structural rather than something each caller must remember.
 
 Mutual trust must be established before federation works in either direction:
 
@@ -404,6 +426,7 @@ The default platform CI run excludes `federation/tests/test_fuse_fs.py` because 
 
 ## Gotchas
 
+- **Request binding and `jti` are both mandatory, so upgrading is a coordinated operation.** A peer running a release older than the one that introduced [request binding](#request-binding) is refused with a message naming the cause. Upgrade both sides; there is no compatibility flag, deliberately — opening a second grace window while closing the first one would have repeated the mistake. The break is one-directional: an upgraded instance still reaches an older peer, because the added claims are ignored by a release that does not check them, but it refuses inbound requests from one. So an instance that upgrades first keeps pulling and stops serving, which is the shape to expect while the other side catches up.
 - **`is_trusted=False` until promoted.** The `POST /peers/` endpoint creates rows with `is_trusted=False`. Inbound requests from a peer are rejected until a superuser flips the flag. This is the trust gate — registering a peer is not the same as trusting it.
 - **`apply_middleware` is the privacy switch, not the pipeline definition.** A federation grant with `apply_middleware=True` makes the server run its configured pipeline. The grant doesn't pick which middleware runs — that's the server's `_build_serve_pipeline()` config. Different recipients of the same recording get the same anonymisation, by design.
 - **FUSE serving strategy depends on pipeline shape.** Header-only pipelines stream signal bytes raw and substitute the new header per-read. Signal pipelines map output ranges back to input records and fetch only those. Full-file pipelines buffer the entire transformed file on first access. Choose the right middleware type for the transform you need; misclassifying as `EDFFullFileMiddleware` when an `EDFSignalMiddleware` would work explodes memory usage on large recordings.
@@ -424,7 +447,6 @@ The default platform CI run excludes `federation/tests/test_fuse_fs.py` because 
 These items were intentionally scoped out of the federation hardening initiative and are tracked here so they don't get lost — each is a hardening improvement, not a blocker for production deployment.
 
 - **CSV export of `FederationAuditLog`.** A management command for SAR / breach response — `export_federation_audit --since <ts> --until <ts> --peer <id>` writing a flat CSV. Until it lands, query via the Django shell. Referenced from [`FederationAuditLog`](#federationauditlog) and from [docs/operations.md](../docs/operations.md#query-the-federation-audit-log).
-- **Tighten `jti` from optional-with-warning to required.** Today the verifier accepts tokens without a `jti` claim and logs a `WARNING`, for backwards-compat with peers that haven't upgraded. Once the federation network has migrated, flip `parse_federation_auth` to reject `jti`-less tokens with 401. Referenced from [Identity and trust](#identity-and-trust).
 - **Automate the announce → promote handoff in `rotate_federation_keys`.** Today the operator runs `--announce`, waits an arbitrary period, then runs `--promote`. Detecting "all peers have refreshed" automatically would let the command self-pace — e.g. by polling each peer's `/.well-known/` for the new key, or by surfacing a per-peer "has refreshed since announce" flag via a status endpoint. Referenced from [Key rotation](#key-rotation).
 - **True concurrent-connection limit on download paths.** The current per-peer download limits (daily byte budget + per-minute request rate) bound total exfil regardless of concurrency. A separate concurrent-connections cap would slow sustained bulk pulls more aggressively, but requires reliable stream-cleanup handling in WSGI (decrement the counter on response completion / abort). The byte budget alone is sufficient for the stated threat model; this is defense-in-depth. Referenced from [Rate limiting and quotas](#rate-limiting-and-quotas).
 - **DNS rebinding defense for `fetch_peer_public_key`.** The SSRF guard resolves the URL's hostname and rejects private IPs, but `urllib.request.urlopen` does its own DNS resolution at connect time — a hostile peer could return a public IP on the first lookup and a private IP on the second. Closing the gap requires pinning the resolved IP for the urllib call, e.g. by passing a custom `HTTPAdapter` / `URLOpener` that bypasses DNS. Referenced from [Outbound URL safety](#outbound-url-safety-ssrf-guard).

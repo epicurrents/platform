@@ -158,10 +158,10 @@ class TestTransformCache:
             patch.object(_TransformCache, "_fetch_range", return_value=raw) as mock_fetch,
             patch.object(pipeline, "apply_header", return_value=transformed) as mock_apply,
         ):
-            result = cache.get_header("https://peer", "HASH", 512, "jwt")
+            result = cache.get_header("https://peer", "HASH", 512, "1")
 
         assert result == transformed
-        mock_fetch.assert_called_once_with("https://peer", "HASH", 0, 511, "jwt")
+        mock_fetch.assert_called_once_with("https://peer", "HASH", 0, 511, "1")
         mock_apply.assert_called_once_with(raw)
 
     def test_get_header_second_call_returns_cached_without_refetch(self):
@@ -174,8 +174,8 @@ class TestTransformCache:
             patch.object(_TransformCache, "_fetch_range", return_value=raw) as mock_fetch,
             patch.object(pipeline, "apply_header", return_value=transformed),
         ):
-            result1 = cache.get_header("https://peer", "HASH", 512, "jwt")
-            result2 = cache.get_header("https://peer", "HASH", 512, "jwt")
+            result1 = cache.get_header("https://peer", "HASH", 512, "1")
+            result2 = cache.get_header("https://peer", "HASH", 512, "1")
 
         assert result1 == result2 == transformed
         mock_fetch.assert_called_once()  # not twice
@@ -188,8 +188,8 @@ class TestTransformCache:
             return recording_hash.encode().ljust(8, b"\x00")
 
         with patch.object(_TransformCache, "_fetch_range", side_effect=fake_fetch):
-            r1 = cache.get_header("https://peer", "HASH_A", 8, "jwt")
-            r2 = cache.get_header("https://peer", "HASH_B", 8, "jwt")
+            r1 = cache.get_header("https://peer", "HASH_A", 8, "1")
+            r2 = cache.get_header("https://peer", "HASH_B", 8, "1")
 
         assert r1[:6] == b"HASH_A"
         assert r2[:6] == b"HASH_B"
@@ -205,7 +205,7 @@ class TestTransformCache:
             ),
             pytest.raises(OSError) as exc_info,
         ):
-            cache.get_header("https://peer", "HASH", 512, "jwt")
+            cache.get_header("https://peer", "HASH", 512, "1")
         assert exc_info.value.args[0] == errno.EIO
 
     def test_get_file_applies_full_pipeline(self):
@@ -229,7 +229,7 @@ class TestTransformCache:
             return raw_header if start == 0 else raw_signals
 
         with patch.object(_TransformCache, "_fetch_range", side_effect=fake_fetch):
-            result = cache.get_file("https://peer", "HASH", 256, 768, "jwt")
+            result = cache.get_file("https://peer", "HASH", 256, 768, "1")
 
         assert result == raw_header + raw_signals[:256]
 
@@ -608,9 +608,10 @@ class TestRead:
         assert result == raw
         mock_range.assert_called_once_with(
             "https://neuro.example.com/recordings/api/v1/00000000000000000000000000000001/file",
-            "jwt",
-            0,
-            511,
+            peer_url="https://neuro.example.com",
+            local_user_id="1",
+            start=0,
+            end=511,
         )
 
     # ── EDF isometric pipeline: header-only read ─────────────────────────────
@@ -662,9 +663,10 @@ class TestRead:
         ops._transform_cache.get_header.assert_not_called()
         mock_range.assert_called_once_with(
             "https://neuro.example.com/recordings/api/v1/ABCDEF1234567890ABCDEF1234567890/file",
-            "jwt",
-            _HEADER_SIZE_32CH,
-            _HEADER_SIZE_32CH + 511,
+            peer_url="https://neuro.example.com",
+            local_user_id="1",
+            start=_HEADER_SIZE_32CH,
+            end=_HEADER_SIZE_32CH + 511,
         )
 
     # ── EDF isometric pipeline: spanning the header/data boundary ────────────
@@ -685,9 +687,10 @@ class TestRead:
         assert result == _ANON_HEADER[offset:] + data_bytes
         mock_range.assert_called_once_with(
             "https://neuro.example.com/recordings/api/v1/ABCDEF1234567890ABCDEF1234567890/file",
-            "jwt",
-            _HEADER_SIZE_32CH,
-            _HEADER_SIZE_32CH + 127,
+            peer_url="https://neuro.example.com",
+            local_user_id="1",
+            start=_HEADER_SIZE_32CH,
+            end=_HEADER_SIZE_32CH + 127,
         )
 
     # ── EDF full-file pipeline ───────────────────────────────────────────────
@@ -849,14 +852,15 @@ class TestFetchTransformedSignalRange:
         # That maps to input record 0: bytes 512–531 on the remote.
         raw_record = bytes(range(20))  # 10 samples × 2 bytes
         with patch("federation.fuse_fs._http_range", return_value=raw_record) as mock_range:
-            result = _fetch_transformed_signal_range(entry, ctx, 512, 515, "jwt")
+            result = _fetch_transformed_signal_range(entry, ctx, 512, 515, "1")
 
         # Should have fetched exactly one input record (20 bytes).
         mock_range.assert_called_once_with(
             "https://neuro.example.com/recordings/api/v1/ABCDEF1234567890ABCDEF1234567890/file",
-            "jwt",
-            512,
-            531,
+            peer_url="https://neuro.example.com",
+            local_user_id="1",
+            start=512,
+            end=531,
         )
         # Result is 4 bytes, sliced from the 10-byte transformed record.
         assert len(result) == 4
@@ -868,13 +872,14 @@ class TestFetchTransformedSignalRange:
         # Remote: input bytes 512–611 (5 records × 20 bytes).
         raw_all = bytes(range(100))  # 5 × 20 bytes
         with patch("federation.fuse_fs._http_range", return_value=raw_all) as mock_range:
-            result = _fetch_transformed_signal_range(entry, ctx, 512, 561, "jwt")
+            result = _fetch_transformed_signal_range(entry, ctx, 512, 561, "1")
 
         mock_range.assert_called_once_with(
             "https://neuro.example.com/recordings/api/v1/ABCDEF1234567890ABCDEF1234567890/file",
-            "jwt",
-            512,
-            611,
+            peer_url="https://neuro.example.com",
+            local_user_id="1",
+            start=512,
+            end=611,
         )
         assert len(result) == 50
 
@@ -1143,9 +1148,10 @@ class TestReadSignalPipeline:
 
         assert len(result) == self._OUT_REC
         mock_range.assert_called_once()
-        _, call_jwt, start, end = mock_range.call_args[0]
-        assert start == self._HEADER_SIZE
-        assert end == self._HEADER_SIZE + self._IN_REC - 1
+        # _http_range takes everything but the url as keyword-only, because it
+        # mints its own token from the peer and acting user.
+        assert mock_range.call_args.kwargs["start"] == self._HEADER_SIZE
+        assert mock_range.call_args.kwargs["end"] == self._HEADER_SIZE + self._IN_REC - 1
 
     def test_boundary_spanning_read_concatenates_header_and_signal(self):
         ops, ctx = self._setup()

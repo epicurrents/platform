@@ -104,8 +104,9 @@ class TestInboundAuthIntegration:
         _configure_local(settings)
         rec, ct = _make_recording_with_grant(mock_federated_peer, make_user)
 
-        token = mock_federated_peer.sign_jwt(audience=LOCAL_URL)
-        resp = self._request(client, self._url(ct, rec.pk), token)
+        url = self._url(ct, rec.pk)
+        token = mock_federated_peer.sign_jwt(audience=LOCAL_URL, path=url)
+        resp = self._request(client, url, token)
 
         assert resp.status_code == 200
 
@@ -116,13 +117,16 @@ class TestInboundAuthIntegration:
         # Sign with a *different* private key — the registered peer.public_key
         # is the mock_federated_peer's; this signature will not verify.
         _, forged_priv_b64 = generate_keypair()
+        url = self._url(ct, rec.pk)
         forged_token = create_jwt(
             load_private_key(forged_priv_b64),
             issuer=mock_federated_peer.url,
             audience=LOCAL_URL,
             subject="remote-user-1",
+            method="GET",
+            path=url,
         )
-        resp = self._request(client, self._url(ct, rec.pk), forged_token)
+        resp = self._request(client, url, forged_token)
 
         assert resp.status_code == 401
 
@@ -139,10 +143,11 @@ class TestInboundAuthIntegration:
         # Reuse the same JTI on both requests; the replay cache should reject
         # the second one even though the signature is still valid.
         replay_jti = uuid.uuid4().hex
-        token = mock_federated_peer.sign_jwt(audience=LOCAL_URL, jti=replay_jti)
+        url = self._url(ct, rec.pk)
+        token = mock_federated_peer.sign_jwt(audience=LOCAL_URL, path=url, jti=replay_jti)
 
-        first = self._request(client, self._url(ct, rec.pk), token)
-        second = self._request(client, self._url(ct, rec.pk), token)
+        first = self._request(client, url, token)
+        second = self._request(client, url, token)
 
         assert first.status_code == 200
         assert second.status_code == 401
@@ -160,8 +165,9 @@ class TestInboundAuthIntegration:
         # Token's ``aud`` claim points at a different instance than the local
         # one — federation auth rejects this to prevent token reuse across
         # peers that happen to share a signing key.
-        token = mock_federated_peer.sign_jwt(audience="https://elsewhere.example.com")
-        resp = self._request(client, self._url(ct, rec.pk), token)
+        url = self._url(ct, rec.pk)
+        token = mock_federated_peer.sign_jwt(audience="https://elsewhere.example.com", path=url)
+        resp = self._request(client, url, token)
 
         assert resp.status_code == 401
 
@@ -183,13 +189,16 @@ class TestInboundAuthIntegration:
         mock_federated_peer.peer.public_key_next = next_pub_b64
         mock_federated_peer.peer.save()
 
+        url = self._url(ct, rec.pk)
         token_signed_with_next_key = create_jwt(
             load_private_key(next_priv_b64),
             issuer=mock_federated_peer.url,
             audience=LOCAL_URL,
             subject="remote-user-1",
+            method="GET",
+            path=url,
         )
-        resp = self._request(client, self._url(ct, rec.pk), token_signed_with_next_key)
+        resp = self._request(client, url, token_signed_with_next_key)
 
         assert resp.status_code == 200
 
@@ -210,7 +219,8 @@ class TestInboundAuthIntegration:
         mock_federated_peer.peer.is_trusted = False
         mock_federated_peer.peer.save()
 
-        token = mock_federated_peer.sign_jwt(audience=LOCAL_URL)
-        resp = self._request(client, self._url(ct, rec.pk), token)
+        url = self._url(ct, rec.pk)
+        token = mock_federated_peer.sign_jwt(audience=LOCAL_URL, path=url)
+        resp = self._request(client, url, token)
 
         assert resp.status_code == 401

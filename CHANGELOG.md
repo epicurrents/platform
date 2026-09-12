@@ -8,6 +8,18 @@ Entries are written for the person deciding whether to upgrade, so the ones that
 
 ## [Unreleased]
 
+### Changed
+
+- **Federation tokens are now bound to the request they authorise, and both instances must be upgraded together.** A token previously carried only who was asking and of whom (`iss` / `aud` / `sub`) plus its time bounds and nonce — nothing about what was being asked for. Anyone who obtained one before it was spent could point it at a different operation on a different object: a full-file download in place of a metadata read. Exploiting that needs an active adversary in the network path, which is exactly the assumption the rest of the federation design refuses to make, since the private-network layer is defence in depth and never the authority.
+
+  Tokens now additionally cover the HTTP method, the request path, and a digest of the remaining request context — today the `Range` header, which decides which bytes a download returns. The absolute URI is deliberately not bound: `aud` already pins scheme and host, and reconstructing them from forwarded headers behind the proxy overlay fails opaquely whenever that configuration drifts. The query string is not bound either, for the reason DPoP omits it — intermediaries rewrite it.
+
+  There is no compatibility flag. A peer on an older release is refused with a message naming the cause, and upgrading both sides is the only path. Opening a grace window here would have repeated the mistake being corrected below.
+
+  The break is one-directional, which is worth knowing while coordinating. An upgraded instance still *reaches* an un-upgraded peer, because the added claims are simply ignored by a release that does not check them. What stops working is the other direction: from the moment an instance upgrades it refuses inbound requests from peers that have not. Expect that asymmetry rather than a clean mutual outage.
+
+- **A federation token that omits `jti` is refused rather than skipping replay protection.** It was previously accepted with a `WARNING`, as backwards-compat for peers predating the claim. No such peer ever existed: `create_jwt` has emitted `jti` since the initial release commit, so the window protected nobody while leaving the *sender* to decide whether replay protection ran — a decision an attacker replaying a captured token makes by stripping the claim.
+
 ### Fixed
 
 - **A distribution built on a checkout with a project active shipped that project's UI.** `VITE_PROJECT` is baked into the SPA at build time and nothing in the output names it afterwards, so `frontend/dist` from such a checkout is the project's whole frontend — routes, nav links, the project's own name — and the packager copied it into a base distribution verbatim. The package started, `EPICURRENTS_PROJECT` was blank as intended, and the recipient was offered links into API mounts that do not exist. The per-project viewer overlays under `viewer-dist/<project>/` rode along the same way, naming the project in a directory, and `--with-frontend` additionally shipped the builder's own `frontend/.env`.
@@ -15,6 +27,8 @@ Entries are written for the person deciding whether to upgrade, so the ones that
   Builds now write `frontend/dist/build-info.json` naming the project and plugins they were compiled with, and [make-bootstrap-fixture.sh](scripts/make-bootstrap-fixture.sh) refuses a package whose bundle names a project it does not carry — with the two ways out in the message. A bundle built for no project is the base UI and is accepted anywhere. The viewer overlays are filtered to the segments the package can serve, the builder's `frontend/.env` is no longer copied, and the package's `.env.example` states its own `EPICURRENTS_PROJECT` and `EPICURRENTS_PLUGINS` instead of inheriting whatever the builder's tree said.
 
   An existing `frontend/dist` predating this carries no stamp and is refused; rebuild it with `npm run build`.
+
+- A federated FUSE read that crossed the EDF header boundary failed on its first attempt. One token was minted per `read()` and reused across the header fetch and the signal fetch, but a token is spent by its first use, so the second request was correctly rejected as a replay. It surfaced only on the first read spanning that boundary — afterwards the header came from cache and one request sufficed — which is why a manual two-instance walkthrough did not reliably reproduce it. Minting now happens inside the single function that issues a federated byte request, so one token per request is structural rather than a rule each caller has to remember.
 
 ### Added
 

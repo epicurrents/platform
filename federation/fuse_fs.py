@@ -46,11 +46,15 @@ How reads work
 --------------
 Each ``read(path, size, offset)`` call:
 
-1. Generates a short-lived ``FederatedBearer`` JWT for the owning peer.
-2. Issues an HTTP ``Range: bytes=<offset>-<end>`` request to the remote
-   ``/recordings/api/v1/<hash>/file`` endpoint. Bytes returned by the server are
-   already at Layer 1 anonymisation level (raw if the grant has
+1. Issues one or more HTTP ``Range: bytes=<offset>-<end>`` requests to the
+   remote ``/recordings/api/v1/<hash>/file`` endpoint — a read spanning the
+   header/signal boundary takes two. Bytes returned by the server are already
+   at Layer 1 anonymisation level (raw if the grant has
    ``apply_middleware=False``, anonymised if it has ``apply_middleware=True``).
+2. Signs a fresh short-lived ``FederatedBearer`` JWT for each of those
+   requests, bound to its method, path and ``Range``. Tokens are single-use at
+   the peer, so one per request is a requirement rather than a preference; the
+   minting lives inside ``_http_range`` for that reason.
 3. **For EDF/BDF files:** if a local post-processing pipeline was supplied at
    mount time, it is applied to the received bytes as Layer 2.
 4. **For all other file types:** bytes are returned verbatim.
@@ -150,25 +154,69 @@ class _RecordingFile(NamedTuple):
 # ---------------------------------------------------------------------------
 
 
-def _make_jwt(peer_url: str, local_user_id: str) -> str:
-    """Sign a short-lived outbound JWT for *peer_url* on behalf of *local_user_id*."""
+class FederationSigningError(ValueError):
+    """This instance cannot sign an outbound federation token.
+
+    Raised only by :func:`_make_jwt`, so a caller can tell "we have no usable
+    key" from any other ``ValueError`` arising in the same block. Minting happens
+    deep inside the read path rather than at its start, so a bare
+    ``except ValueError`` there would report an unrelated failure as a signing
+    one. Subclasses ``ValueError`` so ordinary handlers still catch it.
+    """
+
+
+def _make_jwt(
+    peer_url: str,
+    local_user_id: str,
+    *,
+    method: str,
+    path: str,
+    range_header: str = "",
+) -> str:
+    """Sign a short-lived outbound JWT for one request to *peer_url*.
+
+    The token is bound to the method, path and ``Range`` it is minted for, so it
+    authorises that request and no other. Mint one immediately before each
+    request rather than reusing one across several: a token is spent by its
+    first use (the peer's ``jti`` replay cache), and a reused one is refused.
+    """
     from federation.auth import (
         create_jwt,
         get_local_instance_url,
         get_local_private_key,
     )
 
-    return create_jwt(
-        get_local_private_key(),
-        issuer=get_local_instance_url(),
-        audience=peer_url,
-        subject=str(local_user_id),
-        ttl=60,
-    )
+    try:
+        return create_jwt(
+            get_local_private_key(),
+            issuer=get_local_instance_url(),
+            audience=peer_url,
+            subject=str(local_user_id),
+            method=method,
+            path=path,
+            range_header=range_header,
+            ttl=60,
+        )
+    except ValueError as exc:
+        raise FederationSigningError(str(exc)) from exc
 
 
-def _http_range(url: str, jwt: str, start: int, end: int, timeout: int = 30) -> bytes:
-    """Fetch bytes *start*-*end* (inclusive) from *url* with a FederatedBearer JWT.
+def _http_range(
+    url: str,
+    *,
+    peer_url: str,
+    local_user_id: str,
+    start: int,
+    end: int,
+    timeout: int = 30,
+) -> bytes:
+    """Fetch bytes *start*-*end* (inclusive) from *url* as *local_user_id*.
+
+    Mints its own token rather than accepting one. This is the only place a
+    federated byte request is issued, so minting here is what makes "one token
+    per request" structural instead of a rule every caller has to remember —
+    and the token can be bound to the exact ``Range`` below, which a caller
+    minting in advance could only do by duplicating this function's arithmetic.
 
     Accepts both 206 Partial Content and 200 OK (some HTTP servers return 200
     when the range covers the entire file).
@@ -178,15 +226,24 @@ def _http_range(url: str, jwt: str, start: int, end: int, timeout: int = 30) -> 
     explicit helper rather than relying on Python's default.
 
     Raises urllib.error.URLError / urllib.error.HTTPError on network or
-    authorization failures.
+    authorization failures, and ``ValueError`` when this instance has no usable
+    signing key.
     """
     from federation.auth import _build_tls_context
 
+    range_header = f"bytes={start}-{end}"
+    jwt = _make_jwt(
+        peer_url,
+        local_user_id,
+        method="GET",
+        path=url,
+        range_header=range_header,
+    )
     req = urllib.request.Request(
         url,
         headers={
             "Authorization": f"FederatedBearer {jwt}",
-            "Range": f"bytes={start}-{end}",
+            "Range": range_header,
             "User-Agent": "epicurrents-fuse/1",
         },
     )
@@ -231,7 +288,7 @@ class _TransformCache:
         peer_url: str,
         recording_hash: str,
         header_size: int,
-        jwt: str,
+        local_user_id: str,
     ) -> bytes:
         """Return the transformed header for an *isometric* pipeline.
 
@@ -244,7 +301,7 @@ class _TransformCache:
             if key in self._store:
                 return self._store[key]
 
-        raw = self._fetch_range(peer_url, recording_hash, 0, header_size - 1, jwt)
+        raw = self._fetch_range(peer_url, recording_hash, 0, header_size - 1, local_user_id)
         transformed = self._pipeline.apply_header(raw)
 
         with self._lock:
@@ -257,7 +314,7 @@ class _TransformCache:
         recording_hash: str,
         header_size: int,
         remote_file_size: int,
-        jwt: str,
+        local_user_id: str,
     ) -> bytes:
         """Return the complete transformed file for a *full-file* pipeline.
 
@@ -270,10 +327,10 @@ class _TransformCache:
             if key in self._store:
                 return self._store[key]
 
-        raw_header = self._fetch_range(peer_url, recording_hash, 0, header_size - 1, jwt)
+        raw_header = self._fetch_range(peer_url, recording_hash, 0, header_size - 1, local_user_id)
         signal_size = remote_file_size - header_size
         raw_signals = (
-            self._fetch_range(peer_url, recording_hash, header_size, remote_file_size - 1, jwt)
+            self._fetch_range(peer_url, recording_hash, header_size, remote_file_size - 1, local_user_id)
             if signal_size > 0
             else b""
         )
@@ -290,11 +347,17 @@ class _TransformCache:
         recording_hash: str,
         start: int,
         end: int,
-        jwt: str,
+        local_user_id: str,
     ) -> bytes:
         url = f"{peer_url.rstrip('/')}/recordings/api/v1/{recording_hash}/file"
         try:
-            return _http_range(url, jwt, start, end)
+            return _http_range(
+                url,
+                peer_url=peer_url,
+                local_user_id=local_user_id,
+                start=start,
+                end=end,
+            )
         except urllib.error.URLError as exc:
             logger.warning(
                 "Could not fetch bytes %d-%d for %s from %s: %s",
@@ -463,13 +526,19 @@ def load_catalogue(
         slug = _peer_slug(peer.url)
         dirs[slug] = _PeerDir(slug=slug, peer_url=peer.url)
 
+        remote_url = f"{peer.url.rstrip('/')}/recordings/api/v1/?status=ready&limit=200"
+
         try:
-            jwt = _make_jwt(peer.url, local_user_id)
+            # Bound to the listing endpoint only. The query string is not part
+            # of the binding (intermediaries rewrite it), so this token cannot
+            # be redirected to a different path but can carry different filters
+            # on this one — a distinction with no read consequence here, since
+            # the listing is filtered by grant on the serving side regardless.
+            jwt = _make_jwt(peer.url, local_user_id, method="GET", path=remote_url)
         except ValueError as exc:
             logger.warning("Cannot create JWT for peer %s: %s", peer.url, exc)
             continue
 
-        remote_url = f"{peer.url.rstrip('/')}/recordings/api/v1/?status=ready&limit=200"
         req = urllib.request.Request(
             remote_url,
             headers={
@@ -681,7 +750,7 @@ def _fetch_transformed_signal_range(
     ctx: SignalPipelineContext,
     offset: int,
     end: int,
-    jwt: str,
+    local_user_id: str,
 ) -> bytes:
     """Fetch, transform, and slice a signal-region byte range.
 
@@ -703,7 +772,13 @@ def _fetch_transformed_signal_range(
     fetch_end = entry.header_size + (last_rec + 1) * ctx.input_record_size - 1
     url = f"{entry.peer_url.rstrip('/')}/recordings/api/v1/{entry.recording_hash}/file"
     try:
-        raw_data = _http_range(url, jwt, fetch_start, fetch_end)
+        raw_data = _http_range(
+            url,
+            peer_url=entry.peer_url,
+            local_user_id=local_user_id,
+            start=fetch_start,
+            end=fetch_end,
+        )
     except urllib.error.URLError as exc:
         raise OSError(errno.EIO, str(exc)) from exc
 
@@ -725,7 +800,7 @@ def _read_signal_range(
     ctx: SignalPipelineContext,
     offset: int,
     end: int,
-    jwt: str,
+    local_user_id: str,
 ) -> bytes:
     """Serve a FUSE byte range from a signal-middleware-transformed EDF/BDF file.
 
@@ -741,11 +816,11 @@ def _read_signal_range(
         if end < ctx.new_header_size:
             return header_chunk
         # Spans the header/signal boundary.
-        signal_chunk = _fetch_transformed_signal_range(entry, ctx, ctx.new_header_size, end, jwt)
+        signal_chunk = _fetch_transformed_signal_range(entry, ctx, ctx.new_header_size, end, local_user_id)
         return header_chunk + signal_chunk
 
     # Signal region only.
-    return _fetch_transformed_signal_range(entry, ctx, offset, end, jwt)
+    return _fetch_transformed_signal_range(entry, ctx, offset, end, local_user_id)
 
 
 # ---------------------------------------------------------------------------
@@ -983,12 +1058,6 @@ class FederationOperations(Operations):
         remote_url = f"{entry.peer_url.rstrip('/')}/recordings/api/v1/{entry.recording_hash}/file"
 
         try:
-            jwt = _make_jwt(entry.peer_url, self.local_user_id)
-        except ValueError as exc:
-            logger.error("Cannot sign JWT for %s: %s", entry.peer_url, exc)
-            raise FuseOSError(errno.EIO) from exc
-
-        try:
             # Layer 1 is implicit: the HTTP range request below returns bytes
             # already at the serving peer's privacy level (raw or anonymised
             # depending on apply_middleware on the federation AccessRight grant).
@@ -1001,7 +1070,7 @@ class FederationOperations(Operations):
                             entry.peer_url,
                             entry.recording_hash,
                             entry.header_size,
-                            jwt,
+                            self.local_user_id,
                         )
                         header_end = min(end, entry.header_size - 1)
                         header_chunk = anon_header[offset : header_end + 1]
@@ -1010,12 +1079,26 @@ class FederationOperations(Operations):
                             # Entire request within header; no network I/O needed.
                             return header_chunk
 
-                        # Request spans the header/data boundary.
-                        data_chunk = _http_range(remote_url, jwt, entry.header_size, end)
+                        # Request spans the header/data boundary. This is a
+                        # second HTTP request, and therefore a second token —
+                        # see _http_range on why minting lives down there.
+                        data_chunk = _http_range(
+                            remote_url,
+                            peer_url=entry.peer_url,
+                            local_user_id=self.local_user_id,
+                            start=entry.header_size,
+                            end=end,
+                        )
                         return header_chunk + data_chunk
 
                     # Signal region only — transparent byte-range proxy.
-                    return _http_range(remote_url, jwt, offset, end)
+                    return _http_range(
+                        remote_url,
+                        peer_url=entry.peer_url,
+                        local_user_id=self.local_user_id,
+                        start=offset,
+                        end=end,
+                    )
 
                 elif self._pipeline.has_signal_middleware:
                     # ── Signal pipeline: per-record transform, single range fetch ──
@@ -1024,8 +1107,14 @@ class FederationOperations(Operations):
                     if ctx is None:
                         # Signal context unavailable (header fetch failed at mount time).
                         logger.warning("No signal context for %s; falling back to raw proxy", path)
-                        return _http_range(remote_url, jwt, offset, end)
-                    return _read_signal_range(entry, ctx, offset, end, jwt)
+                        return _http_range(
+                            remote_url,
+                            peer_url=entry.peer_url,
+                            local_user_id=self.local_user_id,
+                            start=offset,
+                            end=end,
+                        )
+                    return _read_signal_range(entry, ctx, offset, end, self.local_user_id)
 
                 else:
                     # ── Full-file: serve slices from complete transformed cache ──
@@ -1034,13 +1123,27 @@ class FederationOperations(Operations):
                         entry.recording_hash,
                         entry.header_size,
                         entry.remote_file_size,
-                        jwt,
+                        self.local_user_id,
                     )
                     return content[offset : end + 1]
 
             # ── Non-EDF or EDF without header info: transparent byte-range proxy ──
-            return _http_range(remote_url, jwt, offset, end)
+            return _http_range(
+                remote_url,
+                peer_url=entry.peer_url,
+                local_user_id=self.local_user_id,
+                start=offset,
+                end=end,
+            )
 
+        except FederationSigningError as exc:
+            # This instance has no usable signing key. Minting happens inside
+            # _http_range, so the guard sits among the other request failures
+            # rather than before the try block; the dedicated type keeps it from
+            # claiming that any other ValueError raised in here is a signing
+            # problem.
+            logger.error("Cannot sign JWT for %s: %s", entry.peer_url, exc)
+            raise FuseOSError(errno.EIO) from exc
         except urllib.error.HTTPError as exc:
             # Must be caught before URLError and OSError (both are base classes).
             if exc.code in (401, 403):

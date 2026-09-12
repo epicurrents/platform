@@ -503,10 +503,19 @@ class TestInboundCheckObject:
         peer_url: str,
         priv_b64: str,
         audience: str,
+        path: str,
         subject: str = "remote-user-1",
     ) -> str:
+        """Sign a peer token bound to *path*, the endpoint the test is about to call."""
         priv = load_private_key(priv_b64)
-        return create_jwt(priv, issuer=peer_url, audience=audience, subject=subject)
+        return create_jwt(
+            priv,
+            issuer=peer_url,
+            audience=audience,
+            subject=subject,
+            method="GET",
+            path=path,
+        )
 
     def _auth_header(self, token: str) -> dict:
         return {"HTTP_AUTHORIZATION": f"FederatedBearer {token}"}
@@ -541,6 +550,7 @@ class TestInboundCheckObject:
             peer_url="https://peer.example.com",
             priv_b64=peer_priv,
             audience="https://local.example.com",
+            path=f"{BASE}/inbound/objects/{ct.pk}/{rec.pk}/",
             subject="remote-user-1",
         )
         resp = client.get(
@@ -574,6 +584,7 @@ class TestInboundCheckObject:
             peer_url="https://peer.example.com",
             priv_b64=peer_priv,
             audience="https://local.example.com",
+            path=f"{BASE}/inbound/objects/{ct.pk}/{rec.pk}/",
         )
         resp = client.get(
             f"{BASE}/inbound/objects/{ct.pk}/{rec.pk}/",
@@ -614,11 +625,13 @@ class TestInboundCheckObject:
             peer_url="https://peer.example.com",
             priv_b64=peer_priv,
             audience="https://local.example.com",
+            path=f"{BASE}/inbound/objects/{ct.pk}/{rec.pk}/",
         )
         token_b = self._make_jwt(
             peer_url="https://peer.example.com",
             priv_b64=peer_priv,
             audience="https://local.example.com",
+            path=f"{BASE}/inbound/objects/{ct.pk}/{rec.pk + 999_999}/",
         )
         resp_unauth = client.get(
             f"{BASE}/inbound/objects/{ct.pk}/{rec.pk}/",
@@ -657,6 +670,7 @@ class TestInboundCheckObject:
             peer_url="https://untrusted.example.com",
             priv_b64=peer_priv,
             audience="https://local.example.com",
+            path=f"{BASE}/inbound/objects/1/1/",
         )
         resp = client.get(
             f"{BASE}/inbound/objects/1/1/",
@@ -696,6 +710,7 @@ class TestInboundCheckObject:
             peer_url="https://peer.example.com",
             priv_b64=peer_priv,
             audience="https://local.example.com",
+            path=f"{BASE}/inbound/objects/{ct.pk}/{rec.pk}/",
             subject="any-random-user",
         )
         resp = client.get(
@@ -741,12 +756,14 @@ class TestInboundCheckObject:
             peer_url="https://peer.example.com",
             priv_b64=peer_priv,
             audience="https://local.example.com",
+            path=f"{BASE}/inbound/objects/{ct.pk}/{rec.pk}/",
             subject="remote-user-1",
         )
         token_missing = self._make_jwt(
             peer_url="https://peer.example.com",
             priv_b64=peer_priv,
             audience="https://local.example.com",
+            path=f"{BASE}/inbound/objects/{ct.pk}/{rec.pk + 999_999}/",
             subject="remote-user-1",
         )
 
@@ -957,14 +974,17 @@ class TestFederationAuditTrail:
         )
 
         priv = load_private_key(peer_priv)
+        probe_path = f"{BASE}/inbound/objects/{rec_ct.pk}/{rec.pk}/"
         token = create_jwt(
             priv,
             issuer="https://peer.example.com",
             audience="https://local.example.com",
             subject="remote-user-1",
+            method="GET",
+            path=probe_path,
         )
         resp = client.get(
-            f"{BASE}/inbound/objects/{rec_ct.pk}/{rec.pk}/",
+            probe_path,
             HTTP_AUTHORIZATION=f"FederatedBearer {token}",
         )
         assert resp.status_code == 200
@@ -1006,14 +1026,17 @@ class TestFederationAuditTrail:
         # No AccessRight — probe will deny.
 
         priv = load_private_key(peer_priv)
+        probe_path = f"{BASE}/inbound/objects/{rec_ct.pk}/{rec.pk}/"
         token = create_jwt(
             priv,
             issuer="https://peer.example.com",
             audience="https://local.example.com",
             subject="remote-user-1",
+            method="GET",
+            path=probe_path,
         )
         resp = client.get(
-            f"{BASE}/inbound/objects/{rec_ct.pk}/{rec.pk}/",
+            probe_path,
             HTTP_AUTHORIZATION=f"FederatedBearer {token}",
         )
         assert resp.status_code == 404

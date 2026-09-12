@@ -32,12 +32,15 @@ def _configure_local(settings):
     settings.FEDERATION_PRIVATE_KEY = priv
 
 
-def _make_jwt(peer_url, peer_priv_b64, audience, subject="remote-user-1"):
+def _make_jwt(peer_url, peer_priv_b64, audience, path, subject="remote-user-1"):
+    """Sign a peer token bound to *path*, the endpoint the caller is about to request."""
     return create_jwt(
         load_private_key(peer_priv_b64),
         issuer=peer_url,
         audience=audience,
         subject=subject,
+        method="GET",
+        path=path,
     )
 
 
@@ -123,9 +126,14 @@ class TestLogFederationAccess:
 
 @pytest.mark.django_db
 class TestInboundCheckObjectAuditing:
+    @staticmethod
+    def _path(ct_id, object_id) -> str:
+        """The inbound URL, and therefore the path a token for it must be bound to."""
+        return f"{BASE}/inbound/objects/{ct_id}/{object_id}/"
+
     def _request(self, client, token, ct_id, object_id):
         return client.get(
-            f"{BASE}/inbound/objects/{ct_id}/{object_id}/",
+            self._path(ct_id, object_id),
             HTTP_AUTHORIZATION=f"FederatedBearer {token}",
         )
 
@@ -148,7 +156,9 @@ class TestInboundCheckObjectAuditing:
             remote_user_id="remote-user-1",
             can_read=True,
         )
-        token = _make_jwt("https://peer.example.com", peer_priv, "https://local.example.com")
+        token = _make_jwt(
+            "https://peer.example.com", peer_priv, "https://local.example.com", self._path(ct.pk, rec.pk)
+        )
         resp = self._request(client, token, ct.pk, rec.pk)
         assert resp.status_code == 200
         row = FederationAuditLog.objects.get()
@@ -169,7 +179,9 @@ class TestInboundCheckObjectAuditing:
         rec = baker.make(Recording, author=owner, file_size=1, status=Recording.Status.READY)
         ct = ContentType.objects.get_for_model(rec, for_concrete_model=False)
         # No grant.
-        token = _make_jwt("https://peer.example.com", peer_priv, "https://local.example.com")
+        token = _make_jwt(
+            "https://peer.example.com", peer_priv, "https://local.example.com", self._path(ct.pk, rec.pk)
+        )
         resp = self._request(client, token, ct.pk, rec.pk)
         assert resp.status_code == 404
         row = FederationAuditLog.objects.get()
@@ -189,7 +201,9 @@ class TestInboundCheckObjectAuditing:
         from recordings.models import Recording
 
         rec_ct = ContentType.objects.get_for_model(Recording, for_concrete_model=False)
-        token = _make_jwt("https://peer.example.com", peer_priv, "https://local.example.com")
+        token = _make_jwt(
+            "https://peer.example.com", peer_priv, "https://local.example.com", self._path(rec_ct.pk, 999_999)
+        )
         # PK that does not exist.
         resp = self._request(client, token, rec_ct.pk, 999_999)
         assert resp.status_code == 404

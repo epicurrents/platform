@@ -59,21 +59,32 @@ class MockFederatedPeer:
         self,
         *,
         audience: str,
+        path: str,
+        method: str = "GET",
+        range_header: str = "",
         subject: str = "remote-user-1",
         ttl: int = 60,
         jti: str | None = None,
     ) -> str:
-        """Sign a JWT impersonating this peer.
+        """Sign a JWT impersonating this peer, bound to one request.
 
         ``audience`` should be the local instance's URL (typically
         ``settings.FEDERATION_INSTANCE_URL``) — federation auth rejects
         tokens whose ``aud`` claim does not match.
+
+        ``path`` has no default on purpose: a token is bound to the request it
+        authorises, so a test that signs one has to say which request it means.
+        A default here would let a test drift onto a different endpoint and fail
+        with a binding mismatch rather than the thing it was checking.
         """
         return create_jwt(
             self.private_key,
             issuer=self.url,
             audience=audience,
             subject=subject,
+            method=method,
+            path=path,
+            range_header=range_header,
             ttl=ttl,
             jti=jti,
         )

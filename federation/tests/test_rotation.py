@@ -24,13 +24,28 @@ from model_bakery import baker
 
 from federation.auth import (
     assert_local_keys_consistent,
-    create_jwt,
+    create_jwt as _create_jwt,
     fetch_peer_public_key,
     generate_keypair,
     load_private_key,
     parse_federation_auth,
 )
 from federation.models import FederatedPeer
+
+
+# ``create_jwt`` requires the request binding with no default (see
+# federation/auth.py). These cases are about key rotation, not binding, so the
+# wrapper supplies a fixed one rather than restating it in every call.
+BOUND_METHOD = "GET"
+BOUND_PATH = "/api/v1/federation/inbound/objects/1/1/"
+
+
+def create_jwt(private_key, **kwargs):
+    """Test wrapper around the real ``create_jwt`` with a default request binding."""
+    kwargs.setdefault("method", BOUND_METHOD)
+    kwargs.setdefault("path", BOUND_PATH)
+    return _create_jwt(private_key, **kwargs)
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -48,8 +63,10 @@ def _well_known_response(current: str, next_key: str = ""):
     return mock_resp
 
 
-def _make_request(token: str):
+def _make_request(token: str, path=BOUND_PATH, method=BOUND_METHOD):
     req = MagicMock()
+    req.method = method
+    req.path = path
     req.META = {"HTTP_AUTHORIZATION": f"FederatedBearer {token}"}
     return req
 

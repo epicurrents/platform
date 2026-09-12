@@ -11,17 +11,49 @@ from federation.auth import (
     _b64_decode,
     _b64_encode,
     _build_tls_context,
+    _claim_fingerprint,
     _check_url_is_safe,
     assert_local_keys_consistent,
-    create_jwt,
+    compute_request_binding,
+    create_jwt as _create_jwt,
     fetch_peer_public_key,
     generate_keypair,
     load_private_key,
     load_public_key,
     parse_federation_auth,
     try_federation_auth,
-    verify_jwt,
+    verify_jwt as _verify_jwt,
 )
+
+# ---------------------------------------------------------------------------
+# Request-binding defaults for tests that are not about binding
+# ---------------------------------------------------------------------------
+#
+# ``create_jwt`` / ``verify_jwt`` require the request binding (method, path)
+# with no default, so a production call site cannot mint an unbound token by
+# omission. Most cases below are about signatures, clocks or replay and would
+# only be made noisier by restating an irrelevant path in every call, so these
+# wrappers supply one. They *default* the arguments rather than removing them —
+# the production signature is unchanged, and TestRequestBinding passes explicit
+# values to exercise the checks themselves.
+
+BOUND_METHOD = "GET"
+BOUND_PATH = "/api/v1/federation/inbound/objects/1/1/"
+
+
+def create_jwt(private_key, **kwargs):
+    """Test wrapper around the real ``create_jwt`` with a default request binding."""
+    kwargs.setdefault("method", BOUND_METHOD)
+    kwargs.setdefault("path", BOUND_PATH)
+    return _create_jwt(private_key, **kwargs)
+
+
+def verify_jwt(token, public_key, **kwargs):
+    """Test wrapper around the real ``verify_jwt`` with a default request binding."""
+    kwargs.setdefault("method", BOUND_METHOD)
+    kwargs.setdefault("path", BOUND_PATH)
+    return _verify_jwt(token, public_key, **kwargs)
+
 
 # ---------------------------------------------------------------------------
 # Key generation and loading
@@ -280,6 +312,9 @@ class TestIatValidation:
             "sub": "u",
             "iat": now,
             "exp": now + 60,
+            "htm": BOUND_METHOD,
+            "htp": BOUND_PATH,
+            "bnd": compute_request_binding(),
         }
         payload_dict.update(overrides)
         payload = _b64_encode(json.dumps(payload_dict, separators=(",", ":")).encode())
@@ -333,6 +368,177 @@ class TestIatValidation:
             verify_jwt(token, self.pub, audience="https://b.example.com")
 
 
+class TestRequestBinding:
+    """``htm`` / ``htp`` / ``bnd`` tie a token to one request.
+
+    Without these a token is an interchangeable bearer credential for the
+    (peer, user) pair: anyone holding one before it is spent can point it at a
+    different operation on a different object. These cases pass explicit
+    binding values rather than the module defaults, because the binding is what
+    is under test.
+    """
+
+    ISSUER = "https://a.example.com"
+    AUDIENCE = "https://b.example.com"
+    PATH = "/recordings/api/v1/a3f9c1/file"
+
+    def setup_method(self):
+        pub_b64, priv_b64 = generate_keypair()
+        self.priv = load_private_key(priv_b64)
+        self.pub = load_public_key(pub_b64)
+
+    def _token(self, **overrides):
+        kwargs = {
+            "issuer": self.ISSUER,
+            "audience": self.AUDIENCE,
+            "subject": "u",
+            "method": "GET",
+            "path": self.PATH,
+        }
+        kwargs.update(overrides)
+        return create_jwt(self.priv, **kwargs)
+
+    def _verify(self, token, **overrides):
+        kwargs = {"audience": self.AUDIENCE, "method": "GET", "path": self.PATH}
+        kwargs.update(overrides)
+        return verify_jwt(token, self.pub, **kwargs)
+
+    def test_matching_binding_verifies(self):
+        payload = self._verify(self._token())
+        assert payload["htm"] == "GET"
+        assert payload["htp"] == self.PATH
+
+    def test_method_mismatch_rejected(self):
+        token = self._token(method="GET")
+        with pytest.raises(ValueError, match="method binding mismatch"):
+            self._verify(token, method="DELETE")
+
+    def test_path_mismatch_rejected(self):
+        """The redirection this exists to stop: a token for one object used on another."""
+        token = self._token(path="/recordings/api/v1/a3f9c1/detail")
+        with pytest.raises(ValueError, match="path binding mismatch"):
+            self._verify(token, path="/recordings/api/v1/b7e2d4/file")
+
+    def test_range_mismatch_rejected(self):
+        token = self._token(range_header="bytes=0-1023")
+        with pytest.raises(ValueError, match="binding mismatch"):
+            self._verify(token, range_header="bytes=0-999999999")
+
+    def test_matching_range_verifies(self):
+        token = self._token(range_header="bytes=256-511")
+        assert self._verify(token, range_header="bytes=256-511")["htp"] == self.PATH
+
+    def test_absent_range_is_bound_too(self):
+        """A token minted for a whole-file read cannot acquire a Range in flight."""
+        token = self._token()
+        with pytest.raises(ValueError, match="binding mismatch"):
+            self._verify(token, range_header="bytes=0-99")
+
+    def test_missing_binding_claims_rejected(self):
+        """A pre-binding peer is refused, not treated as unbound-and-therefore-fine."""
+        header = _b64_encode(json.dumps({"alg": "EdDSA", "typ": "JWT"}, separators=(",", ":")).encode())
+        now = int(time.time())
+        payload = _b64_encode(
+            json.dumps(
+                {
+                    "iss": self.ISSUER,
+                    "aud": self.AUDIENCE,
+                    "sub": "u",
+                    "iat": now,
+                    "exp": now + 60,
+                    "jti": "deadbeef",
+                },
+                separators=(",", ":"),
+            ).encode()
+        )
+        sig = _b64_encode(self.priv.sign(f"{header}.{payload}".encode()))
+        with pytest.raises(ValueError, match="missing request binding claims"):
+            self._verify(f"{header}.{payload}.{sig}")
+
+    def test_query_string_is_not_bound(self):
+        """Intermediaries rewrite query strings; binding them would break in transit."""
+        token = self._token(path=f"https://b.example.com{self.PATH}?status=ready&limit=200")
+        assert self._verify(token, path=self.PATH)["htp"] == self.PATH
+
+    def test_each_side_decodes_exactly_once(self):
+        """Issuer holds an encoded URL; Django hands the verifier a decoded path.
+
+        A segment carrying a literal ``%20`` travels as ``%2520`` and arrives
+        from Django as ``%20``. If the verifying side decodes again it lands on
+        a space while the issuer landed on ``%20``, and every such token is
+        refused for a reason invisible on both ends. Feeding an already-decoded
+        value to both sides would make each a no-op and prove nothing, so the
+        input here is the encoded form the issuer actually holds.
+        """
+        token = self._token(path="https://b.example.com/recordings/api/v1/a%2520b/file")
+
+        payload = self._verify(token, path="/recordings/api/v1/a%20b/file")
+
+        assert payload["htp"] == "/recordings/api/v1/a%20b/file"
+
+    def test_decoded_delimiter_does_not_truncate_the_verified_path(self):
+        """A decoded ``?`` or ``#`` in a segment must not cut the path short.
+
+        ``request.path`` is already decoded, so a segment that travelled as
+        ``%3F`` arrives as a literal ``?``. Splitting the verifying side on it
+        would drop every segment after it and compare a prefix, while the issuer
+        — splitting the raw URL, where the character is a real delimiter — keeps
+        the whole path. Django puts the query in ``QUERY_STRING``, never in
+        ``request.path``, so there is nothing to strip here in the first place.
+        """
+        token = self._token(path="https://b.example.com/recordings/api/v1/a%3Fb/file")
+
+        payload = self._verify(token, path="/recordings/api/v1/a?b/file")
+
+        assert payload["htp"] == "/recordings/api/v1/a?b/file"
+
+    def test_decoded_fragment_marker_does_not_truncate_either(self):
+        token = self._token(path="https://b.example.com/recordings/api/v1/a%23b/file")
+        assert self._verify(token, path="/recordings/api/v1/a#b/file")["htp"] == "/recordings/api/v1/a#b/file"
+
+    def test_issuer_decodes_ordinary_encoding_once(self):
+        """The common case: an encoded URL and the decoded path Django produces."""
+        token = self._token(path="https://b.example.com/recordings/api/v1/a%20b/file")
+        assert self._verify(token, path="/recordings/api/v1/a b/file")["htp"] == "/recordings/api/v1/a b/file"
+
+    def test_binding_checked_after_time_bounds(self):
+        """An expired token reports expiry, not a binding mismatch — the likelier cause."""
+        token = self._token(ttl=-120)
+        with pytest.raises(ValueError, match="expired"):
+            self._verify(token, path="/some/other/path")
+
+    def test_mismatch_message_does_not_echo_peer_supplied_claims(self):
+        """Binding-mismatch text reaches the permanent security log as ``reason``.
+
+        The claimed values are free text chosen by whoever signed the token, so
+        echoing them verbatim would let a hostile peer write a name or an email
+        address into a stream no erasure path can reach. A correlation hash
+        carries the only thing the value was wanted for.
+        """
+        planted = "patient-Ola-Nordmann-ola.nordmann@example.com"
+        token = self._token(path=f"/{planted}", method="GET")
+
+        with pytest.raises(ValueError) as exc:
+            self._verify(token, path=self.PATH)
+
+        message = str(exc.value)
+        assert planted not in message
+        assert "ola.nordmann@example.com" not in message
+        # The expected path is server-side (a matched route) and stays readable.
+        assert self.PATH in message
+        assert _claim_fingerprint(f"/{planted}") in message
+
+    def test_method_mismatch_message_does_not_echo_the_claim(self):
+        planted = "GET-but-actually-Kari-Nordmann"
+        token = self._token(method=planted)
+
+        with pytest.raises(ValueError) as exc:
+            self._verify(token, method="GET")
+
+        assert planted.upper() not in str(exc.value)
+        assert planted not in str(exc.value)
+
+
 @pytest.mark.django_db
 class TestReplayDetection:
     """End-to-end replay protection through ``parse_federation_auth``.
@@ -367,10 +573,12 @@ class TestReplayDetection:
         )
         return peer, token
 
-    def _request(self, token):
+    def _request(self, token, path=BOUND_PATH, method=BOUND_METHOD):
         from unittest.mock import MagicMock
 
         req = MagicMock()
+        req.method = method
+        req.path = path
         req.META = {"HTTP_AUTHORIZATION": f"FederatedBearer {token}"}
         return req
 
@@ -413,17 +621,16 @@ class TestReplayDetection:
         assert parse_federation_auth(self._request(token_a)).ok
         assert parse_federation_auth(self._request(token_b)).ok
 
-    def test_token_without_jti_authenticates_with_warning(self, settings, caplog):
-        """Backwards-compat: peers that don't yet emit jti still work.
+    def test_token_without_jti_is_rejected(self, settings):
+        """A token omitting ``jti`` is refused rather than skipping replay protection.
 
-        Logs a WARNING so the migration window is visible in operations.  A
-        follow-up commit will tighten this to required once peers have
-        migrated — tracked in ROADMAP.
+        An absent claim cannot be read as "no replay check needed": the sender
+        chooses what to send, so an attacker replaying a captured token turns
+        the check off by stripping the claim. ``create_jwt`` emits ``jti``
+        unconditionally, so nothing this codebase mints is refused here.
         """
         self._setup_local(settings)
-        # jti="" empties the claim — represents a peer that doesn't emit it.
-        # ``create_jwt`` won't oblige (it always generates one), so we forge
-        # by hand.
+        # ``create_jwt`` always generates a jti, so forge the payload by hand.
         from federation.models import FederatedPeer
 
         peer_pub, peer_priv = generate_keypair()
@@ -444,6 +651,9 @@ class TestReplayDetection:
                     "sub": "user-1",
                     "iat": now,
                     "exp": now + 60,
+                    "htm": BOUND_METHOD,
+                    "htp": BOUND_PATH,
+                    "bnd": compute_request_binding(),
                 },
                 separators=(",", ":"),
             ).encode()
@@ -452,11 +662,11 @@ class TestReplayDetection:
         sig = _b64_encode(priv.sign(signing_input))
         token = f"{header}.{payload}.{sig}"
 
-        with caplog.at_level("WARNING", logger="federation.auth"):
-            result = parse_federation_auth(self._request(token))
-        assert result.ok
-        matching = [r for r in caplog.records if "missing 'jti'" in r.getMessage()]
-        assert len(matching) == 1
+        result = parse_federation_auth(self._request(token))
+
+        assert not result.ok
+        assert result.error[0] == 401
+        assert "jti" in result.error[1].lower()
 
 
 class TestJwtLeeway:
@@ -882,8 +1092,10 @@ class TestParseFederationAuth:
         )
         return peer, peer_priv
 
-    def _request(self, token: str | None):
+    def _request(self, token: str | None, path=BOUND_PATH, method=BOUND_METHOD):
         req = MagicMock()
+        req.method = method
+        req.path = path
         req.META = {"HTTP_AUTHORIZATION": f"FederatedBearer {token}"} if token else {}
         return req
 

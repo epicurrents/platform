@@ -85,6 +85,8 @@ class Command(BaseCommand):
             issuer=get_local_instance_url(),
             audience=url,
             subject="healthcheck",
+            method="GET",
+            path=probe_url,
             ttl=60,
         )
         request = urllib.request.Request(probe_url, headers={"Authorization": f"FederatedBearer {token}"})

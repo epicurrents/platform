@@ -220,12 +220,16 @@ class TestDownloadEndpointLimits:
         rec = baker.make(Recording, author=user, file_size=1, status=Recording.Status.READY)
         ct = ContentType.objects.get_for_model(rec, for_concrete_model=False)
 
+        probe_path = f"/api/v1/federation/inbound/objects/{ct.pk}/{rec.pk}/"
+
         def _make_token():
             return create_jwt(
                 load_private_key(peer_priv),
                 issuer="https://peer.example.com",
                 audience="https://local.example.com",
                 subject="user-1",
+                method="GET",
+                path=probe_path,
             )
 
         # First call — under limit, should reach 404 (no grant) cleanly.

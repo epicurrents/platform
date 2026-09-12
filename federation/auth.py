@@ -5,9 +5,10 @@ Every check in this file is a defense layer against cross-instance
 authentication bypass.  Silent weakening of any single one
 — removing the ``alg`` check, the ``aud`` literal match, the ``iat``
 bounds, the signature verification, the SSRF guard, the strict TLS
-context, the ``is_trusted`` gate, or the ``jti`` replay cache — opens
-a high-impact gap with no visible test failure on the affected code
-path.  See AGENTS.md → *Load-bearing files* before modifying.
+context, the ``is_trusted`` gate, the ``jti`` replay cache, or the
+request binding — opens a high-impact gap with no visible test
+failure on the affected code path. See AGENTS.md → *Load-bearing
+files* before modifying.
 
 The contract tests are in ``federation/tests/test_auth.py`` and cover
 the full surface: JWT verify failures (alg / sig / exp / aud / iat /
@@ -43,11 +44,45 @@ Payload claims:
     ``iat``  Issued-at timestamp (Unix seconds)
     ``exp``  Expiry timestamp (Unix seconds)
     ``jti``  Random nonce for replay detection (UUID4 hex)
+    ``htm``  HTTP method the token authorises (upper-case)
+    ``htp``  Decoded request path the token authorises
+    ``bnd``  Digest over the remaining bound request context (see below)
+
+Request binding
+---------------
+A token authorises **one request**, not a peer-user pair for a window.
+Without ``htm`` / ``htp`` / ``bnd`` the token is an interchangeable bearer
+credential: anyone who obtains one before it is spent can redirect it at a
+different operation on a different object — a full-file download in place of
+a metadata read — because nothing in the signature says what was asked for.
+That makes TLS the authority rather than a second layer, which inverts the
+design this module exists to hold up.
+
+The claims are checked in :func:`parse_federation_auth` against the request
+actually received. ``bnd`` covers request context that is not in the method
+or the path but still changes what is served — today the ``Range`` header,
+which decides *which bytes* a download returns. It is a digest rather than
+the value itself so the claim set stays fixed-size as more context is bound.
+
+Deliberately **not** bound: the absolute URI. ``aud`` is already matched
+literally against this instance's ``FEDERATION_INSTANCE_URL``, so scheme and
+host are covered without asking the receiver to reconstruct them from
+forwarded headers behind the proxy overlay — a reconstruction that fails
+opaquely (every federated request 401s) when the proxy configuration drifts.
+The query string is likewise unbound, for the reason DPoP (RFC 9449) omits
+it: intermediaries rewrite it. Anything in the query that changes what is
+served belongs in ``bnd``.
+
+Both ``create_jwt`` and ``verify_jwt`` take the binding inputs as *required*
+keyword arguments. That is deliberate, and follows ``offload_file_response``
+in :mod:`epicurrents.offload`: a new call site cannot acquire an unbound
+token by not thinking about it, because there is no default to fall back to.
 """
 
 from __future__ import annotations
 
 import base64
+import hashlib
 import ipaddress
 import json
 import logging
@@ -232,6 +267,80 @@ def assert_local_keys_consistent() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Request binding
+# ---------------------------------------------------------------------------
+
+
+def bound_path_from_url(url: str) -> str:
+    """Return the bound path claim for a URL this instance is about to request.
+
+    The issuing side of the comparison. Query and fragment are dropped (see the
+    module docstring on why the query is not bound) and the path is
+    percent-decoded exactly once, because a URL carries it encoded.
+
+    Pairs with :func:`bound_path_from_request_path`, and the pair only agrees if
+    each side decodes exactly once in total. Django has already decoded by the
+    time the verifier sees a path, which is why that half must not decode again
+    — a segment holding a literal ``%20`` reaches the wire as ``%2520`` and
+    would otherwise resolve to ``%20`` here and to a space there.
+    """
+    path = urllib.parse.unquote(urllib.parse.urlsplit(url).path)
+    return path if path.startswith("/") else "/" + path
+
+
+def bound_path_from_request_path(path: str) -> str:
+    """Return the bound path claim for an inbound request's ``request.path``.
+
+    The verifying side. Deliberately does **not** percent-decode: Django decodes
+    ``request.path`` before any view sees it, so decoding again would consume a
+    second layer the issuer never applied. See :func:`bound_path_from_url`.
+
+    It also does not split off a query, which would be worse than useless here.
+    Django puts the query in ``QUERY_STRING``, never in ``request.path``, so
+    there is none to remove — while a path segment that arrived percent-encoded
+    as ``%3F`` or ``%23`` has already been decoded to a literal ``?`` or ``#``,
+    and splitting on it would silently discard the rest of the path. The issuer
+    splits the raw URL, where those characters are genuine delimiters, and so
+    keeps the whole path; the two halves must not disagree about that.
+    """
+    return path if path.startswith("/") else "/" + path
+
+
+def _claim_fingerprint(value: object) -> str:
+    """Return a short correlation hash of a peer-supplied claim, for log messages.
+
+    Binding-mismatch errors reach ``log_security_event`` as the ``reason`` field,
+    which is a permanent operator-visible stream. The claimed values are free
+    text chosen by whoever signed the token, so echoing them verbatim would let
+    a hostile peer write arbitrary content — a name, an email address — into
+    that stream, which the security-log rules forbid and no erasure path can
+    reach. A truncated digest still lets a SIEM group repeated attempts from one
+    source, which is the only thing the value was wanted for.
+
+    Matches the ``email_hash`` / ``query_hash`` convention in
+    :mod:`user.api.v1.ninja`.
+    """
+    return hashlib.sha256(str(value).encode()).hexdigest()[:16]
+
+
+def compute_request_binding(*, range_header: str = "") -> str:
+    """Return the ``bnd`` claim covering bound request context beyond method and path.
+
+    Context that changes *what is served* but appears in neither the method nor
+    the path belongs here. Today that is the ``Range`` header, which decides
+    which bytes a download returns — an unbound token for a metadata read would
+    otherwise be usable to pull an arbitrary byte range of the same object.
+
+    Serialised as ``<key>=<value>`` pairs joined by ``\\n`` in a fixed key
+    order, so adding a field later cannot silently change the digest of an
+    existing one. A digest rather than the values themselves keeps the claim
+    fixed-size as more context is bound.
+    """
+    payload = f"range={range_header.strip()}"
+    return _b64_encode(hashlib.sha256(payload.encode()).digest())
+
+
+# ---------------------------------------------------------------------------
 # JWT creation and verification
 # ---------------------------------------------------------------------------
 
@@ -242,22 +351,35 @@ def create_jwt(
     issuer: str,
     audience: str,
     subject: str,
+    method: str,
+    path: str,
+    range_header: str = "",
     ttl: int = 60,
     jti: str | None = None,
 ) -> str:
-    """Create a signed federation JWT.
+    """Create a signed federation JWT bound to one specific request.
 
     A random ``jti`` (UUID4 hex) is generated for each token unless caller
     supplies one — the receiving instance uses ``jti`` to detect replays
     within the validity window (see :func:`parse_federation_auth`).
+
+    ``method`` and ``path`` are required rather than defaulted because a token
+    that authorises everything is precisely the failure this binding exists to
+    prevent, and a default would let a new call site mint one without deciding
+    to. Mint one token per request; a token is spent by its first use.
 
     Args:
         private_key: Ed25519 signing key.
         issuer: Canonical URL of the issuing instance (``iss`` claim).
         audience: Canonical URL of the target instance (``aud`` claim).
         subject: Remote user identifier on the issuing instance (``sub`` claim).
+        method: HTTP method this token authorises, e.g. ``"GET"`` (``htm``).
+        path: Request path or full URL this token authorises; query and fragment are
+            discarded and the path is percent-decoded (``htp``).
+        range_header: ``Range`` header value the request will carry, if any. Bound via
+            ``bnd`` so a token minted for one byte range cannot fetch another.
         ttl: Token lifetime in seconds (default 60).
-        jti: Optional explicit token id.  Tests use this to forge collisions;
+        jti: Optional explicit token id. Tests use this to forge collisions;
             production callers should let the default UUID4 stand.
 
     Returns:
@@ -274,6 +396,9 @@ def create_jwt(
                 "iat": now,
                 "exp": now + ttl,
                 "jti": jti if jti is not None else uuid.uuid4().hex,
+                "htm": method.upper(),
+                "htp": bound_path_from_url(path),
+                "bnd": compute_request_binding(range_header=range_header),
             },
             separators=(",", ":"),
         ).encode()
@@ -304,6 +429,9 @@ def verify_jwt(
     public_key: Ed25519PublicKey,
     *,
     audience: str,
+    method: str,
+    path: str,
+    range_header: str = "",
     leeway: int = DEFAULT_JWT_LEEWAY,
     max_age: int = DEFAULT_MAX_JWT_AGE,
 ) -> dict:
@@ -311,21 +439,29 @@ def verify_jwt(
 
     Validates: signature, ``alg``, ``exp`` (with leeway), ``iat`` (must be
     present, not in the future modulo leeway, not older than ``max_age + leeway``),
-    and ``aud``.  Replay detection via ``jti`` is *not* done here — it is
-    stateful and lives in :func:`parse_federation_auth`.
+    ``aud``, and the request binding (``htm`` / ``htp`` / ``bnd``). Replay
+    detection via ``jti`` is *not* done here — it is stateful and lives in
+    :func:`parse_federation_auth`.
+
+    The binding arguments are required for the same reason they are required on
+    :func:`create_jwt`: a caller that omits them would be verifying a token
+    against no request at all, which is not a check.
 
     Args:
         token: Compact serialised JWT string.
         public_key: Ed25519 key of the claimed issuer.
         audience: Expected ``aud`` claim value (this instance's URL).
+        method: HTTP method of the request actually received.
+        path: Path of the request actually received; normalised as on the issuing side.
+        range_header: ``Range`` header of the request actually received, empty when absent.
         leeway: Seconds of tolerance applied to the ``exp`` and ``iat``
-            time-bound checks, to absorb clock skew between peers.  Defaults
-            to ``DEFAULT_JWT_LEEWAY`` (30 s).  Pass ``leeway=0`` for strict
+            time-bound checks, to absorb clock skew between peers. Defaults
+            to ``DEFAULT_JWT_LEEWAY`` (30 s). Pass ``leeway=0`` for strict
             comparison (testing only — in production any non-zero skew between
             peers will cause sporadic "expired" failures on freshly-issued
             tokens).
         max_age: Maximum acceptable age of the token relative to its ``iat``
-            claim.  Defaults to ``DEFAULT_MAX_JWT_AGE`` (60 s) — a token whose
+            claim. Defaults to ``DEFAULT_MAX_JWT_AGE`` (60 s) — a token whose
             ``iat`` is older than this is rejected even if its ``exp`` claims
             it should still be valid, capping the verifier's exposure to
             issuers that pick over-generous TTLs.
@@ -391,6 +527,39 @@ def verify_jwt(
 
     if payload.get("aud") != audience:
         raise ValueError(f"JWT audience mismatch: expected '{audience}', got '{payload.get('aud')}'")
+
+    # Request binding. Checked last so that a token failing both a time bound
+    # and its binding reports the time bound — the more likely misconfiguration,
+    # and the one whose message points at the real cause.
+    #
+    # Each claim is mandatory. Reading a missing one as "unbound, therefore
+    # acceptable" would defeat the check: an attacker chooses which claims to
+    # omit, so an optional check is one the attacker has already skipped.
+    expected_htm = method.upper()
+    expected_htp = bound_path_from_request_path(path)
+    expected_bnd = compute_request_binding(range_header=range_header)
+
+    if "htm" not in payload or "htp" not in payload or "bnd" not in payload:
+        raise ValueError(
+            "JWT is missing request binding claims (htm/htp/bnd); the issuing peer "
+            "is running a release older than the one that made binding mandatory"
+        )
+    # The expected values are safe to name: this runs only on a matched Django
+    # route, so they are a real endpoint and its opaque hash parameters. The
+    # *claimed* values are free text from the token and are fingerprinted
+    # instead — see :func:`_claim_fingerprint`.
+    if payload.get("htm") != expected_htm:
+        raise ValueError(
+            f"JWT method binding mismatch: request is '{expected_htm}', "
+            f"token authorises claim-hash {_claim_fingerprint(payload.get('htm'))}"
+        )
+    if payload.get("htp") != expected_htp:
+        raise ValueError(
+            f"JWT path binding mismatch: request is '{expected_htp}', "
+            f"token authorises claim-hash {_claim_fingerprint(payload.get('htp'))}"
+        )
+    if payload.get("bnd") != expected_bnd:
+        raise ValueError("JWT request-context binding mismatch (bnd); Range header does not match the one the token authorises")
 
     return payload
 
@@ -708,37 +877,51 @@ def parse_federation_auth(request) -> FederationAuthResult:
     # the peer has advertised a ``public_key_next``, retry with that.  Errors
     # that are not signature-related (expired, wrong audience, malformed) are
     # not retried — those are not rotation symptoms.
+    # The binding is derived from the request in hand, never from the token —
+    # reading the expected values out of the claims would make every comparison
+    # trivially true.
+    bound_method = request.method
+    bound_path = request.path
+    bound_range = request.META.get("HTTP_RANGE", "")
+
     try:
         local_url = get_local_instance_url()
         public_key = load_public_key(peer.public_key)
         try:
-            payload = verify_jwt(token, public_key, audience=local_url)
+            payload = verify_jwt(
+                token,
+                public_key,
+                audience=local_url,
+                method=bound_method,
+                path=bound_path,
+                range_header=bound_range,
+            )
         except ValueError as exc:
             if "signature" not in str(exc).lower() or not peer.public_key_next:
                 raise
             next_key = load_public_key(peer.public_key_next)
-            payload = verify_jwt(token, next_key, audience=local_url)
+            payload = verify_jwt(
+                token,
+                next_key,
+                audience=local_url,
+                method=bound_method,
+                path=bound_path,
+                range_header=bound_range,
+            )
     except ValueError as exc:
         return fail(401, str(exc), peer=peer)
 
-    # Replay detection.  ``verify_jwt`` has already bounded the token's age
-    # via ``iat`` + ``exp``; the ``jti`` nonce cache catches replays *within*
-    # that window, which the time checks alone cannot.  Peers that don't yet
-    # emit ``jti`` still authenticate, but with a WARNING so the
-    # backwards-compat window is visible — see follow-up roadmap item to
-    # tighten this once all peers have migrated.
+    # Replay detection. ``verify_jwt`` has already bounded the token's age via
+    # ``iat`` + ``exp``; the ``jti`` nonce cache catches replays *within* that
+    # window, which the time checks alone cannot.
     jti = payload.get("jti", "")
-    if jti:
-        if not _check_and_remember_jti(jti):
-            return fail(401, "JWT replay detected", peer=peer)
-    else:
-        logger.warning(
-            "Federation JWT missing 'jti' claim — replay protection skipped "
-            "for peer=%s (id=%d).  Upgrade the peer to a version that emits "
-            "jti.",
-            peer.url,
-            peer.pk,
-        )
+    if not jti:
+        # Mandatory. An absent claim cannot mean "skip the check": the sender
+        # chooses what to send, so an optional check is one an attacker
+        # replaying a captured token has already turned off.
+        return fail(401, "Federation token missing 'jti' claim", peer=peer)
+    if not _check_and_remember_jti(jti):
+        return fail(401, "JWT replay detected", peer=peer)
 
     return FederationAuthResult(
         peer=peer,
