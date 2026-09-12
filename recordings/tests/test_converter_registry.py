@@ -171,13 +171,9 @@ class TestVendoredCheckoutsStayOutOfTheSuite:
 
         root = Path("recordings/converters")
         checkouts = {
-            child.name
-            for child in root.glob("*")
-            if child.is_dir() and not child.name.startswith((".", "__"))
+            child.name for child in root.glob("*") if child.is_dir() and not child.name.startswith((".", "__"))
         }
-        pruned = {
-            Path(entry).name for entry in conftest.collect_ignore if entry.startswith("recordings/converters/")
-        }
+        pruned = {Path(entry).name for entry in conftest.collect_ignore if entry.startswith("recordings/converters/")}
         assert checkouts <= pruned, f"not pruned from collection: {sorted(checkouts - pruned)}"
 
     def test_the_platform_modules_are_not_pruned(self):

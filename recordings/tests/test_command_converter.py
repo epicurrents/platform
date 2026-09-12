@@ -188,9 +188,11 @@ class TestSourceFilenameNeverEscapes:
             build(_spec(script))(source, tmp_path / "out")
         assert len(str(caught.value)) < 1000
 
-    @pytest.mark.parametrize("body", ["sys.exit(1)", "pass", '(out / "a.edf").write_bytes(b"1")\n(out / "b.edf").write_bytes(b"2")'])
+    @pytest.mark.parametrize(
+        "body", ["sys.exit(1)", "pass", '(out / "a.edf").write_bytes(b"1")\n(out / "b.edf").write_bytes(b"2")']
+    )
     def test_no_failure_path_names_the_file(self, tmp_path, source, body):
-        script = _stub(tmp_path, f'sys.stderr.write(str(source))\n{body}')
+        script = _stub(tmp_path, f"sys.stderr.write(str(source))\n{body}")
         with pytest.raises(CommandConverterError) as caught:
             build(_spec(script))(source, tmp_path / "out")
         assert "Testperson" not in str(caught.value)

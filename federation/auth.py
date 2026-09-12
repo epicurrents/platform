@@ -559,7 +559,9 @@ def verify_jwt(
             f"token authorises claim-hash {_claim_fingerprint(payload.get('htp'))}"
         )
     if payload.get("bnd") != expected_bnd:
-        raise ValueError("JWT request-context binding mismatch (bnd); Range header does not match the one the token authorises")
+        raise ValueError(
+            "JWT request-context binding mismatch (bnd); Range header does not match the one the token authorises"
+        )
 
     return payload
 

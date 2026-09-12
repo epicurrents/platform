@@ -184,9 +184,19 @@ RECORDING_CONVERTERS = {
     # A direct callable.
     ".smr": my_smr_converter,
     # An external program — see External converters below.
-    ".e": {"command": ["{python}", "-m", "nicolet_e2edf.nicolet.cli",
-                       "--in", "{input}", "--out", "{output}", "--json-sidecar"],
-           "requires": "nicolet_e2edf"},
+    ".e": {
+        "command": [
+            "{python}",
+            "-m",
+            "nicolet_e2edf.nicolet.cli",
+            "--in",
+            "{input}",
+            "--out",
+            "{output}",
+            "--json-sidecar",
+        ],
+        "requires": "nicolet_e2edf",
+    },
 }
 ```
 
@@ -209,8 +219,7 @@ The platform carries no vendor-specific conversion code. A converter for a propr
 ```python
 RECORDING_CONVERTERS = {
     ".zip": {
-        "command": ["{python}", "-m", "natus2edf", "--in", "{input}",
-                    "--out", "{output}", "--json-sidecar"],
+        "command": ["{python}", "-m", "natus2edf", "--in", "{input}", "--out", "{output}", "--json-sidecar"],
         "requires": "natus2edf",
     },
 }

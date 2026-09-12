@@ -156,9 +156,7 @@ class TestInboundCheckObjectAuditing:
             remote_user_id="remote-user-1",
             can_read=True,
         )
-        token = _make_jwt(
-            "https://peer.example.com", peer_priv, "https://local.example.com", self._path(ct.pk, rec.pk)
-        )
+        token = _make_jwt("https://peer.example.com", peer_priv, "https://local.example.com", self._path(ct.pk, rec.pk))
         resp = self._request(client, token, ct.pk, rec.pk)
         assert resp.status_code == 200
         row = FederationAuditLog.objects.get()
@@ -179,9 +177,7 @@ class TestInboundCheckObjectAuditing:
         rec = baker.make(Recording, author=owner, file_size=1, status=Recording.Status.READY)
         ct = ContentType.objects.get_for_model(rec, for_concrete_model=False)
         # No grant.
-        token = _make_jwt(
-            "https://peer.example.com", peer_priv, "https://local.example.com", self._path(ct.pk, rec.pk)
-        )
+        token = _make_jwt("https://peer.example.com", peer_priv, "https://local.example.com", self._path(ct.pk, rec.pk))
         resp = self._request(client, token, ct.pk, rec.pk)
         assert resp.status_code == 404
         row = FederationAuditLog.objects.get()

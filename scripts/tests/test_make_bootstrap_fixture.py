@@ -87,6 +87,7 @@ echo "STUB-DOCKER $*" >&2
 exit 9
 """
 
+
 # The Podman counterpart, with the same "anything else is the build" marker. Its
 # `--version` string is what the runtime detection reads: podman-docker installs a
 # `docker` that answers every probe by execing podman, so the name in that string is
@@ -1212,7 +1213,7 @@ class TestBundleProvenance:
         # base UI" and goes into any package — so reading the value alone would
         # pass on exactly the stamp that could not be read.
         root = self._fake_repo(tmp_path, project=None)
-        (root / "frontend" / "dist" / "build-info.json").write_text("{ \"proj")
+        (root / "frontend" / "dist" / "build-info.json").write_text('{ "proj')
         result = self._build(root, tmp_path / "pkg", "--demo")
         assert result.returncode != 0
         assert "build-info.json" in result.stderr
@@ -1259,10 +1260,7 @@ class TestPackageStatesItsOwnProject:
         # that tree belongs to vendor_viewer and its layout is the pin's to decide.
         dest = tmp_path / "dist"
         assert _run(dest, "--dist").returncode == 0
-        projects = {
-            d.name for d in (REPO_ROOT / "projects").iterdir()
-            if d.is_dir() and d.name != "__pycache__"
-        }
+        projects = {d.name for d in (REPO_ROOT / "projects").iterdir() if d.is_dir() and d.name != "__pycache__"}
         segments = {d.name for d in (dest / "frontend" / "viewer-dist").iterdir() if d.is_dir()}
         assert not segments & projects
 

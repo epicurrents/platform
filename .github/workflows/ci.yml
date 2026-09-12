@@ -277,11 +277,14 @@ jobs:
       # `npm run setup` runs inside the builder submodule), and a real
       # frontend/dist needs `npm run build`, whose vue-tsc half is the reason the
       # frontend job stops at vitest — so the UI is a stub file that exists only
-      # to satisfy the mode's guard.
+      # to satisfy the mode's guard. The stub carries the blank build-info.json
+      # stamp the Vite build writes for the base UI: the packager refuses a
+      # bundle with no stamp, and a blank project goes into any package.
       - name: Assemble a demo package
         run: |
           mkdir -p frontend/dist
           echo '<!doctype html><title>stub</title>' > frontend/dist/index.html
+          printf '{"project": "", "plugins": []}\n' > frontend/dist/build-info.json
           scripts/make-bootstrap-fixture.sh "$RUNNER_TEMP/demo" --demo
       - name: The preflight refuses a tree the container user cannot write
         # The runner is uid 1001 and its temp dir is not group- or world-writable,

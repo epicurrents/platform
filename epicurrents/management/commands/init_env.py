@@ -85,8 +85,7 @@ def _env_file_safe(generate):
         # A loud failure beats writing a value that will not survive the trip to
         # the container, or one an operator will read the wrong end off.
         raise CommandError(
-            f"could not generate a secret free of {_ENV_FILE_METACHARACTERS!r} "
-            f"after {_GENERATION_ATTEMPTS} attempts"
+            f"could not generate a secret free of {_ENV_FILE_METACHARACTERS!r} after {_GENERATION_ATTEMPTS} attempts"
         )
 
     return wrapped

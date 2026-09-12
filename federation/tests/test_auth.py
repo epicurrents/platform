@@ -11,19 +11,19 @@ from federation.auth import (
     _b64_decode,
     _b64_encode,
     _build_tls_context,
-    _claim_fingerprint,
     _check_url_is_safe,
+    _claim_fingerprint,
     assert_local_keys_consistent,
     compute_request_binding,
-    create_jwt as _create_jwt,
     fetch_peer_public_key,
     generate_keypair,
     load_private_key,
     load_public_key,
     parse_federation_auth,
     try_federation_auth,
-    verify_jwt as _verify_jwt,
 )
+from federation.auth import create_jwt as _create_jwt
+from federation.auth import verify_jwt as _verify_jwt
 
 # ---------------------------------------------------------------------------
 # Request-binding defaults for tests that are not about binding

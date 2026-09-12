@@ -218,9 +218,7 @@ class TestBootstrapPodmanSharedSteps:
         # `$` in a .env value is stripped by compose and the tail is lost in
         # silence, so the guard has to reach this path too.
         make_env(tmp_path)
-        (tmp_path / ".env").write_text(
-            (tmp_path / ".env").read_text() + "\nADMIN_PASSWORD=abc$def\n"
-        )
+        (tmp_path / ".env").write_text((tmp_path / ".env").read_text() + "\nADMIN_PASSWORD=abc$def\n")
         os_release = make_os_release(tmp_path, distro_id="rhel")
         result = run_script(
             BOOTSTRAP,

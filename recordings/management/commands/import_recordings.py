@@ -321,9 +321,7 @@ class Command(BaseCommand):
         usable = converter_extensions(available_only=True)
         declared = converter_extensions()
         handled = _EDF_EXTENSIONS | usable
-        candidates = (
-            source_path.iterdir() if structure == ImportJob.Structure.FLAT else source_path.rglob("*")
-        )
+        candidates = source_path.iterdir() if structure == ImportJob.Structure.FLAT else source_path.rglob("*")
 
         files = []
         skipped: Counter[str] = Counter()
@@ -356,14 +354,10 @@ class Command(BaseCommand):
         unknown = [(suffix, count) for suffix, count in by_size if suffix not in uninstalled]
         if absent:
             listed = ", ".join(f"{suffix} ({count})" for suffix, count in absent)
-            self.stdout.write(
-                self.style.WARNING(f"  Skipped, the registered converter is not installed: {listed}")
-            )
+            self.stdout.write(self.style.WARNING(f"  Skipped, the registered converter is not installed: {listed}"))
         if unknown:
             listed = ", ".join(f"{suffix} ({count})" for suffix, count in unknown)
-            self.stdout.write(
-                self.style.WARNING(f"  Skipped, no converter registered for the extension: {listed}")
-            )
+            self.stdout.write(self.style.WARNING(f"  Skipped, no converter registered for the extension: {listed}"))
 
     # ------------------------------------------------------------------
     # Collection tree

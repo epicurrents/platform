@@ -109,9 +109,7 @@ def build(spec: dict):
 def run_command(spec: dict, input_path: Path, output_dir: Path) -> tuple[Path, dict | None]:
     """Run the converter described by *spec* and collect what it produced."""
     if not is_available(spec):
-        raise CommandConverterError(
-            f"The converter is not installed: no module named {spec.get('requires')!r}."
-        )
+        raise CommandConverterError(f"The converter is not installed: no module named {spec.get('requires')!r}.")
 
     output_dir.mkdir(parents=True, exist_ok=True)
     argv = [_substitute(part, input_path, output_dir) for part in spec["command"]]
@@ -132,8 +130,7 @@ def run_command(spec: dict, input_path: Path, output_dir: Path) -> tuple[Path, d
         raise CommandConverterError("The converter produced no EDF output.")
     if len(produced) > 1:
         raise CommandConverterError(
-            f"The converter produced {len(produced)} EDF files; "
-            "multi-segment recordings must be split before upload."
+            f"The converter produced {len(produced)} EDF files; multi-segment recordings must be split before upload."
         )
 
     edf_path = produced[0]

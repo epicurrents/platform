@@ -24,14 +24,13 @@ from model_bakery import baker
 
 from federation.auth import (
     assert_local_keys_consistent,
-    create_jwt as _create_jwt,
     fetch_peer_public_key,
     generate_keypair,
     load_private_key,
     parse_federation_auth,
 )
+from federation.auth import create_jwt as _create_jwt
 from federation.models import FederatedPeer
-
 
 # ``create_jwt`` requires the request binding with no default (see
 # federation/auth.py). These cases are about key rotation, not binding, so the
