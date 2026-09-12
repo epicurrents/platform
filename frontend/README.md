@@ -26,6 +26,14 @@ The edition is fetched rather than built because building it means running the b
 
 While the pin is empty nothing is fetched and the deploy host builds the edition from the checkout, which is the state the platform is in until the builder tags its first edition release.
 
+## What the SPA takes from the viewer
+
+Nothing, for a base deployment. `npm run build` and `npm run test` need no `viewer/` checkout on disk: the core types come from the `@epicurrents/core` dev dependency, and the toast stack ([lib/toast.ts](src/lib/toast.ts), [ToastStack.vue](src/components/ToastStack.vue), [AppIcon.vue](src/components/AppIcon.vue)) is the platform's own. The viewer's interface package keeps a copy of the toast files for a standalone viewer with no host; the two are separate on purpose, because a re-export across that boundary is what would put the checkout back in the build.
+
+`@epicurrents/core` is a dev dependency and pinned to an exact version, both deliberately. Dev, because every import of it is `import type` and its runtime closure is large; exact, because a published version does not currently identify a source state (see [ROADMAP.md](../ROADMAP.md)), so a range would let the types drift under the build without anything saying so.
+
+Two things still reach the checkout. An active project's frontend does: its `scoped-event-log` import is a single module, but a project that constructs annotations through a dynamic `#epicurrents/eeg-module` import pulls the core runtime into a lazily loaded chunk — the route [ROADMAP.md](../ROADMAP.md) plans to replace with the viewer's template methods. And the per-project viewer lib built by [vite.config.base.ts](vite.config.base.ts) bundles the interface from source. Both are why a deployment still needs the submodule even though the base SPA does not.
+
 ## Environment Variables
 
 Copy `.env.example` to `.env` (or provide equivalent server-side env values).

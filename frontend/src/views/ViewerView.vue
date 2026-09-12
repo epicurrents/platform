@@ -13,7 +13,7 @@ import type {
     EpicurrentsApp,
     EpicurrentsGlobal,
     VideoAttachment,
-} from '#epicurrents/core/dist/types'
+} from '@epicurrents/core/dist/types'
 // viewer/interface has no compiled .d.ts output; declare only what we need here.
 type InterfaceSettings = { app: { disclaimerAccepted: number } }
 import type { Recording } from '#api/recordings'

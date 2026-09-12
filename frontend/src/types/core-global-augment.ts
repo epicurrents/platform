@@ -9,20 +9,27 @@
  * `EpicurrentsGlobal` name in scope (a local type or an import of that name shadows the interface
  * below); and no import of the augmented module `#epicurrents/core/dist/types`, directly or
  * transitively. That last constraint is why the signatures below are inlined rather than reused
- * from the declarations they mirror — keep them in sync with their definition sites. It is also
- * why the viewer's `announce` callback is absent here: reaching for the interface's
- * `InterfaceGlobalAdditions` would pull the augmented module in through that file's own imports.
+ * from the declarations they mirror — keep them in sync with their definition sites.
  *
- * `announce` instead arrives from the interface's own augmentation of the same interface, which
- * `tsconfig.app.json` names in `include` so it joins this compilation unit. Both specifiers
- * resolve to the same core declaration file, so the two augmentations merge onto one
- * `EpicurrentsGlobal`.
+ * `announce` is the viewer's own field rather than the platform's, and it is declared here because
+ * the alternative is worse: the interface package carries an identical augmentation, but naming it
+ * puts a file from the viewer checkout into this compilation unit, and the SPA type-checks without
+ * that checkout on disk. Keep it in sync with `InterfaceGlobalAdditions` in the interface package.
  */
 
 export {}
 
-declare module '#epicurrents/core/dist/types' {
+declare module '@epicurrents/core/dist/types' {
     interface EpicurrentsGlobal {
+        /**
+         * Viewer → host callback the embedded viewer installs: it routes the viewer's user-facing
+         * callouts into the platform's toast stack, so the two share one surface. Undefined when no
+         * viewer is mounted, so callers guard with `?.()`.
+         */
+        announce?: (
+            message: string | string[],
+            variant: 'brand' | 'success' | 'neutral' | 'warning' | 'danger',
+        ) => void
         /**
          * Host → viewer callback set by the viewer when its app is created: the platform calls it
          * after a (re-)login so network loads latched on a prior auth failure resume. Undefined

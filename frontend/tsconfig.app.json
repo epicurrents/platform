@@ -8,7 +8,9 @@
      * and removed in 7, so targets below are written relative to this file
      * (`paths` has worked without a baseUrl since TypeScript 4.1). */
     "paths": {
-      /* Frontend root — reach the viewer monorepo via "#root/viewer/...".
+      /* Frontend root. Nothing under src/ reaches for it: the SPA's core types come from the
+       * `@epicurrents/core` dev dependency and its toast stack is its own. It stays as the
+       * escape hatch for addressing a file outside src/ without a "../.." chain.
        * A dedicated "#viewer/*" alias was removed: it collided with the
        * catch-all "#*" -> src/* because src/viewer/ exists (the platform's
        * viewer build folder), and vite-tsconfig-paths resolved "#viewer/..."
@@ -16,7 +18,10 @@
        * while tsc, which tries every matching pattern, still passed. "#root/*"
        * is safe because src/root/ does not exist. */
       "#root/*": ["./*"],
-      /* Viewer sub-packages — must appear before the catch-all "#*" below. */
+      /* Viewer sub-packages, reached from the checkout. This serves an active project's frontend,
+       * which imports through it and which this `include` covers; the SPA takes its core types
+       * from the `@epicurrents/core` dev dependency instead. Retiring it means moving a project's
+       * imports too, which is the project half of the same work. */
       "#epicurrents/*": ["./viewer/epicurrents/*"],
       /* The interface package, which is not installed into node_modules — the viewer builds
        * resolve it through their own vite aliases, so type-checking needs its own mapping.
@@ -44,12 +49,6 @@
     "src/**/*.ts",
     "src/**/*.tsx",
     "src/**/*.vue",
-    /* The viewer interface's augmentation of the core-owned `EpicurrentsGlobal`, which carries the
-     * `announce` host callback the platform installs. It applies only while it is part of the
-     * compilation unit, and nothing under src/ imports it — a value import would pull the module
-     * into the bundle for a declaration that emits nothing. See src/types/core-global-augment.ts
-     * for the platform's own additions to the same interface. */
-    "viewer/interface/src/types/core-global-augment.ts",
     /* The active project's Vue plugin, which lives outside src/ because the
      * project is its own repository checked out at projects/<name>/. Globbed
      * rather than pinned to VITE_PROJECT, which tsconfig cannot interpolate —

@@ -15,7 +15,7 @@
  * @package    epicurrents-platform
  */
 
-import type { EpicurrentsApp, SettingsValue } from '#epicurrents/core/dist/types'
+import type { EpicurrentsApp, SettingsValue } from '@epicurrents/core/dist/types'
 import type { ViewerSettingsOverrides } from '#lib/viewerConfig'
 
 /** Per-field verdict from a dry validation run. */

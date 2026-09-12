@@ -9,7 +9,7 @@
  * @package    epicurrents-platform
  */
 
-import type { EpicurrentsApp, SettingsValue } from '#epicurrents/core/dist/types'
+import type { EpicurrentsApp, SettingsValue } from '@epicurrents/core/dist/types'
 
 /**
  * Backend the viewer mirrors a signed-in user's settings to, passed as the `userSettingsBackend`

@@ -1,6 +1,6 @@
 import type { Component } from 'vue'
 import type { RouteLocationRaw, RouteRecordRaw } from 'vue-router'
-import type { DataResource, EpicurrentsApp } from '#epicurrents/core/dist/types'
+import type { DataResource, EpicurrentsApp } from '@epicurrents/core/dist/types'
 
 export interface ProjectNavLink {
     /** Stable identifier used as a Vue key and for debugging. */
