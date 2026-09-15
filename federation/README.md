@@ -9,6 +9,8 @@ Two transport surfaces, one access model:
 
 EDF/BDF content can be transformed on the wire by a configurable middleware pipeline — channel dropping, downsampling, header / annotation anonymisation — without ever modifying the stored file. The same middleware classes serve both the HTTP API and the FUSE filesystem.
 
+The wire contract itself — token claims, binding canonicalisation, the verification order, what the owning instance decides and records, and the protocol's security goals and open issues — is specified in [docs/federation-protocol.md](../docs/federation-protocol.md), written for a reviewer or a reimplementation. This README is the architecture and operator view of the same system.
+
 ## Identity and trust
 
 Each instance has an Ed25519 key pair, stored in `FEDERATION_PUBLIC_KEY` / `FEDERATION_PRIVATE_KEY` env vars as URL-safe base64url strings (43 chars each, no padding — same format as VAPID). The public key is published at:
@@ -31,7 +33,7 @@ JWT claims (EdDSA-signed):
 | `iss` | Issuing instance URL (from `FEDERATION_INSTANCE_URL`). |
 | `aud` | Intended recipient instance URL. |
 | `sub` | Remote user identifier (string PK on the issuing instance). |
-| `iat` / `exp` | Issued-at / expiry in Unix seconds. TTL configurable via `FEDERATION_JWT_TTL` (default `60`). |
+| `iat` / `exp` | Issued-at / expiry in Unix seconds, as JSON integers; a float, numeric string, boolean or non-finite value is refused. TTL configurable via `FEDERATION_JWT_TTL` (default `60`). |
 | `jti` | Random UUID4 hex per token. Receiver uses it for replay detection (see below). Mandatory. |
 | `htm` | HTTP method the token authorises, upper-case. |
 | `htp` | Decoded request path the token authorises. |
@@ -41,7 +43,7 @@ Inbound requests are verified by fetching and caching the peer's public key from
 
 `iat` is the second axis of replay defense: `exp` bounds the validity window the issuer claims, `iat` bounds the window the verifier accepts. `DEFAULT_MAX_JWT_AGE` (60 s) caps how old an inbound token's `iat` can be — a token whose issuer chose a 1-hour TTL is rejected here even though its `exp` claims it should still be valid. Verifier-side bound, not issuer-side trust.
 
-**Replay detection via `jti`.** Each outbound token carries a random `jti`; on receipt, the verifier checks Django's cache for that `jti`, accepts the token if absent (and remembers it for `max_age + leeway` seconds), rejects it as a replay if present. The check is atomic via `cache.add`, which works correctly across gunicorn workers when backed by Redis.
+**Replay detection via `jti`.** Each outbound token carries a random `jti`; on receipt, the verifier checks Django's cache for that `jti`, accepts the token if absent, rejects it as a replay if present. A remembered `jti` is kept until the token itself would stop verifying — the earlier of `exp + leeway` and `iat + max_age + leeway` — plus `JTI_CACHE_MARGIN`. The lifetime is read from the token rather than counted from arrival: a receiver whose clock lags the sender's sees a fresh token before its own `iat`, and a lifetime counted from arrival would expire while that token still verifies. The check is atomic via `cache.add`, which works correctly across gunicorn workers when backed by Redis.
 
 **A token without `jti` is refused.** This was once accepted with a `WARNING`, as backwards-compat for peers predating the claim. The window protected only pre-release installations — `create_jwt` has emitted `jti` since the initial release commit, so no token this codebase ever minted needed it — while leaving the *sender* to decide whether replay protection ran at all, which an attacker replaying a captured token would decide by stripping the claim.
 

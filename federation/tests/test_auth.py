@@ -367,6 +367,24 @@ class TestIatValidation:
         with pytest.raises(ValueError, match="'iat'.*not a valid timestamp"):
             verify_jwt(token, self.pub, audience="https://b.example.com")
 
+    def test_token_missing_exp_rejected(self):
+        token = self._forge_token(exp=None)
+        with pytest.raises(ValueError, match="missing 'exp'"):
+            verify_jwt(token, self.pub, audience="https://b.example.com")
+
+    @pytest.mark.parametrize("claim", ["iat", "exp"])
+    @pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf"), 1.0, "0", True])
+    def test_time_claim_that_is_not_an_integer_rejected(self, claim, value):
+        """Only a JSON integer is accepted as ``iat`` or ``exp``.
+
+        ``json.loads`` accepts ``NaN`` and ``Infinity``, and every comparison with
+        NaN is false, so an ``exp`` compared as received would pass as never
+        expiring. The token is otherwise valid, so the claim type is what refuses it.
+        """
+        token = self._forge_token(**{claim: value})
+        with pytest.raises(ValueError, match=f"'{claim}' claim is not a valid timestamp"):
+            verify_jwt(token, self.pub, audience="https://b.example.com")
+
 
 class TestRequestBinding:
     """``htm`` / ``htp`` / ``bnd`` tie a token to one request.
@@ -667,6 +685,40 @@ class TestReplayDetection:
         assert not result.ok
         assert result.error[0] == 401
         assert "jti" in result.error[1].lower()
+
+    @pytest.mark.parametrize("replay_after", [95, 115])
+    def test_replay_refused_while_verifier_clock_lags_issuer(self, settings, replay_after):
+        """The nonce outlives its token when the token arrives before its own ``iat``.
+
+        The issuer's clock runs 25 s ahead, so the token is first seen 25 s before
+        its ``iat`` and stays verifiable until ``iat + 90`` — 115 s after first
+        sight. A nonce kept for a fixed 90 s from first sight is forgotten while the
+        token still passes every time check. Patching ``time.time`` moves the cache's
+        clock with the verifier's, so the nonce's expiry is exercised too.
+        """
+        from federation.models import FederatedPeer
+
+        self._setup_local(settings)
+        peer_pub, peer_priv = generate_keypair()
+        FederatedPeer.objects.create(url="https://peer.example.com", public_key=peer_pub, is_trusted=True)
+        start = int(time.time())
+
+        with patch("federation.auth.time.time", return_value=start + 25):
+            token = create_jwt(
+                load_private_key(peer_priv),
+                issuer="https://peer.example.com",
+                audience="https://local.example.com",
+                subject="user-1",
+            )
+        with patch("federation.auth.time.time", return_value=start):
+            first = parse_federation_auth(self._request(token))
+        with patch("federation.auth.time.time", return_value=start + replay_after):
+            replay = parse_federation_auth(self._request(token))
+
+        assert first.ok
+        assert not replay.ok
+        assert replay.error[0] == 401
+        assert "replay" in replay.error[1].lower()
 
 
 class TestJwtLeeway:

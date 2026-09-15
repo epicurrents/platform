@@ -10,6 +10,8 @@ Entries are written for the person deciding whether to upgrade, so the ones that
 
 ### Changed
 
+- **A federation token's `iat` and `exp` must be JSON integers.** `exp` was compared as received, so a token carrying `NaN` or `Infinity` — both accepted by Python's JSON parser — passed the expiry check as never expiring, and a numeric string raised an unhandled error. `iat` was converted leniently. Both claims now refuse a float, a numeric string, a boolean or a non-finite value. `create_jwt` has always emitted integers, so no token this codebase mints is affected, and only a trusted peer's signature could carry such a value.
+
 - **Annotation export extensions no longer export `id`, `created_at` or `modified_at` unless the registration opts in.** `register_export_extension` gained `include_withheld`; an extension relying on one of these columns names it there.
 
 - **Federation tokens are now bound to the request they authorise, and both instances must be upgraded together.** A token previously carried only who was asking and of whom (`iss` / `aud` / `sub`) plus its time bounds and nonce — nothing about what was being asked for. Anyone who obtained one before it was spent could point it at a different operation on a different object: a full-file download in place of a metadata read. Exploiting that needs an active adversary in the network path, which is exactly the assumption the rest of the federation design refuses to make, since the private-network layer is defence in depth and never the authority.
@@ -23,6 +25,8 @@ Entries are written for the person deciding whether to upgrade, so the ones that
 - **A federation token that omits `jti` is refused rather than skipping replay protection.** It was previously accepted with a `WARNING`, as backwards-compat for peers predating the claim. No such peer ever existed: `create_jwt` has emitted `jti` since the initial release commit, so the window protected nobody while leaving the *sender* to decide whether replay protection ran — a decision an attacker replaying a captured token makes by stripping the claim.
 
 ### Fixed
+
+- **A federation token could be replayed when the receiving instance's clock ran behind the sender's.** The replay cache kept each token's `jti` for 90 seconds from arrival, but a token stays verifiable until 90 seconds after its own `iat`. A receiver lagging the sender sees a fresh token up to 30 seconds before that `iat`, so for up to 30 seconds after the `jti` was forgotten the same token passed every check again. Request binding limited such a replay to repeating the original request. The `jti` is now kept until the token itself would stop verifying, read from its `iat` and `exp`, plus a five-second margin.
 
 - The federated recording listing could advertise a de-identified `download_size` for a recording served raw — where an exact-user grant overrode a peer-wide de-identifying one, or a direct grant overrode a de-identifying dataset share. The bytes were right and the number was wrong, visible only under a pipeline that changes file size. The listing now resolves each recording's terms with the download path's precedence.
 

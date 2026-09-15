@@ -424,6 +424,24 @@ DEFAULT_JWT_LEEWAY = 30
 DEFAULT_MAX_JWT_AGE = 60
 
 
+def _timestamp_claim(payload: dict, name: str) -> int:
+    """Return the value of a mandatory time claim, or raise ``ValueError``.
+
+    Only a JSON integer is accepted. A float, a numeric string or a boolean is
+    refused rather than converted, since ``create_jwt`` emits integers and a
+    lenient conversion would widen what a load-bearing check admits. So are the
+    ``NaN`` and ``Infinity`` that ``json.loads`` accepts: every comparison with
+    NaN is false, so an ``exp`` compared as received would never expire.
+    """
+    value = payload.get(name)
+    if value is None:
+        raise ValueError(f"JWT missing '{name}' claim")
+    if isinstance(value, bool) or not isinstance(value, int):
+        # ValueError rather than TypeError: every caller of verify_jwt catches ValueError alone.
+        raise ValueError(f"JWT '{name}' claim is not a valid timestamp")  # noqa: TRY004
+    return value
+
+
 def verify_jwt(
     token: str,
     public_key: Ed25519PublicKey,
@@ -437,8 +455,9 @@ def verify_jwt(
 ) -> dict:
     """Verify a federation JWT and return its payload.
 
-    Validates: signature, ``alg``, ``exp`` (with leeway), ``iat`` (must be
-    present, not in the future modulo leeway, not older than ``max_age + leeway``),
+    Validates: signature, ``alg``, ``exp`` (a present integer, with leeway),
+    ``iat`` (a present integer, not in the future modulo leeway, not older than
+    ``max_age + leeway``),
     ``aud``, and the request binding (``htm`` / ``htp`` / ``bnd``). Replay
     detection via ``jti`` is *not* done here — it is stateful and lives in
     :func:`parse_federation_auth`.
@@ -467,11 +486,12 @@ def verify_jwt(
             issuers that pick over-generous TTLs.
 
     Returns:
-        Decoded payload dict.
+        Decoded payload dict, in which ``exp`` and ``iat`` are integers.
 
     Raises:
-        ``ValueError`` on any failure (malformed token, bad signature,
-        expired token, ``iat`` missing or out of bounds, audience mismatch).
+        ``ValueError`` on any failure (malformed token, bad signature, expired
+        token, ``exp`` or ``iat`` missing, non-integer or out of bounds,
+        audience or binding mismatch).
     """
     parts = token.split(".")
     if len(parts) != 3:
@@ -505,7 +525,8 @@ def verify_jwt(
 
     # Token is expired iff ``now`` is past ``exp + leeway`` — i.e. the leeway
     # extends the validity window into the future from the issuer's claimed exp.
-    if payload.get("exp", 0) + leeway < now:
+    exp = _timestamp_claim(payload, "exp")
+    if exp + leeway < now:
         raise ValueError("JWT has expired")
 
     # ``iat`` is mandatory: ``create_jwt`` has always emitted it, and the
@@ -513,13 +534,7 @@ def verify_jwt(
     # ``iat`` claims to be in the future (modulo leeway) suggests a misconfigured
     # peer clock; one whose ``iat`` is older than ``max_age`` is a replay or an
     # over-generous issuer TTL — either way, reject.
-    iat = payload.get("iat")
-    if iat is None:
-        raise ValueError("JWT missing 'iat' claim")
-    try:
-        iat = int(iat)
-    except (TypeError, ValueError):
-        raise ValueError("JWT 'iat' claim is not a valid timestamp")
+    iat = _timestamp_claim(payload, "iat")
     if iat - leeway > now:
         raise ValueError("JWT 'iat' is in the future")
     if iat + max_age + leeway < now:
@@ -922,7 +937,13 @@ def parse_federation_auth(request) -> FederationAuthResult:
         # chooses what to send, so an optional check is one an attacker
         # replaying a captured token has already turned off.
         return fail(401, "Federation token missing 'jti' claim", peer=peer)
-    if not _check_and_remember_jti(jti):
+    # The last second at which this token still passes ``verify_jwt``, read from
+    # its own claims, which ``verify_jwt`` has confirmed are integers.
+    not_after = min(
+        payload["exp"] + DEFAULT_JWT_LEEWAY,
+        payload["iat"] + DEFAULT_MAX_JWT_AGE + DEFAULT_JWT_LEEWAY,
+    )
+    if not _check_and_remember_jti(jti, not_after=not_after):
         return fail(401, "JWT replay detected", peer=peer)
 
     return FederationAuthResult(
@@ -960,21 +981,34 @@ def try_federation_auth(request) -> tuple[FederatedPeer, str] | None:
 # inspecting the Redis keyspace can grep for federation entries.
 JTI_CACHE_PREFIX = "fed-jti:"
 
+# Seconds a nonce is kept beyond the moment its token stops verifying, so a cache
+# that expires a key slightly early cannot reopen the replay window at its edge.
+JTI_CACHE_MARGIN = 5
 
-def _check_and_remember_jti(jti: str) -> bool:
-    """Atomically mark ``jti`` as seen.  Returns False if it was already seen.
+
+def _check_and_remember_jti(jti: str, *, not_after: int) -> bool:
+    """Atomically mark ``jti`` as seen. Returns False if it was already seen.
 
     Uses Django's cache, which is ``LocMemCache`` in dev/test and ``RedisCache``
-    in production (per ``epicurrents/settings/production.py``).  ``cache.add``
+    in production (per ``epicurrents/settings/production.py``). ``cache.add``
     is atomic across processes when backed by Redis — important because
     gunicorn runs multiple workers and a single-process LocMemCache would only
     protect within one worker.
 
-    The TTL is the maximum acceptable token age plus leeway: once the time
-    checks in ``verify_jwt`` would reject the token anyway, the nonce can be
-    forgotten without weakening replay protection.
+    ``not_after`` is the last second, from the token's own ``iat`` and ``exp``,
+    at which the token carrying ``jti`` would still pass ``verify_jwt``. The
+    nonce is kept until then plus ``JTI_CACHE_MARGIN``; after that the time
+    checks reject the token, so forgetting the nonce weakens nothing.
+
+    The lifetime must be anchored to the token rather than to the moment it is
+    first seen. When this instance's clock runs behind the issuer's, a fresh
+    token arrives up to ``DEFAULT_JWT_LEEWAY`` seconds before its own ``iat``,
+    and a lifetime counted from arrival would expire while the token is still
+    verifiable. Required rather than defaulted, so a new caller cannot restore a
+    fixed lifetime by omission.
     """
     from django.core.cache import cache
 
     key = f"{JTI_CACHE_PREFIX}{jti}"
-    return bool(cache.add(key, 1, timeout=DEFAULT_MAX_JWT_AGE + DEFAULT_JWT_LEEWAY))
+    timeout = max(1, not_after - int(time.time())) + JTI_CACHE_MARGIN
+    return bool(cache.add(key, 1, timeout=timeout))
