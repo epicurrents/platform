@@ -820,6 +820,70 @@ class TestDatasetSharedRecordingsAreServed:
             )
         assert sizes[inherited.pk] == inherited.file_size // 2
 
+    @pytest.mark.parametrize(
+        "overriding_remote_user_id, overridden",
+        [
+            # An exact-user raw grant decides over a peer-wide de-identifying one.
+            ("user42", "direct wildcard"),
+            # A direct raw grant decides over a de-identifying dataset share.
+            ("", "dataset share"),
+        ],
+    )
+    def test_download_size_follows_the_grant_that_decides_the_bytes(self, user, overriding_remote_user_id, overridden):
+        """Every de-identifying grant used to count, so these advertised a halved size for raw bytes."""
+        from unittest.mock import patch
+
+        from epicurrents.permissions import get_federated_read_access_result
+        from recordings.api.v1.ninja import _compute_download_sizes_for_peer
+        from recordings.models import RecordingMeta
+
+        peer = _make_peer(user)
+        recording = _make_recording(user)
+        recording_ct = ContentType.objects.get_for_model(recording, for_concrete_model=False)
+        AccessRight.objects.create(
+            content_type=recording_ct,
+            object_id=str(recording.pk),
+            access_giver=user,
+            federated_peer=peer,
+            remote_user_id=overriding_remote_user_id,
+            can_read=True,
+            apply_middleware=False,
+        )
+        if overridden == "dataset share":
+            self._share_dataset(user, peer, recording, apply_middleware=True)
+        else:
+            AccessRight.objects.create(
+                content_type=recording_ct,
+                object_id=str(recording.pk),
+                access_giver=user,
+                federated_peer=peer,
+                remote_user_id="",
+                can_read=True,
+                apply_middleware=True,
+            )
+        meta = RecordingMeta.objects.create(
+            content_type=recording_ct,
+            object_id=str(recording.pk),
+            format="edf",
+            duration=1.0,
+            data_record_count=1,
+            data_record_duration=1.0,
+            signal_count=1,
+        )
+
+        class _HalvingPipeline:
+            is_empty = False
+            is_size_preserving = False
+            has_signal_middleware = False
+
+            def compute_output_size(self, file_size, header_size):
+                return file_size // 2
+
+        assert get_federated_read_access_result(peer, "user42", recording).apply_middleware is False
+        with patch("recordings.api.v1.ninja._build_serve_pipeline", return_value=_HalvingPipeline()):
+            sizes = _compute_download_sizes_for_peer([recording], peer, "user42", {recording.pk: meta})
+        assert sizes[recording.pk] == recording.file_size
+
     def test_a_dataset_shared_recording_is_not_listed_for_another_peer(self, client, user):
         peer = _make_peer(user)
         recording = _make_recording(user)

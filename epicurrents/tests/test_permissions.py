@@ -635,6 +635,117 @@ class TestGetFederatedReadAccessResult:
         assert result.granted is False
 
 
+#: Grant shapes on one recording, as (kind, remote_user_id, apply_middleware), and the terms the
+#: per-object check serves remote user "u1" on: None for denied, else apply_middleware.
+_FEDERATED_OVERLAPS = {
+    "exact raw over wildcard de-identified": ([("direct", "u1", False), ("direct", "", True)], False),
+    "exact de-identified over wildcard raw": ([("direct", "u1", True), ("direct", "", False)], True),
+    "direct raw over dataset de-identified": ([("direct", "", False), ("dataset", "", True)], False),
+    "direct de-identified over dataset raw": ([("direct", "", True), ("dataset", "", False)], True),
+    "two datasets, raw and de-identified": ([("dataset", "", False), ("dataset", "", True)], True),
+    "dataset exact raw over dataset wildcard": ([("dataset", "u1", False), ("dataset", "", True)], False),
+    "expired direct de-identified, dataset raw": ([("expired", "", True), ("dataset", "", False)], False),
+    "only another user's grant": ([("direct", "u2", True)], None),
+}
+
+
+class TestGetFederatedAccessTerms:
+    """The batch answer has to be the per-object answer, terms included.
+
+    A listing sizes each download by ``apply_middleware`` and the per-object check decides what the
+    bytes are. The recording listing used to collect every de-identifying grant, which looked like the
+    safe direction and advertised a transformed size for recordings an overriding grant served raw.
+    """
+
+    def _make_peer(self, user):
+        from federation.models import FederatedPeer
+
+        return FederatedPeer.objects.create(
+            url="https://batch-peer.example.com", public_key="C" * 43, is_trusted=True, added_by=user
+        )
+
+    def _grant(self, kind, recording, user, peer, remote_user_id, apply_middleware):
+        from datetime import timedelta
+
+        from django.utils import timezone
+
+        from library.models import Dataset, DatasetItem
+
+        recording_ct = ContentType.objects.get_for_model(recording, for_concrete_model=False)
+        right = {
+            "access_giver": user,
+            "federated_peer": peer,
+            "remote_user_id": remote_user_id,
+            "can_read": True,
+            "apply_middleware": apply_middleware,
+        }
+        if kind == "dataset":
+            dataset = Dataset.objects.create(name="Shared", author=user)
+            DatasetItem.objects.create(dataset=dataset, content_type=recording_ct, object_id=str(recording.pk))
+            dataset_ct = ContentType.objects.get_for_model(Dataset, for_concrete_model=False)
+            AccessRight.objects.create(content_type=dataset_ct, object_id=str(dataset.pk), **right)
+            return
+        if kind == "expired":
+            right["expires_at"] = timezone.now() - timedelta(seconds=1)
+        AccessRight.objects.create(content_type=recording_ct, object_id=str(recording.pk), **right)
+
+    @pytest.mark.parametrize("creation_order", ["as listed", "reversed"])
+    @pytest.mark.parametrize("shape", list(_FEDERATED_OVERLAPS))
+    def test_agrees_with_the_per_object_check_on_terms(self, user, shape, creation_order):
+        from model_bakery import baker
+
+        from epicurrents.permissions import get_federated_access_terms
+
+        grants, expected = _FEDERATED_OVERLAPS[shape]
+        # Both creation orders: a resolver without a tie-break passes one of them on row order alone.
+        if creation_order == "reversed":
+            grants = grants[::-1]
+        peer = self._make_peer(user)
+        recording = baker.make("recordings.Recording", author=user)
+        for kind, remote_user_id, apply_middleware in grants:
+            self._grant(kind, recording, user, peer, remote_user_id, apply_middleware)
+        recording_ct = ContentType.objects.get_for_model(recording, for_concrete_model=False)
+
+        batch = get_federated_access_terms(peer, "u1", recording_ct, [recording.pk])
+        per_object = get_federated_read_access_result(peer, "u1", recording)
+
+        # Pinned to the expected value as well as to each other, so the two cannot agree on a wrong answer.
+        if expected is None:
+            assert per_object.granted is False
+            assert batch == {}
+        else:
+            assert per_object.granted is True and per_object.apply_middleware is expected
+            assert batch[str(recording.pk)].apply_middleware is expected
+
+    def test_only_the_requested_objects_are_answered(self, user):
+        from model_bakery import baker
+
+        from epicurrents.permissions import get_federated_access_terms
+
+        peer = self._make_peer(user)
+        asked = baker.make("recordings.Recording", author=user)
+        other = baker.make("recordings.Recording", author=user)
+        for recording in (asked, other):
+            self._grant("dataset", recording, user, peer, "", True)
+            self._grant("direct", recording, user, peer, "", True)
+        recording_ct = ContentType.objects.get_for_model(asked, for_concrete_model=False)
+
+        assert set(get_federated_access_terms(peer, "u1", recording_ct, [asked.pk])) == {str(asked.pk)}
+
+    def test_no_peer_or_no_objects_answers_nothing(self, user):
+        from model_bakery import baker
+
+        from epicurrents.permissions import get_federated_access_terms
+
+        peer = self._make_peer(user)
+        recording = baker.make("recordings.Recording", author=user)
+        self._grant("direct", recording, user, peer, "", True)
+        recording_ct = ContentType.objects.get_for_model(recording, for_concrete_model=False)
+
+        assert get_federated_access_terms(None, "u1", recording_ct, [recording.pk]) == {}
+        assert get_federated_access_terms(peer, "u1", recording_ct, []) == {}
+
+
 @pytest.fixture
 def gate_registry():
     """Snapshot and restore the module-global visibility-gate registry."""

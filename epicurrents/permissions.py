@@ -205,7 +205,9 @@ def get_federated_visible_terms(peer, remote_user_id: str, content_type) -> dict
     transformation nobody needed, and the cost of the reverse is PHI.
 
     Callers still apply their own visibility rules to the rows they resolve — this
-    answers which objects an extension reaches, not whether they may be shown.
+    answers which objects an extension reaches, not whether they may be shown. It is
+    not the terms an object is served on where a direct row also reaches it; a caller
+    needing those takes them from :func:`get_federated_access_terms`.
     """
     terms: dict = {}
     if peer is None:
@@ -222,6 +224,49 @@ def get_federated_visible_terms(peer, remote_user_id: str, content_type) -> dict
 def get_federated_visible_ids(peer, remote_user_id: str, content_type) -> set[str]:
     """Ids of *content_type* objects a peer reaches through registered extensions."""
     return set(get_federated_visible_terms(peer, remote_user_id, content_type))
+
+
+def get_federated_access_terms(peer, remote_user_id: str, content_type, object_ids) -> dict:
+    """Terms on which a peer reads each of *object_ids*, resolved as the per-object check resolves them.
+
+    The batch counterpart of :func:`get_federated_read_access_result`, for a listing that needs
+    ``apply_middleware`` for many objects at once — the federated recording listing sizes each
+    download by it. The precedence is the per-object one, not a looser fold: a grant naming the
+    remote user outranks the peer-wide wildcard, a direct row outranks every extension, expired rows
+    count for nothing, and extensions answer only for objects no direct row reaches. Collecting every
+    de-identifying grant instead looks like the safe direction and still disagrees with what the
+    per-object check serves, so a listing advertises a transformed size for bytes that ship raw.
+
+    Keys are strings; objects the peer does not reach are absent. Read-visibility gates are not
+    consulted — they take an object, and the caller has already resolved the objects it lists.
+    """
+    permission_model = _resolve_read_permission_model()
+    wanted = {str(object_id) for object_id in object_ids}
+    if permission_model is None or peer is None or not wanted:
+        return {}
+
+    rows = (
+        permission_model.objects.filter(
+            content_type=content_type,
+            object_id__in=sorted(wanted),
+            can_read=True,
+            federated_peer=peer,
+        )
+        .filter(Q(expires_at__isnull=True) | Q(expires_at__gt=timezone.now()))
+        .filter(Q(remote_user_id="") | Q(remote_user_id=remote_user_id))
+        # The per-object query's own ordering, so the first row per object is the one it picks: the
+        # exact-user row before the peer-wide wildcard. Stated rather than left to the database, whose
+        # natural order happens to agree on some backends and would hide a regression there.
+        .order_by("-remote_user_id")
+        .values_list("object_id", "apply_middleware")
+    )
+    terms: dict = {}
+    for object_id, apply_middleware in rows:
+        terms.setdefault(object_id, ReadAccessTerms(granted=True, apply_middleware=apply_middleware))
+    for object_id, object_terms in get_federated_visible_terms(peer, remote_user_id, content_type).items():
+        if object_id in wanted and object_id not in terms:
+            terms[object_id] = object_terms
+    return terms
 
 
 def _resolve_read_permission_model():

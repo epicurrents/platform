@@ -74,9 +74,9 @@ from epicurrents.permissions import (
     can_modify_object,
     can_read_object,
     ensure_can_write_object,
+    get_federated_access_terms,
     get_federated_read_access_result,
     get_federated_visible_ids,
-    get_federated_visible_terms,
     get_read_access_result,
 )
 from federation.audit import log_federation_access
@@ -440,8 +440,8 @@ def _try_federated_auth(request):
 def _compute_download_sizes_for_peer(recordings, peer, remote_user_id, meta_by_pk):
     """Compute server-side post-pipeline file sizes for a list of recordings.
 
-    For each recording where the requesting peer's ``AccessRight`` has
-    ``apply_middleware=True``, returns the byte count that the server will
+    For each recording the requesting peer is served with ``apply_middleware=True``
+    (resolved by ``get_federated_access_terms``, as the download endpoint resolves it), returns the byte count that the server will
     actually transmit after the pipeline is applied.  Recordings without that
     flag, or where the pipeline is isometric (no size change), return the raw
     ``file_size``.
@@ -463,29 +463,12 @@ def _compute_download_sizes_for_peer(recordings, peer, remote_user_id, meta_by_p
     """
     recording_ct = ContentType.objects.get_for_model(Recording, for_concrete_model=False)
 
-    # One batch query: which recordings does this peer access with apply_middleware?
-    middleware_object_ids = set(
-        AccessRight.objects.filter(
-            federated_peer=peer,
-            can_read=True,
-            apply_middleware=True,
-            content_type=recording_ct,
-            object_id__in=[str(r.pk) for r in recordings],
-        )
-        .filter(Q(remote_user_id="") | Q(remote_user_id=remote_user_id))
-        .values_list("object_id", flat=True)
-    )
-    # Recordings the peer reaches without a row of their own — through a dataset
-    # shared with it — carry the terms of the grant they were inherited from. Left
-    # out, a dataset shared with de-identification on advertises the raw size while
-    # serving transformed bytes, so a peer sizing a download by this field is wrong
-    # by exactly what the pipeline changes.
-    listed_ids = {str(r.pk) for r in recordings}
-    middleware_object_ids |= {
-        object_id
-        for object_id, terms in get_federated_visible_terms(peer, remote_user_id, recording_ct).items()
-        if terms.apply_middleware and object_id in listed_ids
-    }
+    # The terms each recording is served on, resolved with the download path's own precedence: an
+    # exact-user grant over the peer-wide wildcard, a direct row over a dataset share. Collecting every
+    # de-identifying grant instead advertises a transformed size for a recording an overriding grant
+    # serves raw, and a peer sizing a transfer by this field is then wrong by what the pipeline changes.
+    terms_by_id = get_federated_access_terms(peer, remote_user_id, recording_ct, [r.pk for r in recordings])
+    middleware_object_ids = {object_id for object_id, terms in terms_by_id.items() if terms.apply_middleware}
 
     # Server-side pipeline for the API scope — identical to what download_recording uses.
     pipeline = _build_serve_pipeline()
