@@ -10,6 +10,8 @@ Entries are written for the person deciding whether to upgrade, so the ones that
 
 ### Changed
 
+- **Annotation export extensions no longer export `id`, `created_at` or `modified_at` unless the registration opts in.** `register_export_extension` gained `include_withheld`; an extension relying on one of these columns names it there.
+
 - **Federation tokens are now bound to the request they authorise, and both instances must be upgraded together.** A token previously carried only who was asking and of whom (`iss` / `aud` / `sub`) plus its time bounds and nonce — nothing about what was being asked for. Anyone who obtained one before it was spent could point it at a different operation on a different object: a full-file download in place of a metadata read. Exploiting that needs an active adversary in the network path, which is exactly the assumption the rest of the federation design refuses to make, since the private-network layer is defence in depth and never the authority.
 
   Tokens now additionally cover the HTTP method, the request path, and a digest of the remaining request context — today the `Range` header, which decides which bytes a download returns. The absolute URI is deliberately not bound: `aud` already pins scheme and host, and reconstructing them from forwarded headers behind the proxy overlay fails opaquely whenever that configuration drifts. The query string is not bound either, for the reason DPoP omits it — intermediaries rewrite it.
@@ -31,6 +33,8 @@ Entries are written for the person deciding whether to upgrade, so the ones that
 - A federated FUSE read that crossed the EDF header boundary failed on its first attempt. One token was minted per `read()` and reused across the header fetch and the signal fetch, but a token is spent by its first use, so the second request was correctly rejected as a replay. It surfaced only on the first read spanning that boundary — afterwards the header came from cache and one request sufficed — which is why a manual two-instance walkthrough did not reliably reproduce it. Minting now happens inside the single function that issues a federated byte request, so one token per request is structural rather than a rule each caller has to remember.
 
 ### Added
+
+- Projects can add rows from their own models to the bulk annotation export as additional export types, with `annotations.export.register_export_row_source`. It and `register_export_extension` are now part of the surface the platform version covers.
 
 - Account and group management has a UI. The API replacing the Django admin's user surface shipped without a client, so the only ways to create an ordinary account were a hand-built request with a session cookie and CSRF token, or a shell on the host — and a deployment maintained by a hosting service has neither. Four routes under `/admin/` now cover the account roster and detail, the group roster and detail, reached from the user menu in the nav bar.
 

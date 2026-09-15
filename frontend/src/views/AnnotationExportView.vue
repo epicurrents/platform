@@ -1,8 +1,8 @@
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref } from 'vue'
 import { t } from '#i18n'
-import { downloadAnnotationExport, listExportAnnotators } from '#api/annotationExport'
-import type { ExportAnnotator, ExportFormat, ExportType } from '#api/annotationExport'
+import { downloadAnnotationExport, listExportAnnotators, listExportTypes } from '#api/annotationExport'
+import type { ExportAnnotator, ExportFormat, ExportType, ExportTypeChoice } from '#api/annotationExport'
 import { listDatasets } from '#api/library'
 import type { Collection } from '#api/library'
 import { readBlobError } from '#lib/download'
@@ -21,8 +21,18 @@ const form = reactive({
     until: '',
     versionId: '',
 })
-const includeEvents = ref(true)
-const includeLabels = ref(true)
+/**
+ * Selectable types come from the server rather than a hard-coded pair: the active project can
+ * register annotation stores of its own, and a type the form cannot offer is one nobody exports.
+ * The fallback is what the annotations app always carries, so a failed lookup costs the project
+ * types, not the whole form.
+ */
+const FALLBACK_TYPES: ExportTypeChoice[] = [
+    { name: 'events', label: 'Events' },
+    { name: 'labels', label: 'Labels' },
+]
+const exportTypes = ref<ExportTypeChoice[]>(FALLBACK_TYPES)
+const selectedTypeNames = ref(new Set<ExportType>(FALLBACK_TYPES.map(entry => entry.name)))
 const format = ref<ExportFormat>('json')
 const datasets = ref<Collection[]>([])
 const annotators = ref<ExportAnnotator[]>([])
@@ -30,21 +40,14 @@ const selectedAnnotators = ref(new Set<number>())
 const rosterFailed = ref(false)
 const exporting = ref(false)
 
-const selectedTypes = computed<ExportType[]>(() => {
-    const types: ExportType[] = []
-    if (includeEvents.value) {
-        types.push('events')
-    }
-    if (includeLabels.value) {
-        types.push('labels')
-    }
-    return types
-})
+const selectedTypes = computed<ExportType[]>(
+    () => exportTypes.value.map(entry => entry.name).filter(name => selectedTypeNames.value.has(name))
+)
 
 /**
- * CSV carries one type per file because events and labels do not share a column set. Rather than
- * letting the server reject the combination, the form surfaces it as a blocked Export button with
- * the reason spelled out.
+ * CSV carries one type per file because the types do not share a column set. Rather than letting
+ * the server reject the combination, the form surfaces it as a blocked Export button with the
+ * reason spelled out.
  */
 const csvNeedsOneType = computed(() => format.value === 'csv' && selectedTypes.value.length !== 1)
 
@@ -65,7 +68,7 @@ const blockedReason = computed(() => {
         return t('Select at least one annotation type.', SCOPE)
     }
     if (csvNeedsOneType.value) {
-        return t('CSV holds one annotation type per file. Select either events or labels, or switch to JSON.', SCOPE)
+        return t('CSV holds one annotation type per file. Select a single type, or switch to JSON.', SCOPE)
     }
     if (noAnnotatorsSelected.value) {
         return t('Select at least one annotator.', SCOPE)
@@ -74,6 +77,16 @@ const blockedReason = computed(() => {
 })
 
 onMounted(async () => {
+    try {
+        const types = await listExportTypes()
+        if (types.length) {
+            exportTypes.value = types
+            selectedTypeNames.value = new Set(types.map(entry => entry.name))
+        }
+    } catch {
+        // Keep the core pair; a project's own types are missing but the form still works.
+        showToast(t('Could not load the annotation type list; only events and labels are offered.', SCOPE), 'warning')
+    }
     try {
         // 200 is the server-side maximum for the datasets listing (422 above it).
         datasets.value = await listDatasets({ limit: 200 })
@@ -97,12 +110,20 @@ function onSelectFormat (event: Event) {
     format.value = (event.target as HTMLInputElement).value as ExportFormat
 }
 
-function onToggleEvents (event: Event) {
-    includeEvents.value = (event.target as HTMLInputElement).checked
+function onToggleType (name: ExportType, event: Event) {
+    const next = new Set(selectedTypeNames.value)
+    if ((event.target as HTMLInputElement).checked) {
+        next.add(name)
+    } else {
+        next.delete(name)
+    }
+    selectedTypeNames.value = next
 }
 
-function onToggleLabels (event: Event) {
-    includeLabels.value = (event.target as HTMLInputElement).checked
+/** Row count for one annotator under one export type; the roster keys counts by type name. */
+function annotatorCount (annotator: ExportAnnotator, name: ExportType) {
+    const value = annotator[name]
+    return typeof value === 'number' ? value : 0
 }
 
 function onToggleAnnotator (id: number, event: Event) {
@@ -165,11 +186,11 @@ async function onExport () {
                 <section class="annotation-export-section">
                     <h2>{{ t('Contents', SCOPE) }}</h2>
                     <div class="annotation-export-section__row">
-                        <wa-checkbox :checked="includeEvents" @change="onToggleEvents">
-                            {{ t('Events', SCOPE) }}
-                        </wa-checkbox>
-                        <wa-checkbox :checked="includeLabels" @change="onToggleLabels">
-                            {{ t('Labels', SCOPE) }}
+                        <wa-checkbox v-for="entry in exportTypes" :key="entry.name"
+                            :checked="selectedTypeNames.has(entry.name)"
+                            @change="onToggleType(entry.name, $event)"
+                        >
+                            {{ t(entry.label, SCOPE) }}
                         </wa-checkbox>
                     </div>
                     <wa-radio-group
@@ -177,7 +198,7 @@ async function onExport () {
                         :value="format"
                         @change="onSelectFormat"
                     >
-                        <wa-radio value="json">{{ t('JSON — both types in one file, values kept intact', SCOPE) }}</wa-radio>
+                        <wa-radio value="json">{{ t('JSON — every selected type in one file, values kept intact', SCOPE) }}</wa-radio>
                         <wa-radio value="csv">{{ t('CSV — one type per file, opens in a spreadsheet', SCOPE) }}</wa-radio>
                     </wa-radio-group>
                 </section>
@@ -207,8 +228,11 @@ async function onExport () {
                                 <th>{{ t('ID', SCOPE) }}</th>
                                 <th>{{ t('Name', SCOPE) }}</th>
                                 <th>{{ t('Username', SCOPE) }}</th>
-                                <th class="annotation-export-annotators__count">{{ t('Events', SCOPE) }}</th>
-                                <th class="annotation-export-annotators__count">{{ t('Labels', SCOPE) }}</th>
+                                <th v-for="entry in exportTypes" :key="entry.name"
+                                    class="annotation-export-annotators__count"
+                                >
+                                    {{ t(entry.label, SCOPE) }}
+                                </th>
                             </tr>
                         </thead>
                         <tbody>
@@ -223,8 +247,11 @@ async function onExport () {
                                 <td>{{ annotator.id }}</td>
                                 <td>{{ annotator.name }}</td>
                                 <td>{{ annotator.username }}</td>
-                                <td class="annotation-export-annotators__count">{{ annotator.events }}</td>
-                                <td class="annotation-export-annotators__count">{{ annotator.labels }}</td>
+                                <td v-for="entry in exportTypes" :key="entry.name"
+                                    class="annotation-export-annotators__count"
+                                >
+                                    {{ annotatorCount(annotator, entry.name) }}
+                                </td>
                             </tr>
                         </tbody>
                     </table>

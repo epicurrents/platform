@@ -12,23 +12,36 @@ import { http } from '#lib/http'
 
 const EXPORT_URL = '/annotations/api/v1/export'
 
-/** Annotation types the export understands. */
-export type ExportType = 'events' | 'labels'
+/**
+ * An annotation type the export understands. The core pair is `events` and `labels`; a deployment
+ * whose active project registers a row source adds its own, so this is a string rather than a
+ * union — {@link listExportTypes} is what a caller enumerates.
+ */
+export type ExportType = string
 
-/** Output formats. CSV carries one type per file; JSON carries either or both. */
+/** Output formats. CSV carries one type per file; JSON carries any selection. */
 export type ExportFormat = 'json' | 'csv'
 
-/** One entry of the staff-only annotator roster. */
+/**
+ * One entry of the staff-only annotator roster. Row counts are keyed by export type name, so a
+ * deployment with a registered row source gets a count for it here too.
+ */
 export interface ExportAnnotator {
     /** User id — the value the export's `author_id` fields carry. */
     id: number
     username: string
     /** Full name, falling back to the username when none is set. */
     name: string
-    /** Number of Event rows this user has authored. */
-    events: number
-    /** Number of Label rows this user has authored. */
-    labels: number
+    /** Rows this user has authored, keyed by export type name. */
+    [type: string]: number | string
+}
+
+/** One selectable export type, as the server names it to a person. */
+export interface ExportTypeChoice {
+    /** Value passed back in `types`. */
+    name: ExportType
+    /** Display name for the export form. */
+    label: string
 }
 
 /** Filters narrowing an export. Every field is optional; omitting all of them exports everything. */
@@ -51,7 +64,16 @@ export interface AnnotationExportFilters {
 }
 
 /**
- * Fetch the annotator roster: every user who has authored events or labels, with their user id,
+ * Fetch the annotation types this deployment can export, in the order the form should offer them.
+ * Available to every authenticated caller: the list describes the endpoint, not anyone's data.
+ */
+export async function listExportTypes(): Promise<ExportTypeChoice[]> {
+    const response = await http.get(`${EXPORT_URL}/types`)
+    return response.data.types
+}
+
+/**
+ * Fetch the annotator roster: every user who has authored an exportable row, with their user id,
  * identity, and per-type counts. Staff only — the server answers 403 for anyone else.
  */
 export async function listExportAnnotators(): Promise<ExportAnnotator[]> {

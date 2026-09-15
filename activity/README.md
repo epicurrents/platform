@@ -407,6 +407,7 @@ To check the table against the tree, walk the AST for `log_activity` / `with_sys
 | `annotations.event.mine` | `list_my_events` |
 | `annotations.event.update` | `update_event` |
 | `annotations.export` | `export_annotations` |
+| `annotations.export.types` | `list_export_types` |
 | `annotations.interruption.create` | `create_interruption` |
 | `annotations.interruption.delete` | `delete_interruption` |
 | `annotations.interruption.list` | `list_interruptions` |

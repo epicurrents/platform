@@ -153,6 +153,7 @@ Covered — a breaking change to any of these bumps the major:
 - The pipeline, converter, CSV-subconverter and conversion-hook registries, and the settings keys that configure them.
 - The EDF middleware ABCs in [federation/middleware.py](../federation/middleware.py) and `build_header` / `recordings.testing` in [recordings](../recordings/README.md).
 - The audit recorders in [activity/audit.py](../activity/audit.py) and `with_system_activity`, which cross-cutting rules require projects to call directly.
+- The annotation-export registries `register_export_extension` and `register_export_row_source` in [annotations/export.py](../annotations/export.py).
 - The AppConfig contract a project or plugin implements: `requires_platform`, `plugin_url_namespace`, `requires`.
 - The URL mount points (`/project/api/v1/`, `/project/<name>/`, `/plugin/<name>/`).
 - Core model names and their identity fields, which project foreign keys point at.

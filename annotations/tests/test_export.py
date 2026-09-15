@@ -741,3 +741,528 @@ class TestAnnotatorRoster:
         activity = Activity.objects.filter(verb="annotations.annotator.list").latest("id")
         assert activity.metadata == {"annotator_count": 1}
         assert "identifiable_person" not in json.dumps(activity.metadata)
+
+
+def _row_source(type_name, **kwargs):
+    from annotations import export as annotation_export
+
+    defaults = {"type_name": type_name, "label": type_name.title(), "columns": ("author_id",)}
+    defaults.update(kwargs)
+    defaults.setdefault("get_queryset", lambda: None)
+    defaults.setdefault("serialise", lambda obj: {})
+    return annotation_export.ExportRowSource(**defaults)
+
+
+def _make_peer(added_by, **kwargs):
+    defaults = {"added_by": added_by, "url": f"https://{baker.random_gen.gen_string(12).lower()}.example"}
+    defaults.update(kwargs)
+    return baker.make("federation.FederatedPeer", **defaults)
+
+
+def _make_interruption(author, recording, **kwargs):
+    from annotations.models import Interruption
+
+    defaults = {
+        "author": author,
+        "target_content_type": _recording_ct(recording),
+        "target_object_id": str(recording.pk),
+        "object_hash": baker.random_gen.gen_string(32).upper()[:32],
+        "timestamp": 3.5,
+        "duration": 1.0,
+    }
+    defaults.update(kwargs)
+    return baker.make(Interruption, **defaults)
+
+
+@pytest.mark.django_db
+class TestExportRowSources:
+    """The project hook that contributes rows of its own as an additional export type.
+
+    Backed by ``Interruption`` — a real annotation model the export does not carry as a core type,
+    so it stands in for a project table without needing one installed. ``FederatedPeer`` stands in
+    where the test needs a nullable author.
+    """
+
+    TYPE = "interruptions"
+
+    @pytest.fixture
+    def row_source(self, monkeypatch):
+        from annotations import export as annotation_export
+        from annotations.models import Interruption
+
+        def serialise(obj):
+            return {
+                # Deliberately wrong: the export must overwrite it from the row's own FK.
+                "author_id": -1,
+                "object_hash": obj.object_hash,
+                "timestamp": obj.timestamp,
+            }
+
+        source = _row_source(
+            self.TYPE,
+            columns=("author_id", "object_hash", "timestamp"),
+            get_queryset=lambda: Interruption.objects.all(),
+            serialise=serialise,
+        )
+        monkeypatch.setattr(annotation_export, "_ROW_SOURCES", {self.TYPE: source})
+        return source
+
+    def test_registered_type_is_exportable(self, row_source):
+        from annotations import export as annotation_export
+
+        assert annotation_export.exportable_types() == ("events", "labels", self.TYPE)
+
+    def test_rows_are_exported_under_their_own_key(self, client, make_user, row_source):
+        staff = _staff(make_user)
+        rater = make_user()
+        interruption = _make_interruption(rater, _make_recording(rater))
+
+        client.force_login(staff)
+        body = _json_body(client.get(f"{EXPORT_URL}?types={self.TYPE}"))
+
+        assert [row["object_hash"] for row in body[self.TYPE]] == [interruption.object_hash]
+        assert body["metadata"]["counts"] == {self.TYPE: 1}
+
+    def test_omitting_types_exports_registered_sources_too(self, client, make_user, row_source):
+        staff = _staff(make_user)
+        rater = make_user()
+        recording = _make_recording(rater)
+        _make_event(rater, recording)
+        _make_interruption(rater, recording)
+
+        client.force_login(staff)
+        body = _json_body(client.get(EXPORT_URL))
+
+        assert body["metadata"]["counts"] == {"events": 1, "labels": 0, self.TYPE: 1}
+
+    def test_author_id_comes_from_the_row_not_the_serialiser(self, client, make_user, row_source):
+        staff = _staff(make_user)
+        rater = make_user()
+        _make_interruption(rater, _make_recording(rater))
+
+        client.force_login(staff)
+        row = _json_body(client.get(f"{EXPORT_URL}?types={self.TYPE}"))[self.TYPE][0]
+
+        assert row["author_id"] == rater.pk
+
+    def test_rows_are_projected_onto_the_declared_columns(self, client, make_user, monkeypatch):
+        """An undeclared key never leaves the platform, and a missing declared one is null."""
+        from annotations import export as annotation_export
+        from annotations.models import Interruption
+
+        source = _row_source(
+            self.TYPE,
+            columns=("author_id", "object_hash", "timestamp"),
+            get_queryset=lambda: Interruption.objects.all(),
+            serialise=lambda obj: {"object_hash": obj.object_hash, "created_at": obj.created_at},
+        )
+        monkeypatch.setattr(annotation_export, "_ROW_SOURCES", {self.TYPE: source})
+        staff = _staff(make_user)
+        rater = make_user()
+        _make_interruption(rater, _make_recording(rater))
+
+        client.force_login(staff)
+        row = _json_body(client.get(f"{EXPORT_URL}?types={self.TYPE}"))[self.TYPE][0]
+
+        assert list(row) == ["author_id", "object_hash", "timestamp"]
+        assert row["timestamp"] is None
+
+    def test_non_staff_caller_sees_only_own_rows(self, client, make_user, row_source):
+        mine = make_user()
+        theirs = make_user()
+        recording = _make_recording(mine)
+        own = _make_interruption(mine, recording)
+        _make_interruption(theirs, recording)
+
+        client.force_login(mine)
+        body = _json_body(client.get(f"{EXPORT_URL}?types={self.TYPE}"))
+
+        assert [row["object_hash"] for row in body[self.TYPE]] == [own.object_hash]
+
+    def test_annotator_filter_narrows_rows(self, client, make_user, row_source):
+        staff = _staff(make_user)
+        wanted = make_user()
+        other = make_user()
+        recording = _make_recording(wanted)
+        kept = _make_interruption(wanted, recording)
+        _make_interruption(other, recording)
+
+        client.force_login(staff)
+        body = _json_body(client.get(f"{EXPORT_URL}?types={self.TYPE}&annotator_id={wanted.pk}"))
+
+        assert [row["object_hash"] for row in body[self.TYPE]] == [kept.object_hash]
+
+    def test_date_window_applies_to_the_sources_created_field(self, client, make_user, row_source):
+        from annotations.models import Interruption
+
+        staff = _staff(make_user)
+        rater = make_user()
+        recording = _make_recording(rater)
+        old = _make_interruption(rater, recording)
+        recent = _make_interruption(rater, recording)
+        Interruption.objects.filter(pk=old.pk).update(created_at="2020-01-01T00:00:00Z")
+
+        client.force_login(staff)
+        body = _json_body(client.get(f"{EXPORT_URL}?types={self.TYPE}&since=2021-01-01"))
+
+        assert [row["object_hash"] for row in body[self.TYPE]] == [recent.object_hash]
+
+    def test_recording_filter_omits_the_source(self, client, make_user, row_source):
+        staff = _staff(make_user)
+        rater = make_user()
+        recording = _make_recording(rater)
+        _make_event(rater, recording)
+        _make_interruption(rater, recording)
+
+        client.force_login(staff)
+        url = f"{EXPORT_URL}?types=events,{self.TYPE}&recording={recording.content_hash}"
+        body = _json_body(client.get(url))
+
+        # The core type matches, so the omission is the source's, not an empty target scope.
+        assert len(body["events"]) == 1
+        assert body[self.TYPE] == []
+
+    def test_dataset_filter_omits_the_source(self, client, make_user, row_source):
+        staff = _staff(make_user)
+        rater = make_user()
+        recording = _make_recording(rater)
+        _make_event(rater, recording)
+        _make_interruption(rater, recording)
+        dataset = baker.make("library.Dataset", author=rater)
+        baker.make(
+            "library.DatasetItem",
+            dataset=dataset,
+            content_type=_recording_ct(recording),
+            object_id=str(recording.pk),
+        )
+
+        client.force_login(staff)
+        body = _json_body(client.get(f"{EXPORT_URL}?types=events,{self.TYPE}&dataset_id={dataset.pk}"))
+
+        assert len(body["events"]) == 1
+        assert body[self.TYPE] == []
+
+    def test_version_filter_omits_a_source_without_a_version_field(self, client, make_user, row_source):
+        staff = _staff(make_user)
+        rater = make_user()
+        _make_interruption(rater, _make_recording(rater), version_id="v1")
+
+        client.force_login(staff)
+        body = _json_body(client.get(f"{EXPORT_URL}?types={self.TYPE}&version_id=v1"))
+
+        assert body[self.TYPE] == []
+
+    def test_a_version_aware_source_has_the_version_filter_applied(self, client, make_user, monkeypatch):
+        from annotations import export as annotation_export
+        from annotations.models import Interruption
+
+        source = _row_source(
+            self.TYPE,
+            columns=("author_id", "object_hash"),
+            get_queryset=lambda: Interruption.objects.all(),
+            serialise=lambda obj: {"object_hash": obj.object_hash},
+            version_field="version_id",
+        )
+        monkeypatch.setattr(annotation_export, "_ROW_SOURCES", {self.TYPE: source})
+        staff = _staff(make_user)
+        rater = make_user()
+        recording = _make_recording(rater)
+        kept = _make_interruption(rater, recording, version_id="v1")
+        _make_interruption(rater, recording, version_id="v2")
+
+        client.force_login(staff)
+        body = _json_body(client.get(f"{EXPORT_URL}?types={self.TYPE}&version_id=v1"))
+
+        assert [row["object_hash"] for row in body[self.TYPE]] == [kept.object_hash]
+
+    def test_rows_without_an_author_are_left_out(self, client, make_user, monkeypatch):
+        from annotations import export as annotation_export
+        from federation.models import FederatedPeer
+
+        source = _row_source(
+            "peers",
+            columns=("author_id", "url"),
+            get_queryset=lambda: FederatedPeer.objects.all(),
+            serialise=lambda obj: {"url": obj.url},
+            author_field="added_by",
+        )
+        monkeypatch.setattr(annotation_export, "_ROW_SOURCES", {"peers": source})
+        staff = _staff(make_user)
+        rater = make_user()
+        attributed = _make_peer(rater)
+        _make_peer(None)
+
+        client.force_login(staff)
+        body = _json_body(client.get(f"{EXPORT_URL}?types=peers"))
+        roster = _json_body(client.get(ANNOTATORS_URL))["annotators"]
+
+        assert body["peers"] == [{"author_id": rater.pk, "url": attributed.url}]
+        assert [entry["id"] for entry in body["metadata"]["annotators"]] == [rater.pk]
+        assert [entry["id"] for entry in roster] == [rater.pk]
+
+    def test_csv_uses_the_sources_columns_without_extension_columns(self, client, make_user, row_source, monkeypatch):
+        from annotations import export as annotation_export
+
+        monkeypatch.setattr(
+            annotation_export,
+            "_EXPORT_EXTENSIONS",
+            {"recordings.recording": [(("site_code",), lambda *, caller, objects: {})]},
+        )
+        staff = _staff(make_user)
+        rater = make_user()
+        _make_interruption(rater, _make_recording(rater))
+
+        client.force_login(staff)
+        body = client.get(f"{EXPORT_URL}?types={self.TYPE}&format=csv").content.decode()
+        reader = csv.DictReader(io.StringIO("\n".join(line for line in body.splitlines() if not line.startswith("#"))))
+
+        assert reader.fieldnames == ["author_id", "object_hash", "timestamp"]
+        assert [row["author_id"] for row in reader] == [str(rater.pk)]
+
+    def test_export_roster_counts_the_registered_type(self, client, make_user, row_source):
+        staff = _staff(make_user)
+        rater = make_user()
+        _make_interruption(rater, _make_recording(rater))
+
+        client.force_login(staff)
+        annotators = _json_body(client.get(f"{EXPORT_URL}?types={self.TYPE}"))["metadata"]["annotators"]
+
+        assert annotators == [{"id": rater.pk, "events": 0, "labels": 0, self.TYPE: 1}]
+
+    def test_annotator_roster_endpoint_counts_the_registered_type(self, client, make_user, row_source):
+        staff = _staff(make_user)
+        rater = make_user()
+        _make_interruption(rater, _make_recording(rater))
+
+        client.force_login(staff)
+        roster = _json_body(client.get(ANNOTATORS_URL))["annotators"]
+
+        assert [(entry["id"], entry["events"], entry[self.TYPE]) for entry in roster] == [(rater.pk, 0, 1)]
+
+    def test_roster_count_is_not_split_by_an_ordered_queryset(self, client, make_user, monkeypatch):
+        from annotations import export as annotation_export
+        from federation.models import FederatedPeer
+
+        source = _row_source(
+            "peers",
+            get_queryset=lambda: FederatedPeer.objects.order_by("url"),
+            author_field="added_by",
+        )
+        monkeypatch.setattr(annotation_export, "_ROW_SOURCES", {"peers": source})
+        staff = _staff(make_user)
+        rater = make_user()
+        _make_peer(rater, url="https://a.example")
+        _make_peer(rater, url="https://b.example")
+
+        client.force_login(staff)
+        roster = _json_body(client.get(ANNOTATORS_URL))["annotators"]
+
+        assert [(entry["id"], entry["peers"]) for entry in roster] == [(rater.pk, 2)]
+
+    def test_unknown_type_is_still_rejected(self, client, make_user, row_source):
+        client.force_login(_staff(make_user))
+        response = client.get(f"{EXPORT_URL}?types=nonesuch")
+
+        assert response.status_code == 422
+        assert self.TYPE in response.content.decode()
+
+
+@pytest.mark.django_db
+class TestExportTypesEndpoint:
+    """The list the export form builds its options from."""
+
+    URL = f"{EXPORT_URL}/types"
+
+    def test_core_types_are_listed_to_a_non_staff_caller(self, client, make_user):
+        client.force_login(make_user())
+        body = _json_body(client.get(self.URL))
+
+        assert body["types"] == [
+            {"name": "events", "label": "Events"},
+            {"name": "labels", "label": "Labels"},
+        ]
+
+    def test_registered_source_is_offered_after_the_core_types(self, client, make_user, monkeypatch):
+        from annotations import export as annotation_export
+
+        monkeypatch.setattr(annotation_export, "_ROW_SOURCES", {"widgets": _row_source("widgets", label="Widgets")})
+        client.force_login(make_user())
+        body = _json_body(client.get(self.URL))
+
+        assert [entry["name"] for entry in body["types"]] == ["events", "labels", "widgets"]
+        assert body["types"][-1] == {"name": "widgets", "label": "Widgets"}
+
+    def test_requires_authentication(self, client):
+        assert client.get(self.URL).status_code == 401
+
+    def test_listing_is_audited_with_a_count_only(self, client, make_user):
+        client.force_login(make_user())
+        client.get(self.URL)
+
+        activity = Activity.objects.filter(verb="annotations.export.types").latest("id")
+        assert activity.metadata == {"type_count": 2}
+
+
+class TestRowSourceRegistration:
+    """Registration-time refusals, which are the only place a misregistration is cheap to catch."""
+
+    @pytest.fixture(autouse=True)
+    def empty_registries(self, monkeypatch):
+        from annotations import export as annotation_export
+
+        monkeypatch.setattr(annotation_export, "_ROW_SOURCES", {})
+        monkeypatch.setattr(annotation_export, "_EXPORT_EXTENSIONS", {})
+        return annotation_export
+
+    def _register(self, name, **kwargs):
+        from annotations import export as annotation_export
+
+        defaults = {"label": "Widgets", "columns": ("author_id",), "get_queryset": lambda: None}
+        defaults.update(kwargs)
+        defaults.setdefault("serialise", lambda obj: {})
+        annotation_export.register_export_row_source(name, **defaults)
+
+    def test_valid_registration_becomes_exportable(self, empty_registries):
+        self._register("widgets", version_field="version_id")
+
+        assert empty_registries.exportable_types() == ("events", "labels", "widgets")
+        assert empty_registries._ROW_SOURCES["widgets"].version_field == "version_id"
+
+    def test_duplicate_type_name_is_refused(self):
+        self._register("widgets")
+        with pytest.raises(ValueError, match="already registered"):
+            self._register("widgets")
+
+    @pytest.mark.parametrize("name", ["events", "labels"])
+    def test_core_type_name_is_refused(self, name):
+        with pytest.raises(ValueError, match="already registered"):
+            self._register(name)
+
+    def test_metadata_type_name_is_refused(self):
+        # A source under this name would replace the JSON export's header with its rows.
+        with pytest.raises(ValueError, match="reserved"):
+            self._register("metadata")
+
+    def test_source_without_author_id_column_is_refused(self):
+        with pytest.raises(ValueError, match="author_id"):
+            self._register("widgets", columns=("name",))
+
+    @pytest.mark.parametrize("name", ["epoch labels", "epoch,labels", "EpochLabels", "2labels", "", "widgets\n"])
+    def test_unselectable_type_names_are_refused(self, name):
+        with pytest.raises(ValueError, match="must match"):
+            self._register(name)
+
+    def test_source_column_taken_by_an_extension_is_refused(self, empty_registries):
+        empty_registries.register_export_extension(
+            "recordings.recording", columns=("site_code",), resolver=lambda *, caller, objects: {}
+        )
+        with pytest.raises(ValueError, match="site_code"):
+            self._register("widgets", columns=("author_id", "site_code"))
+
+    def test_extension_column_taken_by_a_source_is_refused(self, empty_registries):
+        self._register("widgets", columns=("author_id", "site_code"))
+        with pytest.raises(ValueError, match="site_code"):
+            empty_registries.register_export_extension(
+                "recordings.recording", columns=("site_code",), resolver=lambda *, caller, objects: {}
+            )
+
+
+@pytest.mark.django_db
+class TestWithheldColumns:
+    """``id``, ``created_at`` and ``modified_at`` leave only when a registration opts in by name."""
+
+    TYPE = "interruptions"
+
+    @pytest.fixture(autouse=True)
+    def registries(self, monkeypatch):
+        from annotations import export as annotation_export
+
+        monkeypatch.setattr(annotation_export, "_ROW_SOURCES", {})
+        monkeypatch.setattr(annotation_export, "_EXPORT_EXTENSIONS", {})
+        return annotation_export
+
+    def _register_source(self, registries, **kwargs):
+        from annotations.models import Interruption
+
+        registries.register_export_row_source(
+            self.TYPE,
+            label="Interruptions",
+            columns=("author_id", "id", "object_hash", "created_at", "modified_at"),
+            get_queryset=lambda: Interruption.objects.all(),
+            serialise=lambda obj: {
+                "id": obj.pk,
+                "object_hash": obj.object_hash,
+                "created_at": obj.created_at,
+                "modified_at": obj.modified_at,
+            },
+            **kwargs,
+        )
+
+    def _export_one(self, client, make_user, url_suffix):
+        staff = _staff(make_user)
+        rater = make_user()
+        recording = _make_recording(rater)
+        _make_interruption(rater, recording)
+        _make_event(rater, recording)
+        client.force_login(staff)
+        return client.get(f"{EXPORT_URL}?{url_suffix}")
+
+    def test_a_row_source_withholds_them_by_default(self, client, make_user, registries):
+        self._register_source(registries)
+
+        row = _json_body(self._export_one(client, make_user, f"types={self.TYPE}"))[self.TYPE][0]
+        text = self._export_one(client, make_user, f"types={self.TYPE}&format=csv").content.decode()
+        header = next(line for line in text.splitlines() if not line.startswith("#")).split(",")
+
+        assert list(row) == ["author_id", "object_hash"]
+        assert header == ["author_id", "object_hash"]
+
+    def test_a_row_source_exports_only_the_withheld_column_it_names(self, client, make_user, registries):
+        self._register_source(registries, include_withheld=("created_at",))
+
+        row = _json_body(self._export_one(client, make_user, f"types={self.TYPE}"))[self.TYPE][0]
+
+        assert list(row) == ["author_id", "object_hash", "created_at"]
+        assert row["created_at"]
+
+    def test_an_extension_withholds_them_by_default(self, client, make_user, registries):
+        registries.register_export_extension(
+            "recordings.recording",
+            columns=("site_code", "created_at"),
+            resolver=lambda *, caller, objects: {
+                str(obj.pk): {"site_code": "s", "created_at": "2026-01-01"} for obj in objects
+            },
+        )
+
+        body = _json_body(self._export_one(client, make_user, "types=events"))
+
+        assert "created_at" not in body["events"][0]
+        assert body["events"][0]["site_code"] == "s"
+        assert body["metadata"]["extension_columns"] == ["site_code"]
+
+    def test_an_extension_exports_the_withheld_column_it_names(self, client, make_user, registries):
+        registries.register_export_extension(
+            "recordings.recording",
+            columns=("site_code", "created_at"),
+            resolver=lambda *, caller, objects: {
+                str(obj.pk): {"site_code": "s", "created_at": "2026-01-01"} for obj in objects
+            },
+            include_withheld=("created_at",),
+        )
+
+        row = _json_body(self._export_one(client, make_user, "types=events"))["events"][0]
+
+        assert row["created_at"] == "2026-01-01"
+
+    def test_naming_a_column_that_is_not_withheld_is_refused(self, registries):
+        with pytest.raises(ValueError, match="not withheld"):
+            self._register_source(registries, include_withheld=("object_hash",))
+
+    def test_naming_an_undeclared_withheld_column_is_refused(self, registries):
+        with pytest.raises(ValueError, match="undeclared"):
+            registries.register_export_extension(
+                "recordings.recording",
+                columns=("site_code",),
+                resolver=lambda *, caller, objects: {},
+                include_withheld=("created_at",),
+            )

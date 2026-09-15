@@ -24,9 +24,14 @@ a file is written, so the id-to-identity mapping stays behind authentication ins
 :func:`list_annotators` backs the staff-only roster endpoint the exporter reads it from. See
 annotations/README.md for the operator note.
 
-Projects extend the rows rather than replacing the endpoint: :func:`register_export_extension`
-lets a plugin complement rows targeting its own models with target-derived columns while the
-access tiers, target hiding, and de-identification above keep applying unchanged.
+Projects extend this endpoint rather than replacing it, through two registries that differ in what
+they contribute. :func:`register_export_extension` complements rows the export already found with
+target-derived columns, while the target hiding and de-identification above keep applying to them.
+:func:`register_export_row_source` contributes rows of its own, from a model the annotations app
+does not know, as an additional exportable type. A project that keeps rater output outside
+``Event`` / ``Label`` needs the second: without it the export answers such a deployment with a
+well-formed empty file, which reads as "nothing was annotated" rather than as "this table was never
+consulted". Neither registry lets a project decide who may export which rows.
 """
 
 from __future__ import annotations
@@ -52,8 +57,12 @@ from annotations.models import Event, Label
 #: the metadata header — annotator identity resolves via the in-platform roster endpoint instead.
 FORMAT_VERSION = 2
 
-#: Annotation types the export understands, in the order they appear in a JSON payload.
+#: The core annotation types, in the order they appear in a JSON payload. Registered row sources
+#: add to this set at runtime — :func:`exportable_types` is what a deployment can export.
 EXPORTABLE_TYPES = ("events", "labels")
+
+#: Display names for the core types. Registered row sources carry their own on the registration.
+_CORE_TYPE_LABELS = {"events": "Events", "labels": "Labels"}
 
 #: A ``since``/``until`` value carrying no time component, which is widened to cover the whole day.
 _DATE_ONLY_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
@@ -106,8 +115,158 @@ _COLUMNS = {
 #: :func:`register_export_extension`.
 _EXPORT_EXTENSIONS: dict[str, list[tuple[tuple[str, ...], object]]] = {}
 
+#: Columns both registries withhold unless the registration names them in ``include_withheld``. They
+#: are the fields the core types omit (see :data:`_COLUMNS`), and a project table carries them as
+#: readily as an annotation does: a sequential primary key leaks creation order and volume, and the
+#: absolute timestamps are what the de-identification rule keeps off annotation responses.
+_WITHHELD_COLUMNS = frozenset({"id", "created_at", "modified_at"})
 
-def register_export_extension(target_model_label: str, *, columns: tuple[str, ...], resolver) -> None:
+
+def _exported_columns(columns, include_withheld, *, owner: str) -> tuple[str, ...]:
+    """Return *columns* without the withheld ones the registration did not opt into.
+
+    An ``include_withheld`` entry that is not a withheld column, or that *columns* does not declare,
+    raises ``ValueError``: either makes the opt-in read as doing something it does not.
+    """
+    include = set(include_withheld)
+    not_withheld = sorted(include - _WITHHELD_COLUMNS)
+    if not_withheld:
+        raise ValueError(f"{owner}: include_withheld names column(s) that are not withheld: {', '.join(not_withheld)}")
+    undeclared = sorted(include - set(columns))
+    if undeclared:
+        raise ValueError(f"{owner}: include_withheld names undeclared column(s): {', '.join(undeclared)}")
+    return tuple(column for column in columns if column not in _WITHHELD_COLUMNS or column in include)
+
+
+@dataclass(frozen=True)
+class ExportRowSource:
+    """A project-owned model contributing rows to the export as an export type of its own.
+
+    See :func:`register_export_row_source` for what each field declares and which filter the export
+    applies through it. ``columns`` holds the exported columns, withheld ones already removed.
+    """
+
+    type_name: str
+    label: str
+    columns: tuple[str, ...]
+    get_queryset: object
+    serialise: object
+    author_field: str = "author"
+    created_field: str = "created_at"
+    version_field: str | None = None
+    include_withheld: tuple[str, ...] = ()
+
+
+#: Registered row sources, keyed by type name. See :func:`register_export_row_source`.
+_ROW_SOURCES: dict[str, ExportRowSource] = {}
+
+#: Shape a registered type name must take, matching the core types' own spelling.
+_TYPE_NAME_RE = re.compile(r"[a-z][a-z0-9_]*")
+
+
+def register_export_row_source(
+    type_name: str,
+    *,
+    label: str,
+    columns: tuple[str, ...],
+    get_queryset,
+    serialise,
+    author_field: str = "author",
+    created_field: str = "created_at",
+    version_field: str | None = None,
+    include_withheld: tuple[str, ...] = (),
+) -> None:
+    """Register a project model as an additional exportable annotation type.
+
+    *type_name* joins ``events`` and ``labels`` in ``?types=``, in the JSON payload, and in the
+    roster's per-type counts. It is lower-case snake like the core pair, because it travels through
+    a comma-separated query parameter and into the download's filename, and it may not be
+    ``metadata``, the JSON key the export's header sits under. *label* names the type to a
+    person choosing what to export. *columns* is the source's complete column set in CSV order, and
+    must contain ``author_id``: the export's frame is per-annotator attribution, and a row it cannot
+    attribute has no place in it.
+
+    The registration is declarative and the export keeps the enforcement. ``get_queryset`` returns
+    the rows the source offers for export, before any of the export's own filters — a callable, so
+    the queryset is built per export rather than once at registration. The export applies the annotator restriction through ``author_field`` (a foreign
+    key to the user model), the ``since`` / ``until`` window through ``created_field``, and the
+    ordering, so a source cannot widen its own scope; rows with no author are left out. ``serialise``
+    maps one instance to a dict, from which the export keeps only the declared *columns*, filling a
+    missing one with ``None`` and overwriting ``author_id`` from the row's own foreign key. A
+    serialiser can therefore neither misattribute a row nor ship a field the registration does not
+    show.
+
+    ``id``, ``created_at`` and ``modified_at`` are withheld even when declared — the fields the core
+    types omit, for the reasons on :data:`_COLUMNS`. Name a declared one in *include_withheld* to
+    export it anyway. The opt-in sits at the call site, where a reviewer sees it; a deployment that
+    exports timestamps records why in the phi-exposure exemptions.
+
+    A source's rows have no annotation target, so the ``recording`` and ``dataset_id`` filters can
+    never apply to them, and ``version_id`` applies only through a named ``version_field``. A source
+    is **omitted** from an export narrowed by a filter it cannot answer. Omission is the safe
+    direction: rows a filter could not be applied to would otherwise arrive looking as though they
+    had passed it.
+
+    Call from ``AppConfig.ready()``. A malformed, reserved or already-taken name, a column set without
+    ``author_id``, a column an export extension already uses, or an ``include_withheld`` entry that
+    is not a declared withheld column raises ``ValueError``. Registered
+    types are additive and do not bump :data:`FORMAT_VERSION`; a parser meets them as new keys in
+    the metadata header's ``counts``.
+    """
+    if not _TYPE_NAME_RE.fullmatch(type_name):
+        raise ValueError(f"Export type name {type_name!r} must match {_TYPE_NAME_RE.pattern}.")
+    if type_name == "metadata":
+        # render_json keys each type's rows beside the header, so this name would overwrite it.
+        raise ValueError("Export type name 'metadata' is reserved for the export's header.")
+    if type_name in _MODELS or type_name in _ROW_SOURCES:
+        raise ValueError(f"Export type {type_name!r} is already registered.")
+    if "author_id" not in columns:
+        raise ValueError(f"Export row source {type_name!r} must emit an 'author_id' column.")
+    exported = _exported_columns(columns, include_withheld, owner=f"Export row source {type_name!r}")
+    # Checked in both directions — here and in register_export_extension — so the outcome does not
+    # depend on which app's ready() ran first.
+    collisions = [column for column in exported if column in _extension_columns()]
+    if collisions:
+        raise ValueError(f"Export row source column(s) already used by an export extension: {', '.join(collisions)}")
+    _ROW_SOURCES[type_name] = ExportRowSource(
+        type_name=type_name,
+        label=label,
+        columns=exported,
+        get_queryset=get_queryset,
+        serialise=serialise,
+        author_field=author_field,
+        created_field=created_field,
+        version_field=version_field,
+        include_withheld=tuple(include_withheld),
+    )
+
+
+def exportable_types() -> tuple[str, ...]:
+    """Return every type this deployment can export: the core pair, then registered row sources.
+
+    The core pair keeps its canonical order so an existing parser sees no reordering. Registered
+    sources follow sorted, so the order is a property of the deployment rather than of app-loading
+    sequence.
+    """
+    return EXPORTABLE_TYPES + tuple(sorted(_ROW_SOURCES))
+
+
+def exportable_type_choices() -> list[dict]:
+    """Return ``{"name", "label"}`` for every exportable type, in :func:`exportable_types` order."""
+    return [
+        {"name": name, "label": _CORE_TYPE_LABELS.get(name) or _ROW_SOURCES[name].label} for name in exportable_types()
+    ]
+
+
+def _columns_for(type_name: str) -> tuple[str, ...]:
+    """Return the base column order for one exportable type, core or registered."""
+    source = _ROW_SOURCES.get(type_name)
+    return source.columns if source else _COLUMNS[type_name]
+
+
+def register_export_extension(
+    target_model_label: str, *, columns: tuple[str, ...], resolver, include_withheld: tuple[str, ...] = ()
+) -> None:
     """Register a project extension that complements exported rows with target-derived fields.
 
     Rows whose annotation target is an instance of *target_model_label* (``"app_label.model"``,
@@ -121,18 +280,23 @@ def register_export_extension(target_model_label: str, *, columns: tuple[str, ..
 
     The resolver receives the caller so it can apply field-level gates of its own (a project
     extension can gate ``Recording.original_name`` this way). Call from ``AppConfig.ready()``; a
-    column that collides with a base column or an earlier registration raises ``ValueError``
-    at registration rather than shadowing silently. Additive by design — registered columns do
-    not bump :data:`FORMAT_VERSION`.
+    column that collides with a base column, a registered row source's column, or an earlier
+    registration raises ``ValueError`` at registration rather than shadowing silently. Additive by
+    design — registered columns do not bump :data:`FORMAT_VERSION`.
+
+    ``id``, ``created_at`` and ``modified_at`` are withheld even when declared, as they are for a row
+    source; name a declared one in *include_withheld* to export it anyway.
     """
+    exported = _exported_columns(columns, include_withheld, owner=f"Export extension on {target_model_label!r}")
     taken = {column for type_columns in _COLUMNS.values() for column in type_columns}
+    taken.update(column for source in _ROW_SOURCES.values() for column in source.columns)
     for registered in _EXPORT_EXTENSIONS.values():
         for existing_columns, _ in registered:
             taken.update(existing_columns)
-    collisions = [column for column in columns if column in taken]
+    collisions = [column for column in exported if column in taken]
     if collisions:
         raise ValueError(f"Export extension column(s) already in use: {', '.join(collisions)}")
-    _EXPORT_EXTENSIONS.setdefault(target_model_label, []).append((tuple(columns), resolver))
+    _EXPORT_EXTENSIONS.setdefault(target_model_label, []).append((exported, resolver))
 
 
 def _extension_columns() -> tuple[str, ...]:
@@ -221,13 +385,17 @@ def parse_filters(
     the whole day — ``until=2026-08-11`` includes everything annotated on the 11th, which is what
     someone typing a date means, and the alternative silently truncates a day of rows.
     """
-    requested = tuple(part.strip() for part in (types or "").split(",") if part.strip()) or EXPORTABLE_TYPES
-    unknown = [name for name in requested if name not in _MODELS]
+    available = exportable_types()
+    requested = tuple(part.strip() for part in (types or "").split(",") if part.strip()) or available
+    unknown = [name for name in requested if name not in available]
     if unknown:
-        raise HttpError(422, f"Unknown annotation type(s): {', '.join(unknown)}. Valid types: events, labels.")
+        raise HttpError(
+            422,
+            f"Unknown annotation type(s): {', '.join(unknown)}. Valid types: {', '.join(available)}.",
+        )
     # Preserve the canonical order rather than the order they were typed, so the JSON key order and
     # the generated filename are stable for the same selection.
-    ordered = tuple(name for name in EXPORTABLE_TYPES if name in requested)
+    ordered = tuple(name for name in available if name in requested)
 
     fmt = (export_format or "json").strip().lower()
     if fmt not in ("json", "csv"):
@@ -235,8 +403,8 @@ def parse_filters(
     if fmt == "csv" and len(ordered) != 1:
         raise HttpError(
             422,
-            "CSV exports carry one annotation type per file, because events and labels do not "
-            "share a column set. Request types=events or types=labels, or use format=json.",
+            "CSV exports carry one annotation type per file, because the types do not share a "
+            "column set. Request a single type, or use format=json.",
         )
 
     return ExportFilters(
@@ -287,6 +455,8 @@ def build_export(*, caller, filters: ExportFilters) -> ExportResult:
 
     collected: dict[str, list] = {}
     for type_name in filters.types:
+        if type_name in _ROW_SOURCES:
+            continue
         queryset = _build_queryset(
             _MODELS[type_name],
             caller=caller,
@@ -304,8 +474,53 @@ def build_export(*, caller, filters: ExportFilters) -> ExportResult:
         visible = [row for row in rows if (row.target_content_type_id, row.target_object_id) in targets]
         result.rows[type_name] = [_serialise_row(row, type_name, targets=targets, extras=extras) for row in visible]
 
+    for type_name in filters.types:
+        source = _ROW_SOURCES.get(type_name)
+        if source is not None:
+            result.rows[type_name] = _source_rows(
+                source, caller=caller, filters=filters, restricted=restricted, target_scope=target_scope
+            )
+
     result.annotators, result.annotator_ids = _build_roster(result.rows)
     return result
+
+
+def _source_rows(
+    source: ExportRowSource, *, caller, filters: ExportFilters, restricted: bool, target_scope
+) -> list[dict]:
+    """Return the serialised rows one registered row source contributes under *filters*.
+
+    Empty when the export is narrowed by a filter the source cannot answer — see
+    :func:`register_export_row_source` on why omission is the safe direction. Every filter is
+    applied here rather than by the source, and each row is projected onto the declared columns with
+    the author id read off the row itself, so what leaves the platform is what the registration
+    declares.
+    """
+    if target_scope is not None:
+        return []
+    if filters.version_id is not None and source.version_field is None:
+        return []
+
+    author_id_field = f"{source.author_field}_id"
+    queryset = source.get_queryset().filter(**{f"{author_id_field}__isnull": False})
+    if restricted:
+        queryset = queryset.filter(**{author_id_field: caller.pk})
+    elif filters.annotator_ids:
+        queryset = queryset.filter(**{f"{author_id_field}__in": filters.annotator_ids})
+    if filters.since is not None:
+        queryset = queryset.filter(**{f"{source.created_field}__gte": filters.since})
+    if filters.until is not None:
+        queryset = queryset.filter(**{f"{source.created_field}__lte": filters.until})
+    if filters.version_id is not None:
+        queryset = queryset.filter(**{source.version_field: filters.version_id})
+
+    rows = []
+    for obj in queryset.order_by(source.created_field, "pk"):
+        serialised = source.serialise(obj)
+        row = {column: serialised.get(column) for column in source.columns}
+        row["author_id"] = getattr(obj, author_id_field)
+        rows.append(row)
+    return rows
 
 
 def _resolve_target_scope(filters: ExportFilters) -> set[tuple[int, str]] | None:
@@ -536,32 +751,42 @@ def _build_roster(rows_by_type: dict[str, list[dict]]) -> tuple[list[dict], list
     deliberately carries nothing but the id — identity resolves through :func:`list_annotators`
     inside the platform. Authors whose rows were all filtered out do not appear.
     """
+    blank = {t: 0 for t in exportable_types()}
     counts: dict[int, dict] = {}
     for type_name, rows in rows_by_type.items():
         for row in rows:
             author_id = row["author_id"]
-            entry = counts.setdefault(author_id, {"id": author_id, **{t: 0 for t in EXPORTABLE_TYPES}})
+            entry = counts.setdefault(author_id, {"id": author_id, **blank})
             entry[type_name] += 1
     ordered = sorted(counts)
     return [counts[author_id] for author_id in ordered], ordered
 
 
 def list_annotators() -> list[dict]:
-    """Return every user who has authored an Event or Label, with per-type row counts.
+    """Return every user who has authored an exportable row, with per-type row counts.
 
     Backs the staff-only roster endpoint: the counterpart the export file's ``author_id`` values
-    are resolved against without the mapping ever entering the file. Sorted by username. An
-    erased account leaves the roster together with its annotations (the author FK cascades), so
-    ids inside previously exported files stop resolving.
+    are resolved against without the mapping ever entering the file. Registered row sources are
+    counted alongside the core types, so a project's raters appear even when they have authored no
+    Event or Label. Sorted by username. An erased account leaves the roster together with its
+    annotations (the author FK cascades), so ids inside previously exported files stop resolving.
     """
     from django.contrib.auth import get_user_model
     from django.db.models import Count
 
+    blank = {t: 0 for t in exportable_types()}
     counts: dict[int, dict[str, int]] = {}
     for type_name, model in _MODELS.items():
         rows = model.objects.values("author_id").annotate(count=Count("pk"))
         for entry in rows:
-            counts.setdefault(entry["author_id"], {t: 0 for t in EXPORTABLE_TYPES})[type_name] = entry["count"]
+            counts.setdefault(entry["author_id"], dict(blank))[type_name] = entry["count"]
+    for type_name, source in _ROW_SOURCES.items():
+        author_id_field = f"{source.author_field}_id"
+        # A source's queryset may arrive ordered, and Django adds explicit ordering fields to the
+        # GROUP BY — one annotator would then span several groups, the last overwriting the rest.
+        rows = source.get_queryset().order_by().values(author_id_field).annotate(count=Count("pk"))
+        for entry in rows:
+            counts.setdefault(entry[author_id_field], dict(blank))[type_name] = entry["count"]
 
     users = get_user_model().objects.filter(pk__in=counts).only("pk", "username", "first_name", "last_name")
     roster = []
@@ -612,12 +837,15 @@ def render_csv(result: ExportResult, metadata: dict) -> str:
     (``pandas.read_csv(path, comment='#')``). It is still worth carrying: an export whose annotator
     roster lives in a separate file arrives detached from it soon enough.
 
-    Registered extension columns are always appended to the header — empty for rows whose target
-    the extension does not cover — so the CSV shape depends on the deployment, not on which
-    targets happened to match the filters.
+    Registered extension columns are always appended to a core type's header — empty for rows whose
+    target the extension does not cover — so the CSV shape depends on the deployment, not on which
+    targets happened to match the filters. A row source's CSV carries its declared columns only:
+    extensions key on annotation targets, which a source's rows do not have.
     """
     type_name = result.filters.types[0]
-    columns = _COLUMNS[type_name] + _extension_columns()
+    columns = _columns_for(type_name)
+    if type_name not in _ROW_SOURCES:
+        columns += _extension_columns()
     rows = result.rows[type_name]
 
     buffer = io.StringIO()

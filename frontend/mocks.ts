@@ -1083,6 +1083,16 @@ export async function handleMock(
 
     // ── Annotation export ─────────────────────────────────────────────────────
 
+    if (path === '/annotations/api/v1/export/types' && method === 'GET') {
+        if (!isLoggedIn(req)) return send(res, 401, { detail: 'Authentication credentials were not provided.' })
+        return send(res, 200, {
+            types: [
+                { name: 'events', label: 'Events' },
+                { name: 'labels', label: 'Labels' },
+            ],
+        })
+    }
+
     if (path === '/annotations/api/v1/export/annotators' && method === 'GET') {
         if (!isLoggedIn(req)) return send(res, 401, { detail: 'Authentication credentials were not provided.' })
         if (!_state.user.is_superuser) return send(res, 403, { detail: 'Listing annotators requires staff access.' })

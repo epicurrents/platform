@@ -22,6 +22,7 @@ POST          /codes/                 Attach a Code to an Event, Interruption, o
 PATCH/DELETE  /codes/{id}             Update or delete a specific code.
 
 GET           /export                 Bulk export of events / labels as JSON or CSV.
+GET           /export/types           Annotation types this deployment can export.
 GET           /export/annotators      Staff-only annotator roster (id-to-identity mapping).
 
 GET           /content-types          List available content types (for target lookup).
@@ -924,7 +925,7 @@ def delete_code(request, code_id: int):
 @export_router.get("", auth=None)
 def export_annotations(
     request,
-    types: str = Query("events,labels"),
+    types: str | None = Query(None),
     format: str = Query("json"),
     recording: list[str] = Query([]),
     dataset_id: int | None = Query(None),
@@ -933,14 +934,15 @@ def export_annotations(
     until: str | None = Query(None),
     version_id: str | None = Query(None),
 ):
-    """Export events and/or labels as a downloadable JSON or CSV file.
+    """Export events, labels and any registered project types as a downloadable JSON or CSV file.
 
+    Omitting ``types`` exports every type the deployment offers, registered row sources included.
     Staff (and superusers) export across all annotators, optionally narrowed with repeated
     ``annotator_id`` parameters; every other caller gets only their own rows, enforced on the
     queryset rather than filtered afterwards. The file identifies annotators by numeric user id
     only — identity resolves via the roster endpoint below, inside the platform. CSV takes exactly
-    one type per file — events and labels have different columns — so ``format=csv`` with both
-    types is a 422.
+    one type per file — the types have different columns — so ``format=csv`` with several types is
+    a 422.
 
     The response is an attachment rather than a JSON body, so the browser saves it directly; the
     ``no-store`` default from ``SecurityHeadersMiddleware`` still applies to it.
@@ -1004,6 +1006,22 @@ def export_annotations(
         filename=annotation_export.export_filename(result, exported_at),
     )
     return response
+
+
+@export_router.get("/types", auth=None)
+def list_export_types(request):
+    """List the annotation types this deployment can export, as ``{name, label}``.
+
+    The core pair plus whatever the active project registered as a row source, so the export form
+    offers a deployment's own types instead of hard-coding the two the annotations app owns. Every
+    authenticated caller may read it, staff or not: the list describes the endpoint, not anyone's
+    data.
+    """
+    _require_auth(request)
+    choices = annotation_export.exportable_type_choices()
+    # Count only — the type names are deployment configuration, already recoverable from the code.
+    log_activity(verb="annotations.export.types", metadata={"type_count": len(choices)})
+    return {"types": choices}
 
 
 @export_router.get("/annotators", auth=None)

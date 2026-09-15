@@ -31,7 +31,7 @@ import re
 #: for initial development, and the surface this number promises over — the
 #: extension points a project builds on — is not stable yet. See
 #: :func:`compatible_range` for what that does to a cap.
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 
 # Semver's own grammar for the numeric core: no leading zeroes, so "1.01.0" is
 # rejected rather than silently read as 1.1.0.
