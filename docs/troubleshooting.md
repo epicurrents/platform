@@ -295,6 +295,12 @@ The `FEDERATION_INSTANCE_URL` configured on the receiving side doesn't match wha
 
 Trailing-slash differences on `aud` are a common cause. Normalise to no trailing slash.
 
+The error names this instance's expected URL but shows the audience the token claimed only as `claim-hash` followed by 16 hexadecimal characters, because a sender must not be able to write arbitrary text into the security log. To test whether a candidate URL is what the peer sent, hash it the same way and compare the result with the logged value:
+
+```bash
+printf %s 'https://candidate.example.org' | shasum -a 256 | cut -c1-16
+```
+
 The `iss` claim, by contrast, is normalised server-side (`.strip().rstrip("/")`) before peer lookup, so trailing-slash variants on the sending peer's `FEDERATION_INSTANCE_URL` resolve correctly without operator intervention.
 
 ### Peer registration fails with `502` "URL ... resolves to non-public address — refusing to fetch (SSRF guard)"

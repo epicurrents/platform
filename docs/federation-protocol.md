@@ -182,9 +182,9 @@ The owning instance performs these steps in order and stops at the first failure
 4. Decode the payload **without** verifying it and read `iss`, trimmed of whitespace and trailing `/`; absent → **401**. This value is used only to select a key; nothing else from the unverified payload is trusted.
 5. Look up a peer whose URL equals `iss`. None, or not trusted → **401**.
 6. Verify the token against the peer's current key:
-   1. the header's `alg` is `EdDSA`;
+   1. the header is a JSON object whose `alg` is `EdDSA`;
    2. the signature is valid;
-   3. the payload is valid JSON;
+   3. the payload is a JSON object;
    4. `exp` is present and a JSON integer, and `exp + 30 ≥ now`;
    5. `iat` is present and a JSON integer, `iat − 30 ≤ now`, and `iat + 60 + 30 ≥ now`;
    6. `aud` equals this instance's URL;
@@ -194,7 +194,7 @@ The owning instance performs these steps in order and stops at the first failure
 9. Atomically record `jti` in the shared nonce store until the token could no longer pass step 6 — the earlier of `exp + 30` and `iat + 90`, read from the token — plus a margin of 5 s. If it was already recorded → **401** (replay).
 10. Accept: the request is from this peer, on behalf of remote user `sub`.
 
-Every failure at steps 2–9 emits a `federation.auth_failed` security event carrying the client address, the peer if one was resolved, and the reason. Claimed binding values from the token are included only as truncated digests, since they are text chosen by the sender and the security log must not carry it verbatim.
+Every failure at steps 2–9 emits a `federation.auth_failed` security event carrying the client address, the peer if one was resolved, and the reason. Values claimed by the token — the algorithm, the audience and the binding claims — appear in the reason only as truncated digests: the first 16 hexadecimal characters of SHA-256 over the value's string form. They are text chosen by the sender, and for the algorithm by anyone at all, since the header is read before the signature is verified; the security log must not carry them verbatim.
 
 A request that carries both a valid session cookie and a federated token is authenticated as the session user; the token is not examined.
 

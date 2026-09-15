@@ -309,12 +309,14 @@ def bound_path_from_request_path(path: str) -> str:
 def _claim_fingerprint(value: object) -> str:
     """Return a short correlation hash of a peer-supplied claim, for log messages.
 
-    Binding-mismatch errors reach ``log_security_event`` as the ``reason`` field,
-    which is a permanent operator-visible stream. The claimed values are free
-    text chosen by whoever signed the token, so echoing them verbatim would let
-    a hostile peer write arbitrary content — a name, an email address — into
-    that stream, which the security-log rules forbid and no erasure path can
-    reach. A truncated digest still lets a SIEM group repeated attempts from one
+    Errors naming a claimed value — the algorithm, the audience, the request
+    binding — reach ``log_security_event`` as the ``reason`` field, which is a
+    permanent operator-visible stream. The claimed values are free text chosen
+    by the sender: by whoever signed the token for a payload claim, and by
+    anyone at all for ``alg``, since the header is checked before the signature.
+    Echoing them verbatim would let that sender write arbitrary content — a
+    name, an email address — into the stream, which the security-log rules
+    forbid and no erasure path can reach. A truncated digest still lets a SIEM group repeated attempts from one
     source, which is the only thing the value was wanted for.
 
     Matches the ``email_hash`` / ``query_hash`` convention in
@@ -504,12 +506,17 @@ def verify_jwt(
         header = json.loads(_b64_decode(header_enc))
     except Exception:
         raise ValueError("JWT header is not valid JSON")
+    # Checked before anything reads a field: the header arrives before any signature
+    # check, so a non-object here is input from anyone, and ``.get`` on it would escape
+    # as an AttributeError. ValueError rather than TypeError, as every caller catches it alone.
+    if not isinstance(header, dict):
+        raise ValueError("JWT header is not a JSON object")  # noqa: TRY004
 
     if header.get("alg") != "EdDSA":
         # Defensive: Ed25519 verify will fail on a forged signature anyway, but
         # explicit alg rejection blocks ``alg: "none"`` style attacks and gives
         # operators a clearer diagnostic than "Invalid JWT signature".
-        raise ValueError(f"JWT alg must be 'EdDSA', got {header.get('alg')!r}")
+        raise ValueError(f"JWT alg must be 'EdDSA', got claim-hash {_claim_fingerprint(header.get('alg'))}")
 
     try:
         public_key.verify(_b64_decode(sig_enc), signing_input)
@@ -520,6 +527,8 @@ def verify_jwt(
         payload = json.loads(_b64_decode(payload_enc))
     except Exception:
         raise ValueError("JWT payload is not valid JSON")
+    if not isinstance(payload, dict):
+        raise ValueError("JWT payload is not a JSON object")  # noqa: TRY004
 
     now = int(time.time())
 
@@ -541,7 +550,9 @@ def verify_jwt(
         raise ValueError("JWT 'iat' is too old")
 
     if payload.get("aud") != audience:
-        raise ValueError(f"JWT audience mismatch: expected '{audience}', got '{payload.get('aud')}'")
+        raise ValueError(
+            f"JWT audience mismatch: expected '{audience}', got claim-hash {_claim_fingerprint(payload.get('aud'))}"
+        )
 
     # Request binding. Checked last so that a token failing both a time bound
     # and its binding reports the time bound — the more likely misconfiguration,

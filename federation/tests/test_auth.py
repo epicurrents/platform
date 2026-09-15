@@ -235,6 +235,40 @@ class TestJwtVerifyFailures:
                 audience="https://b.example.com",
             )
 
+    def test_claimed_alg_is_fingerprinted_not_echoed(self):
+        """The header is read before the signature, so its ``alg`` is text from anyone."""
+        forged = "none (written by a stranger)"
+        _, payload, sig = self._make_token().split(".")
+        forged_header = _b64_encode(json.dumps({"alg": forged, "typ": "JWT"}).encode())
+        with pytest.raises(ValueError) as excinfo:
+            verify_jwt(f"{forged_header}.{payload}.{sig}", self.pub, audience="https://b.example.com")
+        assert forged not in str(excinfo.value)
+        assert _claim_fingerprint(forged) in str(excinfo.value)
+
+    def test_claimed_audience_is_fingerprinted_not_echoed(self):
+        forged = "https://peer-chosen.example.com/Jane.Doe@hospital.example"
+        token = self._make_token(audience=forged)
+        with pytest.raises(ValueError, match="audience mismatch") as excinfo:
+            verify_jwt(token, self.pub, audience="https://b.example.com")
+        assert forged not in str(excinfo.value)
+        assert _claim_fingerprint(forged) in str(excinfo.value)
+        # The expected value is this instance's own URL, so it stays readable.
+        assert "https://b.example.com" in str(excinfo.value)
+
+    def test_header_that_is_not_a_json_object_rejected(self):
+        """Refused as malformed rather than escaping as an ``AttributeError``, before any signature check."""
+        _, payload, sig = self._make_token().split(".")
+        header = _b64_encode(json.dumps(["EdDSA"]).encode())
+        with pytest.raises(ValueError, match="header is not a JSON object"):
+            verify_jwt(f"{header}.{payload}.{sig}", self.pub, audience="https://b.example.com")
+
+    def test_payload_that_is_not_a_json_object_rejected(self):
+        header = _b64_encode(json.dumps({"alg": "EdDSA", "typ": "JWT"}, separators=(",", ":")).encode())
+        payload = _b64_encode(json.dumps(["not", "an", "object"]).encode())
+        sig = _b64_encode(self.priv.sign(f"{header}.{payload}".encode()))
+        with pytest.raises(ValueError, match="payload is not a JSON object"):
+            verify_jwt(f"{header}.{payload}.{sig}", self.pub, audience="https://b.example.com")
+
 
 class TestJtiClaim:
     """``create_jwt`` emits a unique ``jti`` per token.
@@ -1169,6 +1203,32 @@ class TestParseFederationAuth:
         assert result.ok
         assert result.peer.pk == peer.pk
         assert result.remote_user_id == "user-42"
+
+    def test_security_event_reason_carries_no_claimed_alg(self, settings):
+        """A stranger's forged ``alg`` does not reach the permanent security log.
+
+        The header is refused before any signature check, so this token needs no
+        key of the peer it names — which is exactly why the value cannot be echoed.
+        """
+        self._setup_local(settings)
+        self._make_peer(url="https://peer.example.com")
+        stranger_priv = load_private_key(generate_keypair()[1])
+        forged = "none <written into the log by a stranger>"
+        _, payload, sig = create_jwt(
+            stranger_priv,
+            issuer="https://peer.example.com",
+            audience="https://local.example.com",
+            subject="user-1",
+        ).split(".")
+        header = _b64_encode(json.dumps({"alg": forged, "typ": "JWT"}).encode())
+
+        with patch("epicurrents.security_log.log_security_event") as log_event:
+            result = parse_federation_auth(self._request(f"{header}.{payload}.{sig}"))
+
+        assert not result.ok
+        reason = log_event.call_args.kwargs["reason"]
+        assert forged not in reason
+        assert _claim_fingerprint(forged) in reason
 
     def test_try_wrapper_returns_tuple_on_success(self, settings):
         self._setup_local(settings)
