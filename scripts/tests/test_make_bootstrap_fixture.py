@@ -15,7 +15,13 @@ import subprocess
 import tarfile
 from pathlib import Path
 
-from scripts.tests.conftest import REPO_ROOT, SCRIPTS_DIR, requires_built_frontend, requires_rsync
+from scripts.tests.conftest import (
+    REPO_ROOT,
+    SCRIPTS_DIR,
+    requires_built_frontend,
+    requires_rsync,
+    system_path,
+)
 
 FIXTURE = SCRIPTS_DIR / "make-bootstrap-fixture.sh"
 
@@ -576,7 +582,10 @@ class TestStartShPreflight:
         assert _run(dest, "--dist").returncode == 0
         empty = tmp_path / "emptybin"
         empty.mkdir()
-        result = self._start(dest, f"{empty}:/usr/bin:/bin")
+        # An empty stub directory does not make a host runtime-less: the system
+        # directories after it on PATH still answer, and a Linux CI runner ships
+        # /usr/bin/docker. Mask both runtimes out of that half.
+        result = self._start(dest, f"{empty}:{system_path(empty, {'docker', 'podman'})}")
         assert result.returncode != 0
         assert "No container runtime found" in result.stderr
 

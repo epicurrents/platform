@@ -23,6 +23,10 @@ with ``fakebin.stub(name, body=...)`` when a test needs custom output
 the rest, so ``sudo dnf install ...`` lands at the dnf stub and shows
 up in the call log as a clean ``dnf install ...`` line.
 
+``fakebin.remove(name)`` is the inverse, and it rewrites the system half
+of that PATH rather than only deleting the stub: see :func:`system_path`
+for why a host that has the real binary would otherwise keep answering.
+
 These tests are mocked dry-runs (Tier 2 in the testing plan). Real
 container runtime behaviour — image pulls, volume permissions, init
 order — is out of scope and requires the Tier 3 container-based
@@ -31,6 +35,7 @@ harness.
 
 from __future__ import annotations
 
+import os
 import shlex
 import shutil
 import subprocess
@@ -75,6 +80,7 @@ class FakeBin:
     path: Path
     log: Path
     _stubbed: set[str] = field(default_factory=set)
+    _removed: set[str] = field(default_factory=set)
 
     def stub(self, name: str, body: str = "", exit_code: int = 0) -> None:
         """Install (or replace) a stub binary that logs its invocation.
@@ -95,11 +101,27 @@ class FakeBin:
         )
         stub.chmod(0o755)
         self._stubbed.add(name)
+        # Stubbing after a remove puts the name back: the stub directory leads
+        # PATH, so the name resolves again and masking the system half is moot.
+        self._removed.discard(name)
 
     def remove(self, name: str) -> None:
-        """Drop a stub so ``command -v <name>`` fails in the script."""
+        """Make the script's ``command -v <name>`` fail.
+
+        Unlinking the stub is not enough on its own: the fallback system
+        directories stay on PATH, so dropping the ``docker`` stub on a host that
+        has a real ``/usr/bin/docker`` just hands the script the real binary.
+        The name is recorded here and :func:`run_script` masks it out of the
+        system half of PATH.
+        """
         (self.path / name).unlink(missing_ok=True)
         self._stubbed.discard(name)
+        self._removed.add(name)
+
+    @property
+    def removed(self) -> set[str]:
+        """Names that must not resolve anywhere on the script's PATH."""
+        return set(self._removed)
 
     def calls(self) -> list[str]:
         if not self.log.exists():
@@ -272,6 +294,49 @@ def stage_script(script_name: str, cwd: Path) -> Path:
     return target
 
 
+#: The system half of the harness PATH, appended after the fake-binary directory
+#: so the scripts still reach real coreutils (sed, grep, tar, …).
+SYSTEM_PATH_DIRS = ("/usr/bin", "/bin")
+
+
+def system_path(base: Path, masked: set[str] | None = None) -> str:
+    """Return the system half of the harness PATH, minus the ``masked`` names.
+
+    With nothing masked this is just the real directories. Mask a name and the
+    caller gets a directory of symlinks (built under ``base``) to everything
+    those directories hold *except* that name, so a script's ``command -v
+    <name>`` finds nothing.
+
+    Masking has to work this way because ``command -v`` searches PATH: no file
+    the harness places in the fake-binary directory can hide a real binary that
+    sits further along it. A host without the binary installed passes either
+    way, which is why an absent mask reads as a green suite on macOS and a red
+    one on a Linux CI runner that ships ``/usr/bin/docker``.
+    """
+    masked = masked or set()
+    if not masked:
+        return ":".join(SYSTEM_PATH_DIRS)
+    # The mask is part of the directory name: a second call with a wider mask
+    # would otherwise reuse the first mirror and keep the symlink it already
+    # made for the newly masked name, masking nothing while reporting success.
+    mirror = base / (".sysbin-" + "+".join(sorted(masked)))
+    mirror.mkdir(exist_ok=True)
+    for directory in SYSTEM_PATH_DIRS:
+        source = Path(directory)
+        if not source.is_dir():
+            continue
+        for entry in source.iterdir():
+            # First directory wins, as it would in a real PATH search, and only
+            # executables are candidates there. lexists, not exists: a link whose
+            # target went away still occupies the name.
+            if entry.name in masked or os.path.lexists(mirror / entry.name):
+                continue
+            if entry.is_dir() or not os.access(entry, os.X_OK):
+                continue
+            (mirror / entry.name).symlink_to(entry)
+    return str(mirror)
+
+
 def run_script(
     script_name: str,
     fakebin: FakeBin,
@@ -289,7 +354,7 @@ def run_script(
     """
     staged = stage_script(script_name, cwd)
     env = {
-        "PATH": f"{fakebin.path}:/usr/bin:/bin",
+        "PATH": f"{fakebin.path}:{system_path(fakebin.path, fakebin.removed)}",
         "HOME": str(cwd),
         "USER": "testuser",
         "LC_ALL": "C",
