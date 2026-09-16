@@ -269,7 +269,7 @@ Every federated endpoint is a `GET`. None modifies data on the owning instance; 
 
 `{hash}` is the opaque 32-character identifier of a recording or media file. Author-private fields — a recording's original filename and processing error — are always null for a federated caller.
 
-The inbound check endpoint answers every non-success outcome — unknown content type, unknown object, no grant, failed recording — with the same 404 body, so a peer cannot use it to learn which objects exist. Its resolution differs from the table above; see [Open issues](#open-issues).
+The inbound check endpoint answers every non-success outcome — unknown content type, unknown object, no grant, failed recording — with the same 404 body, so a peer cannot use it to learn which objects exist. It decides access with the same resolver as the serving endpoints, but addresses objects by integer primary key rather than by the opaque hash the rest of the surface uses; see [Open issues](#open-issues).
 
 ## Sanitisation
 
@@ -359,7 +359,7 @@ Departures from the goals above, and gaps the protocol does not yet close. Items
 
 1. **Nonce store unavailability is undefined.** An error from the cache propagates as an unhandled exception. The request fails, but by accident; the intended behaviour is an explicit 503 with a security event.
 2. **Event text reaches peers regardless of sanitisation.** The slice metadata endpoint returns each overlapping event's `name` and `value` to any peer holding a read grant, with no regard to `apply_middleware`. A grant configured to strip annotation text from the signal file still discloses structured events through this path. No test covers what a federated caller receives from it.
-3. **The inbound check resolves access differently.** It reads direct grants only — no visibility gate and no extensions — and addresses objects by integer primary key. It therefore answers 404 for a recording a peer can reach through a shared dataset and download successfully, and can answer 200 for a trashed recording that every serving endpoint hides. It also exposes the integer key scheme that the rest of the surface avoids.
+3. **The inbound check addresses objects by integer primary key.** Every other peer-facing route names an object by its opaque hash, so this one exposes a key scheme the rest of the surface avoids, and the count and creation order it implies. Changing it alters the path both sides sign, so it belongs with peer version gating.
 4. **Query-carried parameters are unbound.** `/{hash}/file/slice` takes its time window in the query, so a token for one window can be replayed for another window of the same object. This grants nothing beyond the grant, and no client mints tokens for the endpoint yet; binding the named parameters into `bnd` is on the ROADMAP.
 5. **Two settings are inert.** `FEDERATION_JWT_TTL` and `FEDERATION_KEY_FETCH_TIMEOUT` are defined and documented but never read. Token lifetime is fixed at 60 s and the discovery fetch timeout at 10 s.
 6. **Trust verification is partial.** The API promotion path takes no fingerprint, and a key refresh replaces a trusted peer's key without re-verification or loss of trust.

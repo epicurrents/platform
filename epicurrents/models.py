@@ -85,32 +85,6 @@ class AccessRightQuerySet(models.QuerySet):
             .exists()
         )
 
-    def has_federated_permission(
-        self,
-        peer,
-        remote_user_id: str,
-        content_type,
-        object_id,
-        permission_field: str,
-    ) -> bool:
-        """Check permission for a federated peer + remote user pair.
-
-        Matches rights where ``federated_peer`` equals ``peer`` and either
-        ``remote_user_id`` matches exactly or is blank (wildcard — grants
-        access to any authenticated user from that peer).
-        """
-
-        if peer is None:
-            return False
-
-        qs = self.active().filter(
-            content_type=content_type,
-            object_id=str(object_id),
-            federated_peer=peer,
-            **{permission_field: True},
-        )
-        return qs.filter(Q(remote_user_id="") | Q(remote_user_id=remote_user_id)).exists()
-
 
 class AccessRight(models.Model):
     """Generic object-level access control entry across apps and models."""
@@ -279,18 +253,6 @@ class AccessRight(models.Model):
         content_type = ContentType.objects.get_for_model(obj, for_concrete_model=False)
         return cls.objects.has_permission_for_token(
             token=token,
-            content_type=content_type,
-            object_id=getattr(obj, "pk", None),
-            permission_field="can_read",
-        )
-
-    @classmethod
-    def can_federated_peer_read(cls, peer, remote_user_id: str, obj) -> bool:
-        """Return True when a federated peer + remote user may read ``obj``."""
-        content_type = ContentType.objects.get_for_model(obj, for_concrete_model=False)
-        return cls.objects.has_federated_permission(
-            peer=peer,
-            remote_user_id=remote_user_id,
             content_type=content_type,
             object_id=getattr(obj, "pk", None),
             permission_field="can_read",

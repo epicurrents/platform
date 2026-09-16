@@ -27,6 +27,7 @@ from datetime import datetime
 
 from django.conf import settings
 from django.contrib.contenttypes.models import ContentType
+from django.core.exceptions import ValidationError
 from django.db import transaction
 from ninja import NinjaAPI, Schema
 from ninja.errors import HttpError
@@ -34,6 +35,7 @@ from ninja.errors import HttpError
 from activity.audit import log_activity
 from epicurrents.auth import enforce_session_csrf
 from epicurrents.models import AccessRight
+from epicurrents.permissions import get_federated_read_access_result
 from federation import services
 from federation.audit import log_federation_access
 from federation.auth import parse_federation_auth
@@ -438,17 +440,30 @@ def inbound_check_object(request, ct_id: int, object_id: str):
     if model_class is None:
         deny()
 
-    obj = model_class.objects.filter(pk=object_id).first()
+    # ``object_id`` is free text from the peer, and a model keyed by an integer or a
+    # UUID raises on a value it cannot parse rather than returning no row. An id of
+    # the wrong shape is a probe like any other and answers the same 404.
+    try:
+        obj = model_class.objects.filter(pk=object_id).first()
+    except (ValidationError, ValueError, TypeError):
+        obj = None
     if obj is None:
         deny()
 
-    if not AccessRight.can_federated_peer_read(peer=peer, remote_user_id=remote_user_id, obj=obj):
+    # The resolver every serving endpoint uses, rather than a direct-row query of
+    # this endpoint's own: it consults the read-visibility gates and the registered
+    # federated extensions, so the probe and the download agree about a recording in
+    # the trash and about one the peer reaches only through a shared dataset.
+    if not get_federated_read_access_result(peer, remote_user_id, obj).granted:
         deny(obj=obj)
 
     # FAILED recordings are hidden from federated peers (and every other
-    # grantee surface).  Collapse into the same 404 as the missing-object
+    # grantee surface). Collapse into the same 404 as the missing-object
     # path so the peer cannot distinguish "this recording was rejected by
-    # ingest" from "no such object".
+    # ingest" from "no such object". The resolver's visibility gate above
+    # refuses these too; this is the endpoint-side layer AGENTS.md asks every
+    # recording surface to carry, kept as defence in depth rather than as the
+    # only check.
     from recordings.models import Recording
 
     if isinstance(obj, Recording) and obj.status == Recording.Status.FAILED:

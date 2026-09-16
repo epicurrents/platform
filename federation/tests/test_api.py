@@ -561,6 +561,133 @@ class TestInboundCheckObject:
         data = resp.json()
         assert data["object_id"] == str(rec.pk)
 
+    def test_returns_200_for_an_item_of_a_dataset_shared_with_the_peer(self, client, make_user, settings):
+        """The probe and the download must agree about a recording reached through a dataset.
+
+        The download endpoints resolve with ``get_federated_read_access_result``, which
+        consults the registered federated extensions; a probe reading direct rows alone
+        answered 404 for a recording the peer could then fetch.
+        """
+        local_pub, local_priv = generate_keypair()
+        settings.FEDERATION_INSTANCE_URL = "https://local.example.com"
+        settings.FEDERATION_PUBLIC_KEY = local_pub
+        settings.FEDERATION_PRIVATE_KEY = local_priv
+
+        peer_pub, peer_priv = generate_keypair()
+        peer = _make_peer(url="https://peer.example.com", trusted=True)
+        peer.public_key = peer_pub
+        peer.save()
+
+        owner = make_user(username="dataset-owner")
+        from library.models import Dataset, DatasetItem
+        from recordings.models import Recording
+
+        rec = baker.make(Recording, author=owner, file_size=1, status=Recording.Status.READY)
+        ct = ContentType.objects.get_for_model(rec, for_concrete_model=False)
+        dataset = baker.make(Dataset, author=owner)
+        DatasetItem.objects.create(dataset=dataset, content_type=ct, object_id=str(rec.pk))
+        AccessRight.objects.create(
+            content_type=ContentType.objects.get_for_model(dataset, for_concrete_model=False),
+            object_id=str(dataset.pk),
+            access_giver=owner,
+            federated_peer=peer,
+            remote_user_id="remote-user-1",
+            can_read=True,
+        )
+
+        path = f"{BASE}/inbound/objects/{ct.pk}/{rec.pk}/"
+        token = self._make_jwt(
+            peer_url="https://peer.example.com",
+            priv_b64=peer_priv,
+            audience="https://local.example.com",
+            path=path,
+            subject="remote-user-1",
+        )
+        resp = client.get(path, **self._auth_header(token))
+
+        assert resp.status_code == 200
+        assert resp.json()["object_id"] == str(rec.pk)
+
+    def test_returns_404_for_a_trashed_recording_the_peer_holds_a_grant_on(self, client, make_user, settings):
+        """Every serving endpoint hides a trashed recording, so the probe must not confirm it."""
+        from django.utils import timezone
+
+        local_pub, local_priv = generate_keypair()
+        settings.FEDERATION_INSTANCE_URL = "https://local.example.com"
+        settings.FEDERATION_PUBLIC_KEY = local_pub
+        settings.FEDERATION_PRIVATE_KEY = local_priv
+
+        peer_pub, peer_priv = generate_keypair()
+        peer = _make_peer(url="https://peer.example.com", trusted=True)
+        peer.public_key = peer_pub
+        peer.save()
+
+        owner = make_user(username="trash-owner")
+        from recordings.models import Recording
+
+        rec = baker.make(
+            Recording,
+            author=owner,
+            file_size=1,
+            status=Recording.Status.READY,
+            deleted_at=timezone.now(),
+        )
+        ct = ContentType.objects.get_for_model(rec, for_concrete_model=False)
+        AccessRight.objects.create(
+            content_type=ct,
+            object_id=str(rec.pk),
+            access_giver=owner,
+            federated_peer=peer,
+            remote_user_id="remote-user-1",
+            can_read=True,
+        )
+
+        path = f"{BASE}/inbound/objects/{ct.pk}/{rec.pk}/"
+        token = self._make_jwt(
+            peer_url="https://peer.example.com",
+            priv_b64=peer_priv,
+            audience="https://local.example.com",
+            path=path,
+            subject="remote-user-1",
+        )
+        resp = client.get(path, **self._auth_header(token))
+
+        assert resp.status_code == 404
+        assert resp.json()["detail"] == "Object not found or access denied"
+
+    def test_returns_404_for_an_object_id_the_model_cannot_parse(self, client, settings):
+        """An id of the wrong shape is a probe like any other, not a 500.
+
+        The path parameter is free text from the peer, and a model with an integer
+        primary key raises rather than returning no row, so the lookup has to be
+        guarded for the response to stay uniform.
+        """
+        local_pub, local_priv = generate_keypair()
+        settings.FEDERATION_INSTANCE_URL = "https://local.example.com"
+        settings.FEDERATION_PUBLIC_KEY = local_pub
+        settings.FEDERATION_PRIVATE_KEY = local_priv
+
+        peer_pub, peer_priv = generate_keypair()
+        peer = _make_peer(url="https://peer.example.com", trusted=True)
+        peer.public_key = peer_pub
+        peer.save()
+
+        from recordings.models import Recording
+
+        ct = ContentType.objects.get_for_model(Recording, for_concrete_model=False)
+        path = f"{BASE}/inbound/objects/{ct.pk}/not-an-integer/"
+        token = self._make_jwt(
+            peer_url="https://peer.example.com",
+            priv_b64=peer_priv,
+            audience="https://local.example.com",
+            path=path,
+            subject="remote-user-1",
+        )
+        resp = client.get(path, **self._auth_header(token))
+
+        assert resp.status_code == 404
+        assert resp.json()["detail"] == "Object not found or access denied"
+
     def test_returns_404_when_no_grant(self, client, make_user, settings):
         """No grant returns 404, not 403 — see ``test_response_identical_for_missing_and_unauthorized``."""
         local_pub, local_priv = generate_keypair()
