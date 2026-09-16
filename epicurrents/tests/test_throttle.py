@@ -28,6 +28,18 @@ def _clear_cache():
     cache.clear()
 
 
+@pytest.fixture(autouse=True)
+def _pin_minute_bucket(monkeypatch):
+    """Freeze the counter window so no test straddles a minute boundary.
+
+    The counters are keyed by UTC minute, so a rollover between two calls of
+    one test puts them in different buckets and the second starts from zero —
+    the within-then-over assertions then fail on the clock rather than on their
+    subject. ``Retry-After`` is computed from the real clock and is unaffected.
+    """
+    monkeypatch.setattr(throttle, "_minute_bucket", lambda: "202601011200")
+
+
 @pytest.fixture
 def rf():
     return RequestFactory()

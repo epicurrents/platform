@@ -14,6 +14,7 @@ from unittest.mock import patch
 import pytest
 from model_bakery import baker
 
+from federation import limits
 from federation.auth import generate_keypair
 from federation.limits import (
     QuotaExceeded,
@@ -21,6 +22,20 @@ from federation.limits import (
     check_peer_inbound_rate,
 )
 from federation.models import FederatedPeer
+
+
+@pytest.fixture(autouse=True)
+def _pin_limit_windows(monkeypatch):
+    """Freeze the counter windows so no test straddles a bucket boundary.
+
+    Every assertion here is cumulative — the second call trips the limit the
+    first call charged. The counters are keyed by UTC minute (byte budget: UTC
+    day), so a rollover between two calls of one test puts them in different
+    buckets and the second starts from zero, failing the test on the clock
+    rather than on its subject.
+    """
+    monkeypatch.setattr(limits, "_minute_bucket", lambda: "202601011200")
+    monkeypatch.setattr(limits, "_day_bucket", lambda: "20260101")
 
 
 def _make_peer():
