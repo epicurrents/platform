@@ -557,7 +557,6 @@ FRONTEND_URL = config("FRONTEND_URL", default="http://localhost:5173")
 #   URL-safe base64 (no padding, 43 chars each) — same format as VAPID keys.
 #   Generate with: python manage.py generate_federation_keys
 # - FEDERATION_KEY_FETCH_TIMEOUT: seconds to wait when fetching a peer's public key.
-# - FEDERATION_JWT_TTL: lifetime of outbound federation JWTs in seconds.
 FEDERATION_INSTANCE_URL = config("FEDERATION_INSTANCE_URL", default="")
 FEDERATION_PUBLIC_KEY = config("FEDERATION_PUBLIC_KEY", default="")
 FEDERATION_PRIVATE_KEY = config("FEDERATION_PRIVATE_KEY", default="")
@@ -569,7 +568,6 @@ FEDERATION_PRIVATE_KEY = config("FEDERATION_PRIVATE_KEY", default="")
 FEDERATION_PUBLIC_KEY_NEXT = config("FEDERATION_PUBLIC_KEY_NEXT", default="")
 FEDERATION_PRIVATE_KEY_NEXT = config("FEDERATION_PRIVATE_KEY_NEXT", default="")
 FEDERATION_KEY_FETCH_TIMEOUT = config("FEDERATION_KEY_FETCH_TIMEOUT", default=10, cast=int)
-FEDERATION_JWT_TTL = config("FEDERATION_JWT_TTL", default=60, cast=int)
 # Per-peer exfiltration limits on the federated download paths.  Defaults are
 # generous enough that an honest peer running normal workloads will not notice,
 # but cap a compromised peer that tries to bulk-download the corpus.  Set

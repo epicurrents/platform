@@ -8,6 +8,8 @@ import pytest
 from django.core.exceptions import ImproperlyConfigured
 
 from federation.auth import (
+    DEFAULT_JWT_TTL,
+    DEFAULT_MAX_JWT_AGE,
     _b64_decode,
     _b64_encode,
     _build_tls_context,
@@ -755,6 +757,27 @@ class TestReplayDetection:
         assert "replay" in replay.error[1].lower()
 
 
+def test_default_token_lifetime_is_the_age_ceiling_a_receiver_accepts():
+    """The issuer's default lifetime and the verifier's age cap are one constant.
+
+    A receiver refuses a token whose ``iat`` is older than ``DEFAULT_MAX_JWT_AGE``
+    whatever its ``exp`` claims, so a longer lifetime would be refused on arrival.
+    Pinning the two together keeps a future change to either from creating tokens
+    that are born already unacceptable.
+    """
+    _, priv_b64 = generate_keypair()
+    token = create_jwt(
+        load_private_key(priv_b64),
+        issuer="https://a.example.com",
+        audience="https://b.example.com",
+        subject="u",
+    )
+    payload = json.loads(_b64_decode(token.split(".")[1]))
+
+    assert DEFAULT_JWT_TTL == DEFAULT_MAX_JWT_AGE
+    assert payload["exp"] - payload["iat"] == DEFAULT_MAX_JWT_AGE
+
+
 class TestJwtLeeway:
     """``verify_jwt`` tolerates ``leeway`` seconds of clock skew on ``exp``.
 
@@ -871,6 +894,30 @@ class TestFetchPeerPublicKey:
         with patch("federation.auth.urllib.request.urlopen", return_value=mock_resp):
             with pytest.raises(ValueError, match="Invalid public key"):
                 fetch_peer_public_key("https://peer.example.com")
+
+    def test_timeout_comes_from_the_setting(self, settings):
+        """A caller naming no timeout gets the deployment's configured one."""
+        settings.FEDERATION_KEY_FETCH_TIMEOUT = 3
+        pub_b64, _ = generate_keypair()
+        with patch(
+            "federation.auth.urllib.request.urlopen",
+            return_value=self._good_response(pub_b64),
+        ) as urlopen:
+            fetch_peer_public_key("https://peer.example.com")
+
+        assert urlopen.call_args.kwargs["timeout"] == 3
+
+    def test_explicit_timeout_overrides_the_setting(self, settings):
+        """``federation_check_peer`` passes its own ``--timeout``, which must still win."""
+        settings.FEDERATION_KEY_FETCH_TIMEOUT = 3
+        pub_b64, _ = generate_keypair()
+        with patch(
+            "federation.auth.urllib.request.urlopen",
+            return_value=self._good_response(pub_b64),
+        ) as urlopen:
+            fetch_peer_public_key("https://peer.example.com", timeout=11)
+
+        assert urlopen.call_args.kwargs["timeout"] == 11
 
     def test_tls_context_is_strict(self):
         """Asserts the outbound TLS posture so it cannot silently regress.

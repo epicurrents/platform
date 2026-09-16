@@ -24,7 +24,13 @@ Entries are written for the person deciding whether to upgrade, so the ones that
 
 - **A federation token that omits `jti` is refused rather than skipping replay protection.** It was previously accepted with a `WARNING`, as backwards-compat for peers predating the claim. No such peer ever existed: `create_jwt` has emitted `jti` since the initial release commit, so the window protected nobody while leaving the *sender* to decide whether replay protection ran — a decision an attacker replaying a captured token makes by stripping the claim.
 
+### Removed
+
+- **`FEDERATION_JWT_TTL`.** Nothing read it: outbound tokens were minted with a hardcoded 60-second lifetime. Raising it would also have bought nothing, because a receiver refuses any token whose `iat` is older than 60 seconds whatever its `exp` claims. The lifetime is now the `DEFAULT_JWT_TTL` constant in [federation/auth.py](federation/auth.py), defined as that same ceiling so the two cannot drift apart. A deployment that still carries the setting in its `.env` is unaffected; the value is simply ignored.
+
 ### Fixed
+
+- **`FEDERATION_KEY_FETCH_TIMEOUT` had no effect.** The setting was defined and documented, but `fetch_peer_public_key` kept its own 10-second default and no caller passed the configured value, so a deployment whose peer answers slowly could not raise it. The fetch now reads the setting.
 
 - **The federated object check disagreed with the endpoints that serve the object.** It resolved access from direct grant rows alone, while every serving endpoint resolves through `get_federated_read_access_result`. A peer probing a recording it reaches through a shared dataset was told 404 and could then download it, and a recording in the trash — which every serving path hides — was confirmed as readable. The check now uses the same resolver, so the visibility gates and the registered extensions apply to it. `AccessRight.can_federated_peer_read` and the manager's `has_federated_permission`, which nothing else called, are removed.
 

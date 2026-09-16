@@ -348,7 +348,7 @@ The peer's token claims an `iat` more than `DEFAULT_MAX_JWT_AGE + DEFAULT_JWT_LE
 
 - Run `date -u` on both ends and compare; if they differ by more than the leeway, NTP is broken or absent on at least one host.
 - Inside Docker, the container clock follows the host; fix NTP on the host.
-- The JWT TTL itself (`FEDERATION_JWT_TTL`, default 60 s) plus the leeway is the total validity window. A peer with extreme network latency to this instance could also see expiry if the token spends ~90 s in transit, but this is not the usual cause.
+- The token lifetime itself (60 s) plus the leeway is the total validity window. A peer with extreme network latency to this instance could also see expiry if the token spends ~90 s in transit, but this is not the usual cause.
 
 ### Service won't start: `ImproperlyConfigured: FEDERATION_PUBLIC_KEY_NEXT and FEDERATION_PRIVATE_KEY_NEXT must be set together`
 

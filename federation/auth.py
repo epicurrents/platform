@@ -346,6 +346,25 @@ def compute_request_binding(*, range_header: str = "") -> str:
 # JWT creation and verification
 # ---------------------------------------------------------------------------
 
+# Clock-skew tolerance for the ``exp`` and ``iat`` checks. Federated peers run on
+# independent machines; sub-second to multi-second skew between them is normal even
+# with NTP. Without leeway, a brand-new token from a peer whose clock is one second
+# ahead is rejected as already expired. 30 seconds is conservative enough that
+# legitimate skew passes while still bounding replay value below the token lifetime.
+DEFAULT_JWT_LEEWAY = 30
+
+# Maximum acceptable age of an inbound token, from the verifier's perspective. The
+# ``exp`` check alone bounds replay to whatever TTL the issuer chose, which could be
+# larger than this instance is willing to accept. Capping ``iat`` age at the verifier
+# side enforces a deployment-wide ceiling on token validity regardless of what the
+# issuer claims.
+DEFAULT_MAX_JWT_AGE = 60
+
+# Lifetime of an outbound token, deliberately the same constant as the ceiling above:
+# a receiver refuses a token older than DEFAULT_MAX_JWT_AGE whatever its ``exp`` says,
+# so issuing longer-lived tokens would buy nothing and invite the two to drift apart.
+DEFAULT_JWT_TTL = DEFAULT_MAX_JWT_AGE
+
 
 def create_jwt(
     private_key: Ed25519PrivateKey,
@@ -356,7 +375,7 @@ def create_jwt(
     method: str,
     path: str,
     range_header: str = "",
-    ttl: int = 60,
+    ttl: int = DEFAULT_JWT_TTL,
     jti: str | None = None,
 ) -> str:
     """Create a signed federation JWT bound to one specific request.
@@ -380,7 +399,8 @@ def create_jwt(
             discarded and the path is percent-decoded (``htp``).
         range_header: ``Range`` header value the request will carry, if any. Bound via
             ``bnd`` so a token minted for one byte range cannot fetch another.
-        ttl: Token lifetime in seconds (default 60).
+        ttl: Token lifetime in seconds. Defaults to ``DEFAULT_JWT_TTL``, which is the age
+            ceiling a receiver applies, so a longer value is refused on arrival anyway.
         jti: Optional explicit token id. Tests use this to forge collisions;
             production callers should let the default UUID4 stand.
 
@@ -408,22 +428,6 @@ def create_jwt(
     signing_input = f"{header}.{payload}".encode()
     sig = _b64_encode(private_key.sign(signing_input))
     return f"{header}.{payload}.{sig}"
-
-
-# Clock-skew tolerance for the ``exp`` and ``iat`` checks.  Federated peers
-# run on independent machines; sub-second to multi-second skew between them is
-# normal even with NTP.  Without leeway, a brand-new token from a peer whose
-# clock is one second ahead is rejected as already expired.  30 seconds is
-# conservative enough that legitimate skew passes while still bounding replay
-# value below the typical 60-second JWT TTL.
-DEFAULT_JWT_LEEWAY = 30
-
-# Maximum acceptable age of an inbound token, from the verifier's perspective.
-# The ``exp`` check alone bounds replay to whatever TTL the issuer chose, which
-# could be larger than this instance is willing to accept.  Capping ``iat`` age
-# at the verifier side enforces a deployment-wide ceiling on token validity
-# regardless of what the issuer claims.
-DEFAULT_MAX_JWT_AGE = 60
 
 
 def _timestamp_claim(payload: dict, name: str) -> int:
@@ -761,12 +765,15 @@ def _build_tls_context() -> ssl.SSLContext:
     return ctx
 
 
-def fetch_peer_public_key(instance_url: str, timeout: int = 10) -> tuple[str, str]:
+def fetch_peer_public_key(instance_url: str, timeout: int | None = None) -> tuple[str, str]:
     """Fetch the peer's current and (optional) next public key.
 
     Contacts ``{instance_url}/.well-known/epicurrents-federation.json`` and
     returns ``(current, next)`` — ``next`` is an empty string when the peer is
     not announcing a rotation overlap.
+
+    ``timeout`` defaults to ``FEDERATION_KEY_FETCH_TIMEOUT``, read here rather than
+    at each call site so a deployment whose peer is slow to answer can raise it once.
 
     Both keys are validated as parseable Ed25519 keys before return; an
     advertised but malformed ``federation_public_key_next`` is treated as
@@ -777,6 +784,11 @@ def fetch_peer_public_key(instance_url: str, timeout: int = 10) -> tuple[str, st
         malformed, exceeds ``MAX_WELL_KNOWN_RESPONSE_SIZE``, or either key
         cannot be parsed.
     """
+    if timeout is None:
+        from django.conf import settings
+
+        timeout = getattr(settings, "FEDERATION_KEY_FETCH_TIMEOUT", 10)
+
     url = instance_url.rstrip("/") + WELL_KNOWN_PATH
     # SSRF guard runs before the request goes out — see ``_check_url_is_safe``
     # for the threat model.  Raises ValueError on a non-public target; that

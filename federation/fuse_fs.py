@@ -195,7 +195,6 @@ def _make_jwt(
             method=method,
             path=path,
             range_header=range_header,
-            ttl=60,
         )
     except ValueError as exc:
         raise FederationSigningError(str(exc)) from exc

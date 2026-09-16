@@ -87,7 +87,6 @@ class Command(BaseCommand):
             subject="healthcheck",
             method="GET",
             path=probe_url,
-            ttl=60,
         )
         request = urllib.request.Request(probe_url, headers={"Authorization": f"FederatedBearer {token}"})
         try:
