@@ -351,6 +351,85 @@ class TestFederatedDetailSlice:
             resp = client.get(f"{DETAIL_SLICE_URL.format(hash=_hash(r))}?t_start=0&t_end=5")
         assert resp.status_code == 401
 
+    def _event_on(self, recording, author, name="Seizure onset", tag="evt"):
+        """Create one event on *recording*. ``tag`` keeps two events on one recording distinct.
+
+        ``object_hash`` is unique per (target, version, hash), so a second event on the
+        same recording needs a hash of its own.
+        """
+        from annotations.models import Event
+
+        return Event.objects.create(
+            author=author,
+            target_content_type=ContentType.objects.get_for_model(recording, for_concrete_model=False),
+            target_object_id=str(recording.pk),
+            object_hash=f"{tag}{recording.pk:029d}",
+            name=name,
+            value={"note": "left temporal"},
+            timestamp=1.0,
+        )
+
+    def test_detail_slice_withholds_event_text_under_a_de_identifying_grant(self, client, user):
+        """A peer's grant de-identifies the bytes; the same text in these rows follows it.
+
+        The peer authors nothing here, so every row's text is withheld. See AGENTS.md
+        → *Annotation text follows ``apply_middleware``*.
+        """
+        peer = _make_peer(user)
+        r = self._make_edf_recording_with_meta(user)
+        event = self._event_on(r, user)
+        _grant(peer, r, user, apply_middleware=True)
+
+        with _as_peer(peer):
+            resp = client.get(f"{DETAIL_SLICE_URL.format(hash=_hash(r))}?t_start=0&t_end=5")
+
+        assert resp.status_code == 200
+        row = next(e for e in resp.json()["events"] if e["object_hash"] == event.object_hash)
+        assert row["name"] == ""
+        assert row["value"] is None
+        assert row["text_withheld"] is True
+
+    def test_detail_slice_serves_event_text_under_a_raw_grant(self, client, user):
+        peer = _make_peer(user)
+        r = self._make_edf_recording_with_meta(user)
+        event = self._event_on(r, user)
+        _grant(peer, r, user, apply_middleware=False)
+
+        with _as_peer(peer):
+            resp = client.get(f"{DETAIL_SLICE_URL.format(hash=_hash(r))}?t_start=0&t_end=5")
+
+        assert resp.status_code == 200
+        row = next(e for e in resp.json()["events"] if e["object_hash"] == event.object_hash)
+        assert row["name"] == "Seizure onset"
+        assert row["text_withheld"] is False
+
+    def test_detail_slice_keeps_machine_produced_text_for_a_peer(self, client, user):
+        """The machine exemption does not depend on who is asking.
+
+        A peer owns no row on this instance, so a de-identifying grant withholds every
+        author's text from it — except findings an analysis run produced, which are
+        computed from the de-identified signal rather than transcribed from it.
+        """
+        from model_bakery import baker
+
+        from compute.models import RunAnnotation
+
+        peer = _make_peer(user)
+        r = self._make_edf_recording_with_meta(user)
+        human = self._event_on(r, user)
+        machine = self._event_on(r, user, name="spike", tag="mch")
+        baker.make(RunAnnotation, event=machine)
+        _grant(peer, r, user, apply_middleware=True)
+
+        with _as_peer(peer):
+            resp = client.get(f"{DETAIL_SLICE_URL.format(hash=_hash(r))}?t_start=0&t_end=5")
+
+        assert resp.status_code == 200
+        rows = {e["object_hash"]: e for e in resp.json()["events"]}
+        assert rows[human.object_hash]["name"] == ""
+        assert rows[machine.object_hash]["name"] == "spike"
+        assert rows[machine.object_hash]["text_withheld"] is False
+
 
 # ---------------------------------------------------------------------------
 # TestFederatedDownload

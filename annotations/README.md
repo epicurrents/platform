@@ -124,6 +124,8 @@ Three different checks, applied at the right point in the lifecycle:
 | Delete an annotation | `can_modify_object(user, annotation)` | Same as update. |
 | Create a `Code` | `can_modify_object(user, parent_annotation)` | Authorship of the **parent annotation**. |
 
+**Reading a list resolves terms, not a boolean.** `_list_for_target` calls `get_read_access_result` and keeps the `ReadAccessTerms`, because a grant carrying `apply_middleware` de-identifies the recording's bytes and these rows hold the same text. [redaction.py](redaction.py) decides whose text the caller may read — their own always, machine-produced findings always, everyone else's not — and the three text-bearing serialisers take the answer as a required `withhold_text` argument. A withheld row keeps its hash, author id and timing, and carries `text_withheld: true`. The rule is in AGENTS.md → *Annotation text follows `apply_middleware`*.
+
 The lower bar for `can_annotate_object` exists because annotations are inherently personal: a user reading a shared recording should be able to attach their own observations without needing write access to the recording itself. Update / delete is then gated by authorship of the annotation, so the original annotator stays in control of their own work.
 
 See [epicurrents/README.md](../epicurrents/README.md#permission-functions) for the full permission function table.

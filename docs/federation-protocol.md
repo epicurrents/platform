@@ -280,7 +280,7 @@ The inbound check endpoint answers every non-success outcome — unknown content
 
 The grant selects whether the pipeline runs, not what it contains; every recipient under a sanitising grant receives the same transformation.
 
-Sanitisation applies to recording bytes only. It does not apply to metadata responses — in particular, event names and values in the slice response are served as stored — and no de-identification exists for media files.
+Sanitisation reaches the annotation rows a metadata response carries, not only the bytes: under a sanitising grant the time-slice response gives each event's timing with its name and value emptied and `text_withheld` set, since those rows hold the text the pipeline strips out of the signal file. A peer authors nothing on the owning instance, so every row's text is withheld from it. Timing, hashes and a classification code's standard and value are unaffected; a code's free-form `meta` follows the text. No de-identification exists for media files.
 
 The requesting instance may apply its own transformations to received bytes (for example, dropping channels in a FUSE mount). These carry no privacy guarantee, since they run on the side that has already received the data.
 
@@ -358,15 +358,14 @@ Such a change breaks in one direction. An upgraded instance still reaches an old
 Departures from the goals above, and gaps the protocol does not yet close. Items with a ROADMAP entry say so.
 
 1. **Nonce store unavailability is undefined.** An error from the cache propagates as an unhandled exception. The request fails, but by accident; the intended behaviour is an explicit 503 with a security event.
-2. **Event text reaches peers regardless of sanitisation.** The slice metadata endpoint returns each overlapping event's `name` and `value` to any peer holding a read grant, with no regard to `apply_middleware`. A grant configured to strip annotation text from the signal file still discloses structured events through this path. No test covers what a federated caller receives from it.
-3. **The inbound check addresses objects by integer primary key.** Every other peer-facing route names an object by its opaque hash, so this one exposes a key scheme the rest of the surface avoids, and the count and creation order it implies. Changing it alters the path both sides sign, so it belongs with peer version gating.
-4. **Query-carried parameters are unbound.** `/{hash}/file/slice` takes its time window in the query, so a token for one window can be replayed for another window of the same object. This grants nothing beyond the grant, and no client mints tokens for the endpoint yet; binding the named parameters into `bnd` is on the ROADMAP.
-5. **Trust verification is partial.** The API promotion path takes no fingerprint, and a key refresh replaces a trusted peer's key without re-verification or loss of trust.
-6. **`sub` is linkable.** The issuer sends its local integer user identifier to every peer, so peers can correlate one user across instances. A per-peer pseudonym is on the ROADMAP.
-7. **No end-user assertion.** Carrying an identity-provider-signed assertion about the user, which the owning instance validates itself, would remove the dependence on the peer's honesty for user identity and carry authentication strength with it.
-8. **One capability.** Read access covers listing, metadata, time slices, byte ranges and whole files identically, and `can_write` / `can_share` on a federated grant have no effect. The distinctions a governance decision needs — metadata only, sanitised signal, raw file, annotations, bulk retrieval — cannot be expressed.
-9. **Media is served without sanitisation or per-peer limits.** Keeping media out of federated grants unless explicitly acknowledged is on the ROADMAP.
-10. **Audit rows lack the terms of disclosure.** Byte range, sanitisation applied and bytes transmitted are not recorded, so the log shows that a disclosure happened but not what it contained.
-11. **No revocation distribution and no version gating.** A compromised instance can be distrusted locally but not announced to others; peer version gating is on the ROADMAP.
-12. **Outbound URL checks are not repeated**, and DNS rebinding is open. Tracked in [federation/README.md](../federation/README.md).
-13. **Signing keys live in the environment file.** A restricted key file or an external key service would separate signing capability from the rest of the instance's secrets.
+2. **The inbound check addresses objects by integer primary key.** Every other peer-facing route names an object by its opaque hash, so this one exposes a key scheme the rest of the surface avoids, and the count and creation order it implies. Changing it alters the path both sides sign, so it belongs with peer version gating.
+3. **Query-carried parameters are unbound.** `/{hash}/file/slice` takes its time window in the query, so a token for one window can be replayed for another window of the same object. This grants nothing beyond the grant, and no client mints tokens for the endpoint yet; binding the named parameters into `bnd` is on the ROADMAP.
+4. **Trust verification is partial.** The API promotion path takes no fingerprint, and a key refresh replaces a trusted peer's key without re-verification or loss of trust.
+5. **`sub` is linkable.** The issuer sends its local integer user identifier to every peer, so peers can correlate one user across instances. A per-peer pseudonym is on the ROADMAP.
+6. **No end-user assertion.** Carrying an identity-provider-signed assertion about the user, which the owning instance validates itself, would remove the dependence on the peer's honesty for user identity and carry authentication strength with it.
+7. **One capability.** Read access covers listing, metadata, time slices, byte ranges and whole files identically, and `can_write` / `can_share` on a federated grant have no effect. The distinctions a governance decision needs — metadata only, sanitised signal, raw file, annotations, bulk retrieval — cannot be expressed.
+8. **Media is served without sanitisation or per-peer limits.** Keeping media out of federated grants unless explicitly acknowledged is on the ROADMAP.
+9. **Audit rows lack the terms of disclosure.** Byte range, sanitisation applied and bytes transmitted are not recorded, so the log shows that a disclosure happened but not what it contained.
+10. **No revocation distribution and no version gating.** A compromised instance can be distrusted locally but not announced to others; peer version gating is on the ROADMAP.
+11. **Outbound URL checks are not repeated**, and DNS rebinding is open. Tracked in [federation/README.md](../federation/README.md).
+12. **Signing keys live in the environment file.** A restricted key file or an external key service would separate signing capability from the rest of the instance's secrets.

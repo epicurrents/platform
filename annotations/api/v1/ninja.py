@@ -46,12 +46,13 @@ from ninja.errors import HttpError
 from activity.audit import log_activity
 from annotations import export as annotation_export
 from annotations.models import Annotation, Code, Event, Interruption, Label
+from annotations.redaction import withheld_row_ids
 from annotations.vocabularies import validate_code
 from epicurrents.auth import enforce_session_csrf
 from epicurrents.permissions import (
     can_annotate_object,
     can_modify_object,
-    can_read_object,
+    get_read_access_result,
 )
 from epicurrents.security_log import get_client_ip, log_security_event
 
@@ -122,15 +123,19 @@ def _list_for_target(
     limit: int,
     offset: int,
 ):
-    """Return ``(rows, target)`` for the requested parent and annotation type.
+    """Return ``(rows, target, terms)`` for the requested parent and annotation type.
 
     The caller uses ``target`` to populate ``log_activity(target=...)`` since
-    the parent — not the annotation list — is the audit-trail subject.
+    the parent — not the annotation list — is the audit-trail subject, and
+    ``terms`` to decide whose annotation text it may serialise: a grant carrying
+    ``apply_middleware`` de-identifies the recording's bytes, and these rows hold
+    the same text. See [annotations/redaction.py](../../redaction.py).
     """
     user = _require_auth(request)
     content_type, target = _resolve_target_or_404(content_type_id, object_id)
 
-    if not can_read_object(user=user, obj=target):
+    terms = get_read_access_result(user=user, obj=target)
+    if not terms.granted:
         raise HttpError(403, "You do not have permission to view this object")
 
     queryset = model_class.objects.filter(
@@ -144,7 +149,7 @@ def _list_for_target(
         queryset = queryset.prefetch_related("codes")
 
     rows = list(queryset.order_by("-created_at")[offset : offset + limit])
-    return rows, target
+    return rows, target, terms
 
 
 def _resolve_codeable_parent_or_400(content_type_id: int, object_id: str):
@@ -166,14 +171,23 @@ def _resolve_codeable_parent_or_400(content_type_id: int, object_id: str):
 # ── Serialisers ─────────────────────────────────────────────────────────────
 
 
-def _serialize_code(code: Code) -> dict:
+def _serialize_code(code: Code, *, withhold_meta: bool = False) -> dict:
+    """Serialise one classification code, without its ``meta`` when *withhold_meta*.
+
+    ``standard`` and ``value`` stay: a code's value is checked against a registered
+    vocabulary, so it names a concept rather than describing a subject. ``meta`` is
+    the one part nobody validates, so it follows the annotation text it hangs off.
+
+    Unlike the annotation serialisers, the flag defaults — the two code endpoints
+    return a code the caller has just written to their own annotation.
+    """
     return {
         "id": code.pk,
         "content_type_id": code.content_type_id,
         "object_id": code.object_id,
         "standard": code.standard,
         "value": code.value,
-        "meta": code.meta,
+        "meta": None if withhold_meta else code.meta,
     }
 
 
@@ -187,8 +201,16 @@ def _serialize_base(obj) -> dict:
     }
 
 
-def _serialize_annotation(annotation: Annotation) -> dict:
+def _serialize_annotation(annotation: Annotation, *, withhold_text: bool) -> dict:
+    """Serialise one annotation bundle, without its content when *withhold_text*.
+
+    ``withhold_text`` is keyword-only and has no default, so a new call site cannot
+    serialise annotation text without deciding whether this caller may read it.
+    :func:`annotations.redaction.withheld_row_ids` is what answers that.
+    """
     base = _serialize_base(annotation)
+    if withhold_text:
+        return {**base, "value": None, "text_withheld": True}
     content = annotation.content
     if isinstance(content, str):
         try:
@@ -200,32 +222,49 @@ def _serialize_annotation(annotation: Annotation) -> dict:
     return {**base, "value": content}
 
 
-def _serialize_event(event: Event) -> dict:
+def _serialize_event(event: Event, *, withhold_text: bool) -> dict:
+    """Serialise one event, without its name and value when *withhold_text*.
+
+    Timing and codes stay: they carry no free text from the source file. See
+    :func:`_serialize_annotation` on why the flag is keyword-only and undefaulted.
+    """
     return {
         **_serialize_base(event),
-        "name": event.name,
+        "name": "" if withhold_text else event.name,
         "timestamp": event.timestamp,
         "duration": event.duration,
-        "value": event.value,
-        "codes": [_serialize_code(c) for c in event.codes.all()],
+        "value": None if withhold_text else event.value,
+        "codes": [_serialize_code(c, withhold_meta=withhold_text) for c in event.codes.all()],
+        "text_withheld": withhold_text,
     }
 
 
-def _serialize_interruption(interruption: Interruption) -> dict:
+def _serialize_interruption(interruption: Interruption, *, withhold_meta: bool = False) -> dict:
+    """Serialise one interruption, without its codes' ``meta`` when *withhold_meta*.
+
+    An interruption carries no text of its own — a start and a duration — so nothing
+    here follows the annotation-text rule except the free-form ``meta`` its codes may
+    carry, which is text like any other.
+    """
     return {
         **_serialize_base(interruption),
         "timestamp": interruption.timestamp,
         "duration": interruption.duration,
-        "codes": [_serialize_code(c) for c in interruption.codes.all()],
+        "codes": [_serialize_code(c, withhold_meta=withhold_meta) for c in interruption.codes.all()],
     }
 
 
-def _serialize_label(label: Label) -> dict:
+def _serialize_label(label: Label, *, withhold_text: bool) -> dict:
+    """Serialise one label, without its name and value when *withhold_text*.
+
+    See :func:`_serialize_annotation` on why the flag is keyword-only and undefaulted.
+    """
     return {
         **_serialize_base(label),
-        "name": label.name,
-        "value": label.value,
-        "codes": [_serialize_code(c) for c in label.codes.all()],
+        "name": "" if withhold_text else label.name,
+        "value": None if withhold_text else label.value,
+        "codes": [_serialize_code(c, withhold_meta=withhold_text) for c in label.codes.all()],
+        "text_withheld": withhold_text,
     }
 
 
@@ -365,7 +404,7 @@ def list_annotations(
     limit: int = Query(500, ge=1, le=1000),
     offset: int = Query(0, ge=0),
 ):
-    rows, target = _list_for_target(
+    rows, target, terms = _list_for_target(
         request,
         Annotation,
         target_content_type_id,
@@ -384,7 +423,8 @@ def list_annotations(
             "returned_count": len(rows),
         },
     )
-    return [_serialize_annotation(row) for row in rows]
+    withheld = withheld_row_ids(rows, caller=request.user, terms=terms)
+    return [_serialize_annotation(row, withhold_text=row.pk in withheld) for row in rows]
 
 
 @annotations_router.get("/mine", auth=None)
@@ -399,7 +439,8 @@ def list_my_annotations(
         verb="annotations.annotation.mine",
         metadata={"limit": limit, "offset": offset, "returned_count": len(rows)},
     )
-    return [_serialize_annotation(row) for row in rows]
+    # The caller wrote every row here, so nothing is withheld.
+    return [_serialize_annotation(row, withhold_text=False) for row in rows]
 
 
 @annotations_router.post("/", auth=None)
@@ -421,7 +462,7 @@ def create_annotation(request, payload: AnnotationIn):
         annotation.full_clean()
         annotation.save()
         log_activity(verb="annotations.annotation.create", target=annotation)
-    return _serialize_annotation(annotation)
+    return _serialize_annotation(annotation, withhold_text=False)
 
 
 @annotations_router.patch("/{object_hash}", auth=None)
@@ -450,7 +491,7 @@ def update_annotation(request, object_hash: str, payload: AnnotationPatch):
             target=annotation,
             metadata={"fields_updated": sorted(patch.keys())},
         )
-    return _serialize_annotation(annotation)
+    return _serialize_annotation(annotation, withhold_text=False)
 
 
 @annotations_router.delete("/{object_hash}", auth=None)
@@ -482,7 +523,7 @@ def list_events(
     limit: int = Query(500, ge=1, le=1000),
     offset: int = Query(0, ge=0),
 ):
-    rows, target = _list_for_target(
+    rows, target, terms = _list_for_target(
         request,
         Event,
         target_content_type_id,
@@ -501,7 +542,8 @@ def list_events(
             "returned_count": len(rows),
         },
     )
-    return [_serialize_event(row) for row in rows]
+    withheld = withheld_row_ids(rows, caller=request.user, terms=terms)
+    return [_serialize_event(row, withhold_text=row.pk in withheld) for row in rows]
 
 
 @events_router.get("/mine", auth=None)
@@ -518,7 +560,8 @@ def list_my_events(
         verb="annotations.event.mine",
         metadata={"limit": limit, "offset": offset, "returned_count": len(rows)},
     )
-    return [_serialize_event(row) for row in rows]
+    # The caller wrote every row here, so nothing is withheld.
+    return [_serialize_event(row, withhold_text=False) for row in rows]
 
 
 @events_router.post("/", auth=None)
@@ -543,7 +586,7 @@ def create_event(request, payload: EventIn):
         event.full_clean()
         event.save()
         log_activity(verb="annotations.event.create", target=event)
-    return _serialize_event(event)
+    return _serialize_event(event, withhold_text=False)
 
 
 @events_router.patch("/{object_hash}", auth=None)
@@ -572,7 +615,7 @@ def update_event(request, object_hash: str, payload: EventPatch):
             target=event,
             metadata={"fields_updated": sorted(patch.keys())},
         )
-    return _serialize_event(event)
+    return _serialize_event(event, withhold_text=False)
 
 
 @events_router.delete("/{object_hash}", auth=None)
@@ -603,7 +646,7 @@ def list_interruptions(
     limit: int = Query(500, ge=1, le=1000),
     offset: int = Query(0, ge=0),
 ):
-    rows, target = _list_for_target(
+    rows, target, terms = _list_for_target(
         request,
         Interruption,
         target_content_type_id,
@@ -622,7 +665,9 @@ def list_interruptions(
             "returned_count": len(rows),
         },
     )
-    return [_serialize_interruption(row) for row in rows]
+    # The row itself holds no text, but the codes hanging off it can.
+    withheld = withheld_row_ids(rows, caller=request.user, terms=terms)
+    return [_serialize_interruption(row, withhold_meta=row.pk in withheld) for row in rows]
 
 
 @interruptions_router.get("/mine", auth=None)
@@ -724,7 +769,7 @@ def list_labels(
     limit: int = Query(500, ge=1, le=1000),
     offset: int = Query(0, ge=0),
 ):
-    rows, target = _list_for_target(
+    rows, target, terms = _list_for_target(
         request,
         Label,
         target_content_type_id,
@@ -743,7 +788,8 @@ def list_labels(
             "returned_count": len(rows),
         },
     )
-    return [_serialize_label(row) for row in rows]
+    withheld = withheld_row_ids(rows, caller=request.user, terms=terms)
+    return [_serialize_label(row, withhold_text=row.pk in withheld) for row in rows]
 
 
 @labels_router.get("/mine", auth=None)
@@ -760,7 +806,8 @@ def list_my_labels(
         verb="annotations.label.mine",
         metadata={"limit": limit, "offset": offset, "returned_count": len(rows)},
     )
-    return [_serialize_label(row) for row in rows]
+    # The caller wrote every row here, so nothing is withheld.
+    return [_serialize_label(row, withhold_text=False) for row in rows]
 
 
 @labels_router.post("/", auth=None)
@@ -783,7 +830,7 @@ def create_label(request, payload: LabelIn):
         label.full_clean()
         label.save()
         log_activity(verb="annotations.label.create", target=label)
-    return _serialize_label(label)
+    return _serialize_label(label, withhold_text=False)
 
 
 @labels_router.patch("/{object_hash}", auth=None)
@@ -812,7 +859,7 @@ def update_label(request, object_hash: str, payload: LabelPatch):
             target=label,
             metadata={"fields_updated": sorted(patch.keys())},
         )
-    return _serialize_label(label)
+    return _serialize_label(label, withhold_text=False)
 
 
 @labels_router.delete("/{object_hash}", auth=None)

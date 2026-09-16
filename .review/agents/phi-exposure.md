@@ -51,6 +51,18 @@ For annotation responses (Annotation, Event, Interruption, Label):
 omit `id`, `created_at`, `modified_at`. Keep `author_id`. CRUD
 endpoints take `/{object_hash}` URL parameters, not integer PKs.
 
+Annotation *text* additionally follows the grant. A caller whose read
+terms carry `apply_middleware` may not receive `Event.name` / `value`,
+`Label.name` / `value` or `Annotation.content` for rows they did not
+author — those rows hold what the byte pipeline strips out of the
+signal file. A surface that serialises them must resolve access with
+`get_read_access_result` / `get_federated_read_access_result` and ask
+`annotations.redaction.withheld_row_ids`; resolving with the boolean
+`can_read_object` and serialising text is a finding, as is a call to
+`_serialize_event` / `_serialize_label` / `_serialize_annotation`
+without an explicit `withhold_text`. See AGENTS.md → *Annotation text
+follows `apply_middleware`*.
+
 A new field on an `Out` class that introduces one of the forbidden
 names is a finding. So is an existing `Out` class gaining one in this
 diff.

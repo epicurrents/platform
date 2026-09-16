@@ -40,3 +40,12 @@ class ComputeConfig(AppConfig):
         from .tasks import set_signal_loader
 
         set_signal_loader(load_signal_window)
+
+        # A run's findings are computed from the signal, not transcribed from it, so
+        # they stay readable under a de-identifying grant. Registered rather than
+        # imported by ``annotations``, which must not depend on its producers.
+        from annotations.redaction import register_exempt_rows
+
+        from .redaction import machine_produced_event_ids
+
+        register_exempt_rows(machine_produced_event_ids)

@@ -233,13 +233,19 @@ class RecordingOut(Schema):
 
 
 class SlicedEventOut(Schema):
-    """Event with timestamp and duration relative to the slice start, clamped to the slice window."""
+    """Event with timestamp and duration relative to the slice start, clamped to the slice window.
+
+    ``name`` and ``value`` are empty and ``text_withheld`` true for a caller reading
+    under a de-identifying grant, matching what the serving pipeline strips out of
+    the recording's own bytes. See [annotations/redaction.py](../../../annotations/redaction.py).
+    """
 
     object_hash: str
     name: str
     timestamp: float
     duration: float | None = None
     value: dict | list | str | int | float | None = None
+    text_withheld: bool = False
 
 
 class SlicedInterruptionOut(Schema):
@@ -1702,8 +1708,8 @@ def recording_detail_slice(
                 status_code=404,
             )
             raise HttpError(404, "Recording not found")
-        granted = get_federated_read_access_result(fed_peer, remote_user_id, recording).granted
-        if not granted:
+        fed_terms = get_federated_read_access_result(fed_peer, remote_user_id, recording)
+        if not fed_terms.granted:
             log_federation_access(
                 peer=fed_peer,
                 remote_user_id=remote_user_id,
@@ -1771,6 +1777,18 @@ def recording_detail_slice(
     actual_t_end = (last_rec + 1) * dr
 
     from annotations.models import Event, Interruption
+    from annotations.redaction import withheld_row_ids
+
+    # Annotation text follows the same de-identification decision as the bytes: under
+    # a sanitising grant a caller gets each event's timing without its text, unless
+    # they wrote the row themselves. An author or superuser resolves to no terms,
+    # which withholds nothing; a peer owns no local row, so it sees no text at all.
+    if fed is not None:
+        text_caller, text_terms = None, fed_terms
+    elif getattr(user, "is_superuser", False) or recording.author_id == user.pk:
+        text_caller, text_terms = user, None
+    else:
+        text_caller, text_terms = user, get_read_access_result(user=user, obj=recording)
 
     def _overlaps(ts: float, dur: float | None) -> bool:
         if ts >= actual_t_end:
@@ -1785,18 +1803,21 @@ def recording_detail_slice(
             target_object_id=str(recording.pk),
         ).order_by("timestamp")
     )
+    withheld_events = withheld_row_ids(all_events, caller=text_caller, terms=text_terms)
     slice_events = []
     for event in all_events:
         if not _overlaps(event.timestamp, event.duration):
             continue
         sliced_ts, sliced_dur = _clamp_annotation(event.timestamp, event.duration, actual_t_start, actual_t_end)
+        withhold = event.pk in withheld_events
         slice_events.append(
             {
                 "object_hash": event.object_hash,
-                "name": event.name,
+                "name": "" if withhold else event.name,
                 "timestamp": sliced_ts,
                 "duration": sliced_dur,
-                "value": event.value,
+                "value": None if withhold else event.value,
+                "text_withheld": withhold,
             }
         )
 
@@ -1889,14 +1910,19 @@ def list_recording_annotations(
     if _failed_hidden_for_caller(recording, user, None):
         raise HttpError(404, "Recording not found")
 
-    if not (
-        getattr(user, "is_superuser", False)
-        or recording.author_id == user.pk
-        or can_read_object(user=user, obj=recording)
-    ):
-        raise HttpError(403, "You do not have permission to view this recording")
+    # Resolved as terms rather than a boolean, for the same reason the slice endpoint
+    # does it: these bundles hold the text a de-identifying grant strips out of the
+    # bytes. An author or superuser resolves to no terms and reads everything.
+    if getattr(user, "is_superuser", False) or recording.author_id == user.pk:
+        text_caller, text_terms = user, None
+    else:
+        text_terms = get_read_access_result(user=user, obj=recording)
+        if not text_terms.granted:
+            raise HttpError(403, "You do not have permission to view this recording")
+        text_caller = user
 
     from annotations.models import Annotation
+    from annotations.redaction import withheld_row_ids
 
     recording_ct = ContentType.objects.get_for_model(recording, for_concrete_model=False)
     queryset = Annotation.objects.filter(
@@ -1920,14 +1946,19 @@ def list_recording_annotations(
         },
     )
 
-    def _serialize(ann):
+    withheld = withheld_row_ids(annotations, caller=text_caller, terms=text_terms)
+
+    def _serialize(ann, *, withhold_text: bool):
         import json as _json
 
         base = {
             "author_id": ann.author_id,
             "object_hash": ann.object_hash,
             "content_hash": ann.content_hash,
+            "text_withheld": withhold_text,
         }
+        if withhold_text:
+            return {**base, "value": None}
         content = ann.content
         if isinstance(content, str):
             try:
@@ -1938,7 +1969,7 @@ def list_recording_annotations(
             return {**base, **content}
         return {**base, "value": content}
 
-    return [_serialize(ann) for ann in annotations]
+    return [_serialize(ann, withhold_text=ann.pk in withheld) for ann in annotations]
 
 
 # ── Batch operations on a literal path ───────────────────────────────────────
