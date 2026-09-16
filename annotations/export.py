@@ -5,9 +5,17 @@ this module answers "give me the rows, across targets, attributable per annotato
 the research / QA workflow where someone needs the rater output off the platform and into pandas or
 R, and needs to keep apart whose output is whose.
 
-Access follows the staff tier from AGENTS.md: a staff (or superuser) caller exports across all
-authors, anyone else is restricted to their own rows. The restriction is applied to the queryset,
-not checked afterwards, so a non-staff caller cannot widen it through any filter combination.
+Access is tiered: a caller who may export across annotators gets every author's rows, anyone else
+is restricted to their own. :func:`can_export_all_annotators` is the single derivation of that
+tier — a superuser always qualifies, and whether a plain staff account does is the deployment's
+choice through ``ANNOTATION_EXPORT_ALL_ANNOTATORS_REQUIRES_SUPERUSER``, which defaults to requiring
+superuser. The restriction is applied to the queryset, not checked afterwards, so a caller outside
+the tier cannot widen it through any filter combination.
+
+The narrow default is deliberate. This module reads clinical annotation text, which the
+annotation-text rule withholds from a grantee reading under a de-identifying grant; exporting
+across annotators is the one path that answers past that rule, so it is gated on the tier the
+platform reserves for its other content-level bypasses rather than on admin visibility.
 
 Two rules from AGENTS.md are enforced on the way out, both concerning the *target* rather than the
 annotation:
@@ -21,7 +29,7 @@ annotation:
 Annotators are identified by their numeric user id only, per row and in the metadata roster. No
 username or real name enters the file: personal data leaves the platform's erasure reach the moment
 a file is written, so the id-to-identity mapping stays behind authentication instead —
-:func:`list_annotators` backs the staff-only roster endpoint the exporter reads it from. See
+:func:`list_annotators` backs the roster endpoint the exporter reads it from, on the same tier. See
 annotations/README.md for the operator note.
 
 Projects extend this endpoint rather than replacing it, through two registries that differ in what
@@ -78,7 +86,7 @@ _MODELS = {"events": Event, "labels": Label}
 #: the queryset sorts on ``created_at`` before serialising.
 #:
 #: ``author_id`` is the only annotator identifier — no username or name appears anywhere in the
-#: file. The staff-only roster endpoint (:func:`list_annotators`) maps ids to identities inside the
+#: file. The roster endpoint (:func:`list_annotators`) maps ids to identities inside the
 #: platform, so an exported file carries attribution without carrying personal data.
 _COLUMNS = {
     "events": (
@@ -443,12 +451,38 @@ def _parse_boundary(raw: str | None, name: str, *, end_of_day: bool) -> datetime
     return parsed
 
 
+def can_export_all_annotators(caller) -> bool:
+    """Return True when *caller* may export across annotators rather than only their own rows.
+
+    A superuser always may. Whether a plain staff account may is the deployment's
+    choice, through ``ANNOTATION_EXPORT_ALL_ANNOTATORS_REQUIRES_SUPERUSER``, which
+    defaults to requiring the superuser tier.
+
+    The default is the narrow one because this reads clinical annotation text rather
+    than administration data, and every other content-level bypass in the platform —
+    ``_can_see_original_name``, the read resolver's own fast path — is superuser-only.
+    A deployment whose staff tier *is* its research-coordinator tier turns the setting
+    off and gets the wider behaviour back.
+
+    This is the single derivation of that tier. The export endpoint's own check calls
+    it too: two derivations of one access question drift, and the queryset scoping
+    below follows from this answer rather than repeating it.
+    """
+    from django.conf import settings
+
+    if getattr(caller, "is_superuser", False):
+        return True
+    if getattr(settings, "ANNOTATION_EXPORT_ALL_ANNOTATORS_REQUIRES_SUPERUSER", True):
+        return False
+    return bool(getattr(caller, "is_staff", False))
+
+
 def build_export(*, caller, filters: ExportFilters) -> ExportResult:
     """Collect and serialise every row the caller may export under *filters*."""
-    is_staff = bool(getattr(caller, "is_staff", False) or getattr(caller, "is_superuser", False))
-    restricted = not is_staff
+    exports_all_annotators = can_export_all_annotators(caller)
+    restricted = not exports_all_annotators
     if restricted and any(annotator_id != caller.pk for annotator_id in filters.annotator_ids):
-        raise HttpError(403, "Exporting another user's annotations requires staff access.")
+        raise HttpError(403, "Exporting another user's annotations requires the cross-annotator export tier.")
 
     target_scope = _resolve_target_scope(filters)
     result = ExportResult(filters=filters, restricted_to_self=restricted)
@@ -467,7 +501,7 @@ def build_export(*, caller, filters: ExportFilters) -> ExportResult:
         collected[type_name] = list(queryset)
 
     every_row = [row for rows in collected.values() for row in rows]
-    targets, target_objects = _resolve_targets(every_row, caller=caller, is_staff=is_staff)
+    targets, target_objects = _resolve_targets(every_row, caller=caller, all_annotators=exports_all_annotators)
     extras = _resolve_extension_values(caller=caller, targets=targets, objects=target_objects)
 
     for type_name, rows in collected.items():
@@ -585,15 +619,15 @@ def _build_queryset(model, *, caller, filters: ExportFilters, restricted: bool, 
     return queryset.order_by("created_at", "pk")
 
 
-def _resolve_targets(rows, *, caller, is_staff):
+def _resolve_targets(rows, *, caller, all_annotators):
     """Resolve every distinct target in *rows*, omitting the ones this caller must not see.
 
     Returns ``(targets, objects)``: the ``{key: TargetInfo}`` naming map and the matching
     ``{key: instance}`` map handed to export extensions. A missing key means "drop these rows".
     Targets disappear for three reasons: the object is gone (a hard-deleted or never-existing
     generic FK target), it is a recording the FAILED-hidden or soft-delete rule keeps from this
-    caller, or — for a non-staff caller — read access to it has since been revoked. Access is
-    checked once per distinct target, not once per row.
+    caller, or — for a caller outside the cross-annotator tier — read access to it has since been
+    revoked. Access is checked once per distinct target, not once per row.
     """
     from recordings.api.v1.ninja import _failed_hidden_for_caller, _resolve_display_name
     from recordings.models import Recording
@@ -628,7 +662,7 @@ def _resolve_targets(rows, *, caller, is_staff):
             resolved[key] = TargetInfo(type_name, _opaque_ref(obj), "")
             fetched[key] = obj
 
-    if not is_staff:
+    if not all_annotators:
         resolved = _drop_unreadable(resolved, rows=rows, caller=caller)
     # Extension resolvers must only ever see access-filtered targets, so the instances handed back
     # track the resolved key set exactly.
@@ -638,9 +672,9 @@ def _resolve_targets(rows, *, caller, is_staff):
 def _drop_unreadable(resolved, *, rows, caller):
     """Drop targets the caller can no longer read.
 
-    Only reached for non-staff callers, who by then hold nothing but their own annotations. The
-    annotation content is theirs either way; what this keeps back is the target's label and
-    identity after a grant was revoked.
+    Only reached for callers outside the cross-annotator tier, who by then hold nothing but their
+    own annotations. The annotation content is theirs either way; what this keeps back is the
+    target's label and identity after a grant was revoked.
     """
     from epicurrents.permissions import can_read_object
 
@@ -765,7 +799,8 @@ def _build_roster(rows_by_type: dict[str, list[dict]]) -> tuple[list[dict], list
 def list_annotators() -> list[dict]:
     """Return every user who has authored an exportable row, with per-type row counts.
 
-    Backs the staff-only roster endpoint: the counterpart the export file's ``author_id`` values
+    Backs the roster endpoint, which is gated on the same tier as the export itself: the
+    counterpart the export file's ``author_id`` values
     are resolved against without the mapping ever entering the file. Registered row sources are
     counted alongside the core types, so a project's raters appear even when they have authored no
     Event or Label. Sorted by username. An erased account leaves the roster together with its

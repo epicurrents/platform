@@ -120,7 +120,14 @@ RUN chmod +x /code/entrypoint.sh
 # installs before the source copy so editing a Python file does not reinstall it.
 FROM base AS test
 
-RUN pip install -r requirements-test.txt
+# git is a test dependency, not a runtime one, so it installs here rather than in
+# base: the suite has checks that ask the repository what it tracks — whether a
+# converter ships as a package the image would silently drop, for one — and
+# without the binary those fail on a missing file rather than on their subject.
+RUN apt-get update -y \
+    && apt-get install -y --no-install-recommends git \
+    && rm -rf /var/lib/apt/lists/* \
+    && pip install -r requirements-test.txt
 
 # .dockerignore excludes frontend/ from the build context — the Python image
 # never contains frontend source. Frontend bundles arrive at runtime via

@@ -23,7 +23,7 @@ PATCH/DELETE  /codes/{id}             Update or delete a specific code.
 
 GET           /export                 Bulk export of events / labels as JSON or CSV.
 GET           /export/types           Annotation types this deployment can export.
-GET           /export/annotators      Staff-only annotator roster (id-to-identity mapping).
+GET           /export/annotators      Annotator roster (id-to-identity mapping), on the export tier.
 
 GET           /content-types          List available content types (for target lookup).
 GET           /health                 Health check.
@@ -984,9 +984,11 @@ def export_annotations(
     """Export events, labels and any registered project types as a downloadable JSON or CSV file.
 
     Omitting ``types`` exports every type the deployment offers, registered row sources included.
-    Staff (and superusers) export across all annotators, optionally narrowed with repeated
-    ``annotator_id`` parameters; every other caller gets only their own rows, enforced on the
-    queryset rather than filtered afterwards. The file identifies annotators by numeric user id
+    A caller on the cross-annotator tier exports every author's rows, optionally narrowed with
+    repeated ``annotator_id`` parameters; everyone else gets only their own, enforced on the
+    queryset rather than filtered afterwards. Superusers are always on that tier, and whether a
+    plain staff account joins them is the deployment's choice — see
+    :func:`~annotations.export.can_export_all_annotators`. The file identifies annotators by numeric user id
     only — identity resolves via the roster endpoint below, inside the platform. CSV takes exactly
     one type per file — the types have different columns — so ``format=csv`` with several types is
     a 422.
@@ -1006,10 +1008,10 @@ def export_annotations(
         version_id=version_id,
     )
 
-    is_staff = bool(user.is_staff or user.is_superuser)
-    if not is_staff and any(annotator != user.pk for annotator in filters.annotator_ids):
-        # A non-staff caller naming someone else is a permission denial, not a filter miss — the
-        # bare 403 would otherwise be the only trace of an attempt to read another rater's output.
+    exports_all_annotators = annotation_export.can_export_all_annotators(user)
+    if not exports_all_annotators and any(annotator != user.pk for annotator in filters.annotator_ids):
+        # A caller outside the tier naming someone else is a permission denial, not a filter miss —
+        # the bare 403 would otherwise be the only trace of an attempt to read another rater's output.
         log_security_event(
             "permission.denied",
             actor_id=user.pk,
@@ -1018,7 +1020,7 @@ def export_annotations(
             path=request.path,
             method=request.method,
         )
-        raise HttpError(403, "Exporting another user's annotations requires staff access.")
+        raise HttpError(403, "Exporting another user's annotations requires the cross-annotator export tier.")
 
     exported_at = timezone.now()
     result = annotation_export.build_export(caller=user, filters=filters)
@@ -1073,15 +1075,18 @@ def list_export_types(request):
 
 @export_router.get("/annotators", auth=None)
 def list_export_annotators(request):
-    """List every annotator as ``{id, username, name, events, labels}``, for staff callers.
+    """List every annotator as ``{id, username, name, events, labels}``, for the export tier.
 
     The in-platform counterpart of the export's ``author_id`` values: exported files carry no
     personal data, so this roster is where an exporter picks the annotators to include and later
-    resolves the ids in a file back to people. It stays behind staff authentication and never
-    enters an export.
+    resolves the ids in a file back to people. It never enters an export.
+
+    Gated on :func:`~annotations.export.can_export_all_annotators`, the same tier as the export
+    itself. A caller who may not read across annotators has no use for the roster of them, and
+    deciding the question here a second time is how the two answers drift apart.
     """
     user = _require_auth(request)
-    if not (user.is_staff or user.is_superuser):
+    if not annotation_export.can_export_all_annotators(user):
         log_security_event(
             "permission.denied",
             actor_id=user.pk,
@@ -1090,7 +1095,7 @@ def list_export_annotators(request):
             path=request.path,
             method=request.method,
         )
-        raise HttpError(403, "Listing annotators requires staff access.")
+        raise HttpError(403, "Listing annotators requires the cross-annotator export tier.")
 
     roster = annotation_export.list_annotators()
     # Count only — usernames and names must not enter the permanent audit trail.

@@ -87,6 +87,19 @@ def _json_body(response):
     return json.loads(response.content.decode())
 
 
+@pytest.fixture(autouse=True)
+def staff_exports_across_annotators(settings):
+    """Run this file in the configuration where staff are the cross-annotator tier.
+
+    Most of what is tested here is export mechanics — formats, columns, target hiding,
+    the annotator roster — and needs a caller who reaches more than one author's rows,
+    not a statement about which role that is. Staff-wide export is a supported
+    configuration rather than the default one, so the file asks for it once here and
+    the tests that are about the tier itself set the value they mean.
+    """
+    settings.ANNOTATION_EXPORT_ALL_ANNOTATORS_REQUIRES_SUPERUSER = False
+
+
 @pytest.mark.django_db
 class TestExportAccessTiers:
     def test_anonymous_is_rejected(self, client):
@@ -106,6 +119,85 @@ class TestExportAccessTiers:
         assert body["metadata"]["restricted_to_own_annotations"] is False
         author_ids = {row["author_id"] for row in body["events"]}
         assert author_ids == {rater_a.pk, rater_b.pk}
+
+    def test_staff_is_restricted_to_own_rows_when_the_tier_requires_superuser(
+        self, client, make_user, settings, superuser
+    ):
+        """Cross-annotator export reads clinical text, so a deployment can reserve it.
+
+        Under that setting a staff account is an ordinary caller here: own rows only,
+        whatever else the staff tier grants elsewhere.
+        """
+        settings.ANNOTATION_EXPORT_ALL_ANNOTATORS_REQUIRES_SUPERUSER = True
+        staff = _staff(make_user)
+        rater = make_user()
+        recording = _make_recording(staff)
+        # A restricted caller's targets go through the readability filter, which knows
+        # nothing about authorship — the row needs a grant even for the recording's own
+        # author. See AGENTS.md → Testing conventions.
+        _grant_read(staff, recording, superuser)
+        _make_event(staff, recording, name="mine")
+        _make_event(rater, recording, name="theirs")
+
+        client.force_login(staff)
+        body = _json_body(client.get(f"{EXPORT_URL}?types=events"))
+
+        assert [row["name"] for row in body["events"]] == ["mine"]
+        assert body["metadata"]["restricted_to_own_annotations"] is True
+
+    def test_staff_naming_another_annotator_is_denied_when_the_tier_requires_superuser(
+        self, client, make_user, settings
+    ):
+        settings.ANNOTATION_EXPORT_ALL_ANNOTATORS_REQUIRES_SUPERUSER = True
+        staff = _staff(make_user)
+        other = make_user()
+
+        client.force_login(staff)
+        response = client.get(f"{EXPORT_URL}?annotator_id={other.pk}")
+
+        assert response.status_code == 403
+
+    def test_the_roster_follows_the_export_tier(self, client, make_user, settings):
+        """Whoever may not read across annotators has no use for the roster of them.
+
+        The roster carries usernames and names, and it exists to resolve the ids in an
+        export — so it moves with the export rather than deciding the tier a second time.
+        """
+        settings.ANNOTATION_EXPORT_ALL_ANNOTATORS_REQUIRES_SUPERUSER = True
+        staff = _staff(make_user)
+
+        client.force_login(staff)
+        assert client.get(f"{EXPORT_URL}/annotators").status_code == 403
+
+        settings.ANNOTATION_EXPORT_ALL_ANNOTATORS_REQUIRES_SUPERUSER = False
+        assert client.get(f"{EXPORT_URL}/annotators").status_code == 200
+
+    def test_the_shipped_default_reserves_the_tier_for_superusers(self, make_user, make_superuser, settings):
+        """The file's autouse fixture opts into staff-wide export, so pin the default here.
+
+        Deleting the override restores the absent setting, which is what a deployment
+        that has never heard of it runs with.
+        """
+        from annotations.export import can_export_all_annotators
+
+        del settings.ANNOTATION_EXPORT_ALL_ANNOTATORS_REQUIRES_SUPERUSER
+
+        assert can_export_all_annotators(_staff(make_user)) is False
+        assert can_export_all_annotators(make_superuser()) is True
+        assert can_export_all_annotators(make_user()) is False
+
+    def test_superuser_is_unaffected_by_the_setting(self, superuser_client, make_user, settings):
+        """The setting narrows the staff tier; it never narrows a superuser."""
+        settings.ANNOTATION_EXPORT_ALL_ANNOTATORS_REQUIRES_SUPERUSER = True
+        su_client, _ = superuser_client
+        rater = make_user()
+        recording = _make_recording(rater)
+        _make_event(rater, recording)
+
+        body = _json_body(su_client.get(f"{EXPORT_URL}?types=events"))
+
+        assert len(body["events"]) == 1
+        assert body["metadata"]["restricted_to_own_annotations"] is False
 
     def test_superuser_sees_every_author(self, superuser_client, make_user):
         su_client, _ = superuser_client
@@ -674,7 +766,7 @@ ANNOTATORS_URL = f"{EXPORT_URL}/annotators"
 
 @pytest.mark.django_db
 class TestAnnotatorRoster:
-    """The staff-only roster endpoint that maps exported author ids back to identities."""
+    """The roster endpoint that maps exported author ids back to identities, on the export tier."""
 
     def test_anonymous_is_rejected(self, client):
         assert client.get(ANNOTATORS_URL).status_code == 401
