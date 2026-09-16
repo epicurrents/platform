@@ -28,6 +28,8 @@ from pathlib import Path
 
 from decouple import Csv, config
 
+from .env import env_bool
+
 BASE_DIR = Path(__file__).resolve().parent.parent.parent
 
 
@@ -662,6 +664,26 @@ CSRF_COOKIE_SAMESITE = "Lax"
 # development.py turns it off so the Vite-served SPA and local tooling do
 # not need to carry a CSRF token. Never disable in a production deployment.
 SESSION_CSRF_ENFORCED = config("SESSION_CSRF_ENFORCED", default=True, cast=bool)
+
+# ── Annotation export tier ───────────────────────────────────────────────────
+# Whether exporting annotations across annotators is reserved for superusers.
+# That export applies no per-object access check and reads clinical annotation
+# text rather than administration data, so the narrow tier is the default: the
+# platform's other content-level bypasses are superuser-only too. A deployment
+# whose staff tier is its research-coordinator tier sets this False and gets
+# staff-wide export back. See annotations/export.py → can_export_all_annotators.
+#
+# Declared here rather than read with a getattr default at the point of use,
+# because which role holds the tier is a deployment posture an operator sets in
+# .env. A setting that exists only as a getattr default is documented to the
+# operator as configurable while silently ignoring whatever they configure.
+#
+# Read through env_bool, not config(..., cast=bool): a bare NAME= line would
+# otherwise read as False and hand staff the wider tier. See settings/env.py.
+ANNOTATION_EXPORT_ALL_ANNOTATORS_REQUIRES_SUPERUSER = env_bool(
+    "ANNOTATION_EXPORT_ALL_ANNOTATORS_REQUIRES_SUPERUSER",
+    default=True,
+)
 
 # ──────────────────────────────────────────────────────────────────────────────
 # External login — OpenID Connect (Microsoft Entra ID).

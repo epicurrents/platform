@@ -226,6 +226,7 @@ All three use `_annotation_hash(recording.pk, suffix)` keyed on the recording PK
 | Setting | Default | Effect |
 |---|---|---|
 | `ANNOTATION_CODE_STRICT_VOCABULARY` | `False` | When `True`, `Code` API writes with an unregistered `standard` are rejected with 422 — see [Vocabulary registry](#code--standardised-classification). A project-settings decision, not `common`. |
+| `ANNOTATION_EXPORT_ALL_ANNOTATORS_REQUIRES_SUPERUSER` | `True` | Reserves cross-annotator export, and the annotator roster with it, for superusers. Set to `False` where the staff tier is the deployment's research-coordinator tier. Declared in [common.py](../epicurrents/settings/common.py), so an operator sets it in `.env` — unlike the vocabulary switch above. |
 
 ## Project plugin extension points
 

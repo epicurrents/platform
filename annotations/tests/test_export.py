@@ -3,6 +3,8 @@
 import csv
 import io
 import json
+import re
+from pathlib import Path
 
 import pytest
 from django.contrib.contenttypes.models import ContentType
@@ -85,6 +87,28 @@ def _staff(make_user):
 
 def _json_body(response):
     return json.loads(response.content.decode())
+
+
+def _declared_export_tier_default() -> bool:
+    """Return the export-tier default as the settings module declares it.
+
+    Read out of the source rather than out of ``django.conf.settings``: the value in
+    force under test is whatever the deployment's .env supplies, and the test below is
+    about what the platform ships for a deployment that has never set it.
+    """
+    from epicurrents.settings import common
+
+    source = Path(common.__file__).read_text(encoding="utf-8")
+    match = re.search(
+        r"ANNOTATION_EXPORT_ALL_ANNOTATORS_REQUIRES_SUPERUSER = env_bool\((?P<args>[^)]*)\)",
+        source,
+    )
+    assert match is not None, "the export tier is no longer declared in epicurrents/settings/common.py"
+    declaration = " ".join(match.group("args").split())
+    assert "default=True" in declaration or "default=False" in declaration, (
+        f"the export tier declaration carries no boolean default: {declaration}"
+    )
+    return "default=True" in declaration
 
 
 @pytest.fixture(autouse=True)
@@ -175,12 +199,13 @@ class TestExportAccessTiers:
     def test_the_shipped_default_reserves_the_tier_for_superusers(self, make_user, make_superuser, settings):
         """The file's autouse fixture opts into staff-wide export, so pin the default here.
 
-        Deleting the override restores the absent setting, which is what a deployment
-        that has never heard of it runs with.
+        The setting is declared in the settings module, so what a deployment that has
+        never heard of it runs with is that declaration's default rather than a fallback
+        at the point of use. Flipping the declared default fails this test.
         """
         from annotations.export import can_export_all_annotators
 
-        del settings.ANNOTATION_EXPORT_ALL_ANNOTATORS_REQUIRES_SUPERUSER
+        settings.ANNOTATION_EXPORT_ALL_ANNOTATORS_REQUIRES_SUPERUSER = _declared_export_tier_default()
 
         assert can_export_all_annotators(_staff(make_user)) is False
         assert can_export_all_annotators(make_superuser()) is True

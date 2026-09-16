@@ -455,8 +455,9 @@ def can_export_all_annotators(caller) -> bool:
     """Return True when *caller* may export across annotators rather than only their own rows.
 
     A superuser always may. Whether a plain staff account may is the deployment's
-    choice, through ``ANNOTATION_EXPORT_ALL_ANNOTATORS_REQUIRES_SUPERUSER``, which
-    defaults to requiring the superuser tier.
+    choice, through ``ANNOTATION_EXPORT_ALL_ANNOTATORS_REQUIRES_SUPERUSER``, declared
+    in ``epicurrents/settings/common.py`` and defaulting to requiring the superuser
+    tier.
 
     The default is the narrow one because this reads clinical annotation text rather
     than administration data, and every other content-level bypass in the platform —
@@ -472,7 +473,7 @@ def can_export_all_annotators(caller) -> bool:
 
     if getattr(caller, "is_superuser", False):
         return True
-    if getattr(settings, "ANNOTATION_EXPORT_ALL_ANNOTATORS_REQUIRES_SUPERUSER", True):
+    if settings.ANNOTATION_EXPORT_ALL_ANNOTATORS_REQUIRES_SUPERUSER:
         return False
     return bool(getattr(caller, "is_staff", False))
 
