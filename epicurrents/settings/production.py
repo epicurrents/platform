@@ -3,6 +3,7 @@
 from decouple import config
 
 from .common import *
+from .env import env_bool
 
 DEBUG = False
 
@@ -60,7 +61,7 @@ if _trust_forwarded_proto:
     SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
 
 # Redirect all plain-HTTP requests to HTTPS.
-SECURE_SSL_REDIRECT = config("SECURE_SSL_REDIRECT", default=True, cast=bool)
+SECURE_SSL_REDIRECT = env_bool("SECURE_SSL_REDIRECT", default=True)
 
 # The web container's healthcheck requests /api/v1/ready over loopback, as plain
 # HTTP with no X-Forwarded-Proto, so the redirect above answers it with a 301 to
@@ -92,8 +93,8 @@ SECURE_REDIRECT_EXEMPT = [r"^api/v1/ready$"]
 # registered domain is HTTPS-only — preload-list submission is effectively
 # irreversible. See docs/operations.md -> Security headers.
 SECURE_HSTS_SECONDS = config("SECURE_HSTS_SECONDS", default=300, cast=int)
-SECURE_HSTS_INCLUDE_SUBDOMAINS = config("SECURE_HSTS_INCLUDE_SUBDOMAINS", default=True, cast=bool)
-SECURE_HSTS_PRELOAD = config("SECURE_HSTS_PRELOAD", default=False, cast=bool)
+SECURE_HSTS_INCLUDE_SUBDOMAINS = env_bool("SECURE_HSTS_INCLUDE_SUBDOMAINS", default=True)
+SECURE_HSTS_PRELOAD = env_bool("SECURE_HSTS_PRELOAD", default=False)
 
 # Mark session and CSRF cookies as secure (HTTPS-only).
 # Configurable so a dev / staging deployment behind a non-HTTPS endpoint
@@ -104,8 +105,8 @@ SECURE_HSTS_PRELOAD = config("SECURE_HSTS_PRELOAD", default=False, cast=bool)
 # fires in ``epicurrents.apps`` when either is False under
 # DJANGO_MODE=production so an accidental flip in real production is
 # loud rather than silent.
-SESSION_COOKIE_SECURE = config("SESSION_COOKIE_SECURE", default=True, cast=bool)
-CSRF_COOKIE_SECURE = config("CSRF_COOKIE_SECURE", default=True, cast=bool)
+SESSION_COOKIE_SECURE = env_bool("SESSION_COOKIE_SECURE", default=True)
+CSRF_COOKIE_SECURE = env_bool("CSRF_COOKIE_SECURE", default=True)
 
 # Django's default session lifetime is two weeks — too long for a platform
 # serving PHI. 12 hours covers a clinical workday with margin; deployments
@@ -184,7 +185,7 @@ CONTENT_SECURITY_POLICY = config(
 # Failing loudly is the point of the default. An enforced policy names the
 # blocked URL and directive in the console, where report-only on a deployment
 # nobody is watching reports to no one — nothing collects violations server-side.
-CSP_REPORT_ONLY = config("CSP_REPORT_ONLY", default=False, cast=bool)
+CSP_REPORT_ONLY = env_bool("CSP_REPORT_ONLY", default=False)
 
 # Deny powerful browser features the platform does not use.
 PERMISSIONS_POLICY = config(

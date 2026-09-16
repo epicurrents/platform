@@ -347,6 +347,12 @@ The consequence to plan for is that the host stops centring **all** of its child
 
 ## Cross-cutting rules
 
+### Boolean settings are read with `env_bool`
+
+`config("NAME", default=True, cast=bool)` answers `False` for a bare `NAME=` line in `.env`, and for `NAME=""` or a whitespace-only value. decouple finds the key, so the declared default never applies, and its boolean cast maps the empty string to `False`. A half-written line therefore reads as a decision to turn the setting off — silently, and wherever the default is the safe direction, unsafely: a bare `SESSION_CSRF_ENFORCED=` disables the CSRF chokepoint on every session-authenticated write, and the production transport flags let every cookie travel over plaintext HTTP.
+
+Every boolean setting goes through `env_bool` in [epicurrents/settings/env.py](epicurrents/settings/env.py), which treats an empty value as unanswered and leaves the declared default standing. An unrecognised token still raises, so a setting that cannot be read stops the boot rather than being guessed at. The scan in [epicurrents/tests/test_settings_boolean_reads.py](epicurrents/tests/test_settings_boolean_reads.py) fails any settings module that reaches for `cast=bool` directly, because the next boolean setting gets written by copying the line above it.
+
 ### Staff vs superuser tier
 
 Django's built-in `is_staff` flag is the access tier for admin-level features — dashboards, batch operations, anything that requires visibility across all users' data. `is_superuser` is reserved for destructive or irreversible actions (epoch generation with `--clear`, future data-deletion flows, etc.). Treat superuser as a strict subset of staff: anything a superuser can do, a staff user should also be able to do or see in read-only form.

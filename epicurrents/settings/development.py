@@ -3,8 +3,9 @@
 from decouple import config
 
 from .common import *
+from .env import env_bool
 
-DEBUG = config("DEBUG", default=True, cast=bool)
+DEBUG = env_bool("DEBUG", default=True)
 
 db_dev_engine = config("DB_DEV_ENGINE", default="sqlite").strip().lower()
 
@@ -39,20 +40,20 @@ else:
 # localhost) needs both cookies sent over HTTP — otherwise admin form
 # submits 403 on CSRF. Both stay env-overrideable so a dev box behind
 # local HTTPS (mkcert + reverse proxy) can opt back up to True.
-CSRF_COOKIE_SECURE = config("CSRF_COOKIE_SECURE", default=False, cast=bool)
-SESSION_COOKIE_SECURE = config("SESSION_COOKIE_SECURE", default=False, cast=bool)
+CSRF_COOKIE_SECURE = env_bool("CSRF_COOKIE_SECURE", default=False)
+SESSION_COOKIE_SECURE = env_bool("SESSION_COOKIE_SECURE", default=False)
 
 # The enforce_session_csrf chokepoint is off by default in development: the
 # Vite dev server serves the SPA from a different origin than the API, so it
 # cannot read the csrftoken cookie to echo it back, and host tooling (httpie,
 # curl) would otherwise need a token on every write. Opt back in by setting
 # SESSION_CSRF_ENFORCED=true to exercise the production path locally.
-SESSION_CSRF_ENFORCED = config("SESSION_CSRF_ENFORCED", default=False, cast=bool)
+SESSION_CSRF_ENFORCED = env_bool("SESSION_CSRF_ENFORCED", default=False)
 
 # The API request-rate throttle is off by default in development: hot-reload
 # loops, test scripts, and a single dev poking every endpoint would otherwise
 # trip it. Set API_THROTTLE_ENABLED=true to exercise it locally.
-API_THROTTLE_ENABLED = config("API_THROTTLE_ENABLED", default=False, cast=bool)
+API_THROTTLE_ENABLED = env_bool("API_THROTTLE_ENABLED", default=False)
 
 # Diagnostic logging for development. Without an explicit LOGGING dict the
 # stack falls back to Django's defaults, which keep app loggers silent

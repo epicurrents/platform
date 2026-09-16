@@ -258,8 +258,8 @@ RECORDINGS_ORIGINALS_PATH = config("RECORDINGS_ORIGINALS_PATH", default="") or N
 # Both default off. A flag named for an enforcement it does not perform reads as
 # a control in a compliance review, so neither was added until the enrolment path
 # that makes them safe to turn on existed.
-TWO_FACTOR_REQUIRED_FOR_STAFF = config("TWO_FACTOR_REQUIRED_FOR_STAFF", default=False, cast=bool)
-TWO_FACTOR_REQUIRED_FOR_ALL = config("TWO_FACTOR_REQUIRED_FOR_ALL", default=False, cast=bool)
+TWO_FACTOR_REQUIRED_FOR_STAFF = env_bool("TWO_FACTOR_REQUIRED_FOR_STAFF", default=False)
+TWO_FACTOR_REQUIRED_FOR_ALL = env_bool("TWO_FACTOR_REQUIRED_FOR_ALL", default=False)
 
 # ── Ingest privacy overrides ─────────────────────────────────────────────────
 # Both default off, because they discard information the author may legitimately
@@ -274,7 +274,7 @@ TWO_FACTOR_REQUIRED_FOR_ALL = config("TWO_FACTOR_REQUIRED_FOR_ALL", default=Fals
 # filename is a direct identifier arriving through a field nobody thinks of as
 # one. It is masked from the audit trail already; this stops it reaching the
 # live row as well.
-RECORDINGS_DISCARD_ORIGINAL_NAME = config("RECORDINGS_DISCARD_ORIGINAL_NAME", default=False, cast=bool)
+RECORDINGS_DISCARD_ORIGINAL_NAME = env_bool("RECORDINGS_DISCARD_ORIGINAL_NAME", default=False)
 
 # Drop annotation content that came out of the uploaded file — the embedded
 # text events of an EDF and the sidecar events of a converted Nicolet .e — so
@@ -287,7 +287,7 @@ RECORDINGS_DISCARD_ORIGINAL_NAME = config("RECORDINGS_DISCARD_ORIGINAL_NAME", de
 # and the viewer and compute layer both read data positions that depend on it.
 # Dropping gaps would not protect anyone and would put every event after the
 # first splice on signal it does not describe.
-RECORDINGS_DISCARD_EMBEDDED_ANNOTATIONS = config("RECORDINGS_DISCARD_EMBEDDED_ANNOTATIONS", default=False, cast=bool)
+RECORDINGS_DISCARD_EMBEDDED_ANNOTATIONS = env_bool("RECORDINGS_DISCARD_EMBEDDED_ANNOTATIONS", default=False)
 
 # Whether an uploader may ask for annotation text to be kept in the stored file.
 # Stripping it is already the default, so this is the difference between a
@@ -296,7 +296,7 @@ RECORDINGS_DISCARD_EMBEDDED_ANNOTATIONS = config("RECORDINGS_DISCARD_EMBEDDED_AN
 # command, or a project calling the task directly — can put clinical free text
 # into a stored recording. Left True by default because a deployment holding its
 # own clinical recordings may legitimately want the original file intact.
-RECORDINGS_ALLOW_PRESERVE_ANNOTATIONS = config("RECORDINGS_ALLOW_PRESERVE_ANNOTATIONS", default=True, cast=bool)
+RECORDINGS_ALLOW_PRESERVE_ANNOTATIONS = env_bool("RECORDINGS_ALLOW_PRESERVE_ANNOTATIONS", default=True)
 
 # Whether to keep each channel's ORIGINAL name, transducer and filter strings and
 # its original position, alongside the cleaned values. The cleaned values are
@@ -308,9 +308,7 @@ RECORDINGS_ALLOW_PRESERVE_ANNOTATIONS = config("RECORDINGS_ALLOW_PRESERVE_ANNOTA
 # such a workflow the client cleaned the file already, so the columns would hold
 # cleaned values anyway — but holding nothing is the difference between that
 # being true and being merely likely.
-RECORDINGS_DISCARD_SOURCE_CHANNEL_METADATA = config(
-    "RECORDINGS_DISCARD_SOURCE_CHANNEL_METADATA", default=False, cast=bool
-)
+RECORDINGS_DISCARD_SOURCE_CHANNEL_METADATA = env_bool("RECORDINGS_DISCARD_SOURCE_CHANNEL_METADATA", default=False)
 
 #   RECORDING_PIPELINES = {
 #       "web":    {"header": {"strip_annotation_text": False}},
@@ -360,7 +358,7 @@ MEDIA_ALLOWED_UPLOAD_EXTENSIONS: list[str] = []
 #
 # It never applies to a middleware-applied grant — those bytes are computed, not
 # stored, and the interlock lives in offload_file_response(), not here.
-PROXY_FILE_OFFLOAD_ENABLED = config("PROXY_FILE_OFFLOAD_ENABLED", default=False, cast=bool)
+PROXY_FILE_OFFLOAD_ENABLED = env_bool("PROXY_FILE_OFFLOAD_ENABLED", default=False)
 
 MEDIA_UPLOAD_PATH = config("MEDIA_UPLOAD_PATH", default=str(BASE_DIR / "media_uploads"))
 MEDIA_STAGING_PATH = config("MEDIA_STAGING_PATH", default=str(BASE_DIR / "media_staging"))
@@ -448,7 +446,7 @@ TRUSTED_PROXIES: list[str] = config("TRUSTED_PROXIES", default="", cast=Csv())
 # COEP=require-corp rejects any cross-origin subresource that doesn't send CORP —
 # turning this on without auditing third-party fetches will break those flows.
 # See ``epicurrents.middleware.CrossOriginIsolationMiddleware``.
-ENABLE_CROSS_ORIGIN_ISOLATION = config("ENABLE_CROSS_ORIGIN_ISOLATION", default=False, cast=bool)
+ENABLE_CROSS_ORIGIN_ISOLATION = env_bool("ENABLE_CROSS_ORIGIN_ISOLATION", default=False)
 
 # PHI hygiene: emit Cache-Control: no-store so neither the browser nor an
 # intermediary proxy persists response bodies (which can carry PHI). Applied via
@@ -456,13 +454,13 @@ ENABLE_CROSS_ORIGIN_ISOLATION = config("ENABLE_CROSS_ORIGIN_ISOLATION", default=
 # assets (the content-hashed SPA bundles, the viewer lib) opt back into caching
 # by setting their own Cache-Control. On unless explicitly opted out — set
 # DISABLE_NO_STORE_HEADERS=True only where a cache layer must store responses.
-DISABLE_NO_STORE_HEADERS = config("DISABLE_NO_STORE_HEADERS", default=False, cast=bool)
+DISABLE_NO_STORE_HEADERS = env_bool("DISABLE_NO_STORE_HEADERS", default=False)
 
 # Standalone, auth-free public viewer at /viewer/<mode> (see
 # ``epicurrents.views.public_viewer_view``). Off by default — opt in per
 # deployment. The page sets its own COOP/COEP so the viewer's SharedArrayBuffer
 # memory manager works regardless of the site-wide ENABLE_CROSS_ORIGIN_ISOLATION.
-ENABLE_PUBLIC_VIEWER = config("ENABLE_PUBLIC_VIEWER", default=False, cast=bool)
+ENABLE_PUBLIC_VIEWER = env_bool("ENABLE_PUBLIC_VIEWER", default=False)
 
 # Non-commercial feature gate. Some compute features embed material licensed for
 # NON-COMMERCIAL use only — model weights an operator provisions under such
@@ -473,7 +471,7 @@ ENABLE_PUBLIC_VIEWER = config("ENABLE_PUBLIC_VIEWER", default=False, cast=bool)
 # commercial (CC's NonCommercial standard). See ``compute/licensing.py``.
 # The licensed material itself is operator-provisioned, never vendored — the
 # flag unlocks the mechanism, the operator supplies the model.
-EPICURRENTS_NONCOMMERCIAL_USE = config("EPICURRENTS_NONCOMMERCIAL_USE", default=False, cast=bool)
+EPICURRENTS_NONCOMMERCIAL_USE = env_bool("EPICURRENTS_NONCOMMERCIAL_USE", default=False)
 
 # Mains (power-line) frequency for this deployment, in Hz — 50 across Europe, 60
 # in North America. Unset ⇒ no default mains notch and BIDS PowerLineFrequency
@@ -529,7 +527,7 @@ PUBLIC_VIEWER_MODES = {
 # Report-Only via ``CSP_REPORT_ONLY`` — see the middleware docstring and
 # docs/operations.md → Security headers.
 CONTENT_SECURITY_POLICY = config("CONTENT_SECURITY_POLICY", default="")
-CSP_REPORT_ONLY = config("CSP_REPORT_ONLY", default=True, cast=bool)
+CSP_REPORT_ONLY = env_bool("CSP_REPORT_ONLY", default=True)
 PERMISSIONS_POLICY = config("PERMISSIONS_POLICY", default="")
 
 ADMIN_USERNAME = config("ADMIN_USERNAME", default="admin")
@@ -543,8 +541,8 @@ ADMIN_EMAIL = config("ADMIN_EMAIL", default="admin@epicurrents.local")
 EMAIL_BACKEND = config("EMAIL_BACKEND", default="django.core.mail.backends.console.EmailBackend")
 EMAIL_HOST = config("EMAIL_HOST", default="localhost")
 EMAIL_PORT = config("EMAIL_PORT", default=587, cast=int)
-EMAIL_USE_TLS = config("EMAIL_USE_TLS", default=True, cast=bool)
-EMAIL_USE_SSL = config("EMAIL_USE_SSL", default=False, cast=bool)
+EMAIL_USE_TLS = env_bool("EMAIL_USE_TLS", default=True)
+EMAIL_USE_SSL = env_bool("EMAIL_USE_SSL", default=False)
 EMAIL_HOST_USER = config("EMAIL_HOST_USER", default="")
 EMAIL_HOST_PASSWORD = config("EMAIL_HOST_PASSWORD", default="")
 DEFAULT_FROM_EMAIL = config("EMAIL_FROM", default=EMAIL_HOST_USER or "noreply@epicurrents.local")
@@ -597,7 +595,7 @@ FEDERATION_PEER_INBOUND_RATE_LIMIT = config(
 # SSRF defense for `fetch_peer_public_key` blocks URLs resolving to private
 # IPs by default.  Set to True in dev environments where you legitimately
 # need to federate against a localhost peer — NEVER enable in production.
-FEDERATION_ALLOW_PRIVATE_PEER_URLS = config("FEDERATION_ALLOW_PRIVATE_PEER_URLS", default=False, cast=bool)
+FEDERATION_ALLOW_PRIVATE_PEER_URLS = env_bool("FEDERATION_ALLOW_PRIVATE_PEER_URLS", default=False)
 # The surgical form of the override above: networks a peer URL may resolve to
 # despite not being globally routable. A deployment federating over a private
 # overlay — a tailnet, a site-to-site VPN — lists that network and keeps the
@@ -614,7 +612,7 @@ FEDERATION_ALLOWED_PEER_CIDRS = config("FEDERATION_ALLOWED_PEER_CIDRS", default=
 # (a classroom, a hospital proxy) that present as one address. On by default
 # with limits generous enough that honest use never hits them; a project plugin
 # may zero or override any of these. Development disables the whole thing.
-API_THROTTLE_ENABLED = config("API_THROTTLE_ENABLED", default=True, cast=bool)
+API_THROTTLE_ENABLED = env_bool("API_THROTTLE_ENABLED", default=True)
 # Per-minute request ceilings for identified callers, keyed by scope. The
 # scope map below routes paths to a scope; everything else uses "default".
 API_THROTTLE_RATES = {
@@ -663,7 +661,7 @@ CSRF_COOKIE_SAMESITE = "Lax"
 # Master switch for the enforce_session_csrf chokepoint. On by default;
 # development.py turns it off so the Vite-served SPA and local tooling do
 # not need to carry a CSRF token. Never disable in a production deployment.
-SESSION_CSRF_ENFORCED = config("SESSION_CSRF_ENFORCED", default=True, cast=bool)
+SESSION_CSRF_ENFORCED = env_bool("SESSION_CSRF_ENFORCED", default=True)
 
 # ── Annotation export tier ───────────────────────────────────────────────────
 # Whether exporting annotations across annotators is reserved for superusers.
@@ -677,9 +675,6 @@ SESSION_CSRF_ENFORCED = config("SESSION_CSRF_ENFORCED", default=True, cast=bool)
 # because which role holds the tier is a deployment posture an operator sets in
 # .env. A setting that exists only as a getattr default is documented to the
 # operator as configurable while silently ignoring whatever they configure.
-#
-# Read through env_bool, not config(..., cast=bool): a bare NAME= line would
-# otherwise read as False and hand staff the wider tier. See settings/env.py.
 ANNOTATION_EXPORT_ALL_ANNOTATORS_REQUIRES_SUPERUSER = env_bool(
     "ANNOTATION_EXPORT_ALL_ANNOTATORS_REQUIRES_SUPERUSER",
     default=True,
@@ -693,11 +688,11 @@ ANNOTATION_EXPORT_ALL_ANNOTATORS_REQUIRES_SUPERUSER = env_bool(
 # → "External login (OIDC)" for the production setup steps and for the
 # PHI-containment controls: the email-domain allowlist here is control #1; the
 # identity-provider-side controls #2/#3 are documented there.
-OIDC_ENABLED = config("OIDC_ENABLED", default=False, cast=bool)
+OIDC_ENABLED = env_bool("OIDC_ENABLED", default=False)
 
 # First-login provisioning policy (shared across providers).
-OIDC_AUTO_CREATE_USERS = config("OIDC_AUTO_CREATE_USERS", default=True, cast=bool)
-OIDC_LINK_BY_VERIFIED_EMAIL = config("OIDC_LINK_BY_VERIFIED_EMAIL", default=True, cast=bool)
+OIDC_AUTO_CREATE_USERS = env_bool("OIDC_AUTO_CREATE_USERS", default=True)
+OIDC_LINK_BY_VERIFIED_EMAIL = env_bool("OIDC_LINK_BY_VERIFIED_EMAIL", default=True)
 
 # Single-tenant Microsoft Entra ID. The tenant GUID locks logins to one
 # directory — the token ``tid`` claim is checked against it — and the redirect
