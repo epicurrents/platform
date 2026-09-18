@@ -26,6 +26,8 @@ completion would run forever.
 """
 
 import re
+import shlex
+import subprocess
 from pathlib import Path
 
 import yaml
@@ -253,3 +255,67 @@ class TestWorkerPoolIsBounded:
             "--concurrency has no usable default, so an unset CELERY_CONCURRENCY leaves the pool "
             "unbounded or the worker unable to start; give the interpolation a ${VAR:-N} fallback"
         )
+
+
+class TestMigrateWaitIsBounded:
+    """The migrate service waits for the database port before running migrations,
+    and an unbounded wait is indistinguishable from work in progress.
+
+    Reproduced on Ubuntu 24.04 with Podman: without the ``aardvark-dns`` package
+    nothing resolves ``db``, so ``nc`` fails instantly and forever. The container
+    sits at ``Up`` with empty logs, compose reports every service behind it as
+    ``Waiting``, and db and redis stay ``healthy`` throughout because their probes
+    run inside their own containers — a stack that reads as slow rather than
+    broken, for as long as anyone is willing to wait for it.
+    """
+
+    def _command(self) -> str:
+        command = _merged()["migrate"]["command"]
+        if isinstance(command, list):
+            command = " ".join(str(part) for part in command)
+        # compose collapses `$$` to a literal `$` before the shell sees it.
+        return command.replace("$$", "$")
+
+    def test_the_wait_gives_up_and_names_the_usual_cause(self):
+        command = self._command()
+        assert "while ! nc -z" in command, "the wait loop moved; this test needs updating"
+        assert re.search(r"-ge\s+\d+", command), "the wait loop has no cap, so a stalled stack never reports"
+        assert "aardvark-dns" in command, (
+            "the timeout message does not name container DNS, which is the cause that produces this "
+            "failure with no other symptom"
+        )
+
+    def test_the_loop_exits_rather_than_running_migrations(self, tmp_path):
+        """Runs the real command with a failing ``nc`` and the cap lowered.
+
+        Asserting on the text alone would pass on a loop whose shell syntax is
+        wrong — the quoting here goes through YAML folding, compose tokenisation
+        and ``sh -c`` before anything runs.
+
+        ``shlex.split`` rather than handing the string to a shell, because that
+        is what compose does with a string ``command``: it tokenises and execs,
+        with no shell of its own. Wrapping it in one instead adds an expansion
+        pass that the container never performs, and the loop counter — evaluated
+        early, against an unset variable — comes out as a literal.
+        """
+        argv = shlex.split(re.sub(r"-ge\s+\d+", "-ge 2", self._command()))
+        assert argv[:2] == ["sh", "-c"] and len(argv) == 3, (
+            f"the command no longer tokenises to a single sh -c script: {argv[:4]}"
+        )
+        bindir = tmp_path / "bin"
+        bindir.mkdir()
+        for name, body in (("nc", "exit 1"), ("python", 'echo "MIGRATIONS-RAN" >&2; exit 0')):
+            stub = bindir / name
+            stub.write_text(f"#!/bin/sh\n{body}\n")
+            stub.chmod(0o755)
+        result = subprocess.run(
+            argv,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=60,
+            env={"PATH": f"{bindir}:/usr/bin:/bin", "DB_HOSTNAME": "db", "DB_PORT": "5432"},
+        )
+        assert result.returncode != 0, "an unreachable database must fail the container, not hang"
+        assert "MIGRATIONS-RAN" not in result.stderr, "the loop fell through to migrate without a database"
+        assert "giving up" in result.stderr

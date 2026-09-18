@@ -845,6 +845,41 @@ else
         echo "enabled: sudo systemctl enable --now podman.socket" >&2
         exit 1
     fi
+    # Container DNS. Every service reaches the database as the name `db`, and
+    # netavark answers that through aardvark-dns — which Ubuntu packages as a
+    # *recommendation* of netavark rather than a dependency, so a host installed
+    # with --no-install-recommends runs a Podman that resolves no service name at
+    # all. The RHEL family pulls it in as a hard dependency, which is why nothing
+    # here had to check until a distribution met Ubuntu.
+    #
+    # Worth a preflight because every symptom points away from DNS: migrate waits
+    # on a name that never resolves and sits at Up with empty logs, compose
+    # reports the services behind it as Waiting, and db and redis report healthy
+    # throughout, their probes running inside their own containers. The stack
+    # reads as slow rather than broken, for as long as anyone is willing to wait.
+    #
+    # Only a positive answer is acted on: podman names the resolver it found, and
+    # an empty value is that name being absent. An older podman without the field
+    # fails the template instead, which leaves the question unanswered and is
+    # allowed through — this checks for one packaging gap rather than gating the
+    # network stack.
+    if PODMAN_DNS_PATH="$(sudo -E podman info --format '{{.Host.NetworkBackendInfo.DNS.Path}}' 2>/dev/null)"; then
+        if [ -z "$PODMAN_DNS_PATH" ]; then
+            echo "Podman has no container DNS resolver installed (aardvark-dns)." >&2
+            echo "Containers cannot reach each other by name, so the database is" >&2
+            echo "unreachable as 'db' and the stack stalls without reporting an error." >&2
+            echo >&2
+            echo "Install it:" >&2
+            echo "  sudo apt-get install -y aardvark-dns    (Debian/Ubuntu)" >&2
+            echo "  sudo dnf install -y aardvark-dns        (RHEL family)" >&2
+            echo >&2
+            echo "Then run this script again. If a previous attempt already created" >&2
+            echo "the stack, bring it down first: a network keeps the DNS setting it" >&2
+            echo "was created with, so installing the package leaves it unchanged." >&2
+            exit 1
+        fi
+    fi
+
     # Podman 4 is where its Docker-API compose compatibility became usable; the
     # combination this was verified against is newer (Podman 5.8.2 with
     # docker-compose 5.1.4 on RHEL 9), and anything in between is expected to work.
@@ -1193,7 +1228,17 @@ fi
 if [ -n "$ADMIN_PW" ]; then
     echo "  Log in as:  ${ADMIN_USER} / ${ADMIN_PW}"
 else
-    echo "  Log in as:  ${ADMIN_USER} — password is ADMIN_PASSWORD in .env"
+    # Not "the password is ADMIN_PASSWORD in .env", which it stops being the
+    # moment the account exists: createadmin reads that value once, at creation,
+    # and no-ops on every later run. Naming the file sends an operator who has
+    # lost the password to edit a value that changes nothing — and the restart
+    # afterwards reports success, so the only signal that it did nothing is a
+    # login refused in the same words as a wrong password.
+    echo "  Log in as:  ${ADMIN_USER}"
+    echo "  Password:   the one the account was created with. ADMIN_PASSWORD in"
+    echo "              .env applies at creation only; editing it resets nothing."
+    echo "              To set a new password:"
+    echo "              ${COMPOSE[*]} exec web python manage.py changepassword ${ADMIN_USER}"
 fi
 if [ -n "$ACTIVE_PROJECT" ]; then
     echo "  Project:    ${ACTIVE_PROJECT} (active)"

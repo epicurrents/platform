@@ -150,9 +150,23 @@ services:
     user: "1000:1000"
     entrypoint: []
     working_dir: /code
+    # The wait loop is bounded because an unbounded one is indistinguishable from
+    # work. Without a name to resolve — a Podman host missing aardvark-dns and a
+    # host firewall blocking the container bridge both do it, and the second is
+    # reachable on a managed VM nobody here administers — `nc` fails instantly
+    # and forever, this container sits
+    # at Up with empty logs, compose reports every dependent service as Waiting,
+    # and db and redis stay healthy throughout, since their probes run inside
+    # their own containers. Nothing in that picture says "stalled", so the stack
+    # looks slow rather than broken. The cap counts attempts rather than seconds,
+    # since an attempt costs its own connect timeout on top of the sleep: 120 of
+    # them is at least two minutes, far past the point db reports healthy — a
+    # condition of this container starting at all — so reaching it means the port
+    # is unreachable rather than slow.
     command: >
       sh -c "
-        while ! nc -z $$DB_HOSTNAME $$DB_PORT; do sleep 1; done &&
+        waited=0;
+        while ! nc -z $$DB_HOSTNAME $$DB_PORT; do waited=$$((waited + 1)); if [ $$waited -ge 120 ]; then echo 'migrate: the database did not answer after 120 attempts; giving up.' >&2; echo 'migrate: check DB_HOSTNAME and DB_PORT, then whether this container resolves the database by name at all. On podman that fails when the aardvark-dns package is missing, and when a host firewall blocks the container bridge.' >&2; exit 1; fi; sleep 1; done &&
         python manage.py migrate &&
         python manage.py collectstatic --no-input &&
         (python manage.py createadmin || true)

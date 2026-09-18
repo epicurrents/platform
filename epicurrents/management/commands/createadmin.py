@@ -2,6 +2,12 @@
 
 Run automatically by ``entrypoint.sh`` on first container start; no-op when
 any superuser is already present.
+
+``ADMIN_PASSWORD`` applies at creation and never again. An operator who edits it
+in ``.env`` to reset a forgotten password gets a stack that restarts cleanly, a
+file that reads as though the new value were in force, and a login that answers
+401 — so the no-op path says what it did not do, and names the command that
+does.
 """
 
 from django.conf import settings
@@ -15,7 +21,11 @@ def create_admin():
     user_model = get_user_model()
     existing_admins = user_model.objects.filter(is_superuser=True).count()
     if existing_admins > 0:
-        return False, "Admin user already exists. No new admin created."
+        return False, (
+            "Admin user already exists. No new admin created, and ADMIN_PASSWORD was not applied — "
+            "an existing account keeps the password it was created with. "
+            "To change it: manage.py changepassword <username>"
+        )
 
     username = getattr(settings, "ADMIN_USERNAME", "admin")
     password = getattr(settings, "ADMIN_PASSWORD", "admin")
@@ -42,10 +52,9 @@ class Command(BaseCommand):
             if created:
                 self.stdout.write(self.style.SUCCESS(message))
             else:
-                notice = getattr(self.style, "NOTICE", None)
-                if notice:
-                    self.stdout.write(notice(message))
-                else:
-                    self.stdout.write(message)
+                # WARNING, not NOTICE: every no-op here means a credential the
+                # operator believes is in force is not, and this runs inside the
+                # migrate container where the line has one chance to be noticed.
+                self.stdout.write(self.style.WARNING(message))
         except Exception as exc:
             raise CommandError(str(exc))

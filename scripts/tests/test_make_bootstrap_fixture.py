@@ -98,11 +98,27 @@ exit 9
 # `--version` string is what the runtime detection reads: podman-docker installs a
 # `docker` that answers every probe by execing podman, so the name in that string is
 # the only thing separating the two runtimes.
-def _podman_stub(version="5.8.2", provider="Docker Compose version v5.1.4"):
+def _podman_stub(version="5.8.2", provider="Docker Compose version v5.1.4", dns="/usr/libexec/podman/aardvark-dns"):
     # `compose version` answers in three lines, as the real thing does: podman
     # announces the external provider before the version, so the version is not on
     # line one. A single-line stub let a first-line capture pass the suite while
     # failing on a real host, so the shape belongs in the fixture.
+    #
+    # ``dns`` is what `podman info` reports for the network backend's resolver: a
+    # path where aardvark-dns is installed, "" where it is not (the field exists
+    # and is empty), and None for a podman too old to carry the field, where the
+    # template fails instead of answering. The three are different answers, and
+    # the preflight acts on only one of them.
+    if dns is None:
+        dns_branch = """
+case "$1 $2" in
+    "info --format") echo "Error: template: :1:7: executing at <.Host.NetworkBackendInfo>" >&2; exit 125 ;;
+esac"""
+    else:
+        dns_branch = f"""
+case "$1 $2" in
+    "info --format") echo "{dns}"; exit 0 ;;
+esac"""
     return f"""
 case "$1 $2" in
     "compose version")
@@ -111,6 +127,7 @@ case "$1 $2" in
         echo "{provider}"
         exit 0 ;;
 esac
+{dns_branch}
 case "$1" in
     --version) echo "podman version {version}"; exit 0 ;;
     version) echo "{version}"; exit 0 ;;
@@ -519,6 +536,19 @@ class TestDistTailnet:
         # Idempotent, so re-running start.sh on a live deployment is safe.
         assert "borg info /backup" in body
 
+    def test_summary_never_presents_env_as_the_password_of_an_existing_account(self, tmp_path):
+        # ADMIN_PASSWORD is read once, when createadmin creates the account, and
+        # is a no-op on every later run. The summary used to name the file anyway,
+        # which sends an operator who has lost the password to edit a value that
+        # changes nothing: the restart reports success and the login is refused in
+        # the same words as a wrong password. Verified on a live deployment — the
+        # edited value returned 401 while the original still returned 200.
+        dest = tmp_path / "dist"
+        assert _run(dest, "--dist").returncode == 0
+        body = (dest / "start.sh").read_text()
+        assert "password is ADMIN_PASSWORD in .env" not in body
+        assert "manage.py changepassword" in body
+
     def test_generated_start_sh_parses_and_documents_the_flags(self, tmp_path):
         dest = tmp_path / "dist"
         assert _run(dest, "--dist").returncode == 0
@@ -642,6 +672,49 @@ class TestStartShPreflight:
         assert result.returncode != 0
         assert "not backed by docker-compose v2" in result.stderr
         assert "STUB-PODMAN" not in result.stderr, "the build started on the wrong provider"
+
+    def test_refuses_a_podman_without_container_dns(self, tmp_path):
+        # aardvark-dns is what resolves `db` inside the stack, and Ubuntu packages
+        # it as a recommendation of netavark rather than a dependency — so a host
+        # installed with --no-install-recommends runs a Podman that resolves no
+        # service name. Reproduced on Ubuntu 24.04: migrate waits at Up with empty
+        # logs, compose shows the services behind it as Waiting, and db and redis
+        # report healthy the whole time, because their probes run inside their own
+        # containers. Nothing says "stalled", so it has to be caught before the build.
+        dest = tmp_path / "dist"
+        assert _run(dest, "--dist").returncode == 0
+        path = _stub_path(
+            tmp_path,
+            podman=_podman_stub(dns=""),
+            sudo=_SUDO_STUB,
+            getent="exit 0",
+            stat=_stat_stub(uid=1000, gid=1000, mode=755),
+        )
+        result = self._start(dest, path)
+        assert result.returncode != 0
+        assert "aardvark-dns" in result.stderr
+        assert "STUB-PODMAN" not in result.stderr, "the build started without container DNS"
+        # Installing the package is not the whole fix: a network keeps the DNS
+        # setting it was created with, so the message has to ask for a recreate.
+        assert "keeps the DNS setting" in result.stderr
+
+    def test_a_podman_too_old_to_answer_about_dns_is_allowed_through(self, tmp_path):
+        # The check acts on a positive answer only. A podman whose `info` has no
+        # such field fails the template rather than reporting an absence, and a
+        # preflight for one packaging gap must not refuse every host it cannot
+        # interrogate — the floor check below already covers versions too old to run.
+        dest = tmp_path / "dist"
+        assert _run(dest, "--dist").returncode == 0
+        path = _stub_path(
+            tmp_path,
+            podman=_podman_stub(dns=None),
+            sudo=_SUDO_STUB,
+            getent="exit 0",
+            stat=_stat_stub(uid=1000, gid=1000, mode=755),
+        )
+        result = self._start(dest, path)
+        assert "aardvark-dns" not in result.stderr
+        assert "STUB-PODMAN" in result.stderr, "preflight stopped on an inconclusive probe"
 
     def test_refuses_a_podman_below_the_floor(self, tmp_path):
         dest = tmp_path / "dist"

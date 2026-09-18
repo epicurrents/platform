@@ -39,6 +39,14 @@ def test_noop_when_superuser_already_exists(admin_settings, make_superuser):
     assert "already exists" in message.lower()
     # Did not touch the prior superuser.
     assert get_user_model().objects.filter(is_superuser=True).count() == 1
+    assert get_user_model().objects.get(username="prior").check_password("prior")
+    # The no-op has to say what it did not do. ADMIN_PASSWORD reads as the
+    # account's password in .env long after it stopped being one, so an operator
+    # resetting a forgotten password edits it, restarts, and is refused by a login
+    # that answers exactly as it would for a wrong password. This line is the only
+    # place the deployment says otherwise.
+    assert "ADMIN_PASSWORD was not applied" in message
+    assert "changepassword" in message
 
 
 @pytest.mark.django_db

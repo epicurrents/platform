@@ -109,6 +109,51 @@ docker compose restart celery celery-beat
 
 If both are running and Celery still exits, check that `REDIS_PASSWORD` is set in `.env` — the compose stack starts Redis with `--requirepass` and injects credentialed broker URLs into the app containers, overriding the `CELERY_BROKER_URL` value in `.env`.
 
+### The stack never finishes starting — `migrate` sits at `Waiting` (Podman)
+
+Symptom: `compose up` prints `Container <stack>-migrate-1 Waiting` and stays there for as long as you let it. `podman ps` shows migrate `Up` with empty logs, `db` and `redis` both `healthy`, and every service behind migrate `Created`.
+
+Cause on a Podman host is almost always container DNS: services reach the database by the name `db`, and when that name does not resolve `nc` fails instantly and forever rather than timing out. `db` and `redis` keep reporting healthy throughout, because their probes run inside their own containers and never cross the network — which is what makes the stack look slow rather than broken.
+
+Confirm it from inside a running container rather than from the network's own configuration, which is misleading here: a network reports `DNSEnabled: true` whether or not a resolver is installed or reachable.
+
+```bash
+sudo podman exec <stack>-redis-1 getent hosts db
+```
+
+Two causes produce that identical failure, and they are distinguished by whether the resolver is installed:
+
+**The resolver is missing.** netavark answers names through `aardvark-dns`, which Ubuntu packages as a *recommendation* of netavark rather than a dependency, so a host installed with `--no-install-recommends` has no resolver at all. The RHEL family installs it as a hard dependency, which is why [scripts/bootstrap-podman.sh](../scripts/bootstrap-podman.sh) never had to check for it. Note the recreate — a network keeps the DNS setting it was created with, so installing the package changes nothing for a stack that is already up. Bring it down with the same `-f` compose files it was started with:
+
+```bash
+dpkg -l aardvark-dns
+sudo apt-get install -y aardvark-dns
+sudo -E podman compose -f docker-compose.yml down
+sudo -E podman compose -f docker-compose.yml up -d
+```
+
+**A host firewall blocks the container network.** With the package installed and name resolution still failing, the queries never reach the resolver. On Ubuntu this is `ufw`, and **enabling it with its stock settings is enough** — no rule has to be written against the deployment, which is why this can arrive on a managed host that nobody touched. Two defaults do it together: deny incoming drops the container's DNS query, because `aardvark-dns` listens on the bridge gateway and that address belongs to the host, and `DEFAULT_FORWARD_POLICY="DROP"` drops traffic forwarded between containers on the bridge. The first is what turns every name lookup into an instant failure.
+
+Find the bridge and check the policy — a compose-created network gets its own `podmanN` interface:
+
+```bash
+ip -brief link show | grep podman
+sudo ufw status verbose
+```
+
+`Default: deny (incoming), deny (routed)` is the combination above. Exempt the bridge rather than opening ports, since this is host-internal traffic:
+
+```bash
+sudo ufw allow in on podman1
+sudo ufw route allow in on podman1 out on podman1
+```
+
+Re-test with `getent hosts db` from inside a container. Nothing needs recreating here: the network was correct all along and the packets were being dropped, so the stack recovers as soon as the rules allow them through.
+
+Worth knowing that Docker's behaviour differs and surprises in the opposite direction: it installs its own iptables chains, so a published port stays reachable through `ufw` rules that appear to block it.
+
+Since the wait loop in `migrate` is bounded, a stack built from a current checkout reports this as a timeout naming DNS instead of waiting indefinitely.
+
 ### API requests fail with `relation "X" does not exist`
 
 The database is missing tables — either migrations haven't run, or you've switched projects without using the proper lifecycle commands.
@@ -172,6 +217,8 @@ scripts/manage.sh createadmin
 ```
 
 This reads `ADMIN_USERNAME` / `ADMIN_PASSWORD` / `ADMIN_EMAIL` from `.env` and creates the user. To pick up a new `ADMIN_PASSWORD`, set it in `.env` first.
+
+**`ADMIN_PASSWORD` resets nothing once the account exists.** `createadmin` is a no-op as soon as any superuser is present, so editing the value and restarting leaves the account on the password it was created with — while the file, and a stack that restarts cleanly, both read as though the new value were in force. The login then fails with `401 Invalid credentials`, the same answer a wrong password gets, and the only trace is one line in the migrate container's log. `changepassword` above is the path that works; run it against the container serving the site, passing the same `-f` compose files the stack was started with, or the reset can land in a database nothing is serving.
 
 ## Recordings
 
