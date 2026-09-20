@@ -294,7 +294,7 @@ If multiple variants of the same icon name are needed (e.g. regular and solid `u
 
 Always use these computeds in Vue components rather than reading `authStore.user?.is_staff` directly.
 
-**Nav links.** Set `requiresStaff: true` or `requiresSuperuser: true` on any `ProjectNavLink` entry whose target view requires elevated access. `App.vue` filters the merged nav link list using `authStore.isStaff` / `authStore.isSuperuser` before rendering, so the link is invisible to users who lack the required role. The route itself should additionally guard the page (via the view's own check or a router guard) so that direct URL access is also blocked.
+**Nav links.** Set `requiresStaff: true` or `requiresSuperuser: true` on any `ProjectNavLink` entry whose target view requires elevated access. `App.vue` filters the merged nav link list using `authStore.isStaff` / `authStore.isSuperuser` before rendering, so the link is invisible to users who lack the required role. The route guard in [frontend/src/router/guard.ts](frontend/src/router/guard.ts) honours the same two flags as route `meta` (`requiresStaff`, `requiresSuperuser`), so set the matching one on the route as well and direct URL access is refused the same way.
 
 **View gating.** Inside a view component, gate write actions with `canSubmit = computed(() => authStore.isSuperuser)` (or `isStaff` for read-only admin sections) and wrap the relevant template block in `v-if="canSubmit"`. Staff users who land on the page without superuser rights should see progress / status information but no submission controls.
 

@@ -7,6 +7,8 @@ import AdminAccountsView from '#views/AdminAccountsView.vue'
 import AdminAccountView from '#views/AdminAccountView.vue'
 import AdminGroupsView from '#views/AdminGroupsView.vue'
 import AdminGroupView from '#views/AdminGroupView.vue'
+import AdminMaintenanceJobView from '#views/AdminMaintenanceJobView.vue'
+import AdminMaintenanceView from '#views/AdminMaintenanceView.vue'
 import AnnotationExportView from '#views/AnnotationExportView.vue'
 import CollectionView from '#views/CollectionView.vue'
 import DatasetView from '#views/DatasetView.vue'
@@ -216,6 +218,29 @@ export const router = createRouter({
                 requiresStaff: true,
                 // AdminGroupView swaps in the group name once loaded.
                 title: 'Group',
+            },
+        },
+        {
+            path: '/admin/maintenance',
+            name: 'admin-maintenance',
+            component: AdminMaintenanceView,
+            meta: {
+                navSection: 'admin',
+                requiresAuth: true,
+                requiresStaff: true,
+                title: 'Maintenance',
+            },
+        },
+        {
+            path: '/admin/maintenance/:id',
+            name: 'admin-maintenance-job',
+            component: AdminMaintenanceJobView,
+            meta: {
+                navSection: 'admin',
+                requiresAuth: true,
+                requiresStaff: true,
+                // AdminMaintenanceJobView swaps in the operation once loaded.
+                title: 'Maintenance job',
             },
         },
         ...(plugin.routes ?? []),

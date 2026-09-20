@@ -12,12 +12,14 @@ import { plugin as pluginsPlugin } from '#plugins/active'
 import type { ProjectNavLink } from '#projects/types'
 import { useAuthStore } from '#stores/auth'
 import { useDeploymentStore } from '#stores/deployment'
+import { useMaintenanceStore } from '#stores/maintenance'
 import { useThemeStore, type ThemeMode } from '#stores/theme'
 
 const SCOPE = 'App'
 
 const authStore = useAuthStore()
 const deploymentStore = useDeploymentStore()
+const maintenanceStore = useMaintenanceStore()
 const themeStore = useThemeStore()
 const route = useRoute()
 const router = useRouter()
@@ -188,6 +190,25 @@ function handleUserMenu (event: Event) {
 </script>
 
 <template>
+    <!--
+        Maintenance banner. Fed by the HTTP layer: the lock middleware answers
+        503 with a maintenance body to whatever it refuses, and the store keeps
+        the last one until a request goes through again. At the top rather than
+        the bottom because it explains why the page is not working, which a
+        reader looks for above the content, not below it.
+    -->
+    <div v-if="maintenanceStore.banner" class="maintenance-banner">
+        <wa-icon name="screwdriver-wrench"></wa-icon>
+        <span>{{ maintenanceStore.banner.message }}</span>
+        <span v-if="maintenanceStore.banner.phase === 'verifying' && authStore.isSuperuser" class="maintenance-banner__aside">
+            {{ t('Update awaiting confirmation. Changes you make now are lost if it is rolled back.', SCOPE) }}
+        </span>
+        <span v-else-if="maintenanceStore.banner.expected_until" class="maintenance-banner__aside">
+            {{ t('Expected back', SCOPE) }}
+            <wa-relative-time :date="maintenanceStore.banner.expected_until"></wa-relative-time>
+        </span>
+    </div>
+
     <nav v-if="showNavigation" class="app-nav">
         <RouterLink class="nav-brand" to="/">
             <AppLogo class="nav-brand__logo" :stroke-width="12" />
@@ -290,6 +311,25 @@ function handleUserMenu (event: Event) {
 </template>
 
 <style scoped>
+/* Maintenance banner: a warning strip above the nav, in the flow rather than
+   fixed, so it pushes the page down instead of covering the nav's controls. */
+.maintenance-banner {
+    align-items: center;
+    background: var(--wa-color-warning-fill-loud);
+    color: white;
+    display: flex;
+    flex-wrap: wrap;
+    font-size: var(--wa-font-size-s);
+    font-weight: 600;
+    gap: var(--wa-space-s);
+    justify-content: center;
+    padding: var(--wa-space-xs) var(--wa-space-m);
+}
+
+.maintenance-banner__aside {
+    font-weight: 400;
+}
+
 .nav-icon {
     /* 0.9em rendered the toolbar icons noticeably smaller than the
      * adjacent text caps — particularly the profile-link icon, which

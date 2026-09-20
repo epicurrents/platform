@@ -121,6 +121,16 @@ class TestConfirm:
         _enrol(user)
         assert confirm_step_up(request_, user, password=PASSWORD, second_factor=False) == "password+totp"
 
+    def test_waiving_the_factor_does_not_waive_an_external_account_s_only_credential(self, make_user, request_):
+        user = make_user()
+        user.set_unusable_password()
+        user.save()
+        credential = _enrol(user)
+        with pytest.raises(HttpError) as excinfo:
+            confirm_step_up(request_, user, second_factor=False)
+        assert excinfo.value.status_code == 400
+        assert confirm_step_up(request_, user, totp_code=_code(credential), second_factor=False) == "totp"
+
     def test_an_external_account_confirms_with_its_factor_alone(self, make_user, request_):
         user = make_user()
         user.set_unusable_password()

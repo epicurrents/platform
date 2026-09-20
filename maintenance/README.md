@@ -115,6 +115,10 @@ The booleans read through `env_bool`.
 
 Verbs: `maintenance.status.read`, `maintenance.operation.list`, `maintenance.job.{list,read,log,create,cancel,verify,rollback}`, and the non-request `maintenance.job.run` and `maintenance.job.sync`, all in the registry in [activity/README.md](../activity/README.md#verb-registry). Security events: `maintenance.job_requested`, `maintenance.rollback_requested`, `maintenance.job_state`, `auth.stepup_failed`. Every job endpoint targets the row, so the Activity metadata carries only what the row does not: the package hash on a request, the byte count on a log read; the security events carry `job_id`, the operation key and the state, never a path.
 
+## The frontend
+
+The Maintenance segment of the administration tabs (`/admin/maintenance`, `/admin/maintenance/{job_id}`) is the client; [frontend/README.md → Maintenance](../frontend/README.md#maintenance) describes it. Two contracts it depends on: the status endpoint's 404 while the master flag is off, which is how the tab decides not to render, and the `503 {"detail": "maintenance", …}` body of the lock, which the SPA's HTTP layer recognises by that literal.
+
 ## Extension points
 
 | Hook | How |

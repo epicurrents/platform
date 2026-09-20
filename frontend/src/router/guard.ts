@@ -15,7 +15,9 @@ import { useAuthStore } from '#stores/auth'
  *
  * Returns `true` to proceed, or a route location to redirect to. Routes opt in
  * via `meta.requiresAuth`, `meta.requiresAuthUnlessToken` (a `?token=` share
- * credential exempts the auth check), and `meta.requiresStaff`.
+ * credential exempts the auth check), `meta.requiresStaff` and
+ * `meta.requiresSuperuser`; the last two mirror the nav-link flags of the same
+ * names, so a link hidden from a user is also a URL refused to them.
  *
  * When the memoised auth store reads unauthenticated, the guard re-validates
  * against the server before redirecting to login. The store can be stale in two
@@ -45,6 +47,10 @@ export async function authGuard (to: RouteLocationNormalized): Promise<true | { 
     }
 
     if (to.meta.requiresStaff && !authStore.isStaff) {
+        return { name: 'home' }
+    }
+
+    if (to.meta.requiresSuperuser && !authStore.isSuperuser) {
         return { name: 'home' }
     }
 

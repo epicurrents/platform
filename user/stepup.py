@@ -59,8 +59,10 @@ def confirm_step_up(
 
     ``password`` is required for an account that has one; ``totp_code`` (a TOTP
     or a backup code) is required when the account has a confirmed second factor
-    and ``second_factor`` is on. An account with neither answers 409, since the
-    state of the account rather than the request is the problem. A wrong or
+    and ``second_factor`` is on, and regardless of ``second_factor`` for an
+    account whose factor is its only credential. An account with neither
+    answers 409, since the state of the account rather than the request is the
+    problem. A wrong or
     missing credential answers 400 without saying which, counts toward the
     lockout, and is logged; five failures lock the account out of step-up for
     five minutes and answer 429.
@@ -81,7 +83,10 @@ def confirm_step_up(
         _fail(request, user, "password", attempt_key, lockout_key)
 
     credential = active_credential(user)
-    if credential is not None and second_factor:
+    # An account without a password has only its factor to confirm with, so a
+    # caller waiving the second factor still gets the code checked there;
+    # otherwise the waiver would confirm with nothing at all.
+    if credential is not None and (second_factor or not user.has_usable_password()):
         code = (totp_code or "").strip()
         if not code or not (consume_totp(credential, code) or consume_backup_code(credential, code)):
             _fail(request, user, "second_factor", attempt_key, lockout_key)

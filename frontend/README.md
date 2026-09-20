@@ -66,12 +66,14 @@ Then run `npm run dev` as normal. Log in with any credentials — the mock accep
 - 2 collections: *Sleep Studies* (2 items, 1 share token), *Epilepsy Cases* (1 item)
 - 2 datasets: *Public EEG Dataset* (2 items, 1 share token), *Research Cohort A* (1 item)
 - 4 accounts and 2 groups for the administration surface, including one deactivated and unnamed account, and one group carrying access grants so a delete is refused
+- 2 maintenance jobs (a finished audit check and a rolled-back update) and three registered operations, including a host-tier update against the mock package `MOCK_PACKAGE_SHA256`
 
 **Behaviour notes:**
 - The pending recording flips to `ready` on its second status poll, exercising the upload-progress UI.
 - Renaming a recording propagates immediately to any collection/dataset items that reference it.
 - `mockuser` is a superuser, which is what makes the staff- and superuser-gated surfaces (administration, viewer settings, annotation export) reachable at all in mock mode.
 - All CRUD is fully in-memory — nothing is persisted between page reloads.
+- A requested maintenance job walks through its states on a timer: a worker job finishes in a few seconds, a host update reaches the confirmation window and waits for verify or rollback. Step-up confirmations accept the password `password`.
 
 **Project roles.** `MOCK_ROLE_PROVIDERS` at the top of [mocks.ts](mocks.ts) is what `GET /admin/roles` answers with. Its keys and values are deliberately fictional, since a real one sitting in a fixture is how a role the platform must not know quietly becomes load-bearing. Set it to `[]` to exercise the roleless deployment, where no role UI may render at all — that is the shape a dev stack with a project active never shows by eye, and the one most likely to be broken without anyone noticing.
 
@@ -160,21 +162,31 @@ resolve through the default icon library.
 | `/admin/accounts/:id` | `AdminAccountView` | Account detail — fields, groups, password, second factor (staff) |
 | `/admin/groups` | `AdminGroupsView` | Group roster — member and grant counts, create, delete (staff) |
 | `/admin/groups/:id` | `AdminGroupView` | Group detail — rename, roles, member roll (staff) |
+| `/admin/maintenance` | `AdminMaintenanceView` | Maintenance — deployment state, registered operations, job history (staff; hidden unless the deployment enables the feature) |
+| `/admin/maintenance/:id` | `AdminMaintenanceJobView` | Maintenance job — timeline, log, confirm / roll back / cancel (staff) |
 | `/profile` | `ProfileView` | User profile / password change |
 | `/login` | `LoginView` | Login form |
 | `/reset-password` | `ResetPasswordView` | Password reset confirmation |
 
 ### Administration
 
-The four `/admin/` routes are the client for the account and group API at `/api/v1/user/admin/`. They are reached from the user menu in the nav bar, not from the main nav, and every one gates on `requiresStaff`.
+The `/admin/` routes are the client for the account and group API at `/api/v1/user/admin/` and, for the two maintenance routes, the maintenance API at `/api/v1/maintenance/`. They are reached from the user menu in the nav bar, not from the main nav, and every one gates on `requiresStaff`.
 
-Staff read, superuser writes — the same tier the API enforces. A staff account that is not a superuser sees both rosters and every detail page with the controls absent, gated in each component on `authStore.isSuperuser`; the route guard has no superuser branch and needs none. Refusals are surfaced as the server reports them rather than pre-checked client-side: the last-active-superuser guard, the grant count blocking a group deletion, the password validators' messages and the duplicate-name conflicts are each decided against server state the client sees stale or not at all.
+Staff read, superuser writes — the same tier the API enforces. A staff account that is not a superuser sees the rosters and every detail page with the controls absent, gated in each component on `authStore.isSuperuser`. The route guard also honours `requiresSuperuser`, mirroring the nav-link flag of the same name, so a route marked that way is refused as a URL and not only hidden as a link; none of the administration routes needs it, since staff may read all of them. Refusals are surfaced as the server reports them rather than pre-checked client-side: the last-active-superuser guard, the grant count blocking a group deletion, the password validators' messages and the duplicate-name conflicts are each decided against server state the client sees stale or not at all.
 
 There is no account deletion control anywhere in the surface. [`erase_user`](../user/README.md#account-erasure-gdpr-art-17) is the sanctioned path because it also unlinks owned recording and media files, which FK cascade never does; the account page points at the command instead of offering a control.
 
 **Membership is written from the account page only.** A deployment has far more users than groups, so assigning groups to a user is a short list of checkboxes while assigning users to a group is an unbounded one. The group page shows its members as a read-only roll linking back to each account. It is also the safer direction. Both membership endpoints take a whole-membership replacement, so a picker built from the capped account roster would drop every member past the cap — people the operator never saw listed — where the group list on an account page is never paged and cannot. [src/api/admin.ts](src/api/admin.ts) wraps only the account-side write for that reason.
 
 Two shapes to know before changing these views. `GET /admin/accounts` returns a bare list with no total, so paging can show "there is more" but not "N of M" — a full page is the entire signal. And there is no single-group read endpoint, so `AdminGroupView` resolves its group out of the group roster, and reads the account roster to name its members; the server caps that at 500, and the view says how many of the group's `member_count` it could show when the two disagree.
+
+### Maintenance
+
+The Maintenance segment of the administration tabs is the client for the [maintenance app](../maintenance/README.md): the deployment's state (installed version, host agent, lock), the operations the server registers, and the job history. It renders only where the deployment has `REMOTE_MAINTENANCE_ENABLED` on; `useMaintenanceStore().probeFeature()` asks `/api/v1/maintenance/status` once and reads a 404 as "off" — the tab is hidden, not broken. An operation's form is built from the argument schema the server publishes for it (`args_schema`: booleans become switches, integers number inputs, strings inputs with the schema's pattern), so a project's registered operation gets a form with no frontend change. The step-up inputs in every confirming dialog come from [src/components/StepUpFields.vue](src/components/StepUpFields.vue), which renders what the status's `step_up.method` says the caller has: the password, the second-factor code, or the code alone for an externally authenticated account.
+
+The lock is the other half. [src/lib/http.ts](src/lib/http.ts) carries a response interceptor that records a `503 {"detail": "maintenance", …}` in [src/lib/maintenanceLock.ts](src/lib/maintenanceLock.ts), a module below both the wrapper and the stores so neither imports the other; the maintenance store watches it and owns what follows: the banner in [src/App.vue](src/App.vue), one toast per phase change, the callout and disabled submit on the login page while the phase is `updating` or `rolling_back`, a poll of `/api/v1/user/me` every ten seconds to notice release, and a reload of the document when the platform comes back on new code — any lifted lock but `verifying`, and the step from `updating` to `verifying`, since after either the server runs a release this bundle is not. A confirmed update's window closing is announced, not reloaded. Regression coverage in [src/stores/maintenance.test.ts](src/stores/maintenance.test.ts).
+
+The job page polls through `usePolling`, backing off from three to ten seconds while nothing changes, and counts the confirmation window down against the server's clock (`server_now` from the status) rather than the browser's.
 
 ### Project roles
 
@@ -196,19 +208,23 @@ A rejected role value aborts the rename with it — the server writes both in on
 | `user.ts` | `/api/v1/user/` | Login, logout, me, password change |
 | `admin.ts` | `/api/v1/user/admin/` | Account and group administration; `rolesPayload` builds the partial role map |
 | `notifications.ts` | `/api/v1/notifications/` | VAPID key, push subscription |
+| `maintenance.ts` | `/api/v1/maintenance/` | Status, operation registry, jobs (request, cancel, verify, rollback); `isFeatureDisabled` reads the gate's 404 |
 
 ## Composables (`src/composables/`)
 
 | File | Description |
 |---|---|
+| `usePolling.ts` | Repeats an async read on a backing-off timer while the component is mounted: the delay grows on every failure or unchanged read and resets when the read reports a change. `start`, `stop`, `refresh`. |
 | `useFileTree.ts` | Normalises all four file/folder input methods (multi-file `<input>`, `webkitdirectory`, drag-and-drop files, drag-and-drop folders) into a unified `UploadTree` structure. Exports `treeFromInputEvent`, `treeFromDropEvent`, `filterByExtension`, `countFiles`, `hasFolders`, `isEmpty`. |
 
 ## Reusable Components (`src/components/`)
 
 | Component | Description |
 |---|---|
-| `AdminTabs.vue` | Segmented control switching between the account and group rosters. A route-linked control rather than a `wa-tab-group`, since the two halves are separate pages with their own URLs and tab panels would put both behind one address. Takes `active` (`'accounts' \| 'groups'`). |
+| `AdminTabs.vue` | Segmented control switching between the administration sections. A route-linked control rather than a `wa-tab-group`, since the sections are separate pages with their own URLs and tab panels would put them all behind one address. Takes `active` (`'accounts' \| 'groups' \| 'maintenance'`); the Maintenance segment renders only where the deployment enables the feature. |
 | `AppLogo.vue` | The Epicurrents mark as inline SVG, rendered in the nav brand link. Geometry is a verbatim port of the logo component in the epicurrents.github.io repository; the colouring is not, so the two can be re-synced by copying the paths across. Size is set by the consumer through the `--logo-size` custom property, outline weight through the `strokeWidth` prop. |
+| `JobStateBadge.vue` | A maintenance job's state as a badge, coloured by what it asks of the reader (warning while a confirmation is awaited or a rollback runs, danger for a failure). Takes `state`. |
+| `StepUpFields.vue` | The credential inputs of a step-up confirmation, rendered from the method the maintenance status reports for the caller. Takes the parent's reactive `credentials` (`password`, `totp_code`), `stepUp`, and `passwordOnly` for an action the server confirms without the second factor. |
 | `CollectionPickerDialog.vue` | Dialog for browsing the Collection hierarchy, creating new collections inline, and selecting a target. Controlled via `:open` prop; emits `select` (with a `PickerSelection`) and `close`. Use when any feature needs the user to pick a collection destination or browse library items. Two modes: `collection` (pick a folder) and `item` (pick a recording inside a folder). Breadcrumb navigation via `wa-breadcrumb`. |
 
 `CollectionPickerDialog` usage pattern:
@@ -242,6 +258,7 @@ function onPickerSelect(sel: PickerSelection) {
 | `useAuthStore` | `auth.ts` | Authenticated user, login/logout |
 | `useRecordingsStore` | `recordings.ts` | Recording list, upload queue |
 | `useLibraryStore` | `library.ts` | Top-level collections and datasets lists |
+| `useMaintenanceStore` | `maintenance.ts` | The maintenance lock as the HTTP layer last saw it, the release poll and reload, and whether the maintenance feature is enabled on this deployment |
 
 ## Styling
 

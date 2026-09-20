@@ -26,6 +26,15 @@
  *   PATCH  /api/v1/user/admin/groups/{id}
  *   DELETE /api/v1/user/admin/groups/{id}
  *   PUT    /api/v1/user/admin/groups/{id}/members
+ *   GET    /api/v1/maintenance/status
+ *   GET    /api/v1/maintenance/operations
+ *   GET    /api/v1/maintenance/jobs
+ *   POST   /api/v1/maintenance/jobs
+ *   GET    /api/v1/maintenance/jobs/{id}
+ *   GET    /api/v1/maintenance/jobs/{id}/log
+ *   POST   /api/v1/maintenance/jobs/{id}/cancel
+ *   POST   /api/v1/maintenance/jobs/{id}/verify
+ *   POST   /api/v1/maintenance/jobs/{id}/rollback
  *
  *   GET    /annotations/api/v1/content-types
  *
@@ -153,7 +162,32 @@ interface MockAuthGroup {
     grantCount: number
 }
 
+interface MockJob {
+    job_id: string
+    operation: string
+    executor: 'celery' | 'host'
+    state: string
+    reason: string
+    step: string
+    requested_by: string | null
+    package_sha256: string | null
+    args: Record<string, unknown>
+    created_at: string
+    started_at: string | null
+    finished_at: string | null
+    verify_deadline: string | null
+    verify_requested_at: string | null
+    rollback_requested_at: string | null
+    installed_version_before: string
+    target_version: string
+    running_version: string
+    snapshot: string
+    post_snapshot: string
+    output: string
+}
+
 interface MockState {
+    jobs: MockJob[]
     user: MockUser
     accounts: MockAccount[]
     authGroups: MockAuthGroup[]
@@ -203,6 +237,69 @@ const MOCK_ROLE_PROVIDERS = [
 
 /** Tracks which pending recordings have been polled once (to simulate processing). */
 const _pendingFlipped = new Set<string>()
+
+/** Timers driving mock jobs through their states; cleared with the state. */
+const _jobTimers = new Set<ReturnType<typeof setTimeout>>()
+
+const IN_FLIGHT_STATES = new Set(['requested', 'accepted', 'running', 'awaiting_verification', 'rolling_back'])
+
+/** The package a mock `platform.update` may name; the real one is uploaded through the API. */
+const MOCK_PACKAGE_SHA256 = 'f'.repeat(64)
+
+/** The operation registry as the server publishes it, argument schemas included. */
+const MOCK_OPERATIONS = [
+    {
+        key: 'activity.verify_audit_integrity',
+        executor: 'celery',
+        label: 'Verify audit-trail integrity',
+        description: 'Walk every audit chain and recompute derived-state digests; reports any break, gap or mismatch.',
+        requires_step_up: false,
+        available: true,
+        args_schema: {
+            properties: {
+                derived_window_days: {
+                    anyOf: [{ type: 'integer', minimum: 0, maximum: 3650 }, { type: 'null' }],
+                    default: null,
+                    description: 'Days of derived-state rows to recompute; 0 skips that phase.',
+                    title: 'Derived Window Days',
+                },
+            },
+        },
+    },
+    {
+        key: 'recordings.refresh_signal_metadata',
+        executor: 'celery',
+        label: 'Refresh signal metadata',
+        description: 'Re-derive recording and channel metadata from the files on disk for every recording that has drifted.',
+        requires_step_up: true,
+        available: true,
+        args_schema: {
+            properties: {
+                dry_run: { type: 'boolean', default: false, description: 'Report drifted recordings without writing anything.', title: 'Dry Run' },
+            },
+        },
+    },
+    {
+        key: 'platform.update',
+        executor: 'host',
+        label: 'Update the platform',
+        description: 'Apply an uploaded, signed package with a verification window and automatic rollback. Needs the host agent.',
+        requires_step_up: true,
+        available: true,
+        args_schema: {
+            properties: {
+                package_sha256: { type: 'string', pattern: '^[0-9a-f]{64}$', description: 'sha256 of an uploaded package.', title: 'Package Sha256' },
+                verify_window_minutes: {
+                    anyOf: [{ type: 'integer', minimum: 5, maximum: 1440 }, { type: 'null' }],
+                    default: null,
+                    description: 'Minutes to wait for a confirmation before rolling back.',
+                    title: 'Verify Window Minutes',
+                },
+            },
+            required: ['package_sha256'],
+        },
+    },
+]
 
 // ─── Session cookie ───────────────────────────────────────────────────────────
 
@@ -612,6 +709,54 @@ function buildSeed(): MockState {
         datasetItems,
         datasetAccess,
         seq: { rec: 17, coll: 3, ds: 3, item: 4, access: 2, account: 5, group: 3 },
+        jobs: [
+            {
+                job_id: '3f2c1a2e-9d4b-4c6e-8a1f-0b7d5e6c9a10',
+                operation: 'activity.verify_audit_integrity',
+                executor: 'celery',
+                state: 'succeeded',
+                reason: '',
+                step: '',
+                requested_by: user.username,
+                package_sha256: null,
+                args: {},
+                created_at: ago(3600 * 26),
+                started_at: ago(3600 * 26 - 2),
+                finished_at: ago(3600 * 26 - 9),
+                verify_deadline: null,
+                verify_requested_at: null,
+                rollback_requested_at: null,
+                installed_version_before: '',
+                target_version: '',
+                running_version: '',
+                snapshot: '',
+                post_snapshot: '',
+                output: '{\n  "chain_breaks": 0,\n  "chain_gaps": [],\n  "chains_checked": 12\n}\nAudit trail verified: no anomalies.\n',
+            },
+            {
+                job_id: '8b6d2c4a-1e3f-4a5b-9c7d-2e1f0a9b8c7d',
+                operation: 'platform.update',
+                executor: 'host',
+                state: 'rolled_back',
+                reason: 'deadline',
+                step: 'health',
+                requested_by: user.username,
+                package_sha256: MOCK_PACKAGE_SHA256,
+                args: { package_sha256: MOCK_PACKAGE_SHA256 },
+                created_at: ago(3600 * 24 * 3),
+                started_at: ago(3600 * 24 * 3 - 30),
+                finished_at: ago(3600 * 24 * 3 - 2400),
+                verify_deadline: ago(3600 * 24 * 3 - 2100),
+                verify_requested_at: null,
+                rollback_requested_at: null,
+                installed_version_before: '0.1.1',
+                target_version: '0.1.2',
+                running_version: '0.1.1',
+                snapshot: 'pre-update-20260917-101500',
+                post_snapshot: 'post-update-20260917-104500',
+                output: '',
+            },
+        ],
     }
 }
 
@@ -620,6 +765,8 @@ let _state: MockState
 export function resetState(): void {
     _state = buildSeed()
     _pendingFlipped.clear()
+    for (const timer of _jobTimers) clearTimeout(timer)
+    _jobTimers.clear()
 }
 
 // Initialize on module load so the first request is always ready.
@@ -827,6 +974,65 @@ function enrichItem(contentTypeId: number, objectId: string): { object_name: str
         if (rec) return { object_name: resolvedDisplayName(rec), object_hash: rec.hash }
     }
     return { object_name: null, object_hash: null }
+}
+
+// ─── Maintenance helpers ──────────────────────────────────────────────────────
+
+function jobOut(job: MockJob) {
+    return {
+        ...job,
+        in_flight: IN_FLIGHT_STATES.has(job.state),
+        // Staff see no output; the mock user is a superuser, so it is included.
+        output: _state.user.is_superuser ? job.output : null,
+    }
+}
+
+/** Run `fn` later unless the state has been reset in between. */
+function later(ms: number, fn: () => void): void {
+    const timer = setTimeout(() => {
+        _jobTimers.delete(timer)
+        fn()
+    }, ms)
+    _jobTimers.add(timer)
+}
+
+/**
+ * Walk a fresh job through the states its tier goes through, on a timer, so
+ * the job page has something to poll. A celery job finishes by itself; a host
+ * update stops at the confirmation window and waits for verify or rollback.
+ */
+function driveJob(job: MockJob): void {
+    later(1500, () => {
+        if (job.state !== 'requested') return
+        job.state = 'running'
+        job.started_at = ago(0)
+        job.step = job.executor === 'host' ? 'snapshot' : ''
+        if (job.executor === 'celery') {
+            later(3000, () => {
+                if (job.state !== 'running') return
+                job.state = 'succeeded'
+                job.finished_at = ago(0)
+                job.output = job.operation === 'activity.verify_audit_integrity'
+                    ? '{\n  "chain_breaks": 0,\n  "chain_gaps": [],\n  "chains_checked": 12\n}\nAudit trail verified: no anomalies.\n'
+                    : `Checked 17 recordings, 0 drifted${job.args.dry_run ? ' (dry run)' : ''}.\n`
+            })
+            return
+        }
+        job.installed_version_before = '0.1.1'
+        job.snapshot = 'pre-update-20260920-120000'
+        later(2000, () => {
+            if (job.state !== 'running') return
+            job.step = 'build'
+            later(2500, () => {
+                if (job.state !== 'running') return
+                job.state = 'awaiting_verification'
+                job.step = 'health'
+                job.running_version = job.target_version
+                const minutes = typeof job.args.verify_window_minutes === 'number' ? job.args.verify_window_minutes : 30
+                job.verify_deadline = new Date(Date.now() + minutes * 60_000).toISOString()
+            })
+        })
+    })
 }
 
 // ─── Route handler ────────────────────────────────────────────────────────────
@@ -1075,6 +1281,147 @@ export async function handleMock(
                 if (missing.length) return send(res, 404, { detail: `No such account: ${missing.join(', ')}.` })
                 group.memberIds = [...userIds]
                 return send(res, 200, groupOut(group))
+            }
+        }
+
+        return notFound(res)
+    }
+
+    // ── Maintenance ───────────────────────────────────────────────────────────
+
+    if (path.startsWith('/api/v1/maintenance/')) {
+        if (!isLoggedIn(req)) return send(res, 401, { detail: 'Not authenticated' })
+        if (!_state.user.is_staff && !_state.user.is_superuser) {
+            return send(res, 403, { detail: 'Staff access required.' })
+        }
+        const tail = path.slice('/api/v1/maintenance/'.length)
+        const inFlight = _state.jobs.find(j => IN_FLIGHT_STATES.has(j.state)) ?? null
+
+        if (tail === 'status' && method === 'GET') {
+            return send(res, 200, {
+                remote_maintenance_enabled: true,
+                remote_update_enabled: true,
+                installed_version: '0.1.1',
+                server_now: new Date().toISOString(),
+                spool_writable: true,
+                release_key_present: true,
+                agent: { installed: true, enabled: true, version: '1', runtime: 'docker', last_run: ago(20), stale: false },
+                lock: inFlight?.state === 'awaiting_verification'
+                    ? { phase: 'verifying', since: inFlight.started_at, expected_until: inFlight.verify_deadline, message: 'The platform was updated and waits for confirmation.', job_id: inFlight.job_id }
+                    : null,
+                in_flight_job: inFlight?.job_id ?? null,
+                // The mock account has a password and no second factor.
+                step_up: { method: 'password', available: true, reason: null },
+            })
+        }
+
+        if (tail === 'operations' && method === 'GET') {
+            return send(res, 200, MOCK_OPERATIONS)
+        }
+
+        if (tail === 'jobs' && method === 'GET') {
+            const rows = [..._state.jobs].sort((a, b) => b.created_at.localeCompare(a.created_at))
+            return send(res, 200, rows.map(jobOut))
+        }
+
+        if (method !== 'GET' && !_state.user.is_superuser) {
+            return send(res, 403, { detail: 'Superuser access required.' })
+        }
+
+        if (tail === 'jobs' && method === 'POST') {
+            const body = await readBody(req)
+            const operation = MOCK_OPERATIONS.find(op => op.key === body.operation)
+            if (!operation) return send(res, 400, { detail: 'Unknown operation.' })
+            const args = (typeof body.args === 'object' && body.args !== null ? body.args : {}) as Record<string, unknown>
+            if (operation.requires_step_up && body.password !== 'password') {
+                return send(res, 400, { detail: 'Confirmation failed.' })
+            }
+            if (operation.key === 'platform.update' && args.package_sha256 !== MOCK_PACKAGE_SHA256) {
+                return send(res, 400, { detail: `No uploaded package has that hash. The mock package is ${MOCK_PACKAGE_SHA256}.` })
+            }
+            if (inFlight) return conflict(res, 'Another maintenance job is in flight.')
+            const job: MockJob = {
+                job_id: randomUUID(),
+                operation: operation.key,
+                executor: operation.executor as 'celery' | 'host',
+                state: 'requested',
+                reason: '',
+                step: '',
+                requested_by: _state.user.username,
+                package_sha256: operation.executor === 'host' ? MOCK_PACKAGE_SHA256 : null,
+                args,
+                created_at: ago(0),
+                started_at: null,
+                finished_at: null,
+                verify_deadline: null,
+                verify_requested_at: null,
+                rollback_requested_at: null,
+                installed_version_before: '',
+                target_version: operation.executor === 'host' ? '0.1.2' : '',
+                running_version: '',
+                snapshot: '',
+                post_snapshot: '',
+                output: '',
+            }
+            _state.jobs.push(job)
+            driveJob(job)
+            return send(res, 202, jobOut(job))
+        }
+
+        const jobMatch = /^jobs\/([0-9a-f-]{36})(\/log|\/cancel|\/verify|\/rollback)?$/.exec(tail)
+        if (jobMatch) {
+            const job = _state.jobs.find(j => j.job_id === jobMatch[1])
+            if (!job) return send(res, 404, { detail: 'No such job' })
+            const suffix = jobMatch[2] ?? ''
+
+            if (suffix === '' && method === 'GET') return send(res, 200, jobOut(job))
+
+            if (suffix === '/log' && method === 'GET') {
+                const text = job.executor === 'host' && job.started_at
+                    ? `::step=check\n::step=snapshot\n::snapshot=${job.snapshot}\n::step=build\n[+] Building 42.1s (18/18) FINISHED\n::step=${job.step}\n`
+                    : job.output
+                return send(res, 200, { job_id: job.job_id, log: text, truncated: false, bytes: text.length })
+            }
+
+            if (suffix === '/cancel' && method === 'POST') {
+                if (job.state !== 'requested') return conflict(res, `A job in state '${job.state}' cannot be cancelled.`)
+                job.state = 'cancelled'
+                job.finished_at = ago(0)
+                return send(res, 200, jobOut(job))
+            }
+
+            const body = await readBody(req)
+            if (body.password !== 'password') return send(res, 400, { detail: 'Confirmation failed.' })
+
+            if (suffix === '/verify' && method === 'POST') {
+                if (job.state !== 'awaiting_verification') return conflict(res, `A job in state '${job.state}' is not awaiting verification.`)
+                job.verify_requested_at = ago(0)
+                later(2000, () => {
+                    if (job.state !== 'awaiting_verification') return
+                    job.state = 'succeeded'
+                    job.finished_at = ago(0)
+                })
+                return send(res, 200, jobOut(job))
+            }
+
+            if (suffix === '/rollback' && method === 'POST') {
+                if (job.state !== 'awaiting_verification' && !(job.state === 'succeeded' && job.snapshot)) {
+                    return conflict(res, `A job in state '${job.state}' cannot be rolled back.`)
+                }
+                job.rollback_requested_at = ago(0)
+                later(2000, () => {
+                    if (!['awaiting_verification', 'succeeded'].includes(job.state)) return
+                    job.state = 'rolling_back'
+                    job.reason = 'requested'
+                    job.post_snapshot = 'post-update-20260920-123000'
+                    later(4000, () => {
+                        if (job.state !== 'rolling_back') return
+                        job.state = 'rolled_back'
+                        job.running_version = job.installed_version_before
+                        job.finished_at = ago(0)
+                    })
+                })
+                return send(res, 200, jobOut(job))
             }
         }
 

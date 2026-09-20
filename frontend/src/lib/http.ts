@@ -1,4 +1,5 @@
 import axios from 'axios'
+import { isMaintenanceNotice, recordMaintenanceNotice } from '#lib/maintenanceLock'
 
 /**
  * API base URL for all frontend HTTP calls.
@@ -18,6 +19,25 @@ export const http = axios.create({
     xsrfCookieName: 'csrftoken',
     xsrfHeaderName: 'X-CSRFToken',
 })
+
+/**
+ * Notice the platform being locked for maintenance.
+ *
+ * The lock middleware answers `503 {"detail": "maintenance", …}` to whatever
+ * it refuses; recording that here, below the stores, is what lets every view
+ * react through one store instead of each request handler checking for it.
+ * The error still rejects, so a caller that was writing sees its write fail.
+ */
+http.interceptors.response.use(
+    (response) => response,
+    (error: unknown) => {
+        const response = (error as { response?: { status?: number, data?: unknown } })?.response
+        if (response?.status === 503 && isMaintenanceNotice(response.data)) {
+            recordMaintenanceNotice(response.data)
+        }
+        return Promise.reject(error)
+    },
+)
 
 /**
  * Pull the server's own explanation out of a failed request.
