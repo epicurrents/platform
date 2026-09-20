@@ -565,6 +565,14 @@ EMAIL_USE_SSL = env_bool("EMAIL_USE_SSL", default=False)
 EMAIL_HOST_USER = config("EMAIL_HOST_USER", default="")
 EMAIL_HOST_PASSWORD = config("EMAIL_HOST_PASSWORD", default="")
 DEFAULT_FROM_EMAIL = config("EMAIL_FROM", default=EMAIL_HOST_USER or "noreply@epicurrents.local")
+# Django leaves this at None, which means the socket's own default — in practice
+# no deadline at all. Mail is sent from inside the workers (the reset task, and
+# maintenance notifications, which go out synchronously from a beat job that
+# runs every minute), so a relay that accepts the connection and then stalls
+# holds a worker child for as long as it cares to, and the next minute's send
+# takes another, with recording processing queued behind them. A relay that
+# cannot answer in 20 s is not going to; the send fails and the task retries.
+EMAIL_TIMEOUT = config("EMAIL_TIMEOUT", default=20, cast=int)
 
 # Base URL of the frontend, used to build password reset links in emails
 FRONTEND_URL = config("FRONTEND_URL", default="http://localhost:5173")

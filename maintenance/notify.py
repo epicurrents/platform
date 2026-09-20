@@ -85,12 +85,25 @@ def notify_job_state(job, *, state: str | None = None) -> str | None:
     except Exception:
         logger.exception("Push notification for maintenance job %s could not be dispatched", job.job_id)
     if mail_configured():
-        from django.core.mail import send_mail
+        from epicurrents.mail import send_mail
 
         addresses = [user.email for user in recipients if user.email]
         if addresses:
             try:
-                send_mail(title, body, None, addresses, fail_silently=True)
+                send_mail(
+                    subject=title,
+                    message=body,
+                    from_email=None,
+                    recipient_list=addresses,
+                    context=f"maintenance.notify[{state}]",
+                )
             except Exception:
-                logger.exception("Mail notification for maintenance job %s could not be sent", job.job_id)
+                # Caught here rather than silenced in the backend: the shared
+                # path has already logged what failed, hashed, and a job's state
+                # must not depend on a mail relay. Silencing it inside the
+                # backend would let an awaiting_verification notice go missing
+                # with nothing recorded anywhere — the one message whose absence
+                # decides an outcome, since an update nobody confirms is rolled
+                # back when the window closes.
+                logger.warning("Mail notification for maintenance job %s was not delivered", job.job_id)
     return state

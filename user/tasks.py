@@ -8,7 +8,6 @@ inventory in docs/gdpr-compliance.md says the store does not hold. A new mail
 flow adds a task that takes a primary key, as the one below does.
 """
 
-import hashlib
 import logging
 
 from celery import shared_task
@@ -20,11 +19,18 @@ def _deliver(task, subject: str, message: str, from_email: str, recipient_list: 
     """Send via the configured backend, retrying the calling task on failure.
 
     Takes the task instance rather than being a method so any task in this module
-    shares one delivery path, and in particular one error branch: the recipient
-    addresses are hashed and the exception reduced to its class name before
-    anything is logged.
+    shares one retry policy. The hygiene half — hashed recipients, exception
+    class only — lives in :mod:`epicurrents.mail`, where the maintenance
+    notifier reaches it too; what is added here is the attempt count, which only
+    a task has.
+
+    Only :class:`~epicurrents.mail.MailDeliveryError` is caught, which is also
+    what is handed to ``retry``: celery re-raises the exception it was given once
+    the retries run out, and the worker logs that failure with a traceback, so
+    handing it the backend's own exception would publish the rejection text — and
+    the address in it — through a path this module never sees.
     """
-    from django.core.mail import send_mail
+    from epicurrents.mail import MailDeliveryError, send_mail
 
     try:
         send_mail(
@@ -32,21 +38,14 @@ def _deliver(task, subject: str, message: str, from_email: str, recipient_list: 
             message=message,
             from_email=from_email,
             recipient_list=recipient_list,
-            fail_silently=False,
+            context=task.name,
         )
-    except Exception as exc:
-        # Hash the recipients: raw addresses must not enter the log stream,
-        # and the SMTP exception is reduced to its class name because
-        # rejection texts commonly echo the address back.
-        recipient_hashes = [hashlib.sha256(addr.strip().lower().encode()).hexdigest()[:16] for addr in recipient_list]
-        logger.warning(
-            "%s: delivery failed to %s — %s (attempt %d/%d)",
-            task.name,
-            recipient_hashes,
-            type(exc).__name__,
-            task.request.retries + 1,
-            task.max_retries + 1,
-        )
+    except MailDeliveryError as exc:
+        attempt = task.request.retries + 1
+        if attempt > task.max_retries:
+            logger.warning("%s: delivery failed after %d attempts, giving up", task.name, attempt)
+        else:
+            logger.warning("%s: retrying delivery (attempt %d/%d)", task.name, attempt, task.max_retries + 1)
         raise task.retry(exc=exc)
 
 
