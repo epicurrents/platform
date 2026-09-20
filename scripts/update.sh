@@ -13,11 +13,17 @@
 #
 # Recovery:
 #   --rollback       Restore the most recent pre-update snapshot — database,
-#                    .env and code — rebuild the image from the restored code,
-#                    and recreate the stack. The rebuild is not optional: the
-#                    image carries the code, so without it the recreate runs the
-#                    new code against the restored database and re-applies the
-#                    migrations being rolled back.
+#                    .env and code — rebuild the images from the restored code,
+#                    re-run the static and vendoring steps, and recreate the
+#                    stack. The rebuild is not optional: the image carries the
+#                    code, so without it the recreate runs the new code against
+#                    the restored database and re-applies the migrations being
+#                    rolled back.
+#
+# While it runs, the script keeps a maintenance flag at update/maintenance.json
+# (phase "updating" or "rolling_back"). The platform reads it to suspend
+# requests for the duration, and the flag is removed at exit unless the run
+# left the stack stopped, or --keep-lock says the caller owns it.
 #
 # Usage:
 #   ./update.sh                          archive mode, newest ./update/epicurrents*.tar.gz
@@ -26,18 +32,86 @@
 #   ./update.sh --from repo --no-pull    repo mode, rebuild the current checkout
 #   ./update.sh --no-backup              skip the pre-update snapshot (not advised —
 #                                        it is what --rollback restores from)
-#   ./update.sh --rollback               undo the last update (database + .env)
+#   ./update.sh --rollback               undo the last update (database, .env, code)
+#   ./update.sh --skip-beat              leave celery-beat stopped after the recreate,
+#                                        so no scheduled purge runs before the update
+#                                        is verified; start it yourself afterwards
+#   ./update.sh --root DIR               operate on the deployment at DIR instead of
+#                                        the one this script sits in
+#   ./update.sh --keep-lock              leave update/maintenance.json in place at
+#                                        exit (for a caller that manages the flag)
 #
 set -euo pipefail
 
+info() { printf '\n\033[1;34m==> %s\033[0m\n' "$*"; }
+ok()   { printf '    \033[32m✓\033[0m  %s\n'  "$*"; }
+warn() { printf '    \033[33m!\033[0m  %s\n'  "$*"; }
+die()  { printf '\n\033[1;31mERROR:\033[0m %s\n' "$*" >&2; exit 1; }
+
+usage() {
+    sed -n '2,43p' "$0" | sed 's/^#\{1,2\} \{0,1\}//'
+}
+
+require_value() {
+    # $1 = flag name, $2 = the candidate value (empty if the flag was last).
+    # Reject a missing or flag-like value so 'update.sh --from' fails with a
+    # clear message instead of a cryptic 'shift' error under set -e.
+    case "$2" in
+        ""|-*) die "Option '$1' requires a value." ;;
+    esac
+}
+
+# ── Arguments ─────────────────────────────────────────────────────────────────
+MODE=archive
+ARCHIVE=""
+REF=""
+PULL=true
+BACKUP=true
+ROLLBACK=false
+ASSUME_YES=false
+SKIP_BEAT=false
+KEEP_LOCK=false
+ROOT=""
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --from)      require_value --from "${2:-}";    MODE="$2"; shift 2 ;;
+        --from=*)    MODE="${1#*=}"; shift ;;
+        --archive)   require_value --archive "${2:-}"; ARCHIVE="$2"; shift 2 ;;
+        --archive=*) ARCHIVE="${1#*=}"; shift ;;
+        --ref)       require_value --ref "${2:-}";     REF="$2"; shift 2 ;;
+        --ref=*)     REF="${1#*=}"; shift ;;
+        --root)      require_value --root "${2:-}";    ROOT="$2"; shift 2 ;;
+        --root=*)    ROOT="${1#*=}"; shift ;;
+        --no-pull)   PULL=false; shift ;;
+        --no-backup) BACKUP=false; shift ;;
+        --backup)    BACKUP=true; shift ;;
+        --rollback)  ROLLBACK=true; shift ;;
+        --skip-beat) SKIP_BEAT=true; shift ;;
+        --keep-lock) KEEP_LOCK=true; shift ;;
+        --yes|-y)    ASSUME_YES=true; shift ;;
+        -h|--help)   usage; exit 0 ;;
+        *)           die "Unknown argument: $1 (try --help)" ;;
+    esac
+done
+
 # ── Locate the deployment root ────────────────────────────────────────────────
-# In a git checkout this script lives in scripts/; in a distribution it is
-# bundled at the deployment root next to start.sh. Detect by the compose file.
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-if [ -f "$SCRIPT_DIR/docker-compose.yml" ]; then
-    ROOT="$SCRIPT_DIR"
+# --root names it outright, for a copy of this script that lives outside the
+# deployment (a root-owned copy an updater runs, a checkout driving a packaged
+# deployment). Otherwise: in a git checkout this script lives in scripts/; in a
+# distribution it is bundled at the deployment root next to start.sh. Detect by
+# the compose file.
+if [ -n "$ROOT" ]; then
+    [ -d "$ROOT" ] || die "--root: no such directory: $ROOT"
+    ROOT="$(cd "$ROOT" && pwd)"
+    [ -f "$ROOT/docker-compose.yml" ] || die "--root: $ROOT does not look like a deployment (no docker-compose.yml)."
 else
-    ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    if [ -f "$SCRIPT_DIR/docker-compose.yml" ]; then
+        ROOT="$SCRIPT_DIR"
+    else
+        ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+    fi
 fi
 cd "$ROOT"
 
@@ -74,51 +148,13 @@ fi
 UPDATE_DIR="./update"
 BACKUP_DIR="./backups"
 KEEP_BACKUPS=3
-
-info() { printf '\n\033[1;34m==> %s\033[0m\n' "$*"; }
-ok()   { printf '    \033[32m✓\033[0m  %s\n'  "$*"; }
-warn() { printf '    \033[33m!\033[0m  %s\n'  "$*"; }
-die()  { printf '\n\033[1;31mERROR:\033[0m %s\n' "$*" >&2; exit 1; }
-
-usage() {
-    sed -n '2,28p' "$0" | sed 's/^#\{1,2\} \{0,1\}//'
-}
-
-require_value() {
-    # $1 = flag name, $2 = the candidate value (empty if the flag was last).
-    # Reject a missing or flag-like value so 'update.sh --from' fails with a
-    # clear message instead of a cryptic 'shift' error under set -e.
-    case "$2" in
-        ""|-*) die "Option '$1' requires a value." ;;
-    esac
-}
-
-# ── Arguments ─────────────────────────────────────────────────────────────────
-MODE=archive
-ARCHIVE=""
-REF=""
-PULL=true
-BACKUP=true
-ROLLBACK=false
-ASSUME_YES=false
-
-while [ $# -gt 0 ]; do
-    case "$1" in
-        --from)      require_value --from "${2:-}";    MODE="$2"; shift 2 ;;
-        --from=*)    MODE="${1#*=}"; shift ;;
-        --archive)   require_value --archive "${2:-}"; ARCHIVE="$2"; shift 2 ;;
-        --archive=*) ARCHIVE="${1#*=}"; shift ;;
-        --ref)       require_value --ref "${2:-}";     REF="$2"; shift 2 ;;
-        --ref=*)     REF="${1#*=}"; shift ;;
-        --no-pull)   PULL=false; shift ;;
-        --no-backup) BACKUP=false; shift ;;
-        --backup)    BACKUP=true; shift ;;
-        --rollback)  ROLLBACK=true; shift ;;
-        --yes|-y)    ASSUME_YES=true; shift ;;
-        -h|--help)   usage; exit 0 ;;
-        *)           die "Unknown argument: $1 (try --help)" ;;
-    esac
-done
+MAINTENANCE_FLAG="$UPDATE_DIR/maintenance.json"
+# How long the restore waits for the locks the schema drop needs before giving
+# up. Anything still connected — a backup dumping the database, a stray shell —
+# holds a share lock the drop cannot get past, and without a bound the rollback
+# hangs rather than failing. Overridable for tests; there is no reason to change
+# it on a deployment.
+RESTORE_LOCK_TIMEOUT="${UPDATE_RESTORE_LOCK_TIMEOUT:-60s}"
 
 [ -f .env ] || die "No .env in $ROOT — initialize the deployment first (./start.sh in a distribution, or 'python manage.py init_env' in a checkout)."
 [ -n "$CONTAINER_RUNTIME" ] || die "No container runtime found — this needs Docker Engine or Podman, either one with Compose v2."
@@ -135,8 +171,13 @@ confirm() {
     [[ "${reply:-N}" =~ ^[Yy]$ ]]
 }
 
+service_running() {
+    # $1 = compose service name.
+    "${COMPOSE[@]}" ps "$1" 2>/dev/null | grep -q "running\|Up"
+}
+
 ensure_db_up() {
-    if "${COMPOSE[@]}" ps db 2>/dev/null | grep -q "running\|Up"; then
+    if service_running db; then
         return 0
     fi
     warn "Database container is not running; starting it."
@@ -152,6 +193,244 @@ ensure_db_up() {
     done
     printf '\n'
     die "PostgreSQL did not become ready within 60s."
+}
+
+# ── The maintenance flag ──────────────────────────────────────────────────────
+# A file rather than a database row, because the rollback restores the database
+# and would erase a row mid-way through the very operation the flag announces.
+# It lives under update/, which every sync and snapshot in this script excludes,
+# so neither direction of an update touches it. Written before anything else
+# changes and removed by the exit trap below; a caller that manages the flag's
+# lifecycle itself passes --keep-lock, and a pre-existing flag is then left as
+# it is rather than overwritten, since it carries that caller's own fields.
+
+FLAG_WRITTEN=false
+SERVICES_STOPPED=false
+tmp=""
+
+write_maintenance_flag() {
+    # $1 = phase, $2 = message for the people locked out.
+    if [ "$KEEP_LOCK" = true ] && [ -f "$MAINTENANCE_FLAG" ]; then
+        return 0
+    fi
+    if [ ! -d "$UPDATE_DIR" ]; then
+        # A checkout deployment may not have the directory yet. Created by root
+        # it would belong to root, and the account the containers run as could
+        # then never write under it; hand it to whoever owns the tree. GNU stat
+        # only, like the ownership preflight — elsewhere the chown is skipped.
+        mkdir "$UPDATE_DIR"
+        chown "$(stat -c %u:%g . 2>/dev/null)" "$UPDATE_DIR" 2>/dev/null || true
+    fi
+    local now
+    now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    printf '{"protocol": 1, "phase": "%s", "job_id": null, "since": "%s", "expected_until": null, "message": "%s"}\n' \
+        "$1" "$now" "$2" > "$MAINTENANCE_FLAG.tmp"
+    mv -f "$MAINTENANCE_FLAG.tmp" "$MAINTENANCE_FLAG"
+    FLAG_WRITTEN=true
+}
+
+cleanup() {
+    local rc=$?
+    [ -n "$tmp" ] && rm -rf "$tmp"
+    if [ "$FLAG_WRITTEN" = true ] && [ "$KEEP_LOCK" = false ]; then
+        if [ "$rc" -ne 0 ] && [ "$SERVICES_STOPPED" = true ]; then
+            # The stack was taken down and not brought back, so the platform is
+            # not serving anyway; the flag is what tells anyone who reaches it
+            # why. Removing it would replace a maintenance page with an error.
+            warn "Leaving the maintenance flag in place ($MAINTENANCE_FLAG) — the stack was stopped"
+            warn "and not restarted. Remove the file once the deployment is repaired."
+        else
+            rm -f "$MAINTENANCE_FLAG"
+        fi
+    fi
+}
+trap cleanup EXIT
+
+# ── Shared steps ──────────────────────────────────────────────────────────────
+# Used by both the update and the rollback path, so a rollback reproduces every
+# step an update runs after the image build. A rollback that skipped them left
+# the failed release's vendored assets under the restored code and never
+# checked the result was serving.
+
+BORG_WAS_RUNNING=false
+
+stop_app_services() {
+    # borg as well as the application services. Its scheduler runs inside the
+    # container and dumps the database on its own clock, and a dump in progress
+    # holds share locks on every table: a migration's ALTER TABLE queues behind
+    # it, and the rollback's schema drop waits on it indefinitely. Stopping the
+    # container ends any dump with it. Whether it was running is recorded first,
+    # so the restart at the end does not start a service the deployment never
+    # ran.
+    if service_running borg; then
+        BORG_WAS_RUNNING=true
+    fi
+    info "Stopping application services"
+    "${COMPOSE[@]}" stop web celery celery-beat borg || true
+    SERVICES_STOPPED=true
+    ok "Application services stopped"
+}
+
+collect_static() {
+    info "Collecting static files"
+    "${COMPOSE[@]}" run --rm --no-deps web python manage.py collectstatic --no-input
+    ok "Static files collected"
+}
+
+refresh_vendored_assets() {
+    # a. Install the pinned viewer edition if it drifted. A pull can move
+    # frontend/viewer-pin.json, so the check runs every update; it is a local
+    # stamp comparison, so the common case costs nothing. An empty pin verifies
+    # clean — that is a deployment still building the edition from the checkout,
+    # not a broken one.
+    #
+    # After the image build, not beside the frontend build: production gives the
+    # `vendor` service no /code bind, so it reads the pin baked into the image,
+    # and running this earlier would install the edition the *previous* pin
+    # named. --user because the production overlay runs the service as root for
+    # the Pyodide tree, while viewer-dist is inside the code snapshot a rollback
+    # restores with rsync as the deploy user — root-owned files there would
+    # survive the rollback.
+    if "${COMPOSE[@]}" --profile vendor run --rm --no-deps -T --user 1000:1000 vendor \
+            python manage.py vendor_viewer --check > /dev/null 2>&1; then
+        ok "Viewer edition matches the pin"
+    else
+        info "Installing the pinned viewer edition"
+        "${COMPOSE[@]}" --profile vendor run --rm --no-deps -T --user 1000:1000 vendor \
+            python manage.py vendor_viewer
+        ok "Viewer edition installed"
+    fi
+
+    # b. Vendor the Pyodide runtime if it is missing or incomplete. The tree is
+    # excluded from this script's rsync so a deployment keeps its own copy, which
+    # means an update never creates one: a fresh host, a restored snapshot, or a
+    # version bump in settings all arrive here with nothing to serve. The check
+    # is a local hash sweep, so the common case costs a second and the vendoring
+    # runs only when it has to.
+    #
+    # This step and the next write through the `vendor` service: web mounts the
+    # tree read-only in production, so it is the one container that cannot
+    # populate it.
+    if "${COMPOSE[@]}" --profile vendor run --rm --no-deps -T vendor python manage.py vendor_pyodide --check > /dev/null 2>&1; then
+        ok "Pyodide runtime present"
+    else
+        info "Vendoring the Pyodide runtime"
+        "${COMPOSE[@]}" --profile vendor run --rm --no-deps -T vendor python manage.py vendor_pyodide
+        ok "Pyodide runtime vendored"
+    fi
+
+    # c. Regenerate the static lead fields. The other half of the vendored tree,
+    # and computed rather than downloaded, so it runs unconditionally: a couple
+    # of seconds, and regenerating is the only way a change to the generator's
+    # montages or grid parameters reaches the deployment. Blob filenames carry a
+    # content hash, so an unchanged field keeps its name and every cached copy
+    # stays valid. Needs the migrated database (it also refreshes the
+    # LeadFieldCache rows the compute API serves from), which the caller has
+    # ensured — by migrating, or by restoring a database that matches the code.
+    info "Generating static lead fields"
+    "${COMPOSE[@]}" --profile vendor run --rm --no-deps -T vendor python manage.py generate_compute_static
+    ok "Static lead fields generated"
+}
+
+recreate_stack() {
+    # --force-recreate so a changed .env is re-read (the prod overlay bakes env at
+    # container-creation time; a plain restart keeps the stale value). Scoped to
+    # the app services — db / redis stay up so the database is never bounced.
+    #
+    # celery-beat is the one autonomous source of work in the stack, and its
+    # database scheduler fires every periodic task that came due while it was
+    # down the moment it starts. A purge that fell due during the build then
+    # unlinks files within seconds of the recreate — files a rollback restores
+    # the rows for and cannot bring back. --skip-beat leaves it stopped until
+    # whoever is verifying the update decides it stays.
+    local services=(web celery)
+    if [ "$SKIP_BEAT" = false ]; then
+        services+=(celery-beat)
+    fi
+    info "Recreating containers"
+    "${COMPOSE[@]}" up -d --force-recreate "${services[@]}"
+    # Caddy serves /assets/, /viewer/ and /static/ straight off bind mounts, so
+    # it has to be recreated after the tree underneath it changes — a running
+    # container holds the mount it was started with. Left out, an archive update
+    # takes the SPA offline while Django reports healthy.
+    if [ "$PROXY_ENABLED" = true ]; then
+        "${COMPOSE[@]}" up -d --force-recreate caddy
+    fi
+    SERVICES_STOPPED=false
+    if [ "$BORG_WAS_RUNNING" = true ]; then
+        # `up` rather than `start`, so a .env the rollback restored is re-read.
+        # A backup service that fails to come back is not a failed update: the
+        # platform is serving, so say so and leave the stack up.
+        "${COMPOSE[@]}" up -d borg \
+            || warn "borg did not start; check '${COMPOSE[*]} logs borg' and start it with: ${COMPOSE[*]} up -d borg"
+    fi
+    ok "Stack is up"
+    if [ "$SKIP_BEAT" = true ]; then
+        warn "celery-beat is left stopped (--skip-beat). Once the update is verified, start it with:"
+        warn "  ${COMPOSE[*]} up -d celery-beat"
+    fi
+}
+
+wait_for_health() {
+    local port ready asset domain spa_served
+    port="$(grep -E '^HOST_PORT=' .env | head -1 | cut -d= -f2- | tr -d ' "' || true)"
+    port="${port:-8000}"
+    info "Waiting for the platform to become ready"
+    ready=false
+    for _ in $(seq 1 60); do
+        if curl -fsS "http://localhost:${port}/api/v1/health" >/dev/null 2>&1; then
+            ready=true
+            break
+        fi
+        sleep 2
+    done
+    if [ "$ready" = true ]; then
+        ok "Health check passed"
+    else
+        warn "Health check did not pass within the timeout; check '${COMPOSE[*]} logs web'."
+    fi
+
+    # The health endpoint says Django is answering. It says nothing about whether
+    # the SPA can load, and those are separable: the bundles are served off disk
+    # by the proxy, so the site can be entirely unusable to a new visitor while
+    # /api/v1/health returns 200. That state shipped once and went unnoticed for
+    # a day, because the hashed bundles are cached `immutable` and every browser
+    # that had already loaded the page kept working. Fetch a real asset, named by
+    # the index.html just installed, so the check fails on exactly what a
+    # first-time visitor would hit.
+    if [ "$PROXY_ENABLED" = true ] && [ -f frontend/dist/index.html ]; then
+        asset="$(grep -oE '/assets/[A-Za-z0-9._-]+\.js' frontend/dist/index.html | head -1 || true)"
+        domain="$(grep -E '^PROXY_DOMAIN=' .env | head -1 | cut -d= -f2- | tr -d ' "' || true)"
+        if [ -n "$asset" ] && [ -n "$domain" ]; then
+            info "Verifying the SPA bundle is servable"
+            # --resolve pins the name to this host so the check tests the local
+            # proxy rather than whatever DNS points at, while still presenting
+            # the SNI the certificate was issued for.
+            # Retried, because the check runs seconds after caddy was recreated
+            # and a starting proxy refuses the TLS handshake outright — reported
+            # by curl as exit 35, which is indistinguishable here from a
+            # genuinely unservable bundle. A single attempt therefore warned on
+            # every successful update, and a check that cries wolf is worse than
+            # no check: it trains the operator to skip the one signal that would
+            # have caught the real outage this block exists to detect.
+            spa_served=false
+            for _ in $(seq 1 10); do
+                if curl -fsS -o /dev/null --max-time 15 \
+                    --resolve "${domain}:443:127.0.0.1" "https://${domain}${asset}"; then
+                    spa_served=true
+                    break
+                fi
+                sleep 3
+            done
+            if [ "$spa_served" = true ]; then
+                ok "SPA bundle served ($asset)"
+            else
+                warn "The SPA bundle at $asset is NOT being served. The site will be blank for"
+                warn "any visitor without a cached copy. Check that caddy restarted:"
+                warn "  ${COMPOSE[*]} up -d --force-recreate caddy"
+            fi
+        fi
+    fi
 }
 
 find_latest_complete_snapshot() {
@@ -202,6 +481,26 @@ prune_backups() {
     done || true
 }
 
+restore_sql_preamble() {
+    # What runs ahead of the dump, inside the same transaction. pg_dump --clean
+    # drops only the objects it dumped, so a table the failed release created is
+    # not in the dump and survives a restore — while the restored
+    # django_migrations says its migration never ran. The next migrate then dies
+    # on "relation already exists", after the snapshot, and rolls back again:
+    # a retry loop with no way out except a shell. Dropping the schema first
+    # makes the restore a replacement rather than an overlay. Inside the single
+    # transaction, so a restore that fails leaves the schema exactly as it was.
+    #
+    # lock_timeout bounds how long the drop waits for the locks it needs; the
+    # dump resets it to 0 in its own preamble, which is fine — once the drop has
+    # its locks nothing else in the restore contends with anyone.
+    cat <<SQL
+SET lock_timeout = '$RESTORE_LOCK_TIMEOUT';
+DROP SCHEMA IF EXISTS public CASCADE;
+CREATE SCHEMA public;
+SQL
+}
+
 # ── Rollback path ─────────────────────────────────────────────────────────────
 
 if [ "$ROLLBACK" = true ]; then
@@ -217,20 +516,21 @@ if [ "$ROLLBACK" = true ]; then
     [ -f "$latest/MANIFEST" ] && cat "$latest/MANIFEST"
     confirm "Restore database + .env from this snapshot? Current data will be overwritten." \
         || die "Rollback aborted."
+    write_maintenance_flag rolling_back "The platform is being rolled back to the previous release."
     ensure_db_up
-    info "Stopping application services"
-    "${COMPOSE[@]}" stop web celery celery-beat || true
+    stop_app_services
     info "Restoring database (single transaction — all or nothing)"
-    # --single-transaction + ON_ERROR_STOP: the restore commits or rolls back as
-    # one unit, so a failure leaves the database exactly as it was rather than
-    # half-restored. On failure we stop here — .env is untouched and the stack is
-    # not recreated — so the operator never lands in a partially-recovered state.
+    # --single-transaction + ON_ERROR_STOP: the schema drop and the restore commit
+    # or roll back as one unit, so a failure leaves the database exactly as it
+    # was rather than half-restored. On failure we stop here — .env is untouched
+    # and the stack is not recreated — so the operator never lands in a
+    # partially-recovered state.
     # SC2016: $POSTGRES_* must expand inside the db container's shell, not here.
     # shellcheck disable=SC2016
-    if ! gunzip -c "$latest/db.sql.gz" \
+    if ! { restore_sql_preamble; gunzip -c "$latest/db.sql.gz"; } \
             | "${COMPOSE[@]}" exec -T db sh -c 'psql --single-transaction -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB"' \
                 >/dev/null; then
-        die "Database restore FAILED and was rolled back — the database is unchanged, .env was not touched, and the stack was not recreated. Investigate before retrying."
+        die "Database restore FAILED and was rolled back — the database is unchanged, .env was not touched, and the stack was not recreated. If the error above is a lock timeout, something is still connected to the database (a backup in progress, a shell); see pg_stat_activity. Investigate before retrying."
     fi
     ok "Database restored"
     cp "$latest/.env" ./.env
@@ -279,9 +579,11 @@ if [ "$ROLLBACK" = true ]; then
         # `build web` leaves the migrate image holding the code being rolled
         # back — and the recreate below then applies the very migrations the
         # rollback just undid, to the data it just restored. Observed exactly
-        # that before this line said `build` instead of `build web`.
+        # that before this line said `build` instead of `build web`. The vendor
+        # profile for the same reason the update build names it: the vendoring
+        # steps below run from that image.
         info "Rebuilding images from the restored code"
-        "${COMPOSE[@]}" build
+        "${COMPOSE[@]}" --profile vendor build
         ok "Images rebuilt"
         CODE_RESTORED=true
     else
@@ -292,8 +594,14 @@ if [ "$ROLLBACK" = true ]; then
         warn "data, it is about to destroy it again. Re-apply a known-good archive first."
     fi
 
-    info "Recreating containers"
-    "${COMPOSE[@]}" up -d --force-recreate web celery celery-beat
+    # The same tail an update runs after its build. Static storage is not
+    # manifest-based, so a stale hashed file would merely linger; the vendored
+    # trees are what matter, since a newer Pyodide closure vendored by the
+    # failed release would otherwise sit under the restored viewer.
+    collect_static
+    refresh_vendored_assets
+    recreate_stack
+    wait_for_health
     echo
     if [ "$CODE_RESTORED" = true ]; then
         ok "Rollback complete — database, .env and code restored."
@@ -354,8 +662,13 @@ would then fail on its first write. Fix the ownership and re-run:
     fi
 fi
 
-
 # ── 0. Snapshot the current code, BEFORE anything overwrites it ───────────────
+# The maintenance flag goes up first. The database dump is taken in step 2 and
+# the services keep running until step 4, with the image build in between —
+# minutes on a small host — so every write in that gap is one a rollback loses.
+# With the flag up, the platform declines them instead.
+write_maintenance_flag updating "The platform is being updated."
+
 # Placement is the whole point. Step 1 rsyncs the new tree over the deployment,
 # so a code snapshot taken with the database in step 2 captures the *new* code
 # and is worthless for rollback — the restore puts the failing version back and
@@ -372,8 +685,8 @@ fi
 # static/ plus frontend/vendor, which the containers write as root, so an
 # unprivileged restore cannot set their timestamps and tar fails the whole
 # extraction on "Cannot utime". static/ is regenerated by the collectstatic step
-# below; frontend/vendor is not, which is why step 6a re-vendors it whenever the
-# tree does not match its own lock.
+# below; frontend/vendor is not, which is why the vendoring step re-vendors it
+# whenever the tree does not match its own lock.
 stamp="$(date -u +%Y%m%d-%H%M%S)"
 snap="$BACKUP_DIR/pre-update-$stamp"
 if [ "$BACKUP" = true ]; then
@@ -408,8 +721,7 @@ if [ "$MODE" = archive ]; then
     command -v rsync >/dev/null 2>&1 || die "rsync is required for archive mode (apt-get install rsync)."
 
     info "Applying archive: $ARCHIVE"
-    tmp="$(mktemp -d)"
-    trap 'rm -rf "$tmp"' EXIT
+    tmp="$(mktemp -d)"   # removed by the exit trap
     tar -xzf "$ARCHIVE" -C "$tmp"
     # Distribution tars wrap their contents in a single versioned top-level dir;
     # descend into it so the sync targets the deployment files, not the wrapper.
@@ -549,7 +861,7 @@ if [ "$BACKUP" = true ]; then
     ok ".env + manifest saved"
 
     # If borgmatic is wired up and running, take a full backup too (data volumes).
-    if [ -x ./scripts/backup.sh ] && "${COMPOSE[@]}" ps borg 2>/dev/null | grep -q "running\|Up"; then
+    if [ -x ./scripts/backup.sh ] && service_running borg; then
         info "Borg is enabled — taking a full backup"
         ./scripts/backup.sh || warn "Borg backup reported an error; the local snapshot is still in place."
     fi
@@ -562,18 +874,16 @@ fi
 # ── 3. Build the image ────────────────────────────────────────────────────────
 
 info "Building Docker images"
-# --profile vendor so the one-shot writer used in steps 6a and 6b is built here
-# with everything else. Its image is the same one web runs, so this costs a cache
-# hit and a tag; left out, the build happens inside step 6a instead, where a
-# failure reads as a vendoring failure.
+# --profile vendor so the one-shot writer used by the vendoring step is built
+# here with everything else. Its image is the same one web runs, so this costs a
+# cache hit and a tag; left out, the build happens inside that step instead,
+# where a failure reads as a vendoring failure.
 "${COMPOSE[@]}" --profile vendor build
 ok "Images built"
 
 # ── 4. Stop application services (so nothing races the schema change) ─────────
 
-info "Stopping application services"
-"${COMPOSE[@]}" stop web celery celery-beat || true
-ok "Application services stopped"
+stop_app_services
 
 # ── 5. Apply ALL pending migrations ───────────────────────────────────────────
 
@@ -582,140 +892,18 @@ info "Applying database migrations"
 "${COMPOSE[@]}" run --rm --no-deps web python manage.py migrate
 ok "Migrations applied"
 
-# ── 6. Collect static files ───────────────────────────────────────────────────
+# ── 6. Collect static files, refresh the vendored trees ───────────────────────
 
-info "Collecting static files"
-"${COMPOSE[@]}" run --rm --no-deps web python manage.py collectstatic --no-input
-ok "Static files collected"
-
-# ── 6a. Install the pinned viewer edition if it drifted ───────────────────────
-# A pull can move frontend/viewer-pin.json, so the check runs every update; it is
-# a local stamp comparison, so the common case costs nothing. An empty pin
-# verifies clean — that is a deployment still building the edition from the
-# checkout, not a broken one.
-#
-# After the image build above, not beside the frontend build: production gives
-# the `vendor` service no /code bind, so it reads the pin baked into the image,
-# and running this earlier would install the edition the *previous* pin named.
-# --user because the production overlay runs the service as root for the Pyodide
-# tree, while viewer-dist is inside the code snapshot a rollback restores with
-# rsync as the deploy user — root-owned files there would survive the rollback.
-
-if "${COMPOSE[@]}" --profile vendor run --rm --no-deps -T --user 1000:1000 vendor \
-        python manage.py vendor_viewer --check > /dev/null 2>&1; then
-    ok "Viewer edition matches the pin"
-else
-    info "Installing the pinned viewer edition"
-    "${COMPOSE[@]}" --profile vendor run --rm --no-deps -T --user 1000:1000 vendor \
-        python manage.py vendor_viewer
-    ok "Viewer edition installed"
-fi
-
-# ── 6b. Vendor the Pyodide runtime if it is missing or incomplete ─────────────
-# The tree is excluded from this script's rsync so a deployment keeps its own
-# copy, which means an update never creates one: a fresh host, a restored
-# snapshot, or a version bump in settings all arrive here with nothing to serve.
-# The check is a local hash sweep, so the common case costs a second and the
-# vendoring runs only when it has to.
-#
-# This step and the next write through the `vendor` service: web mounts the tree
-# read-only in production, so it is the one container that cannot populate it.
-
-if "${COMPOSE[@]}" --profile vendor run --rm --no-deps -T vendor python manage.py vendor_pyodide --check > /dev/null 2>&1; then
-    ok "Pyodide runtime present"
-else
-    info "Vendoring the Pyodide runtime"
-    "${COMPOSE[@]}" --profile vendor run --rm --no-deps -T vendor python manage.py vendor_pyodide
-    ok "Pyodide runtime vendored"
-fi
-
-# ── 6c. Regenerate the static lead fields ─────────────────────────────────────
-# The other half of the vendored tree, and computed rather than downloaded, so it
-# runs unconditionally: a couple of seconds, and regenerating is the only way a
-# change to the generator's montages or grid parameters reaches the deployment.
-# Blob filenames carry a content hash, so an unchanged field keeps its name and
-# every cached copy stays valid. Needs the migrated database (it also refreshes
-# the LeadFieldCache rows the compute API serves from), which step 5 has ensured.
-
-info "Generating static lead fields"
-"${COMPOSE[@]}" --profile vendor run --rm --no-deps -T vendor python manage.py generate_compute_static
-ok "Static lead fields generated"
+collect_static
+refresh_vendored_assets
 
 # ── 7. Recreate the application containers ────────────────────────────────────
-# --force-recreate so a changed .env is re-read (the prod overlay bakes env at
-# container-creation time; a plain restart keeps the stale value). Scoped to the
-# app services — db / redis stay up so the database is never bounced.
 
-info "Recreating containers"
-"${COMPOSE[@]}" up -d --force-recreate web celery celery-beat
-# Caddy serves /assets/, /viewer/ and /static/ straight off bind mounts, so it
-# has to be recreated after the tree underneath it changes — a running container
-# holds the mount it was started with. Left out, an archive update takes the SPA
-# offline while Django reports healthy.
-if [ "$PROXY_ENABLED" = true ]; then
-    "${COMPOSE[@]}" up -d --force-recreate caddy
-fi
-ok "Stack is up"
+recreate_stack
 
 # ── 8. Health check + summary ─────────────────────────────────────────────────
 
-PORT="$(grep -E '^HOST_PORT=' .env | head -1 | cut -d= -f2- | tr -d ' "' || true)"
-PORT="${PORT:-8000}"
-info "Waiting for the platform to become ready"
-ready=false
-for _ in $(seq 1 60); do
-    if curl -fsS "http://localhost:${PORT}/api/v1/health" >/dev/null 2>&1; then
-        ready=true
-        break
-    fi
-    sleep 2
-done
-if [ "$ready" = true ]; then
-    ok "Health check passed"
-else
-    warn "Health check did not pass within the timeout; check '${COMPOSE[*]} logs web'."
-fi
-
-# The health endpoint says Django is answering. It says nothing about whether the
-# SPA can load, and those are separable: the bundles are served off disk by the
-# proxy, so the site can be entirely unusable to a new visitor while /api/v1/health
-# returns 200. That state shipped once and went unnoticed for a day, because the
-# hashed bundles are cached `immutable` and every browser that had already loaded
-# the page kept working. Fetch a real asset, named by the index.html just
-# installed, so the check fails on exactly what a first-time visitor would hit.
-if [ "$PROXY_ENABLED" = true ] && [ -f frontend/dist/index.html ]; then
-    asset="$(grep -oE '/assets/[A-Za-z0-9._-]+\.js' frontend/dist/index.html | head -1 || true)"
-    domain="$(grep -E '^PROXY_DOMAIN=' .env | head -1 | cut -d= -f2- | tr -d ' "' || true)"
-    if [ -n "$asset" ] && [ -n "$domain" ]; then
-        info "Verifying the SPA bundle is servable"
-        # --resolve pins the name to this host so the check tests the local proxy
-        # rather than whatever DNS points at, while still presenting the SNI the
-        # certificate was issued for.
-        # Retried, because the check runs seconds after caddy was recreated and a
-        # starting proxy refuses the TLS handshake outright — reported by curl as
-        # exit 35, which is indistinguishable here from a genuinely unservable
-        # bundle. A single attempt therefore warned on every successful update,
-        # and a check that cries wolf is worse than no check: it trains the
-        # operator to skip the one signal that would have caught the real outage
-        # this block exists to detect.
-        spa_served=false
-        for _ in $(seq 1 10); do
-            if curl -fsS -o /dev/null --max-time 15 \
-                --resolve "${domain}:443:127.0.0.1" "https://${domain}${asset}"; then
-                spa_served=true
-                break
-            fi
-            sleep 3
-        done
-        if [ "$spa_served" = true ]; then
-            ok "SPA bundle served ($asset)"
-        else
-            warn "The SPA bundle at $asset is NOT being served. The site will be blank for"
-            warn "any visitor without a cached copy. Check that caddy restarted:"
-            warn "  ${COMPOSE[*]} up -d --force-recreate caddy"
-        fi
-    fi
-fi
+wait_for_health
 
 echo
 "${COMPOSE[@]}" ps

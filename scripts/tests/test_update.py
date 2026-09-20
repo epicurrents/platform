@@ -12,6 +12,7 @@ dry-run, like the bootstrap-script tests.
 """
 
 import gzip as gzlib
+import json
 import subprocess
 
 import pytest
@@ -43,6 +44,20 @@ def _index_of(calls, substring):
     return -1
 
 
+def _docker_stub(*extra_cases):
+    """A DOCKER_PS_RUNNING-shaped stub with extra ``case`` arms ahead of the defaults.
+
+    Each arm is a complete ``pattern) body ;;`` string. Placed first so a test can
+    make one compose call misbehave — a service that is not running, a step that
+    fails — while everything else keeps the running-stack answers.
+    """
+    return "\ncase \"$*\" in\n" + "\n".join(extra_cases) + r"""
+    *" ps "*) echo running ;;
+    *" exec "*) cat >/dev/null 2>&1 || true ;;
+esac
+"""
+
+
 def _deploy(fakebin, tmp_path, **env):
     """Set up a fake deployment root: a .env plus running-container stubs."""
     make_env(tmp_path, **env)
@@ -52,6 +67,12 @@ def _deploy(fakebin, tmp_path, **env):
     tmp_path.chmod(0o777)
     fakebin.stub("docker", body=DOCKER_PS_RUNNING)
     fakebin.stub("cp", body=REAL_CP)
+
+
+def _read_flag(root):
+    flag = root / "update" / "maintenance.json"
+    assert flag.is_file(), "no maintenance flag at update/maintenance.json"
+    return json.loads(flag.read_text())
 
 
 #: The preflight reads ownership with `stat -c`, which is GNU-only — the guard is a
@@ -379,7 +400,7 @@ mkdir -p "$dir/pkg"
 
 
 class TestRollback:
-    def _seed_snapshot(self, tmp_path, *, with_db=True, with_env=True):
+    def _seed_snapshot(self, tmp_path, *, with_db=True, with_env=True, with_code=False):
         snap = tmp_path / "backups" / "pre-update-20200101-000000"
         snap.mkdir(parents=True)
         if with_db:
@@ -387,6 +408,12 @@ class TestRollback:
                 fh.write("-- dump\nSELECT 1;\n")
         if with_env:
             (snap / ".env").write_text("DJANGO_MODE=production\nHOST_PORT=8000\n")
+        if with_code:
+            # A real, readable archive: the script lists it before restoring.
+            tree = tmp_path / "snapshot-tree"
+            tree.mkdir()
+            (tree / "docker-compose.yml").write_text("services: {}\n")
+            subprocess.run(["tar", "-czf", str(snap / "code.tar.gz"), "-C", str(tree), "."], check=True)
         (snap / "MANIFEST").write_text("mode=archive\n")
         return snap
 
@@ -418,6 +445,307 @@ class TestRollback:
         # All-or-nothing: a refused rollback must not have restored or recreated.
         assert not fakebin.has_call("psql --single-transaction")
         assert not fakebin.has_call("--force-recreate")
+
+    def test_the_restore_replaces_the_schema_inside_the_same_transaction(self, fakebin, tmp_path):
+        """pg_dump --clean drops only what it dumped, so a table the failed release
+        created survives a plain restore while the restored django_migrations says
+        its migration never ran; the next migrate dies on "relation already
+        exists" and rolls back again, forever. The stream psql receives has to
+        drop and recreate the schema *before* the dump, and inside the one
+        transaction, so a failed restore still leaves the schema as it was. What
+        PostgreSQL then does with that stream is test_update_postgres.py's job.
+        """
+        _deploy(fakebin, tmp_path)
+        self._seed_snapshot(tmp_path)
+        capture = tmp_path / "restore-stdin.sql"
+        fakebin.stub("docker", body=_docker_stub(f'*" exec "*) cat > "{capture}" ;;'))
+        result = run_script("update.sh", fakebin, cwd=tmp_path, args=["--rollback", "--yes"])
+        assert result.returncode == 0, result.stderr
+        stream = capture.read_text()
+        drop = stream.index("DROP SCHEMA IF EXISTS public CASCADE;")
+        create = stream.index("CREATE SCHEMA public;")
+        dump = stream.index("-- dump")
+        assert stream.index("SET lock_timeout") < drop < create < dump, stream
+        # One transaction for the preamble and the dump alike — a separate psql
+        # call for the drop would commit an empty schema before the restore began.
+        restores = [c for c in fakebin.calls() if "psql" in c]
+        assert len(restores) == 1 and "--single-transaction" in restores[0], restores
+
+    def test_the_restore_waits_a_bounded_time_for_its_locks(self, fakebin, tmp_path):
+        # Anything still holding a share lock — a backup dumping the database —
+        # blocks the schema drop; without a bound the rollback hangs instead of
+        # failing. The bound is overridable so the real-database test can make it
+        # short, and nothing else should ever set it.
+        _deploy(fakebin, tmp_path)
+        self._seed_snapshot(tmp_path)
+        capture = tmp_path / "restore-stdin.sql"
+        fakebin.stub("docker", body=_docker_stub(f'*" exec "*) cat > "{capture}" ;;'))
+        run_script(
+            "update.sh", fakebin, cwd=tmp_path, args=["--rollback", "--yes"],
+            extra_env={"UPDATE_RESTORE_LOCK_TIMEOUT": "7s"},
+        )
+        assert "SET lock_timeout = '7s';" in capture.read_text()
+
+    def test_rollback_reruns_the_post_build_steps_and_checks_health(self, fakebin, tmp_path):
+        """A rollback used to rebuild the images and recreate the stack, and stop
+        there. The failed release's vendored assets stayed under the restored
+        code, its collected static files stayed in the volume, and nothing
+        checked the result was serving — the one run where that check matters
+        most. After the rebuild a rollback runs the same tail an update does.
+        """
+        _deploy(fakebin, tmp_path)
+        self._seed_snapshot(tmp_path, with_code=True)
+        # Stubbed: the real rsync --delete would sweep the harness out of tmp_path.
+        fakebin.stub("rsync")
+        fakebin.stub("curl")
+        result = run_script("update.sh", fakebin, cwd=tmp_path, args=["--rollback", "--yes"])
+        assert result.returncode == 0, result.stderr
+        calls = fakebin.calls()
+        restore_i = _index_of(calls, "psql --single-transaction")
+        build_i = _index_of(calls, "--profile vendor build")
+        static_i = _index_of(calls, "manage.py collectstatic")
+        viewer_i = _index_of(calls, "vendor_viewer --check")
+        pyodide_i = _index_of(calls, "vendor_pyodide --check")
+        leadfield_i = _index_of(calls, "generate_compute_static")
+        recreate_i = _index_of(calls, "--force-recreate web celery celery-beat")
+        health_i = _index_of(calls, "/api/v1/health")
+        order = [restore_i, build_i, static_i, viewer_i, pyodide_i, leadfield_i, recreate_i, health_i]
+        assert all(i > -1 for i in order), f"a rollback step is missing: {order}"
+        assert order == sorted(order), f"expected restore → build → static → vendor → recreate → health, got {order}"
+
+    def test_rollback_builds_the_vendor_profile_too(self, fakebin, tmp_path):
+        # The vendoring steps run from the `vendor` service's image, which a bare
+        # `build` skips; they would then build it themselves, from the restored
+        # code, which happens to be right but reads as a vendoring failure when
+        # it is not.
+        _deploy(fakebin, tmp_path)
+        self._seed_snapshot(tmp_path, with_code=True)
+        fakebin.stub("rsync")
+        result = run_script("update.sh", fakebin, cwd=tmp_path, args=["--rollback", "--yes"])
+        assert result.returncode == 0, result.stderr
+        builds = [c for c in fakebin.calls() if c.rstrip().endswith(" build")]
+        assert builds and all("--profile vendor" in c for c in builds), builds
+
+
+class TestBorgPause:
+    """borg dumps the database on its own clock, inside the container, and a dump
+    in progress holds share locks on every table. A migration's ALTER TABLE queues
+    behind it; the rollback's schema drop waits on it for good. The container is
+    stopped for the span of either operation and started again only if it was
+    running before.
+    """
+
+    def test_an_update_stops_borg_before_migrating_and_restarts_it_after(self, fakebin, tmp_path):
+        _deploy(fakebin, tmp_path)
+        result = run_script("update.sh", fakebin, cwd=tmp_path, args=["--from", "repo", "--no-pull"])
+        assert result.returncode == 0, result.stderr
+        calls = fakebin.calls()
+        stop_i = _index_of(calls, "stop web celery celery-beat borg")
+        migrate_i = _index_of(calls, "manage.py migrate")
+        recreate_i = _index_of(calls, "--force-recreate web celery")
+        start_i = _index_of(calls, "up -d borg")
+        assert -1 < stop_i < migrate_i < recreate_i < start_i, (
+            f"stop={stop_i} migrate={migrate_i} recreate={recreate_i} start={start_i}"
+        )
+
+    def test_a_rollback_stops_borg_before_the_restore(self, fakebin, tmp_path):
+        _deploy(fakebin, tmp_path)
+        TestRollback()._seed_snapshot(tmp_path)
+        result = run_script("update.sh", fakebin, cwd=tmp_path, args=["--rollback", "--yes"])
+        assert result.returncode == 0, result.stderr
+        calls = fakebin.calls()
+        stop_i = _index_of(calls, "stop web celery celery-beat borg")
+        restore_i = _index_of(calls, "psql --single-transaction")
+        start_i = _index_of(calls, "up -d borg")
+        assert -1 < stop_i < restore_i < start_i, f"stop={stop_i} restore={restore_i} start={start_i}"
+
+    def test_borg_is_not_started_on_a_deployment_that_did_not_run_it(self, fakebin, tmp_path):
+        # A deployment with backups turned off has the service defined and never
+        # started; an update must not be what starts it.
+        _deploy(fakebin, tmp_path)
+        fakebin.stub("docker", body=_docker_stub('*" ps borg") ;;'))
+        result = run_script("update.sh", fakebin, cwd=tmp_path, args=["--from", "repo", "--no-pull"])
+        assert result.returncode == 0, result.stderr
+        assert fakebin.has_call("stop web celery celery-beat borg")
+        assert not fakebin.has_call("up -d borg")
+
+
+class TestSkipBeat:
+    """The database scheduler fires every periodic task that came due while beat
+    was down the moment it starts, so a purge that fell due during the build
+    unlinks files seconds after the recreate — files a rollback restores the rows
+    for and cannot bring back. --skip-beat leaves beat stopped for whoever is
+    verifying the update to start.
+    """
+
+    def test_beat_is_recreated_by_default(self, fakebin, tmp_path):
+        _deploy(fakebin, tmp_path)
+        run_script("update.sh", fakebin, cwd=tmp_path, args=["--from", "repo", "--no-pull"])
+        assert fakebin.has_call("--force-recreate web celery celery-beat")
+
+    def test_skip_beat_leaves_it_stopped_and_says_so(self, fakebin, tmp_path):
+        _deploy(fakebin, tmp_path)
+        result = run_script("update.sh", fakebin, cwd=tmp_path, args=["--from", "repo", "--no-pull", "--skip-beat"])
+        assert result.returncode == 0, result.stderr
+        assert fakebin.has_call("stop web celery celery-beat"), "beat must still be stopped with the rest"
+        started = [c for c in fakebin.calls() if " up " in c and "celery-beat" in c]
+        assert not started, f"--skip-beat must not start celery-beat: {started}"
+        assert fakebin.has_call("--force-recreate web celery")
+        assert "up -d celery-beat" in result.stdout, "the operator is not told how to start beat"
+
+    def test_skip_beat_applies_to_a_rollback(self, fakebin, tmp_path):
+        _deploy(fakebin, tmp_path)
+        TestRollback()._seed_snapshot(tmp_path)
+        result = run_script("update.sh", fakebin, cwd=tmp_path, args=["--rollback", "--yes", "--skip-beat"])
+        assert result.returncode == 0, result.stderr
+        started = [c for c in fakebin.calls() if " up " in c and "celery-beat" in c]
+        assert not started, started
+
+
+class TestRootFlag:
+    """The script derives its root from its own location, which is wrong for a
+    copy run from outside the deployment: it resolves to the copy's parent and
+    snapshots, syncs and locks the wrong tree. --root names the deployment.
+    """
+
+    def _deployment(self, tmp_path):
+        deploy = tmp_path / "deploy"
+        deploy.mkdir()
+        deploy.chmod(0o777)
+        make_env(deploy)
+        (deploy / "docker-compose.yml").write_text("services: {}\n")
+        return deploy
+
+    def test_root_points_every_step_at_the_named_deployment(self, fakebin, tmp_path):
+        deploy = self._deployment(tmp_path)
+        agent = tmp_path / "agent"
+        agent.mkdir()
+        fakebin.stub("docker", body=DOCKER_PS_RUNNING)
+        fakebin.stub("cp", body=REAL_CP)
+        result = run_script(
+            "update.sh", fakebin, cwd=agent,
+            args=["--root", str(deploy), "--from", "repo", "--no-pull", "--keep-lock"],
+        )
+        assert result.returncode == 0, result.stderr
+        snapshots = list((deploy / "backups").glob("pre-update-*"))
+        assert len(snapshots) == 1 and (snapshots[0] / "db.sql.gz").is_file(), snapshots
+        assert (deploy / "update" / "maintenance.json").is_file()
+        assert not (agent / "backups").exists(), "the snapshot landed beside the script instead of in the deployment"
+        assert not (agent / "update").exists()
+
+    def test_root_without_a_compose_file_is_refused(self, fakebin, tmp_path):
+        elsewhere = tmp_path / "elsewhere"
+        elsewhere.mkdir()
+        make_env(elsewhere)
+        result = run_script("update.sh", fakebin, cwd=tmp_path, args=["--root", str(elsewhere)])
+        assert result.returncode != 0
+        assert "does not look like a deployment" in result.stderr
+
+    def test_root_that_does_not_exist_is_refused(self, fakebin, tmp_path):
+        result = run_script("update.sh", fakebin, cwd=tmp_path, args=["--root", str(tmp_path / "nope")])
+        assert result.returncode != 0
+        assert "no such directory" in result.stderr
+
+
+class TestMaintenanceFlag:
+    """update/maintenance.json is up for the whole run, so the platform can
+    decline writes that a rollback would lose — the dump is taken in step 2 and
+    the services keep running through the image build. A file rather than a row,
+    because the rollback restores the database and would erase a row mid-way.
+    """
+
+    def test_the_flag_is_present_during_the_run_and_gone_after(self, fakebin, tmp_path):
+        _deploy(fakebin, tmp_path)
+        seen = tmp_path / "flag-during-migrate.json"
+        # The stub runs with the deployment as its working directory, so it can
+        # copy the flag out while the script is between steps.
+        fakebin.stub("docker", body=_docker_stub(f'*"manage.py migrate"*) /bin/cp update/maintenance.json "{seen}" ;;'))
+        result = run_script("update.sh", fakebin, cwd=tmp_path, args=["--from", "repo", "--no-pull"])
+        assert result.returncode == 0, result.stderr
+        flag = json.loads(seen.read_text())
+        assert flag["phase"] == "updating"
+        assert flag["protocol"] == 1
+        assert flag["job_id"] is None and flag["expected_until"] is None
+        assert flag["since"].endswith("Z") and "T" in flag["since"]
+        assert flag["message"]
+        assert not (tmp_path / "update" / "maintenance.json").exists(), "the flag outlived a successful run"
+
+    def test_the_flag_goes_up_before_the_code_snapshot(self, fakebin, tmp_path):
+        # Step 0 is the first thing that touches the tree; the flag precedes it.
+        body = (SCRIPTS_DIR / "update.sh").read_text()
+        assert body.index("write_maintenance_flag updating") < body.index('snap="$BACKUP_DIR/pre-update-$stamp"')
+
+    def test_a_rollback_announces_itself_as_rolling_back(self, fakebin, tmp_path):
+        _deploy(fakebin, tmp_path)
+        TestRollback()._seed_snapshot(tmp_path)
+        result = run_script("update.sh", fakebin, cwd=tmp_path, args=["--rollback", "--yes", "--keep-lock"])
+        assert result.returncode == 0, result.stderr
+        assert _read_flag(tmp_path)["phase"] == "rolling_back"
+
+    def test_keep_lock_leaves_the_flag_after_success(self, fakebin, tmp_path):
+        _deploy(fakebin, tmp_path)
+        result = run_script("update.sh", fakebin, cwd=tmp_path, args=["--from", "repo", "--no-pull", "--keep-lock"])
+        assert result.returncode == 0, result.stderr
+        assert _read_flag(tmp_path)["phase"] == "updating"
+
+    def test_keep_lock_never_overwrites_a_flag_the_caller_wrote(self, fakebin, tmp_path):
+        # A caller that manages the flag carries its own fields in it (a job id,
+        # an expected end); the script's own flag would erase them.
+        _deploy(fakebin, tmp_path)
+        (tmp_path / "update").mkdir()
+        theirs = '{"protocol": 1, "phase": "updating", "job_id": "abc", "since": "x", "expected_until": null, "message": "m"}\n'
+        (tmp_path / "update" / "maintenance.json").write_text(theirs)
+        result = run_script("update.sh", fakebin, cwd=tmp_path, args=["--from", "repo", "--no-pull", "--keep-lock"])
+        assert result.returncode == 0, result.stderr
+        assert (tmp_path / "update" / "maintenance.json").read_text() == theirs
+
+    def test_a_stale_flag_is_replaced_without_keep_lock(self, fakebin, tmp_path):
+        _deploy(fakebin, tmp_path)
+        (tmp_path / "update").mkdir()
+        (tmp_path / "update" / "maintenance.json").write_text('{"phase": "rolling_back", "job_id": "old"}\n')
+        seen = tmp_path / "flag-during-migrate.json"
+        fakebin.stub("docker", body=_docker_stub(f'*"manage.py migrate"*) /bin/cp update/maintenance.json "{seen}" ;;'))
+        result = run_script("update.sh", fakebin, cwd=tmp_path, args=["--from", "repo", "--no-pull"])
+        assert result.returncode == 0, result.stderr
+        assert json.loads(seen.read_text())["phase"] == "updating"
+
+    def test_a_failure_before_the_stack_is_stopped_removes_the_flag(self, fakebin, tmp_path):
+        # Nothing changed and the platform is still serving, so the flag would
+        # only lock everyone out of a working deployment.
+        _deploy(fakebin, tmp_path)
+        fakebin.stub("docker", body=_docker_stub('*"--profile vendor build"*) exit 1 ;;'))
+        result = run_script("update.sh", fakebin, cwd=tmp_path, args=["--from", "repo", "--no-pull"])
+        assert result.returncode != 0
+        assert not fakebin.has_call("stop web celery")
+        assert not (tmp_path / "update" / "maintenance.json").exists()
+
+    def test_a_failure_after_the_stack_is_stopped_leaves_the_flag_and_says_so(self, fakebin, tmp_path):
+        # The stack is down and not coming back on its own; the flag is what
+        # tells anyone who reaches the platform why.
+        _deploy(fakebin, tmp_path)
+        fakebin.stub("docker", body=_docker_stub('*"manage.py migrate"*) exit 1 ;;'))
+        result = run_script("update.sh", fakebin, cwd=tmp_path, args=["--from", "repo", "--no-pull"])
+        assert result.returncode != 0
+        assert fakebin.has_call("stop web celery")
+        assert _read_flag(tmp_path)["phase"] == "updating"
+        assert "Leaving the maintenance flag in place" in result.stdout
+
+    def test_a_failed_restore_leaves_the_flag(self, fakebin, tmp_path):
+        _deploy(fakebin, tmp_path)
+        TestRollback()._seed_snapshot(tmp_path)
+        fakebin.stub("docker", body=_docker_stub('*"psql --single-transaction"*) cat >/dev/null; exit 1 ;;'))
+        result = run_script("update.sh", fakebin, cwd=tmp_path, args=["--rollback", "--yes"])
+        assert result.returncode != 0
+        assert "restore FAILED" in result.stderr
+        assert _read_flag(tmp_path)["phase"] == "rolling_back"
+
+    def test_the_flag_directory_survives_both_directions(self):
+        # The update overlay and the rollback replace both exclude update/, and
+        # the code snapshot leaves it out, so neither direction can touch the flag.
+        body = (SCRIPTS_DIR / "update.sh").read_text()
+        assert body.count("--exclude='/update/'") == 1, "archive overlay no longer excludes update/"
+        assert body.count('--exclude="update/"') == 1, "rollback replace no longer excludes update/"
+        assert body.count('--exclude="./update"') == 1, "code snapshot no longer excludes update/"
 
 
 class TestUpdateShProxyOverlay:

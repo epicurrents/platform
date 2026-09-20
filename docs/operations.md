@@ -514,16 +514,29 @@ Re-export after any `borg key change-passphrase`, and after initialising any fur
 
 `scripts/update.sh` updates a running deployment and recreates its stack from one of two sources, then runs a shared tail: back up, rebuild the image, apply **all** pending migrations, collect static files, and recreate the application containers on the production overlay.
 
-**From a distribution archive (default)** — for a deployment installed from a distribution tarball, with no git checkout. Drop the newer `epicurrents*.tar.gz` into `./update/`, then run `./update.sh` from the deployment root. The newest matching archive is applied over the deployment, preserving `.env` and the data volumes.
+**From a distribution archive (default)** — for a deployment installed from a distribution tarball, with no git checkout. Drop the newer `epicurrents*.tar.gz` into `./update/`, then run `./update.sh` from the deployment root. The newest matching archive is applied over the deployment, preserving `.env` and the data volumes. The glob looks at `./update/` itself, not its subdirectories; a package that sits anywhere else is named with `--archive FILE`.
 
 **From git** — for a checkout that follows the upstream platform:
 
 ```bash
 scripts/update.sh --from repo            # git pull + frontend build, then the tail
 scripts/update.sh --from repo --no-pull  # rebuild the current checkout (e.g. in CI, or after a manual checkout)
+scripts/update.sh --skip-beat            # either mode: leave celery-beat stopped until the update is verified
 ```
 
-Before touching anything, `update.sh` writes a pre-update snapshot — the code tree, then a database dump plus `.env` — under `./backups/` (and a full borg backup when borg is enabled). Undo the last update with `./update.sh --rollback`, which restores the most recent complete snapshot's database, `.env` and code, rebuilds the images from the restored code and recreates the stack. The rebuild is what makes the rollback real: the image carries the code, so restoring the tree alone would leave the new code running against the old schema. Only a snapshot from before code snapshots existed falls back to data and config alone, and the script says so. Writes made between the snapshot and the rollback are lost from the database, so roll back promptly or not at all.
+Before touching anything, `update.sh` writes a pre-update snapshot — the code tree, then a database dump plus `.env` — under `./backups/` (and a full borg backup when borg is enabled). Undo the last update with `./update.sh --rollback`, which restores the most recent complete snapshot's database, `.env` and code, rebuilds the images from the restored code, re-runs the static and vendoring steps an update runs, recreates the stack and polls the health endpoint. The rebuild is what makes the rollback real: the image carries the code, so restoring the tree alone would leave the new code running against the old schema. The database restore replaces the schema rather than overlaying it — a table the failed release created is gone afterwards, so a retry of the same package or the next update migrates cleanly instead of dying on a relation that already exists. It runs as one transaction, so a restore that fails leaves the database exactly as it was. Only a snapshot from before code snapshots existed falls back to data and config alone, and the script says so. Writes made between the snapshot and the rollback are lost from the database, so roll back promptly or not at all.
+
+Both directions stop `borg` alongside the application services and start it again at the end if it was running: a scheduled backup dumps the database from inside the container, and a dump in progress holds locks that a migration queues behind and the restore's schema drop would wait on for good. The restore waits a bounded time for its locks and then fails rather than hanging; a lock timeout in its output means something else is still connected to the database.
+
+While it runs, the script keeps a maintenance flag at `update/maintenance.json` with the phase (`updating` or `rolling_back`) and a timestamp. The database dump is taken before the image build, and the services keep running until the build finishes, so every write in that gap is one a rollback loses; the flag is what lets the platform decline them. It is removed at exit, unless the run failed after the stack was stopped — the platform is not serving then, and the flag is what tells anyone who reaches it why — in which case the script says so and the file is removed by hand once the deployment is repaired. `--keep-lock` leaves it in place for a caller that manages the flag itself.
+
+`--skip-beat` leaves `celery-beat` stopped after the recreate. The scheduler fires every periodic task that came due while it was down the moment it starts, so a purge that fell due during the build unlinks files seconds after the recreate — files a rollback restores the rows for and cannot bring back. Verify the update first, then start beat:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d celery-beat
+```
+
+`--root DIR` operates on the deployment at `DIR` rather than the one the script sits in, for a copy of the script kept outside the deployment tree.
 
 For development checkouts where you want manual control:
 
