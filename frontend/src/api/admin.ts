@@ -40,12 +40,16 @@ export interface Account {
     groups: GroupRef[]
     /** Roles inherited through group membership, keyed by role key. Read-only here — roles belong to groups. */
     roles: Record<string, string[]>
+    /** Display name of the identity provider this account signs in through, or null for a local account. Password controls do not apply to it. */
+    external_provider: string | null
+    /** The account was created by invitation and has not set a password yet, so the invitation can be sent again. */
+    is_invite_pending: boolean
 }
 
-/** New-account payload. Only `username` and `password` are required. */
+/** New-account payload. Only `username` is required; omitting `password` invites the holder to set their own, which needs `email`. */
 export interface AccountCreate {
     username: string
-    password: string
+    password?: string
     email?: string
     first_name?: string
     last_name?: string
@@ -121,6 +125,16 @@ export async function updateAccount(accountId: number, payload: AccountUpdate): 
  */
 export async function setAccountPassword(accountId: number, newPassword: string): Promise<void> {
     await http.post(`/api/v1/user/admin/accounts/${accountId}/password`, { new_password: newPassword })
+}
+
+/**
+ * Send the set-password invitation again.
+ *
+ * Refused by the server for an account that already has a password or signs in
+ * through a provider, so the control belongs behind `is_invite_pending`.
+ */
+export async function resendAccountInvitation (accountId: number): Promise<void> {
+    await http.post(`/api/v1/user/admin/accounts/${accountId}/invite`, {})
 }
 
 /** Clear an account's second factor, so the holder can enrol again at next sign-in. */

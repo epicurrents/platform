@@ -37,6 +37,9 @@ const creating = ref(false)
 const createError = ref('')
 const createForm = reactive({
     username: '',
+    // Off by default: the ordinary way to add someone is an invitation they
+    // answer with a password of their own, which no operator ever sees.
+    setPassword: false,
     password: '',
     email: '',
     firstName: '',
@@ -105,6 +108,7 @@ function openAccount (account: Account) {
 function openCreate () {
     createError.value = ''
     createForm.username = ''
+    createForm.setPassword = false
     createForm.password = ''
     createForm.email = ''
     createForm.firstName = ''
@@ -128,7 +132,7 @@ async function confirmCreate () {
     try {
         const account = await createAccount({
             username: createForm.username.trim(),
-            password: createForm.password,
+            ...(createForm.setPassword ? { password: createForm.password } : {}),
             email: createForm.email.trim(),
             first_name: createForm.firstName.trim(),
             last_name: createForm.lastName.trim(),
@@ -137,7 +141,15 @@ async function confirmCreate () {
             is_superuser: createForm.isSuperuser,
         })
         showCreate.value = false
-        showToast(t('Account {username} created.', SCOPE, { username: account.username }), 'success')
+        // An account created deactivated is not invited yet — the server holds
+        // the invitation back until it can be signed in to — so the toast must
+        // not claim a mail that did not go out.
+        showToast(
+            account.is_invite_pending && account.is_active
+                ? t('Account {username} created and invited by email.', SCOPE, { username: account.username })
+                : t('Account {username} created.', SCOPE, { username: account.username }),
+            'success'
+        )
         router.push({ name: 'admin-account', params: { id: String(account.id) } })
     } catch (err) {
         // The server owns every refusal here — duplicate username, rejected
@@ -277,17 +289,22 @@ onUnmounted(() => clearTimeout(searchTimer))
                 v-wa="[createForm, 'username']"
             ></wa-input>
             <wa-input
+                :label="t('Email', SCOPE)"
+                :required="!createForm.setPassword"
+                type="email"
+                v-wa="[createForm, 'email']"
+            ></wa-input>
+            <wa-switch v-wa="[createForm, 'setPassword']">{{ t('Set a password myself', SCOPE) }}</wa-switch>
+            <p v-if="!createForm.setPassword" class="form-hint">
+                {{ t('An email invites the account holder to choose their own password. The link is valid for three days and can be sent again.', SCOPE) }}
+            </p>
+            <wa-input v-if="createForm.setPassword"
                 autocomplete="new-password"
                 :label="t('Password', SCOPE)"
                 password-toggle
                 required
                 type="password"
                 v-wa="[createForm, 'password']"
-            ></wa-input>
-            <wa-input
-                :label="t('Email', SCOPE)"
-                type="email"
-                v-wa="[createForm, 'email']"
             ></wa-input>
             <wa-input :label="t('First name', SCOPE)" v-wa="[createForm, 'firstName']"></wa-input>
             <wa-input :label="t('Last name', SCOPE)" v-wa="[createForm, 'lastName']"></wa-input>
@@ -324,6 +341,12 @@ onUnmounted(() => clearTimeout(searchTimer))
 
 .admin-search {
     margin-bottom: var(--wa-space-m);
+}
+
+.form-hint {
+    color: var(--wa-color-text-quiet);
+    font-size: var(--wa-font-size-s);
+    margin: 0;
 }
 
 .admin-form {

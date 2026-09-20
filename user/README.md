@@ -82,6 +82,7 @@ Mounted at `/api/v1/user/`. Full request/response detail in [api/v1/ninja.py](ap
 | `is_staff`, `is_superuser` | Both exposed so the frontend can gate UI elements. The auth store derives `isStaff` (true when either flag is set) and `isSuperuser` (true only when `is_superuser`). |
 | `is_2fa_enabled` | Whether a confirmed second factor gates this account's password login. An unconfirmed enrolment reads as `false`. |
 | `roles` | Project-supplied roles the user inherits through group membership, keyed by the role key the active project registered (e.g. a teaching project's `course_role` → `["instructor"]`). Read through the [project-role registry](#project-roles) — the user app imports no project. Empty map when the deployment defines no roles. |
+| `external_provider` | Display name of the identity provider this account signs in through, or `null`. Set only for an account that also has no local password; see [Externally authenticated accounts](#externally-authenticated-accounts). The profile page reads it to decide whether to render a change-password form at all. |
 
 `UserSearchOut` is a smaller shape returned by `/search`: `id`, `username`, `first_name`, `last_name`. No `email` is exposed (it's PII that doesn't need to leak through search auto-complete).
 
@@ -101,9 +102,10 @@ The one endpoint below with no client is `PUT /admin/groups/{id}/members`. Both 
 |---|---|---|---|
 | `GET` | `/admin/accounts?q=&limit=&offset=` | Staff | List accounts, inactive ones included. `limit` is capped at 500. |
 | `GET` | `/admin/accounts/{id}` | Staff | One account, with group membership and project roles. |
-| `POST` | `/admin/accounts` | Superuser | Create an account. |
+| `POST` | `/admin/accounts` | Superuser | Create an account, by invitation unless a password is supplied. |
 | `PATCH` | `/admin/accounts/{id}` | Superuser | Edit account fields. Username is not editable; roles belong to groups. |
 | `POST` | `/admin/accounts/{id}/password` | Superuser | Set another account's password. |
+| `POST` | `/admin/accounts/{id}/invite` | Superuser | Send the set-password invitation again. Refused once the account has a password of its own. |
 | `DELETE` | `/admin/accounts/{id}/2fa` | Superuser | Remove an account's second factor, for a lost authenticator. See [Two-factor authentication](#two-factor-authentication-totp). |
 | `PUT` | `/admin/accounts/{id}/groups` | Superuser | Replace one account's group membership. |
 | `GET` | `/admin/groups` | Staff | Groups with member and grant counts and their project roles. |
@@ -121,6 +123,32 @@ Four rules the surface enforces, each of which has a test that fails without it:
 - **Passwords go through `AUTH_PASSWORD_VALIDATORS`.** Otherwise an operator-set password would face a lower bar than one a user sets for themselves.
 
 Setting a password deliberately does **not** flush the account's sessions. An operator setting a password is usually helping somebody back in rather than responding to a compromise, and signing them out of a viewer session mid-review is its own harm. For a compromise, deactivate the account — that does end its sessions.
+
+### Creating an account by invitation
+
+`password` on `POST /admin/accounts` is optional, and omitting it is the ordinary way to add someone. The account is created with an unusable password and `send_welcome_email` mails a set-password link, so the credential is chosen by the person who will use it and passes through nobody — where an operator-set password has to be conveyed out of band, which is where it gets written down.
+
+`email` becomes required in that case, because the invitation is the only way into the account. An invitation to an address the account does not have goes nowhere and leaves an account nobody can sign in to, with nothing reporting it.
+
+The link is Django's password-reset token, carrying `PASSWORD_RESET_TIMEOUT` (three days) and the `welcome=1` marker that changes what the page says on a dead link — a person who has never signed in cannot "request a new one", so they are told who to ask. Reusing that token rather than adding a second type keeps one expiry and one set of invalidation rules; the resend action is what covers the person who was away for the three days.
+
+`POST /admin/accounts/{id}/invite` is that resend, audited as `user.account.invite.resend`. It refuses an account that already has a password, which otherwise makes this a way for an operator to mail a password link to anyone on the roster — a request that belongs to the account holder, through password reset. It also refuses a deactivated account, an account with no address, and an externally authenticated one.
+
+`AccountOut.is_invite_pending` says whether the account is in that state, and the account page shows the resend control only when it is.
+
+The task takes a primary key and mints the token at send time, for the reason the reset task does: the broker persists its queue to an append-only file, so a rendered link would sit on disk with a live token beside the recipient's address until a rewrite that a quiet deployment may not do for months. Contract test in [tests/test_invite_flow.py](tests/test_invite_flow.py).
+
+### Externally authenticated accounts
+
+An account provisioned through OIDC has an unusable password on purpose: its access is decided by the tenant (`tid`) claim and the email-domain allowlist in [oidc.py](oidc.py), and a local password on it answers to neither. Three surfaces could put one there, and all three refuse — `request_password_reset` sends no link, `POST /me/change-password` answers 409 naming the provider, and the invitation is never sent.
+
+**`has_usable_password()` is not the discriminator**, which is the trap to know before touching any of them. An invited account has an unusable password too, until the person follows the link — so that test refuses exactly the accounts the invitation exists to serve. `is_externally_authenticated` in [identity.py](identity.py) is the single decision site, and it asks two things: the account holds an `ExternalIdentity` row, *and* it has no usable password.
+
+The second half is what separates the two ways an account comes to hold an identity. An account linked to a provider by verified email (`OIDC_LINK_BY_VERIFIED_EMAIL`) keeps the password it already had, and that password login exists either way — refusing it a reset takes away a recovery path without closing anything, since nothing new is bypassed by restoring a credential the account already uses. So it stays a local account for all three purposes, and only a provider-provisioned one is refused.
+
+The reset refusal answers `ok` like every other outcome and consumes the rate limit the same way, so nothing about it reaches the caller; it records `auth.password_reset_refused_external` in the security log instead. Where one address is shared by an external and a local account, the local one still gets its link.
+
+All of this is inert while `OIDC_ENABLED` is off, which is why [tests/test_external_identity_gate.py](tests/test_external_identity_gate.py) pins it: nothing here can be noticed by using a deployment as it is configured today, and it goes live on the day an operator turns the flag on.
 
 ### Group membership and the audit trail
 

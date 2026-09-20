@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { onMounted, reactive, ref } from 'vue'
+import { computed, onMounted, reactive, ref } from 'vue'
 import axios from 'axios'
 import { t } from '#i18n'
 import { useAuthStore } from '#stores/auth'
@@ -30,6 +30,14 @@ const input = reactive({
 const profileError = ref<string | null>(null)
 const profileSuccess = ref(false)
 const profileLoading = ref(false)
+/**
+ * The identity provider this account signs in through, when it has no password
+ * of its own. The form below is hidden rather than left to fail: submitting it
+ * is refused by the server, and the person would be reading an error about a
+ * password they never had.
+ */
+const externalProvider = computed(() => authStore.user?.external_provider ?? null)
+
 const passwordError = ref<string | null>(null)
 const passwordSuccess = ref(false)
 const passwordLoading = ref(false)
@@ -247,7 +255,10 @@ async function submitPassword () {
 
                 <section class="profile-section">
                     <h2>{{ t('Change password', SCOPE) }}</h2>
-                    <form @submit.prevent="submitPassword">
+                    <p v-if="externalProvider" class="profile-hint">
+                        {{ t('You sign in through {provider}, so your password is managed there rather than here.', SCOPE, { provider: externalProvider }) }}
+                    </p>
+                    <form v-else @submit.prevent="submitPassword">
                         <wa-callout v-if="passwordError" variant="danger">{{ passwordError }}</wa-callout>
                         <wa-callout v-if="passwordSuccess" variant="success">{{ t('Password changed.', SCOPE) }}</wa-callout>
                         <wa-input

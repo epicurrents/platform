@@ -91,3 +91,59 @@ def send_password_reset_email(self, user_id: int):
         from_email=settings.DEFAULT_FROM_EMAIL,
         recipient_list=[user.email],
     )
+
+
+@shared_task(bind=True, max_retries=3, default_retry_delay=60)
+def send_welcome_email(self, user_id: int):
+    """Render and send the invitation for a newly created account.
+
+    Carries a set-password link rather than a password: the account is created
+    with an unusable password, so this message is the only way into it, and no
+    operator ever knows the credential. The link is Django's password-reset
+    token, which keeps one token type and one expiry (``PASSWORD_RESET_TIMEOUT``,
+    three days) instead of a second mechanism that would need its own
+    invalidation rules.
+
+    A primary key for the same reason the reset task takes one — the broker
+    persists its queue to an append-only file, so a rendered link would sit on
+    disk long past the three days it is valid for.
+
+    Silently does nothing for an account that has since been deactivated,
+    deleted, given a password, or linked to an identity provider. Each of those
+    means the invitation is no longer the way in, and the send happens far
+    enough after the request for any of them to have happened in between.
+    """
+    from django.conf import settings
+    from django.contrib.auth import get_user_model
+    from django.contrib.auth.tokens import default_token_generator
+    from django.utils.encoding import force_bytes
+    from django.utils.http import urlsafe_base64_encode
+
+    from user.identity import is_externally_authenticated
+
+    try:
+        user = get_user_model().objects.get(pk=user_id, is_active=True)
+    except get_user_model().DoesNotExist:
+        return
+    if not user.email or user.has_usable_password() or is_externally_authenticated(user):
+        return
+
+    uid = urlsafe_base64_encode(force_bytes(user.pk))
+    token = default_token_generator.make_token(user)
+    # welcome=1 only changes what the page says. An invited person told their
+    # link expired and to "request a new one" has nowhere to request it from,
+    # since they cannot sign in to ask.
+    invite_url = f"{settings.FRONTEND_URL.rstrip('/')}/reset-password?uid={uid}&token={token}&welcome=1"
+
+    _deliver(
+        self,
+        subject="Your Epicurrents account is ready",
+        message=(
+            f"An account has been created for you on Epicurrents, with the username {user.username}.\n\n"
+            f"Choose a password to sign in:\n\n{invite_url}\n\n"
+            "This link expires in 3 days. If it has expired by the time you get here, ask whoever created "
+            "the account to send you a new one."
+        ),
+        from_email=settings.DEFAULT_FROM_EMAIL,
+        recipient_list=[user.email],
+    )

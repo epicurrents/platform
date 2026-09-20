@@ -19,6 +19,7 @@
  *   GET    /api/v1/user/admin/accounts/{id}
  *   PATCH  /api/v1/user/admin/accounts/{id}
  *   POST   /api/v1/user/admin/accounts/{id}/password
+ *   POST   /api/v1/user/admin/accounts/{id}/invite
  *   DELETE /api/v1/user/admin/accounts/{id}/2fa
  *   PUT    /api/v1/user/admin/accounts/{id}/groups
  *   GET    /api/v1/user/admin/groups
@@ -81,6 +82,8 @@ interface MockUser {
     is_staff: boolean
     is_superuser: boolean
     is_2fa_enabled: boolean
+    /** Identity provider this account signs in through, or null for a local account. */
+    external_provider?: string | null
 }
 
 interface MockRecording {
@@ -148,7 +151,7 @@ interface MockAccount extends MockUser {
     is_active: boolean
     date_joined: string
     last_login: string | null
-    /** Password is never read back; held only so a set-password call has somewhere to land. */
+    /** Password is never read back; held only so a set-password call has somewhere to land. Empty for an account created by invitation, which has not chosen one yet. */
     password: string
 }
 
@@ -663,9 +666,42 @@ function buildSeed(): MockState {
             password: 'mock',
         },
         {
+            // Invited and has not chosen a password yet, so the account page
+            // shows the pending state and the resend control.
+            id: 4,
+            username: 'a.okonkwo',
+            email: 'a.okonkwo@epicurrents.dev',
+            first_name: 'Ada',
+            last_name: 'Okonkwo',
+            is_staff: false,
+            is_superuser: false,
+            is_2fa_enabled: false,
+            is_active: true,
+            date_joined: ago(3600 * 6),
+            last_login: null,
+            password: '',
+        },
+        {
+            // Signs in through the identity provider, so every password control
+            // is hidden rather than left to be refused.
+            id: 5,
+            username: 'l.bergstrom',
+            email: 'l.bergstrom@epicurrents.dev',
+            first_name: 'Liv',
+            last_name: 'Bergström',
+            is_staff: false,
+            is_superuser: false,
+            is_2fa_enabled: false,
+            is_active: true,
+            date_joined: ago(3600 * 24 * 60),
+            last_login: ago(3600 * 5),
+            password: '',
+            external_provider: 'Microsoft',
+        },
+        {
             // Deactivated and unnamed, so the roster shows both the inactive
             // marker and the username fallback for a row with no display name.
-            id: 4,
+            id: 6,
             username: 'former.account',
             email: 'former@epicurrents.dev',
             first_name: '',
@@ -708,7 +744,7 @@ function buildSeed(): MockState {
         datasets,
         datasetItems,
         datasetAccess,
-        seq: { rec: 17, coll: 3, ds: 3, item: 4, access: 2, account: 5, group: 3 },
+        seq: { rec: 17, coll: 3, ds: 3, item: 4, access: 2, account: 7, group: 3 },
         jobs: [
             {
                 job_id: '3f2c1a2e-9d4b-4c6e-8a1f-0b7d5e6c9a10',
@@ -850,6 +886,8 @@ function accountOut(account: MockAccount) {
         last_login: account.last_login,
         groups: groupsOf(account.id),
         roles,
+        external_provider: account.external_provider ?? null,
+        is_invite_pending: !account.external_provider && !account.password,
     }
 }
 
@@ -1123,13 +1161,19 @@ export async function handleMock(
                 return conflict(res, 'An account with that username already exists.')
             }
             const password = String(body.password ?? '')
-            if (password.length < 8) {
+            const email = String(body.email ?? '')
+            if (password && password.length < 8) {
                 return send(res, 400, { detail: 'This password is too short. It must contain at least 8 characters.' })
+            }
+            if (!password && !email) {
+                return send(res, 400, {
+                    detail: 'An account created without a password needs an email address to send the invitation to.',
+                })
             }
             const account: MockAccount = {
                 id: _state.seq.account++,
                 username,
-                email: String(body.email ?? ''),
+                email,
                 first_name: String(body.first_name ?? ''),
                 last_name: String(body.last_name ?? ''),
                 is_active: body.is_active !== false,
@@ -1144,7 +1188,7 @@ export async function handleMock(
             return send(res, 201, accountOut(account))
         }
 
-        const accountMatch = /^accounts\/(\d+)(\/groups|\/password|\/2fa)?$/.exec(tail)
+        const accountMatch = /^accounts\/(\d+)(\/groups|\/password|\/2fa|\/invite)?$/.exec(tail)
         if (accountMatch) {
             const account = _state.accounts.find(a => a.id === Number(accountMatch[1]))
             if (!account) return send(res, 404, { detail: 'Account not found.' })
@@ -1183,6 +1227,25 @@ export async function handleMock(
                 }
                 account.password = password
                 return send(res, 200, { status: 'ok' })
+            }
+
+            if (suffix === '/invite' && method === 'POST') {
+                if (account.external_provider) {
+                    return conflict(res, `This account signs in through ${account.external_provider} `
+                        + 'and does not use a password on this platform.')
+                }
+                if (account.password) {
+                    return conflict(res, 'This account already has a password. '
+                        + 'The account holder can request a reset themselves.')
+                }
+                if (!account.is_active) {
+                    return conflict(res, 'This account is deactivated. '
+                        + 'Reactivate it before inviting the account holder in.')
+                }
+                if (!account.email) {
+                    return conflict(res, 'This account has no email address to send the invitation to.')
+                }
+                return send(res, 200, { status: 'sent' })
             }
 
             if (suffix === '/2fa' && method === 'DELETE') {

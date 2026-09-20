@@ -45,9 +45,12 @@ Core registrations, made from `MaintenanceConfig.ready`:
 | `activity.verify_audit_integrity` | celery | `verify_audit_integrity [--derived-window-days N]` | no |
 | `recordings.validate_originals` | celery | `validate_originals --json [--no-size-check]` | no |
 | `recordings.refresh_signal_metadata` | celery | `refresh_signal_metadata [--dry-run]` | yes |
+| `mail.send_test` | celery | `send_test_email` | no |
 | `platform.update` | host | the agent applies the named package | yes |
 
 Projects and plugins register their own from `AppConfig.ready()`. A read-only operation may turn `requires_step_up` off; anything that writes keeps it.
+
+`mail.send_test` is here for the deployment shape this whole app exists for. A relay is configured entirely through `.env`, and on a host with no shell the only way to learn whether the credentials, the port and the sender domain are right is to send something — which otherwise means a password reset or an `awaiting_verification` notice is the first real message, and the answer arrives at the moment it matters least. It takes no arguments and reads the superuser roster for its recipients, so a request cannot name an address to send to from the deployment's own sender domain. Its report carries the relay host, the sender and the truncated recipient hashes the mail path logs, never an address: the output lands in `MaintenanceJob.output`, and the rows here are kept to ids and hashes so that nothing in them needs scrubbing when an account is erased.
 
 ## API
 
@@ -83,11 +86,11 @@ The middleware sits after `AuthenticationMiddleware` and before the throttle and
 
 `MAINTENANCE_SPOOL_PATH`: `./update` in the deployment root, which `update.sh` already excludes from every sync and snapshot; the production overlay bind-mounts it and sets the path to the mount point. The file layout and the state machine are in the design note's spool protocol section; [spool.py](spool.py) is the reader and writer on this side, every write a temporary file renamed into place and every JSON file carrying `protocol: 1` (a newer protocol is ignored with a warning).
 
+The other side of the spool is the host agent, [scripts/updater/epicurrents-updater.sh](../scripts/updater/epicurrents-updater.sh), shipped in every distribution as `updater/` and installed once by the operator; [scripts/updater/README.md](../scripts/updater/README.md) describes what a tick does, the refusal reasons a `failed` request can carry (`refused_signature`, `refused_hash`, `refused_version_not_newer`, …) and the two states that need a shell. Its heartbeat file carries `capabilities`, the operation keys it carries out, and `updater_script`, the `UPDATER_SCRIPT_VERSION` of the `update.sh` copy it runs; `agent_summary` passes neither through yet.
+
 `spool.sync()` is the reconciliation: it applies each newer `status.json` to its row, re-creates a row for a request file that has none, and fails an in-flight host-tier row older than a minute that has neither file as `orphaned`. The spool, not the database, is the record of a host-tier job, because a rollback restores the pre-update dump and erases every row written since; re-creating rows from the request files is what makes the job page survive its own rollback. It runs under a five-second cache lock (every maintenance read, the top of every write, and the `sync_spool` beat task call it) and opens an audited scope — `maintenance.job.sync` — only when it has something to write, so the minute tick does not inflate the audit trail. A state the agent reported is also written to the security log as `maintenance.job_state`, which a restore cannot erase.
 
 ## Celery tasks
-The other side of the spool is the host agent, [scripts/updater/epicurrents-updater.sh](../scripts/updater/epicurrents-updater.sh), shipped in every distribution as `updater/` and installed once by the operator; [scripts/updater/README.md](../scripts/updater/README.md) describes what a tick does, the refusal reasons a `failed` request can carry (`refused_signature`, `refused_hash`, `refused_version_not_newer`, …) and the two states that need a shell. Its heartbeat file carries `capabilities`, the operation keys it carries out, and `updater_script`, the `UPDATER_SCRIPT_VERSION` of the `update.sh` copy it runs; `agent_summary` passes neither through yet.
-
 
 | Task | Schedule | Does |
 |---|---|---|

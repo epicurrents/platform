@@ -12,6 +12,8 @@ export interface AuthUser {
     is_2fa_enabled: boolean
     /** Project-supplied roles inherited through group membership, keyed by the role key the active project registered. Empty when the deployment defines no roles. */
     roles?: Record<string, string[]>
+    /** Display name of the identity provider this account signs in through, or null for an account with its own password. Set only when the account has no local password, so a change-password form is pointless for it. */
+    external_provider?: string | null
 }
 
 export interface ProfileUpdate {

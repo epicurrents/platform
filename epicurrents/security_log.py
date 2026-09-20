@@ -69,6 +69,14 @@ Event types in current use:
   ``auto_create_disabled``, ``inactive_user``, or ``provider_unavailable``.
   The ``provider`` field names the identity provider (e.g. ``entra``). No
   email / subject is logged — the reason token is sufficient.
+- ``auth.password_reset_refused_external`` — a password-reset link was asked
+  for, and withheld, for an account that signs in through an identity provider
+  and has no local password. Confirming such a link would mint a password that
+  bypasses the tenant and email-domain gates the provider login is subject to,
+  so the request is answered ``ok`` like every other reset request and no mail
+  is sent. ``actor_id`` is the account and ``provider`` names the provider. A
+  run of these against one account is someone testing whether the external
+  accounts have a second way in.
 - ``permission.denied`` — a centralised ``ensure_*`` permission check refused
   the request. The specific permission (read / write / modify / annotate)
   is carried in the ``permission`` field.

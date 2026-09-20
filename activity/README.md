@@ -567,6 +567,7 @@ To check the table against the tree, walk the AST for `log_activity` / `with_sys
 | `user.account.create` | `create_account` |
 | `user.account.erase` | `_scrub_only` †, `handle` † |
 | `user.account.groups.set` | `set_account_groups` |
+| `user.account.invite.resend` | `resend_account_invitation` |
 | `user.account.list` | `list_accounts` |
 | `user.account.password.set` | `set_account_password` |
 | `user.account.read` | `get_account` |

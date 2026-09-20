@@ -20,6 +20,7 @@ import {
     fetchAccount,
     listGroups,
     listRoleProviders,
+    resendAccountInvitation,
     resetAccountTwoFactor,
     setAccountGroups,
     setAccountPassword,
@@ -66,6 +67,7 @@ const showPassword = ref(false)
 const settingPassword = ref(false)
 const passwordError = ref('')
 const passwordForm = reactive({ newPassword: '' })
+const resendingInvitation = ref(false)
 
 const showResetTwoFactor = ref(false)
 const resettingTwoFactor = ref(false)
@@ -255,12 +257,31 @@ async function confirmPassword () {
     try {
         await setAccountPassword(accountId, passwordForm.newPassword)
         showPassword.value = false
+        // The account now has a password, so the invitation no longer applies.
+        // Patched rather than reloaded, for the reason the second-factor reset
+        // patches: re-applying the whole account would discard unsaved edits in
+        // the details form above.
+        if (account.value) {
+            account.value = { ...account.value, is_invite_pending: false }
+        }
         showToast(t('Password set.', SCOPE), 'neutral')
     } catch (err) {
         // The password validators answer with their messages joined into one string.
         passwordError.value = errorDetail(err, t('The password could not be set.', SCOPE))
     } finally {
         settingPassword.value = false
+    }
+}
+
+async function resendInvitation () {
+    resendingInvitation.value = true
+    try {
+        await resendAccountInvitation(accountId)
+        showToast(t('Invitation sent again.', SCOPE), 'success')
+    } catch (err) {
+        showToast(errorDetail(err, t('The invitation could not be sent.', SCOPE)), 'danger')
+    } finally {
+        resendingInvitation.value = false
     }
 }
 
@@ -465,12 +486,30 @@ onMounted(load)
                 <div class="section-header">
                     <h2>{{ t('Sign-in', SCOPE) }}</h2>
                 </div>
+                <p v-if="account.external_provider" class="admin-hint">
+                    {{ t('Signs in through {provider}. There is no password on this platform to set or reset.', SCOPE, { provider: account.external_provider }) }}
+                </p>
+                <p v-else-if="account.is_invite_pending && !account.is_active" class="admin-hint">
+                    {{ t('No invitation has been sent: the account is deactivated. Activate it to send one.', SCOPE) }}
+                </p>
+                <p v-else-if="account.is_invite_pending" class="admin-hint">
+                    {{ t('Invited, and has not chosen a password yet.', SCOPE) }}
+                </p>
                 <p class="admin-hint">
                     {{ t('Second factor', SCOPE) }}:
                     {{ account.is_2fa_enabled ? t('enrolled', SCOPE) : t('not enrolled', SCOPE) }}
                 </p>
                 <div v-if="canWrite" class="form-actions">
-                    <wa-button appearance="plain" @click="openPassword">
+                    <wa-button v-if="account.is_invite_pending"
+                        appearance="plain"
+                        :disabled="resendingInvitation || !account.email || !account.is_active"
+                        variant="brand"
+                        @click="resendInvitation"
+                    >
+                        <wa-icon name="envelope" slot="start"></wa-icon>
+                        {{ t('Resend invitation', SCOPE) }}
+                    </wa-button>
+                    <wa-button v-if="!account.external_provider" appearance="plain" @click="openPassword">
                         <wa-icon name="key" slot="start"></wa-icon>
                         {{ t('Set password', SCOPE) }}
                     </wa-button>

@@ -40,7 +40,9 @@ from epicurrents.auth import enforce_session_csrf
 from epicurrents.models import AccessRight
 from epicurrents.security_log import get_client_ip, log_security_event
 from user.audit_digests import GROUP_MEMBERSHIP_DIGEST_KEY, compute_group_membership_digest
+from user.identity import is_externally_authenticated, provider_label
 from user.roles import get_role_providers, read_group_roles, read_roles, write_group_role
+from user.tasks import send_welcome_email
 from user.two_factor import active_credential
 
 router = Router()
@@ -79,13 +81,25 @@ class AccountOut(Schema):
     last_login: str | None
     groups: list[GroupRef]
     roles: dict[str, list[str]]
+    #: The provider this account signs in through, or null for a local account.
+    #: Set only when the account has no local password of its own; see
+    #: user/identity.py for why holding an identity is not by itself enough.
+    external_provider: str | None
+    #: The account was created without a password and can still be invited.
+    is_invite_pending: bool
 
 
 class AccountCreateIn(Schema):
-    """New-account payload. Everything but ``username`` and ``password`` optional."""
+    """New-account payload. Only ``username`` is required.
+
+    Omitting ``password`` is the ordinary way to add someone: the account is
+    created with no usable password and an invitation carrying a set-password
+    link is mailed to ``email``, which is then required. The alternative leaves
+    an operator holding a credential they have to convey out of band.
+    """
 
     username: str
-    password: str
+    password: str | None = None
     email: str = ""
     first_name: str = ""
     last_name: str = ""
@@ -189,7 +203,12 @@ def _require_superuser(request):
 
 
 def _serialize_account(user) -> dict:
-    """Serialize one account to an ``AccountOut`` dict."""
+    """Serialize one account to an ``AccountOut`` dict.
+
+    Both identity-derived fields read ``external_identities``, so a caller
+    serializing a page of accounts prefetches it or pays a query per row.
+    """
+    external = is_externally_authenticated(user)
     return {
         "id": user.pk,
         "username": user.username,
@@ -204,6 +223,8 @@ def _serialize_account(user) -> dict:
         "last_login": user.last_login.isoformat() if user.last_login else None,
         "groups": [{"id": group.pk, "name": group.name} for group in user.groups.all()],
         "roles": read_roles(user),
+        "external_provider": provider_label(user) if external else None,
+        "is_invite_pending": not external and not user.has_usable_password(),
     }
 
 
@@ -221,7 +242,12 @@ def _serialize_group(group, *, member_count: int, grant_count: int) -> dict:
 def _get_account(account_id: int):
     """Fetch an account by primary key or raise 404."""
     User = get_user_model()
-    user = User.objects.filter(pk=account_id).select_related("two_factor").prefetch_related("groups").first()
+    user = (
+        User.objects.filter(pk=account_id)
+        .select_related("two_factor")
+        .prefetch_related("groups", "external_identities")
+        .first()
+    )
     if user is None:
         raise HttpError(404, "Account not found.")
     return user
@@ -321,7 +347,9 @@ def list_accounts(request, q: str = "", limit: int = 100, offset: int = 0):
     # select_related on the credential, not just the group prefetch: without it
     # the is_2fa_enabled column costs one query per row on a 500-row page.
     page = list(
-        accounts.order_by("username").select_related("two_factor").prefetch_related("groups")[offset : offset + limit]
+        accounts.order_by("username")
+        .select_related("two_factor")
+        .prefetch_related("groups", "external_identities")[offset : offset + limit]
     )
     log_activity(
         verb="user.account.list",
@@ -341,9 +369,14 @@ def get_account(request, account_id: int):
 
 @router.post("/accounts", response={201: AccountOut})
 def create_account(request, payload: AccountCreateIn):
-    """Create an account.
+    """Create an account, by invitation unless a password is supplied.
 
-    The password is validated against ``AUTH_PASSWORD_VALIDATORS`` before
+    Without a password the account gets an unusable one and an invitation
+    carrying a set-password link, so the credential is chosen by the person who
+    will use it and passes through nobody else. That needs an address to send
+    to, which is why ``email`` stops being optional in that case.
+
+    A supplied password is validated against ``AUTH_PASSWORD_VALIDATORS`` before
     anything is written, so a rejected password leaves no half-made account.
     """
     _require_superuser(request)
@@ -356,9 +389,13 @@ def create_account(request, payload: AccountCreateIn):
         raise HttpError(409, "An account with that username already exists.")
 
     email = _validated_email(payload.email)
-    # An unsaved instance is enough context for UserAttributeSimilarityValidator,
-    # which is what stops "alice" from setting her password to "alice".
-    _validated_password(payload.password, user=User(username=username, email=email))
+    invite = not payload.password
+    if invite and not email:
+        raise HttpError(400, "An account created without a password needs an email address to send the invitation to.")
+    if not invite:
+        # An unsaved instance is enough context for UserAttributeSimilarityValidator,
+        # which is what stops "alice" from setting her password to "alice".
+        _validated_password(payload.password, user=User(username=username, email=email))
 
     account = User(
         username=username,
@@ -369,8 +406,23 @@ def create_account(request, payload: AccountCreateIn):
         is_staff=payload.is_staff,
         is_superuser=payload.is_superuser,
     )
-    account.set_password(payload.password)
-    account.save()
+    if invite:
+        account.set_unusable_password()
+    else:
+        account.set_password(payload.password)
+
+    # An account created deactivated is not invited yet. The task would refuse
+    # it anyway — an invitation to an account that cannot sign in is worth
+    # nothing — but it would refuse silently, leaving an operator who prepared
+    # the account ahead of time believing the mail went out. The resend action
+    # appears the moment the account is activated.
+    invite_now = invite and account.is_active
+    with transaction.atomic():
+        account.save()
+        if invite_now:
+            # Dispatched on commit so the worker cannot read the row before it
+            # exists. Only the primary key crosses the broker; see user/tasks.py.
+            transaction.on_commit(lambda: send_welcome_email.delay(account.pk))
 
     log_activity(
         verb="user.account.create",
@@ -379,9 +431,43 @@ def create_account(request, payload: AccountCreateIn):
             "is_staff": account.is_staff,
             "is_superuser": account.is_superuser,
             "is_active": account.is_active,
+            "invited": invite,
+            "invitation_sent": invite_now,
         },
     )
     return 201, _serialize_account(account)
+
+
+@router.post("/accounts/{account_id}/invite", response=dict)
+def resend_account_invitation(request, account_id: int):
+    """Send the set-password invitation again, for someone who missed the first one.
+
+    The link expires after three days, which an invitation sent before a holiday
+    routinely outlives, and there is no other way into an account that has never
+    had a password.
+
+    Refused rather than repurposed once the account has a password of its own:
+    this would otherwise be a way for an operator to mail a password link to any
+    account from the roster, which is the user's own request to make through
+    password reset.
+    """
+    _require_superuser(request)
+    account = _get_account(account_id)
+    if is_externally_authenticated(account):
+        raise HttpError(
+            409,
+            f"This account signs in through {provider_label(account)} and does not use a password on this platform.",
+        )
+    if account.has_usable_password():
+        raise HttpError(409, "This account already has a password. The account holder can request a reset themselves.")
+    if not account.is_active:
+        raise HttpError(409, "This account is deactivated. Reactivate it before inviting the account holder in.")
+    if not account.email:
+        raise HttpError(409, "This account has no email address to send the invitation to.")
+
+    send_welcome_email.delay(account.pk)
+    log_activity(verb="user.account.invite.resend", target=account)
+    return {"status": "sent"}
 
 
 @router.patch("/accounts/{account_id}", response=AccountOut)

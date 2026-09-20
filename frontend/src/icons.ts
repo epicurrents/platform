@@ -53,6 +53,7 @@ import key from '@material-symbols/svg-400/outlined/key.svg?raw'
 import light_mode from '@material-symbols/svg-400/outlined/light_mode.svg?raw'
 import link from '@material-symbols/svg-400/outlined/link.svg?raw'
 import lock from '@material-symbols/svg-400/outlined/lock.svg?raw'
+import mail from '@material-symbols/svg-400/outlined/mail.svg?raw'
 import lock_open from '@material-symbols/svg-400/outlined/lock_open.svg?raw'
 import logout from '@material-symbols/svg-400/outlined/logout.svg?raw'
 import menu_book from '@material-symbols/svg-400/outlined/menu_book.svg?raw'
@@ -112,6 +113,7 @@ const ICON_SVGS: Record<string, string> = {
     light_mode,
     link,
     lock,
+    mail,
     lock_open,
     logout,
     menu_book,
@@ -159,6 +161,7 @@ const FA_TO_MATERIAL: Record<string, string> = {
     'display':                     'desktop_windows',
     'download':                    'download',
     'ellipsis':                    'more_horiz',
+    'envelope':                    'mail',
     'file':                        'description',
     'file-music':                  'monitor_heart',
     'files':                       'file_copy',
@@ -175,6 +178,7 @@ const FA_TO_MATERIAL: Record<string, string> = {
     'list-ol':                     'format_list_numbered',
     'lock':                        'lock',
     'lock-open':                   'lock_open',
+    'mail':                        'mail',
     'moon':                        'dark_mode',
     'paperclip':                   'attach_file',
     'pencil':                      'edit',

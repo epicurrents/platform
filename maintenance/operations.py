@@ -188,6 +188,20 @@ def register_core_operations() -> None:
     )
     register_operation(
         Operation(
+            key="mail.send_test",
+            executor=CELERY,
+            label="Send a test email",
+            description=(
+                "Send a test message to every active superuser, to check that the configured relay accepts and "
+                "delivers mail. Reports the relay, the sender and hashed recipients; no address is shown."
+            ),
+            args_schema=NoArgs,
+            command="send_test_email",
+            requires_step_up=False,
+        )
+    )
+    register_operation(
+        Operation(
             key="platform.update",
             executor=HOST,
             label="Update the platform",

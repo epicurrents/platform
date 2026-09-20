@@ -54,6 +54,7 @@ from epicurrents.auth import enforce_session_csrf
 from epicurrents.security_log import get_client_ip, log_security_event
 from user.api.v1.accounts import router as accounts_router
 from user.api.v1.two_factor import router as two_factor_router
+from user.identity import is_externally_authenticated, provider_label
 from user.models import TwoFactorCredential, UserPreference
 from user.oidc import (
     OIDCAuthError,
@@ -178,6 +179,12 @@ class UserOut(Schema):
     is_superuser: bool
     is_2fa_enabled: bool = False
     roles: dict[str, list[str]] = {}
+    #: The identity provider this account signs in through, or null for an
+    #: account with a password of its own. The profile page reads it to decide
+    #: whether to offer a change-password form at all: without it the form is
+    #: rendered, the submission is refused, and the person is left reading an
+    #: error about a password they never had.
+    external_provider: str | None = None
 
 
 class LoginResultOut(Schema):
@@ -281,6 +288,7 @@ def _serialize_user(user) -> dict:
         "is_superuser": user.is_superuser,
         "is_2fa_enabled": active_credential(user) is not None,
         "roles": read_roles(user),
+        "external_provider": provider_label(user) if is_externally_authenticated(user) else None,
     }
 
 
@@ -680,9 +688,21 @@ def update_profile_endpoint(request, payload: ProfileIn):
 
 @api.post("/me/change-password")
 def change_password_endpoint(request, payload: ChangePasswordIn):
-    """Change the current user's password. Keeps the session alive."""
+    """Change the current user's password. Keeps the session alive.
+
+    An account that signs in through an identity provider is refused before the
+    password check rather than by it. ``check_password`` against an unusable
+    password is false, so without this the answer is "your current password is
+    incorrect" — which is not what happened, and sends the person looking for a
+    password they have never had.
+    """
 
     user = _require_auth(request)
+    if is_externally_authenticated(user):
+        raise HttpError(
+            409,
+            f"This account signs in through {provider_label(user)}. Its password is managed there, not here.",
+        )
     if not user.check_password(payload.current_password):
         raise HttpError(400, "Current password is incorrect")
     try:
@@ -752,12 +772,29 @@ def request_password_reset(request, payload: PasswordResetRequestIn):
 
     from user.tasks import send_password_reset_email
 
+    # An account provisioned through an identity provider gets no link. Setting
+    # a local password on it would create a way in that answers to neither the
+    # tenant nor the email-domain gate in user/oidc.py, which between them are
+    # the whole of the control over who may sign in. The response is the same
+    # "ok" as every other outcome, and the rate limit was already consumed
+    # above, so nothing about this reaches the caller.
+    refused = [user for user in users if is_externally_authenticated(user)]
+    for user in refused:
+        log_security_event(
+            "auth.password_reset_refused_external",
+            ip=get_client_ip(request),
+            actor_id=user.pk,
+            provider=provider_label(user),
+        )
+
     # Only the primary key crosses the broker. The URL embeds a token valid for
     # three days and the recipient address is personal data, and the broker now
     # persists to an append-only file, so both would outlive their use on disk.
     # The task mints the token and reads the address at send time.
+    refused_ids = {user.pk for user in refused}
     for user in users:
-        send_password_reset_email.delay(user.pk)
+        if user.pk not in refused_ids:
+            send_password_reset_email.delay(user.pk)
 
     # One Activity row exists per request — log_activity annotates the row the
     # middleware already created rather than appending — so calling it in the
@@ -767,7 +804,7 @@ def request_password_reset(request, payload: PasswordResetRequestIn):
         log_activity(
             verb="user.password.reset.request",
             target=users[0],
-            metadata={"email_hash": email_key, "found": True},
+            metadata={"email_hash": email_key, "found": True, "refused_external": len(refused)},
         )
     else:
         # Several accounts share the address. The row cannot target all of them,
@@ -776,7 +813,7 @@ def request_password_reset(request, payload: PasswordResetRequestIn):
         # account but one. Record the shape of what happened, not who it was.
         log_activity(
             verb="user.password.reset.request",
-            metadata={"found": True, "account_count": len(users)},
+            metadata={"found": True, "account_count": len(users), "refused_external": len(refused)},
         )
     return {"status": "ok"}
 
@@ -845,7 +882,16 @@ def list_groups(request):
 
 @api.post("/reset-password/confirm")
 def confirm_password_reset(request, payload: PasswordResetConfirmIn):
-    """Validate reset token and set a new password."""
+    """Validate reset token and set a new password.
+
+    The externally-authenticated gate is repeated here rather than left to the
+    endpoints that hand links out, because a link can outlive the account state
+    it was minted for. An invitation is sent to a local account; before the
+    three days are up the person signs in through the provider for the first
+    time and is linked by verified email; the invitation link is still valid,
+    and confirming it would mint exactly the local password the gate exists to
+    prevent — through the one path that never asked.
+    """
 
     User = get_user_model()
     try:
@@ -856,6 +902,18 @@ def confirm_password_reset(request, payload: PasswordResetConfirmIn):
 
     if not default_token_generator.check_token(user, payload.token):
         raise HttpError(400, "Reset link is invalid or has expired")
+
+    if is_externally_authenticated(user):
+        # Named rather than answered with the generic refusal: whoever holds
+        # this link holds a valid token for the account already, so there is
+        # nothing to withhold, and they need to know to sign in the other way.
+        log_security_event(
+            "auth.password_reset_refused_external",
+            ip=get_client_ip(request),
+            actor_id=user.pk,
+            provider=provider_label(user),
+        )
+        raise HttpError(409, f"This account signs in through {provider_label(user)}. Use that to sign in.")
 
     try:
         validate_password(payload.new_password, user=user)
