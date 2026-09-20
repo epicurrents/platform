@@ -1,0 +1,15 @@
+[Unit]
+Description=Epicurrents remote-maintenance agent (one tick)
+Documentation=file:///usr/local/lib/epicurrents-updater/README.md
+After=network-online.target docker.service podman.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/lib/epicurrents-updater/epicurrents-updater.sh
+# An update rebuilds every image and a rollback does it again; a tick that
+# carries one runs for minutes, and systemd must not kill it half-way.
+TimeoutStartSec=0
+Nice=5
+IOSchedulingClass=best-effort
+IOSchedulingPriority=6

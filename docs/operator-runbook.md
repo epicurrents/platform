@@ -112,6 +112,40 @@ New uploads should process again. Clearing the *already-stuck* recordings
 requires a developer (it touches the database); if recordings keep getting
 stuck after a restart, that is a code-level problem — escalate.
 
+## A remote update went wrong
+
+Updates applied from the web UI's Maintenance tab are carried out by a host
+agent (`journalctl -t epicurrents-updater` shows its timeline). Most outcomes
+need nobody: a refused package changes nothing, and a failed update or a
+closed verification window rolls the deployment back on its own. Two states
+on the job page need a shell.
+
+**`rollback_failed`.** The agent could not restore the update's snapshot, or
+the platform did not answer after it did. The maintenance flag is left up, so
+the site keeps saying why it is not serving. From the deployment directory:
+
+```bash
+./update.sh --rollback --snapshot <name>     # the job page names the snapshot
+rm update/maintenance.json                   # once the platform answers again
+docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d celery-beat
+```
+
+**`failed` with reason `stale`.** The agent's run died before the update took
+its snapshot (a reboot mid-update, typically); nothing was changed and the
+platform is serving the previous release. Nothing to repair — check the job's
+log for what was attempted, then request the update again.
+
+**"Agent not running" on the Maintenance tab.** The timer is stopped or the
+agent is failing before it writes its heartbeat:
+
+```bash
+systemctl status epicurrents-updater.timer
+journalctl -t epicurrents-updater -n 50
+```
+
+A request made while the agent is not running waits as `requested`; cancel it
+from the job page or let the agent pick it up once it is back.
+
 ## Escalate to a developer
 
 Hand off when the problem is **not** "a service is down":

@@ -165,6 +165,8 @@ class TestSignedPackage:
         assert manifest["platform_compatible"] == _helper("compatible").stdout.strip()
         assert manifest["project"] == "" and manifest["plugins"] == []
         assert manifest["min_updater_version"] == 2
+        agent = (SCRIPTS_DIR / "updater" / "epicurrents-updater.sh").read_text()
+        assert manifest["agent_version"] == int(agent.split("AGENT_VERSION=", 1)[1].split()[0])
         assert manifest["manifest_version"] == 1
         assert manifest["key_id"] == _helper("key-id", str(key.with_name("release.key.pub"))).stdout.strip()
         assert manifest["built_at"].endswith("Z")

@@ -150,6 +150,7 @@ def cmd_manifest(args: argparse.Namespace) -> None:
     plugins = [p for p in (args.plugins or "").split(",") if p]
     fields = {
         "built_at": args.built_at or _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "agent_version": args.agent_version or None,
         "key_id": args.key_id or None,
         "manifest_version": MANIFEST_VERSION,
         "min_updater_version": args.min_updater_version,
@@ -230,6 +231,7 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--project", default="")
     p.add_argument("--plugins", default="", help="comma-separated")
     p.add_argument("--min-updater-version", required=True, type=int)
+    p.add_argument("--agent-version", default=0, type=int, help="the host agent the package ships; 0 for none")
     p.add_argument("--key-id", default="")
     p.add_argument("--built-at", default="")
     p.add_argument("--out")

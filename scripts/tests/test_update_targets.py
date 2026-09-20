@@ -175,8 +175,13 @@ PROGRESS_STEPS_UPDATE = [
 PROGRESS_STEPS_ROLLBACK = [
     "step=restore-db", "step=restore-env", "step=restore-code", "step=build",
 ]
-PROGRESS_FACTS = ["snapshot=", "health=ok", "health=failed", "done", "failed=", "check=ok",
+PROGRESS_FACTS = ["snapshot=", "health=ok", "health=failed", "done", "failed=", "check=ok", "refused=",
                   "archive=", "manifest=", "signature=", "sha256=", "version=", "installed=", "orphan_candidates="]
+
+# The reasons a refusal can name on a ::refused= line. The host agent turns the
+# token into the job's failure reason (refused_<token>), so its README and the
+# script move together.
+REFUSAL_TOKENS = ["signature", "hash", "manifest", "updater_too_old", "incompatible", "version_not_newer"]
 
 
 def test_update_sh_emits_every_progress_line_a_caller_parses():
@@ -215,3 +220,13 @@ def test_update_sh_never_pipes_its_own_output_into_a_quiet_grep():
         if not line.strip().startswith("#") and re.search(r"printf .*\| *grep +-[a-zA-Z]*q", line)
     ]
     assert not offenders, offenders
+
+
+def test_update_sh_names_the_refusals_the_agent_keys_on():
+    body = (SCRIPTS_DIR / "update.sh").read_text()
+    missing = [token for token in REFUSAL_TOKENS if f"refuse {token} " not in body]
+    assert not missing, f"update.sh no longer refuses with: {missing}"
+    # Every token the script can emit is one the agent's README documents as a reason.
+    readme = (SCRIPTS_DIR / "updater" / "README.md").read_text()
+    undocumented = [token for token in REFUSAL_TOKENS if f"`{token}`" not in readme]
+    assert not undocumented, f"scripts/updater/README.md does not document: {undocumented}"

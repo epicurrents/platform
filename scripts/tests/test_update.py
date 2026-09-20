@@ -1130,6 +1130,24 @@ class TestArchiveVerification:
         extract_i = next((i for i, c in enumerate(calls) if c.startswith("tar") and " -x" in c and " -C " in c), -1)
         assert -1 < verify_i < extract_i, f"verify={verify_i} extract={extract_i}"
 
+    def test_a_refusal_names_its_reason_before_the_failure_line(self, fakebin, tmp_path):
+        # The host agent keys on the token; the free text after ::failed= is for people.
+        archive, _ = self._signed(fakebin, tmp_path)
+        fakebin.stub("openssl", body=OPENSSL_REJECTS)
+        result = run_script("update.sh", fakebin, cwd=tmp_path, args=["--check-archive", str(archive)])
+        assert result.returncode != 0
+        lines = _progress(result)
+        assert "refused=signature" in lines
+        assert lines.index("refused=signature") < next(i for i, l in enumerate(lines) if l.startswith("failed="))
+        assert not _extracted_to_disk(fakebin)
+
+    def test_a_package_that_is_not_newer_is_refused_by_name(self, fakebin, tmp_path):
+        _deploy(fakebin, tmp_path, installed_version="0.2.0")
+        archive = _build_package(tmp_path)
+        result = run_script("update.sh", fakebin, cwd=tmp_path, args=["--check-archive", str(archive), "--require-newer"])
+        assert result.returncode != 0
+        assert "refused=version_not_newer" in _progress(result)
+
     def test_a_bad_signature_is_refused_and_nothing_is_touched(self, fakebin, tmp_path):
         self._signed(fakebin, tmp_path)
         fakebin.stub("openssl", body=OPENSSL_REJECTS)

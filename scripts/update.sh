@@ -28,7 +28,8 @@
 # left the stack stopped, or --keep-lock says the caller owns it.
 #
 # Progress is also reported on lines starting with "::" (::step=…, ::snapshot=…,
-# ::health=…, ::done, ::failed=…) for a caller that drives this script.
+# ::health=…, ::done, ::failed=…, and ::refused=<reason> ahead of a refusal the
+# checks can name) for a caller that drives this script.
 #
 # Usage:
 #   ./update.sh                          archive mode, newest ./update/epicurrents*.tar.gz
@@ -76,6 +77,16 @@ die()  {
     printf '\n\033[1;31mERROR:\033[0m %s\n' "$msg" >&2
     emit "failed=${msg%%$'\n'*}"
     exit 1
+}
+# A refusal with a reason a caller can key on: the host agent turns the token
+# into the job's failure reason, where the free text of the message would not
+# survive as a stable identifier. The vocabulary is the one the agent knows —
+# signature, hash, manifest, updater_too_old, incompatible, version_not_newer —
+# and is pinned in scripts/tests/test_update_targets.py.
+refuse() {
+    emit "refused=$1"
+    shift
+    die "$@"
 }
 
 usage() {
@@ -532,7 +543,7 @@ check_archive() {
             if [ ! -f "$key" ]; then
                 SIGNATURE_STATE=unverifiable
                 msg="The package is signed, but there is no release key to verify it against (looked for $key; pass --release-key PATH)."
-                [ "$REQUIRE_SIGNATURE" = false ] || die "$msg"
+                [ "$REQUIRE_SIGNATURE" = false ] || refuse signature "$msg"
                 warn "$msg"
             else
                 verify_manifest_signature "$manifest" "$sig" "$key" && rc=0 || rc=$?
@@ -542,38 +553,38 @@ check_archive() {
                         ok "Signature verified against $key"
                         ;;
                     1)
-                        die "The package signature does NOT verify against $key. Refusing it: the manifest or the signature was altered, or the package was signed with a different key."
+                        refuse signature "The package signature does NOT verify against $key. Refusing it: the manifest or the signature was altered, or the package was signed with a different key."
                         ;;
                     *)
                         SIGNATURE_STATE=unverifiable
                         msg="The package is signed, but nothing on this host can check an Ed25519 signature (needs OpenSSL 3, or python3 with the cryptography package)."
-                        [ "$REQUIRE_SIGNATURE" = false ] || die "$msg"
+                        [ "$REQUIRE_SIGNATURE" = false ] || refuse signature "$msg"
                         warn "$msg"
                         ;;
                 esac
             fi
         else
-            [ "$REQUIRE_SIGNATURE" = false ] || die "The package is not signed (no $sig), and --require-signature is set."
+            [ "$REQUIRE_SIGNATURE" = false ] || refuse signature "The package is not signed (no $sig), and --require-signature is set."
             warn "The package is not signed; its manifest is checked for consistency only."
         fi
 
         want="$(manifest_value "$manifest" sha256)"
-        [ -n "$want" ] || die "The manifest names no sha256; it is not a package manifest."
+        [ -n "$want" ] || refuse manifest "The manifest names no sha256; it is not a package manifest."
         require_sha256_tool
         have="$(sha256_of "$ARCHIVE")"
-        [ "$want" = "$have" ] || die "The archive does not match its manifest: sha256 $have, manifest says $want. The file was altered or corrupted in transit."
+        [ "$want" = "$have" ] || refuse hash "The archive does not match its manifest: sha256 $have, manifest says $want. The file was altered or corrupted in transit."
         want_size="$(manifest_value "$manifest" size)"
         size="$(wc -c < "$ARCHIVE" | tr -d ' ')"
-        [ -z "$want_size" ] || [ "$want_size" = "$size" ] || die "The archive does not match its manifest: $size bytes, manifest says $want_size."
+        [ -z "$want_size" ] || [ "$want_size" = "$size" ] || refuse hash "The archive does not match its manifest: $size bytes, manifest says $want_size."
         PKG_SHA256="$have"
         ok "Archive matches the manifest (sha256 ${have:0:12}…)"
 
         field="$(manifest_value "$manifest" manifest_version)"
-        [ "$field" = 1 ] || die "The manifest is version '$field'; this script understands version 1. Update update.sh first — the package carries a newer one at its root."
+        [ "$field" = 1 ] || refuse manifest "The manifest is version '$field'; this script understands version 1. Update update.sh first — the package carries a newer one at its root."
         field="$(manifest_value "$manifest" min_updater_version)"
-        [[ "$field" =~ ^[0-9]+$ ]] || die "The manifest's min_updater_version is not a number ('$field')."
+        [[ "$field" =~ ^[0-9]+$ ]] || refuse manifest "The manifest's min_updater_version is not a number ('$field')."
         if [ "$field" -gt "$UPDATER_SCRIPT_VERSION" ]; then
-            die "The package needs update.sh version $field and this is version $UPDATER_SCRIPT_VERSION. Replace this script with the package's copy (update.sh at its root) and re-run."
+            refuse updater_too_old "The package needs update.sh version $field and this is version $UPDATER_SCRIPT_VERSION. Replace this script with the package's copy (update.sh at its root) and re-run."
         fi
         PKG_VERSION="$(manifest_value "$manifest" version)"
 
@@ -585,14 +596,14 @@ check_archive() {
         my_project="$(env_value EPICURRENTS_PROJECT)"
         my_plugins="$(normalise_list "$(env_value EPICURRENTS_PLUGINS)")"
         if [ "$pkg_project" != "$my_project" ]; then
-            die "The package is built for project '${pkg_project:-<none>}' and this deployment runs '${my_project:-<none>}'. Build a package for this deployment's project."
+            refuse incompatible "The package is built for project '${pkg_project:-<none>}' and this deployment runs '${my_project:-<none>}'. Build a package for this deployment's project."
         fi
         if [ "$pkg_plugins" != "$my_plugins" ]; then
-            die "The package carries plugins '${pkg_plugins:-<none>}' and this deployment runs '${my_plugins:-<none>}'. Build a package with this deployment's plugins."
+            refuse incompatible "The package carries plugins '${pkg_plugins:-<none>}' and this deployment runs '${my_plugins:-<none>}'. Build a package with this deployment's plugins."
         fi
         ok "Package is for project '${pkg_project:-<none>}', plugins '${pkg_plugins:-<none>}' — matches this deployment"
     else
-        [ "$REQUIRE_SIGNATURE" = false ] || die "No manifest beside the archive ($manifest), and --require-signature is set. A signed package ships as three files: the tarball, .manifest.json and .manifest.sig."
+        [ "$REQUIRE_SIGNATURE" = false ] || refuse signature "No manifest beside the archive ($manifest), and --require-signature is set. A signed package ships as three files: the tarball, .manifest.json and .manifest.sig."
         warn "No manifest beside the archive ($manifest); the package cannot be verified. Its contents are still checked."
     fi
 
@@ -612,15 +623,15 @@ check_archive() {
             ok "Package version $PKG_VERSION is newer than the installed $INSTALLED_VERSION"
         elif [ "$PKG_VERSION" = "$INSTALLED_VERSION" ]; then
             msg="The package is version $PKG_VERSION, the same as the installed release."
-            [ "$REQUIRE_NEWER" = false ] || die "$msg --require-newer refuses it."
+            [ "$REQUIRE_NEWER" = false ] || refuse version_not_newer "$msg --require-newer refuses it."
             warn "$msg"
         else
             msg="The package is version $PKG_VERSION, OLDER than the installed $INSTALLED_VERSION."
-            [ "$REQUIRE_NEWER" = false ] || die "$msg --require-newer refuses a downgrade."
+            [ "$REQUIRE_NEWER" = false ] || refuse version_not_newer "$msg --require-newer refuses a downgrade."
             warn "$msg Applying it is a downgrade; the database will not be migrated backwards."
         fi
     elif [ "$REQUIRE_NEWER" = true ]; then
-        die "--require-newer: cannot compare versions (package: '${PKG_VERSION:-unknown}', installed: '${INSTALLED_VERSION:-unknown}')."
+        refuse version_not_newer "--require-newer: cannot compare versions (package: '${PKG_VERSION:-unknown}', installed: '${INSTALLED_VERSION:-unknown}')."
     fi
 
     emit "archive=$ARCHIVE"

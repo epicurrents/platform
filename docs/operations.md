@@ -572,7 +572,17 @@ The flag is a file rather than a database row because the rollback restores the 
 
 A superuser can run registered management commands from the Maintenance tab of the account administration pages once `REMOTE_MAINTENANCE_ENABLED=True` is set in `.env` and `web`, `celery` and `celery-beat` are recreated. Each request is a `MaintenanceJob` row, audited under the requester, and carries a step-up confirmation (the password, plus the second factor when enrolled) for any operation that writes. The commands available out of the box are the audit-integrity check, the originals-volume validation and the signal-metadata refresh; a project registers its own. The endpoints answer 404 while the flag is off.
 
-Applying an update from the tab needs the host agent as well, which is the next phase of the design in [docs/engineering-notes/remote-maintenance-design.md](engineering-notes/remote-maintenance-design.md); `REMOTE_UPDATE_ENABLED` stays off until it is installed. The spool the two sides share is `./update/`, the package drop directory, bind-mounted into `web` and `celery` by the production overlay.
+Applying an update from the tab needs the host agent as well: a root-owned script under a one-minute systemd timer, outside the containers, which verifies the package a request names and drives `update.sh`. The web application never executes anything on the host; it writes the request into `./update/`, the package drop directory, which the production overlay bind-mounts into `web` and `celery`, and the agent picks it up from there. A distribution ships the agent as `updater/`; install it once, as root, from the unpacked package:
+
+```bash
+sudo ./updater/install-updater.sh
+```
+
+or run the packaged `prepare-host.sh --with-updater` on a fresh host. The installer copies the release key from the package root into `/etc/epicurrents-updater/`, prints the key's id so it can be compared with the publisher's out of band, and leaves the agent disabled. Switching remote updates on is then three settings: `ENABLED=1` in `/etc/epicurrents-updater/config`, and `REMOTE_UPDATE_ENABLED=true` beside `REMOTE_MAINTENANCE_ENABLED=true` in `.env`, followed by a recreate of `web`, `celery` and `celery-beat`. The Maintenance tab shows the agent's heartbeat; two minutes without one and it reports the agent as not running.
+
+A remote update runs `update.sh` as a manual one would, with the signature and version checks made refusals, then waits for a superuser's confirmation for a window (the deployment's `REMOTE_UPDATE_VERIFY_WINDOW_MINUTES`, or what the request named, five minutes to a day). The platform is suspended while the update and any rollback run and read-only for other users during the window. A confirmation ends the job; a rollback request, a closed window, a failed readiness probe or a version that is not the package's rolls the deployment back to the update's own snapshot, after a `post-update` snapshot of what the database gained meanwhile. The agent's own log of each job is readable from the job page, and every state change goes to the host's journal under `epicurrents-updater`, which a database restore cannot erase. What each state means, and the two that need a shell after all, are in [scripts/updater/README.md](../scripts/updater/README.md); the runbook has the recovery steps.
+
+The agent refuses a git checkout by default, since remote updates are meant for distribution deployments; `ALLOW_CHECKOUT=1` in its config overrides that for a checkout that is updated from packages anyway.
 
 ### Dev vs production compose
 

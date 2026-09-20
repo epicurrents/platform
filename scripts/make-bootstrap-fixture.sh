@@ -319,6 +319,11 @@ fi
 #: with UPDATER_SCRIPT_VERSION in scripts/update.sh whenever a package starts
 #: relying on something an older script does not do.
 MIN_UPDATER_VERSION=2
+#: The host agent this package ships under updater/, from its own constant; the
+#: manifest names it so a deployment can see whether a newer agent is on offer.
+#: Empty, and the manifest says null, where the tree has no agent (a synthetic
+#: repository root in the tests); a distribution build refuses that below.
+AGENT_VERSION="$(sed -n '/^AGENT_VERSION=/{s/^AGENT_VERSION=//p;q;}' "$REPO_ROOT/scripts/updater/epicurrents-updater.sh" 2>/dev/null || true)"
 
 if [ -n "$SIGN_KEY" ]; then
     [ "$TARBALL" = true ] || die "--sign-key signs the tarball's manifest; add --tarball."
@@ -1068,6 +1073,13 @@ if command -v getent >/dev/null 2>&1; then
     fi
 fi
 
+# The maintenance spool: the package drop directory, and under it what the
+# platform and the host agent exchange (maintenance/README.md in the platform
+# repository). Created here, by the account that runs the stack, because a
+# bind-mount source the runtime creates itself belongs to root, and the web
+# tier could then never write a request into it.
+mkdir -p update/packages update/jobs
+
 # Two modes, chosen by whether .env names a domain — the same rule bootstrap.sh
 # and update.sh use, so a deployment behaves identically however it was created.
 #
@@ -1368,17 +1380,21 @@ START
 # already in place rather than redoing it.
 #
 # Usage:
-#   sudo ./prepare-host.sh [--user NAME] [--no-sudoers]
+#   sudo ./prepare-host.sh [--user NAME] [--no-sudoers] [--with-updater]
 #
 #   --user NAME    Account to create and hand the deployment to. Default
 #                  "epicurrents". Ignored when uid 1000 is already taken — see
 #                  the account section below.
 #   --no-sudoers   Skip the passwordless-sudo drop-in for that account.
+#   --with-updater Install the remote-maintenance host agent as well
+#                  (updater/install-updater.sh), so later releases can be
+#                  applied from the web UI. It starts disabled; see updater/README.md.
 set -euo pipefail
 cd "$(dirname "$0")"
 
 DEPLOY_USER="epicurrents"
 WRITE_SUDOERS=true
+WITH_UPDATER=false
 KEY_WARNING=false
 # `shift 2` on a flag given as the last argument shifts past the end, which fails
 # under set -e and exits with no message at all — so the count is checked first
@@ -1394,7 +1410,8 @@ while [ $# -gt 0 ]; do
         --user)       need_value "$1" $#; DEPLOY_USER="$2"; shift 2 ;;
         --user=*)     DEPLOY_USER="${1#*=}"; shift ;;
         --no-sudoers) WRITE_SUDOERS=false; shift ;;
-        -h|--help)    sed -n '3,24p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        --with-updater) WITH_UPDATER=true; shift ;;
+        -h|--help)    sed -n '3,26p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) echo "Unknown argument: $1 (try --help)" >&2; exit 1 ;;
     esac
 done
@@ -1474,6 +1491,15 @@ echo "==> Handing the package to ${DEPLOY_USER}…"
 chown -R "${DEPLOY_USER}:${DEPLOY_USER}" .
 echo "    $(pwd) is now owned by ${DEPLOY_USER}."
 
+# After the handover, so the spool directories the installer creates take the
+# account's ownership from the tree rather than root's. Optional: a host with
+# a shell may never want updates driven from the browser.
+if [ "$WITH_UPDATER" = true ]; then
+    echo "==> Remote-maintenance agent…"
+    [ -x ./updater/install-updater.sh ] || { echo "This package carries no updater/; cannot install the agent." >&2; exit 1; }
+    ./updater/install-updater.sh --root "$(pwd)"
+fi
+
 # Without this the account created above cannot be logged into at all on a server
 # reached only by key, and the operator is left with a deployment user they can
 # only become via `su` from the root session they happen to still hold.
@@ -1521,6 +1547,11 @@ echo "  only to a new session, so log in again rather than using su:"
 echo
 echo "      ssh ${DEPLOY_USER}@<this host>"
 echo "      cd $(pwd) && ./start.sh"
+if [ "$WITH_UPDATER" = false ]; then
+    echo
+    echo "  To apply later releases from the web UI, install the host agent:"
+    echo "      sudo ./updater/install-updater.sh"
+fi
 if [ "$KEY_WARNING" = true ]; then
     echo
     echo "  WARNING: ${DEPLOY_USER} has no authorized_keys and root had none to"
@@ -1594,6 +1625,27 @@ DROP
             cp -p "$REPO_ROOT/$f" "$DEST/$f"
         done
         ok "examples/evidence-host/ (${#SHIPPER_FILES[@]} files, shipper half only)"
+
+        # The remote-maintenance host agent: the root-owned half of applying a
+        # package from the web UI. Shipped in every distribution and installed
+        # by the operator once (prepare-host.sh --with-updater, or the
+        # installer by hand); a later package is then applied from the
+        # Maintenance tab. Named files, for the same reason as above.
+        info "Bundling the host agent"
+        UPDATER_FILES=(
+            epicurrents-updater.sh
+            install-updater.sh
+            epicurrents-updater.service
+            epicurrents-updater.timer
+            README.md
+        )
+        mkdir -p "$DEST/updater"
+        for f in "${UPDATER_FILES[@]}"; do
+            [ -f "$REPO_ROOT/scripts/updater/$f" ] || die "Expected file missing from repo: scripts/updater/$f"
+            cp -p "$REPO_ROOT/scripts/updater/$f" "$DEST/updater/$f"
+        done
+        chmod +x "$DEST/updater/epicurrents-updater.sh" "$DEST/updater/install-updater.sh"
+        ok "updater/ (agent version ${AGENT_VERSION:-unknown})"
     fi
 
     info "Writing README.md"
@@ -1729,6 +1781,26 @@ Generate a key at https://login.tailscale.com/admin/settings/keys. It is used
 once and never written to disk; pass it in `TS_AUTHKEY` instead of on the
 command line to keep it out of your shell history. Re-running is safe: a host
 already on a tailnet is left joined and only its name is reconciled.
+
+## Apply later releases from the web UI
+
+A newer package can be applied from the Maintenance tab of the account
+administration pages instead of from a shell, once a host agent is installed.
+The agent runs as root under a systemd timer, outside the containers, and is
+what verifies a package's signature and version and drives `update.sh`; the web
+application itself never executes anything on the host. Install it once:
+
+```bash
+sudo ./updater/install-updater.sh
+```
+
+or pass `--with-updater` to `prepare-host.sh`. Then set `ENABLED=1` in
+`/etc/epicurrents-updater/config`, and `REMOTE_MAINTENANCE_ENABLED=true` and
+`REMOTE_UPDATE_ENABLED=true` in `.env`, and restart. A superuser uploads the
+next release's three files in the tab; the platform is suspended while the
+update runs, comes back on the new release for a verification window, and rolls
+itself back if nobody confirms. `updater/README.md` has the details, and the
+states that need a shell after all.
 
 ## Ship the security log off this machine
 
@@ -2010,6 +2082,7 @@ if [ "$TARBALL" = true ]; then
         --project "$ACTIVE_PROJECT" \
         --plugins "$ACTIVE_PLUGINS" \
         --min-updater-version "$MIN_UPDATER_VERSION" \
+        --agent-version "${AGENT_VERSION:-0}" \
         --key-id "${SIGN_KEY_ID:-}" \
         --out "$MANIFEST"
     ok "$MANIFEST"
