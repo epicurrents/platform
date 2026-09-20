@@ -253,6 +253,12 @@ trap cleanup EXIT
 # checked the result was serving.
 
 BORG_WAS_RUNNING=false
+# Survives a run that stops borg and then dies: the next run finds borg stopped
+# and cannot tell "never ran here" from "the last update stopped it", and the
+# difference is whether a deployment silently loses its backups. Under update/
+# for the same reason as the flag — nothing this script syncs or snapshots
+# touches it.
+BORG_MARKER="$UPDATE_DIR/.borg-was-running"
 
 stop_app_services() {
     # borg as well as the application services. Its scheduler runs inside the
@@ -262,8 +268,10 @@ stop_app_services() {
     # container ends any dump with it. Whether it was running is recorded first,
     # so the restart at the end does not start a service the deployment never
     # ran.
-    if service_running borg; then
+    if service_running borg || [ -f "$BORG_MARKER" ]; then
         BORG_WAS_RUNNING=true
+        mkdir -p "$UPDATE_DIR"
+        : > "$BORG_MARKER"
     fi
     info "Stopping application services"
     "${COMPOSE[@]}" stop web celery celery-beat borg || true
@@ -278,6 +286,12 @@ collect_static() {
 }
 
 refresh_vendored_assets() {
+    # None of these three is allowed to end the run. They execute after the
+    # services are stopped, so a failure that aborted here left the stack down
+    # over an asset tree — observed on a deployment whose project names no
+    # Pyodide asset path. The platform serves without any of them; each failure
+    # is reported, counted, and repeated in the summary.
+    #
     # a. Install the pinned viewer edition if it drifted. A pull can move
     # frontend/viewer-pin.json, so the check runs every update; it is a local
     # stamp comparison, so the common case costs nothing. An empty pin verifies
@@ -296,9 +310,12 @@ refresh_vendored_assets() {
         ok "Viewer edition matches the pin"
     else
         info "Installing the pinned viewer edition"
-        "${COMPOSE[@]}" --profile vendor run --rm --no-deps -T --user 1000:1000 vendor \
-            python manage.py vendor_viewer
-        ok "Viewer edition installed"
+        if "${COMPOSE[@]}" --profile vendor run --rm --no-deps -T --user 1000:1000 vendor \
+                python manage.py vendor_viewer; then
+            ok "Viewer edition installed"
+        else
+            vendor_failed "the viewer edition was not installed; the public viewer page will not load"
+        fi
     fi
 
     # b. Vendor the Pyodide runtime if it is missing or incomplete. The tree is
@@ -315,8 +332,11 @@ refresh_vendored_assets() {
         ok "Pyodide runtime present"
     else
         info "Vendoring the Pyodide runtime"
-        "${COMPOSE[@]}" --profile vendor run --rm --no-deps -T vendor python manage.py vendor_pyodide
-        ok "Pyodide runtime vendored"
+        if "${COMPOSE[@]}" --profile vendor run --rm --no-deps -T vendor python manage.py vendor_pyodide; then
+            ok "Pyodide runtime vendored"
+        else
+            vendor_failed "the Pyodide runtime was not vendored; the viewer works, its Python analysis tools do not"
+        fi
     fi
 
     # c. Regenerate the static lead fields. The other half of the vendored tree,
@@ -328,8 +348,32 @@ refresh_vendored_assets() {
     # LeadFieldCache rows the compute API serves from), which the caller has
     # ensured — by migrating, or by restoring a database that matches the code.
     info "Generating static lead fields"
-    "${COMPOSE[@]}" --profile vendor run --rm --no-deps -T vendor python manage.py generate_compute_static
-    ok "Static lead fields generated"
+    if "${COMPOSE[@]}" --profile vendor run --rm --no-deps -T vendor python manage.py generate_compute_static; then
+        ok "Static lead fields generated"
+    else
+        vendor_failed "the static lead fields were not generated; source localisation computes each montage on the server instead"
+    fi
+}
+
+VENDOR_FAILURES=()
+
+vendor_failed() {
+    # $1 = what did not happen and what that costs. Reported now and again at
+    # the end, because the run continues and the recreate output buries it.
+    warn "$1"
+    warn "Re-run the step once the cause is fixed; the platform serves without it."
+    VENDOR_FAILURES+=("$1")
+}
+
+report_vendor_failures() {
+    if [ "${#VENDOR_FAILURES[@]}" -gt 0 ]; then
+        echo
+        warn "${#VENDOR_FAILURES[@]} vendoring step(s) failed during this run:"
+        local f
+        for f in "${VENDOR_FAILURES[@]}"; do
+            warn "  - $f"
+        done
+    fi
 }
 
 recreate_stack() {
@@ -361,8 +405,11 @@ recreate_stack() {
         # `up` rather than `start`, so a .env the rollback restored is re-read.
         # A backup service that fails to come back is not a failed update: the
         # platform is serving, so say so and leave the stack up.
-        "${COMPOSE[@]}" up -d borg \
-            || warn "borg did not start; check '${COMPOSE[*]} logs borg' and start it with: ${COMPOSE[*]} up -d borg"
+        if "${COMPOSE[@]}" up -d borg; then
+            rm -f "$BORG_MARKER"
+        else
+            warn "borg did not start; check '${COMPOSE[*]} logs borg' and start it with: ${COMPOSE[*]} up -d borg"
+        fi
     fi
     ok "Stack is up"
     if [ "$SKIP_BEAT" = true ]; then
@@ -602,6 +649,7 @@ if [ "$ROLLBACK" = true ]; then
     refresh_vendored_assets
     recreate_stack
     wait_for_health
+    report_vendor_failures
     echo
     if [ "$CODE_RESTORED" = true ]; then
         ok "Rollback complete — database, .env and code restored."
@@ -703,6 +751,13 @@ if [ "$BACKUP" = true ]; then
             --exclude="__pycache__" \
             -C . . 2>/dev/null; then
         ok "Code snapshotted ($(du -h "$snap/code.tar.gz" | cut -f1))"
+        # Run as root, the snapshot belongs to root, and the deploy account can
+        # then neither prune it nor restore from it later. Hand it to whoever
+        # owns the tree. GNU stat only, like the ownership preflight.
+        if [ "$(id -u)" = 0 ]; then
+            owner="$(stat -c %u:%g . 2>/dev/null || true)"
+            [ -n "$owner" ] && chown -R "$owner" "$snap"
+        fi
     else
         rm -rf "$snap"
         die "Code snapshot failed; aborting before any change. (Pass --no-backup to override.)"
@@ -904,6 +959,7 @@ recreate_stack
 # ── 8. Health check + summary ─────────────────────────────────────────────────
 
 wait_for_health
+report_vendor_failures
 
 echo
 "${COMPOSE[@]}" ps

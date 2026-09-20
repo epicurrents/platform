@@ -147,6 +147,17 @@ class Command(BaseCommand):
     def handle(self, *args, **options):
         self._payloads = {}
         version = options["pyodide_version"] or self._configured_version()
+        if version is None:
+            # A deployment whose public viewer mode names no asset path loads Pyodide
+            # from the viewer's default CDN, so there is no tree to vendor or to check.
+            # Saying so and exiting cleanly matters more than it looks: update.sh runs
+            # this after the services are stopped, so an error here is an update that
+            # ends with the stack down.
+            self.stdout.write(
+                "No pyodideAssetPath is configured in PUBLIC_VIEWER_MODES; the viewer loads Pyodide from "
+                "its default CDN and there is nothing to vendor."
+            )
+            return
         out_dir = (
             Path(options["output_dir"]) if options["output_dir"] else Path(settings.VENDOR_DIR) / "pyodide" / version
         )
@@ -222,14 +233,25 @@ class Command(BaseCommand):
 
     # -- version resolution ---------------------------------------------------------
 
-    def _configured_version(self) -> str:
-        """Version named by the public viewer mode's ``pyodideAssetPath``."""
+    def _configured_version(self) -> str | None:
+        """Version named by the public viewer mode's ``pyodideAssetPath``.
+
+        ``None`` when no mode names a path at all — that deployment vendors nothing. A
+        path that is present but does not carry a version is an error rather than a
+        no-op, because it means the setting was written and cannot be acted on.
+        """
         modes = getattr(settings, "PUBLIC_VIEWER_MODES", {}) or {}
+        configured = False
         for mode in modes.values():
             path = (mode.get("setup") or {}).get("pyodideAssetPath") or ""
+            if not path:
+                continue
+            configured = True
             found = _VERSION_IN_PATH.search(path)
             if found:
                 return found.group("version")
+        if not configured:
+            return None
         raise CommandError(
             "No pyodideAssetPath of the form /vendor/pyodide/<version>/ is configured in "
             "PUBLIC_VIEWER_MODES; pass --pyodide-version explicitly."

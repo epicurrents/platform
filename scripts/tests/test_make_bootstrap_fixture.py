@@ -324,6 +324,7 @@ class TestDemoPackage:
         result = _run(dest, "--demo")
         assert result.returncode == 0, result.stderr
         assert (dest / "frontend" / "dist" / "index.html").is_file()
+        assert (dest / "frontend" / "viewer-pin.json").is_file()
         runner = dest / "start.sh"
         assert runner.is_file()
         assert os.access(runner, os.X_OK)
@@ -367,6 +368,9 @@ class TestDistPackage:
         assert result.returncode == 0, result.stderr
         assert (dest / "frontend" / "dist" / "index.html").is_file()
         assert (dest / "frontend" / "viewer-dist" / "epicurrents-lib.umd.js").is_file()
+        # update.sh runs vendor_viewer on every update, and it refuses a tree
+        # without the pin; a package that leaves it out fails its first update.
+        assert (dest / "frontend" / "viewer-pin.json").is_file()
         assert (dest / "projects" / "example" / "apps.py").is_file()
         runner = (dest / "start.sh").read_text()
         assert 'ACTIVE_PROJECT="example"' in runner

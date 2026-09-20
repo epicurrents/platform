@@ -559,6 +559,34 @@ class TestBorgPause:
         start_i = _index_of(calls, "up -d borg")
         assert -1 < stop_i < restore_i < start_i, f"stop={stop_i} restore={restore_i} start={start_i}"
 
+    def test_a_run_that_stopped_borg_and_died_is_repaired_by_the_next(self, fakebin, tmp_path):
+        """Observed on a deployment: a rollback stopped borg, died at a later step,
+        and the next run found borg stopped — indistinguishable from a deployment
+        that never ran it — so backups stayed off until someone noticed. The
+        stop leaves a marker that the next run honours and the restart clears.
+        """
+        _deploy(fakebin, tmp_path)
+        fakebin.stub("docker", body=_docker_stub('*"manage.py migrate"*) exit 1 ;;'))
+        result = run_script("update.sh", fakebin, cwd=tmp_path, args=["--from", "repo", "--no-pull"])
+        assert result.returncode != 0
+        marker = tmp_path / "update" / ".borg-was-running"
+        assert marker.is_file(), "the stop must record that borg was running"
+
+        fakebin.log.write_text("")
+        fakebin.stub("docker", body=_docker_stub('*" ps borg") ;;'))
+        result = run_script("update.sh", fakebin, cwd=tmp_path, args=["--from", "repo", "--no-pull"])
+        assert result.returncode == 0, result.stderr
+        assert fakebin.has_call("up -d borg"), "borg was left down after the repair run"
+        assert not marker.exists(), "a successful restart must clear the marker"
+
+    def test_the_marker_is_kept_when_borg_fails_to_start(self, fakebin, tmp_path):
+        _deploy(fakebin, tmp_path)
+        fakebin.stub("docker", body=_docker_stub('*"up -d borg"*) exit 1 ;;'))
+        result = run_script("update.sh", fakebin, cwd=tmp_path, args=["--from", "repo", "--no-pull"])
+        assert result.returncode == 0, result.stderr
+        assert "borg did not start" in result.stdout
+        assert (tmp_path / "update" / ".borg-was-running").is_file()
+
     def test_borg_is_not_started_on_a_deployment_that_did_not_run_it(self, fakebin, tmp_path):
         # A deployment with backups turned off has the service defined and never
         # started; an update must not be what starts it.
@@ -600,6 +628,24 @@ class TestSkipBeat:
         assert result.returncode == 0, result.stderr
         started = [c for c in fakebin.calls() if " up " in c and "celery-beat" in c]
         assert not started, started
+
+
+class TestSnapshotOwnership:
+    @requires_gnu_stat
+    def test_a_snapshot_taken_by_root_is_handed_to_the_tree_owner(self, fakebin, tmp_path):
+        # Observed on a deployment: a root-run update left backups/pre-update-*
+        # owned by root, which the deploy account can neither prune nor restore.
+        _deploy(fakebin, tmp_path)
+        fakebin.stub("id", body="echo 0")
+        result = run_script("update.sh", fakebin, cwd=tmp_path, args=["--from", "repo", "--no-pull"])
+        assert result.returncode == 0, result.stderr
+        assert any("chown -R" in c and "pre-update-" in c for c in fakebin.calls()), fakebin.calls()
+
+    def test_an_unprivileged_run_does_not_chown(self, fakebin, tmp_path):
+        _deploy(fakebin, tmp_path)
+        result = run_script("update.sh", fakebin, cwd=tmp_path, args=["--from", "repo", "--no-pull"])
+        assert result.returncode == 0, result.stderr
+        assert not any("chown" in c and "pre-update-" in c for c in fakebin.calls())
 
 
 class TestRootFlag:
@@ -849,3 +895,43 @@ class TestUpdateShViewerEdition:
         run_script("update.sh", fakebin, cwd=tmp_path, args=["--from", "repo", "--no-pull"])
         call = next(c for c in fakebin.calls() if "vendor_viewer" in c)
         assert "--user 1000:1000" in call, call
+
+
+class TestVendoringIsNotFatal:
+    """The vendoring steps run after the services are stopped. A failure that
+    aborted there left the stack down over an asset tree — observed on a
+    deployment whose project names no Pyodide asset path — so each step now
+    reports and the run goes on to recreate the stack and check its health.
+    """
+
+    def test_a_pyodide_failure_still_recreates_the_stack(self, fakebin, tmp_path):
+        _deploy(fakebin, tmp_path)
+        fakebin.stub("docker", body=_docker_stub('*"vendor_pyodide"*) exit 1 ;;'))
+        fakebin.stub("curl")
+        result = run_script("update.sh", fakebin, cwd=tmp_path, args=["--from", "repo", "--no-pull"])
+        assert result.returncode == 0, result.stderr
+        assert fakebin.has_call("--force-recreate web celery")
+        assert fakebin.has_call("/api/v1/health")
+        assert "Pyodide runtime was not vendored" in result.stdout
+        assert "vendoring step(s) failed" in result.stdout, "the summary must repeat the failure"
+        assert not (tmp_path / "update" / "maintenance.json").exists()
+
+    def test_every_vendoring_step_is_attempted_after_one_fails(self, fakebin, tmp_path):
+        _deploy(fakebin, tmp_path)
+        fakebin.stub("docker", body=_docker_stub('*"vendor_viewer"*) exit 1 ;;'))
+        result = run_script("update.sh", fakebin, cwd=tmp_path, args=["--from", "repo", "--no-pull"])
+        assert result.returncode == 0, result.stderr
+        assert fakebin.has_call("vendor_pyodide --check")
+        assert fakebin.has_call("generate_compute_static")
+        assert "viewer edition was not installed" in result.stdout
+
+    def test_a_rollback_survives_a_vendoring_failure(self, fakebin, tmp_path):
+        _deploy(fakebin, tmp_path)
+        TestRollback()._seed_snapshot(tmp_path, with_code=True)
+        fakebin.stub("rsync")
+        fakebin.stub("docker", body=_docker_stub('*"generate_compute_static"*) exit 1 ;;'))
+        result = run_script("update.sh", fakebin, cwd=tmp_path, args=["--rollback", "--yes"])
+        assert result.returncode == 0, result.stderr
+        assert fakebin.has_call("--force-recreate web celery")
+        assert "Rollback complete" in result.stdout
+        assert "lead fields were not generated" in result.stdout

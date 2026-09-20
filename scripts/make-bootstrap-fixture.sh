@@ -557,6 +557,17 @@ if [ "$DEMO" = true ] || [ "$DIST" = true ]; then
     mkdir -p "$DEST/frontend"
     rsync -a "${COMMON_EXCLUDES[@]}" "$REPO_ROOT/frontend/dist/" "$DEST/frontend/dist/"
     ok "frontend/dist ($(du -sh "$DEST/frontend/dist" | cut -f1))"
+    # The viewer pin travels with the bundles. update.sh runs `vendor_viewer`
+    # on every update and rollback, and the command refuses a tree with no pin
+    # file; without it every packaged deployment reported a failed vendoring
+    # step on its first update. An empty pin is the statement that the shipped
+    # edition is the one to keep.
+    if [ -f "$REPO_ROOT/frontend/viewer-pin.json" ]; then
+        cp "$REPO_ROOT/frontend/viewer-pin.json" "$DEST/frontend/viewer-pin.json"
+        ok "frontend/viewer-pin.json"
+    else
+        die "frontend/viewer-pin.json is missing; update.sh's viewer check needs it in the package."
+    fi
 fi
 if [ "$DIST" = true ]; then
     info "Copying compiled viewer (frontend/viewer-dist)"
@@ -1228,7 +1239,7 @@ fi
 if [ -n "$ADMIN_PW" ]; then
     echo "  Log in as:  ${ADMIN_USER} / ${ADMIN_PW}"
 else
-    # Not "the password is ADMIN_PASSWORD in .env", which it stops being the
+    # Not "the password is ADMIN_PASSWORD in the env file", which it stops being the
     # moment the account exists: createadmin reads that value once, at creation,
     # and no-ops on every later run. Naming the file sends an operator who has
     # lost the password to edit a value that changes nothing — and the restart
