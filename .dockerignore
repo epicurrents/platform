@@ -102,3 +102,8 @@ recordings/converters/*
 # operator runbook notes). Host-only: nothing in the image reads them, and they
 # name a real organisation and its open compliance gaps.
 local/
+
+# The viewer pin is the one frontend file the image needs: the production
+# vendor service has no /code bind and reads the pin baked in here, and
+# without it every update fails the viewer step with "No pin file".
+!frontend/viewer-pin.json

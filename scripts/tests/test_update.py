@@ -12,12 +12,18 @@ dry-run, like the bootstrap-script tests.
 """
 
 import gzip as gzlib
+import hashlib
 import json
+import os
+import shutil
 import subprocess
+import sys
 
 import pytest
 
 from scripts.tests.conftest import SCRIPTS_DIR, make_env, run_script
+
+RELEASE_SIGN = SCRIPTS_DIR / "lib" / "release_sign.py"
 
 # A docker stub that reports the db / borg containers as running (so
 # ensure_db_up does not take the "start it" branch) and succeeds otherwise.
@@ -58,7 +64,25 @@ esac
 """
 
 
-def _deploy(fakebin, tmp_path, **env):
+#: Real hashing behind the harness's no-op sha256sum stub, so a package's hash
+#: check runs for real: the coreutils binary where there is one, Perl's shasum
+#: elsewhere (macOS).
+REAL_SHA256SUM = 'if [ -x /usr/bin/sha256sum ]; then exec /usr/bin/sha256sum "$@"; fi\nexec shasum -a 256 "$@"'
+
+#: Real tar behind a logging stub, so the call log shows what was extracted.
+REAL_TAR = 'exec /usr/bin/tar "$@"'
+
+#: An openssl that answers as OpenSSL 3 and verifies every signature.
+OPENSSL_VERIFIES = 'case "$1" in version) echo "OpenSSL 3.0.13 30 Jan 2024" ;; esac'
+
+#: An openssl that answers as OpenSSL 3 and rejects every signature.
+OPENSSL_REJECTS = 'case "$1" in version) echo "OpenSSL 3.0.13 30 Jan 2024"; exit 0 ;; esac\nexit 1'
+
+#: The system openssl of a Mac, or of an old distribution: no Ed25519.
+OPENSSL_TOO_OLD = 'case "$1" in version) echo "LibreSSL 3.3.6" ;; esac'
+
+
+def _deploy(fakebin, tmp_path, *, installed_version="0.1.0", **env):
     """Set up a fake deployment root: a .env plus running-container stubs."""
     make_env(tmp_path, **env)
     # update.sh refuses a tree uid 1000 cannot write, and pytest's tmp_path belongs
@@ -67,6 +91,106 @@ def _deploy(fakebin, tmp_path, **env):
     tmp_path.chmod(0o777)
     fakebin.stub("docker", body=DOCKER_PS_RUNNING)
     fakebin.stub("cp", body=REAL_CP)
+    fakebin.stub("sha256sum", body=REAL_SHA256SUM)
+    fakebin.stub("tar", body=REAL_TAR)
+    if installed_version:
+        (tmp_path / "epicurrents").mkdir(exist_ok=True)
+        (tmp_path / "epicurrents" / "version.py").write_text(f'__version__ = "{installed_version}"\n')
+
+
+def _helper(*args):
+    """Run scripts/lib/release_sign.py with the suite's own interpreter, which has cryptography."""
+    return subprocess.run(
+        [sys.executable, str(RELEASE_SIGN), *args], check=True, capture_output=True, text=True
+    ).stdout
+
+
+def _sign_key(tmp_path):
+    """Generate a release key pair; returns (private, public) paths."""
+    key = tmp_path / "keys" / "release.key"
+    _helper("keygen", str(key))
+    return key, key.with_name("release.key.pub")
+
+
+def _build_package(
+    tmp_path,
+    *,
+    name="epicurrents-test",
+    top="epicurrents-test",
+    version="0.2.0",
+    files=None,
+    filelist=True,
+    manifest=True,
+    project="",
+    plugins="",
+    sign_key=None,
+    min_updater_version=2,
+    tar_args=(),
+):
+    """Build a real distribution-shaped tarball under update/ plus its sidecars.
+
+    The tree holds a compose file and a version module, plus ``files`` (relative
+    path → content), wrapped in one top-level directory the way the packager
+    wraps a package. Returns the archive path; the manifest and signature sit
+    beside it under the names update.sh looks for.
+    """
+    tree = tmp_path / "pkg-tree" / top
+    tree.mkdir(parents=True)
+    (tree / "docker-compose.yml").write_text("services: {}\n")
+    (tree / "epicurrents").mkdir()
+    (tree / "epicurrents" / "version.py").write_text(f'__version__ = "{version}"\n')
+    for rel, content in (files or {}).items():
+        path = tree / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content)
+    if filelist:
+        (tree / "FILELIST").write_text("")
+        names = sorted(str(p.relative_to(tree)) for p in tree.rglob("*") if p.is_file())
+        (tree / "FILELIST").write_text("\n".join(names) + "\n")
+    (tmp_path / "update").mkdir(exist_ok=True)
+    archive = tmp_path / "update" / f"{name}.tar.gz"
+    subprocess.run(
+        ["/usr/bin/tar", "-czf", str(archive), *tar_args, "-C", str(tmp_path / "pkg-tree"), top],
+        check=True,
+        env={**os.environ, "COPYFILE_DISABLE": "1"},
+    )
+    if manifest:
+        _write_manifest(archive, version=version, project=project, plugins=plugins,
+                        min_updater_version=min_updater_version, sign_key=sign_key)
+    return archive
+
+
+def _write_manifest(archive, *, version, project="", plugins="", min_updater_version=2, sign_key=None, sha256=None):
+    digest = sha256 or hashlib.sha256(archive.read_bytes()).hexdigest()
+    manifest = archive.with_name(archive.name + ".manifest.json")
+    _helper(
+        "manifest", "--package", archive.name, "--sha256", digest, "--size", str(archive.stat().st_size),
+        "--version", version, "--platform-compatible", ">=0.1,<0.2", "--project", project,
+        "--plugins", plugins, "--min-updater-version", str(min_updater_version), "--out", str(manifest),
+    )
+    if sign_key is not None:
+        signature = manifest.with_name(archive.name + ".manifest.sig")
+        signature.write_text(_helper("sign", str(sign_key), str(manifest)))
+    return manifest
+
+
+def _progress(result):
+    """The ``::`` lines of a run, in order, without the prefix."""
+    return [line[2:] for line in result.stdout.splitlines() if line.startswith("::")]
+
+
+def _extracted_to_disk(fakebin):
+    """Whether any tar call unpacked an archive into a directory (as opposed to listing or streaming one)."""
+    return any(c.startswith("tar") and " -x" in c and " -C " in c for c in fakebin.calls())
+
+
+def _nothing_touched(fakebin, root):
+    """The assertions every refusal shares: no extraction, no overlay, no snapshot, no flag."""
+    assert not _extracted_to_disk(fakebin), "the archive was extracted"
+    assert not fakebin.has_call("rsync"), "the tree was overlaid"
+    assert not (root / "backups").exists(), "a snapshot was taken"
+    assert not (root / "update" / "maintenance.json").exists(), "the maintenance flag went up"
+    assert not fakebin.has_call("stop web"), "the stack was stopped"
 
 
 def _read_flag(root):
@@ -354,22 +478,9 @@ class TestRepoMode:
 
 class TestArchiveMode:
     def _seed_archive(self, fakebin, tmp_path):
-        (tmp_path / "update").mkdir()
-        (tmp_path / "update" / "epicurrents-test.tar.gz").write_bytes(b"x")
-        # tar "extracts" a package whose root carries a docker-compose.yml so the
-        # archive-validity check passes without a real tarball.
-        fakebin.stub(
-            "tar",
-            body=r"""
-dir=""; prev=""
-for a in "$@"; do
-    [ "$prev" = "-C" ] && dir="$a"
-    prev="$a"
-done
-mkdir -p "$dir/pkg"
-: > "$dir/pkg/docker-compose.yml"
-""",
-        )
+        # A real, unsigned package: the manifest is checked for consistency and
+        # the missing signature is a warning on the manual path.
+        _build_package(tmp_path)
         fakebin.stub("rsync")
 
     def test_overlay_sync_never_deletes_and_preserves_operator_state(self, fakebin, tmp_path):
@@ -639,13 +750,41 @@ class TestSnapshotOwnership:
         fakebin.stub("id", body="echo 0")
         result = run_script("update.sh", fakebin, cwd=tmp_path, args=["--from", "repo", "--no-pull"])
         assert result.returncode == 0, result.stderr
-        assert any("chown -R" in c and "pre-update-" in c for c in fakebin.calls()), fakebin.calls()
+        calls = fakebin.calls()
+        chowns = [i for i, c in enumerate(calls) if "chown -R" in c and "pre-update-" in c]
+        assert chowns, calls
+        # Once after the code archive and again after the dump: the dump lands
+        # minutes later, and a single chown after the archive left it root-owned.
+        dump_i = _index_of(calls, "pg_dump")
+        assert dump_i > -1 and chowns[-1] > dump_i, f"no chown after the dump: chowns={chowns} dump={dump_i}"
+
+    @requires_gnu_stat
+    def test_a_named_snapshot_taken_by_root_is_handed_over_whole(self, fakebin, tmp_path):
+        _deploy(fakebin, tmp_path)
+        fakebin.stub("id", body="echo 0")
+        result = run_script("update.sh", fakebin, cwd=tmp_path, args=["--snapshot", "post-update"])
+        assert result.returncode == 0, result.stderr
+        calls = fakebin.calls()
+        assert _index_of(calls, "pg_dump") < max(i for i, c in enumerate(calls) if "chown -R" in c and "post-update-" in c)
 
     def test_an_unprivileged_run_does_not_chown(self, fakebin, tmp_path):
         _deploy(fakebin, tmp_path)
         result = run_script("update.sh", fakebin, cwd=tmp_path, args=["--from", "repo", "--no-pull"])
         assert result.returncode == 0, result.stderr
         assert not any("chown" in c and "pre-update-" in c for c in fakebin.calls())
+
+    @requires_gnu_stat
+    def test_the_installed_file_list_written_by_root_is_handed_to_the_tree_owner(self, fakebin, tmp_path):
+        # Observed on a deployment: a root-run update left .epicurrents-files
+        # owned by root, and a later run as the deployment account would die on
+        # replacing it — after the overlay, the worst place to stop.
+        _deploy(fakebin, tmp_path)
+        _build_package(tmp_path)
+        fakebin.stub("rsync")
+        fakebin.stub("id", body="echo 0")
+        result = run_script("update.sh", fakebin, cwd=tmp_path)
+        assert result.returncode == 0, result.stderr
+        assert any("chown" in c and ".epicurrents-files" in c for c in fakebin.calls()), fakebin.calls()
 
 
 class TestRootFlag:
@@ -935,3 +1074,772 @@ class TestVendoringIsNotFatal:
         assert fakebin.has_call("--force-recreate web celery")
         assert "Rollback complete" in result.stdout
         assert "lead fields were not generated" in result.stdout
+
+
+def _real_openssl3():
+    """Path of an OpenSSL 3 binary on this machine, or None.
+
+    The harness PATH ends in the system directories, and macOS ships LibreSSL
+    there, so the one test that exercises real Ed25519 verification looks for a
+    Homebrew or distribution OpenSSL 3 explicitly.
+    """
+    candidates = ["/opt/homebrew/bin/openssl", "/usr/local/bin/openssl", shutil.which("openssl"), "/usr/bin/openssl"]
+    for candidate in candidates:
+        if not candidate or not os.access(candidate, os.X_OK):
+            continue
+        version = subprocess.run([candidate, "version"], capture_output=True, text=True, check=False).stdout
+        if version.startswith("OpenSSL 3"):
+            return candidate
+    return None
+
+
+class TestArchiveVerification:
+    """A package is checked before a byte of it is extracted, and a refused one
+    leaves no trace: no snapshot, no flag, no overlay. The signature binds the
+    manifest, the manifest binds the tarball by hash, and the manifest says
+    what the package is — version, project, plugins — so a package for the
+    wrong deployment is refused before the snapshot rather than discovered
+    from a broken stack.
+    """
+
+    def _signed(self, fakebin, tmp_path, **kwargs):
+        _deploy(fakebin, tmp_path, **{k: v for k, v in kwargs.items() if k in ("EPICURRENTS_PROJECT", "EPICURRENTS_PLUGINS")})
+        key, pub = _sign_key(tmp_path)
+        shutil.copy(pub, tmp_path / "RELEASE_KEY.pub")
+        build = {k: v for k, v in kwargs.items() if k not in ("EPICURRENTS_PROJECT", "EPICURRENTS_PLUGINS")}
+        archive = _build_package(tmp_path, sign_key=key, **build)
+        fakebin.stub("rsync")
+        fakebin.stub("openssl", body=OPENSSL_VERIFIES)
+        return archive, key
+
+    def test_a_signed_package_verifies_and_applies(self, fakebin, tmp_path):
+        self._signed(fakebin, tmp_path)
+        result = run_script("update.sh", fakebin, cwd=tmp_path, args=["--require-signature", "--require-newer"])
+        assert result.returncode == 0, result.stderr
+        assert fakebin.has_call("pkeyutl -verify")
+        assert "signature=verified" in _progress(result)
+        assert "version=0.2.0" in _progress(result) and "installed=0.1.0" in _progress(result)
+        assert fakebin.has_call("rsync")
+
+    def test_the_signature_is_checked_before_anything_is_extracted(self, fakebin, tmp_path):
+        self._signed(fakebin, tmp_path)
+        calls = []
+        run_script("update.sh", fakebin, cwd=tmp_path)
+        calls = fakebin.calls()
+        verify_i = _index_of(calls, "pkeyutl -verify")
+        extract_i = next((i for i, c in enumerate(calls) if c.startswith("tar") and " -x" in c and " -C " in c), -1)
+        assert -1 < verify_i < extract_i, f"verify={verify_i} extract={extract_i}"
+
+    def test_a_bad_signature_is_refused_and_nothing_is_touched(self, fakebin, tmp_path):
+        self._signed(fakebin, tmp_path)
+        fakebin.stub("openssl", body=OPENSSL_REJECTS)
+        result = run_script("update.sh", fakebin, cwd=tmp_path)
+        assert result.returncode != 0
+        assert "does NOT verify" in result.stderr
+        assert any(line.startswith("failed=") for line in _progress(result))
+        _nothing_touched(fakebin, tmp_path)
+
+    def test_a_real_ed25519_signature_verifies_through_openssl(self, fakebin, tmp_path):
+        # The stubs above answer for openssl; this one lets the real binary check
+        # a signature the Python helper made, which is the pairing a deployment
+        # host runs: cryptography signs on the packaging machine, OpenSSL 3
+        # verifies on the host.
+        openssl = _real_openssl3()
+        if openssl is None:
+            pytest.skip("no OpenSSL 3 on this machine")
+        archive, _ = self._signed(fakebin, tmp_path)
+        fakebin.stub("openssl", body=f'exec {openssl} "$@"')
+        result = run_script("update.sh", fakebin, cwd=tmp_path, args=["--check-archive", str(archive)])
+        assert result.returncode == 0, result.stderr
+        assert "signature=verified" in _progress(result)
+        # And a flipped byte in the manifest is what a bad signature looks like.
+        manifest = archive.with_name(archive.name + ".manifest.json")
+        manifest.write_text(manifest.read_text().replace('"version": "0.2.0"', '"version": "0.2.1"'))
+        result = run_script("update.sh", fakebin, cwd=tmp_path, args=["--check-archive", str(archive)])
+        assert result.returncode != 0
+        assert "does NOT verify" in result.stderr
+
+    def test_a_tampered_archive_fails_the_hash_check(self, fakebin, tmp_path):
+        archive, _ = self._signed(fakebin, tmp_path)
+        with archive.open("ab") as fh:
+            fh.write(b"\0")
+        result = run_script("update.sh", fakebin, cwd=tmp_path)
+        assert result.returncode != 0
+        assert "does not match its manifest" in result.stderr
+        _nothing_touched(fakebin, tmp_path)
+
+    def test_an_unsigned_package_is_refused_when_a_signature_is_required(self, fakebin, tmp_path):
+        _deploy(fakebin, tmp_path)
+        _build_package(tmp_path)
+        fakebin.stub("rsync")
+        result = run_script("update.sh", fakebin, cwd=tmp_path, args=["--require-signature"])
+        assert result.returncode != 0
+        assert "not signed" in result.stderr
+        _nothing_touched(fakebin, tmp_path)
+
+    def test_an_unsigned_package_applies_with_a_warning_on_the_manual_path(self, fakebin, tmp_path):
+        _deploy(fakebin, tmp_path)
+        _build_package(tmp_path)
+        fakebin.stub("rsync")
+        result = run_script("update.sh", fakebin, cwd=tmp_path)
+        assert result.returncode == 0, result.stderr
+        assert "not signed" in result.stdout
+        assert "signature=unsigned" in _progress(result)
+
+    def test_a_package_with_no_manifest_still_applies_but_cannot_be_required(self, fakebin, tmp_path):
+        _deploy(fakebin, tmp_path)
+        _build_package(tmp_path, manifest=False)
+        fakebin.stub("rsync")
+        result = run_script("update.sh", fakebin, cwd=tmp_path)
+        assert result.returncode == 0, result.stderr
+        assert "No manifest" in result.stdout
+        assert "manifest=none" in _progress(result)
+        # The version still comes out of the tarball itself.
+        assert "version=0.2.0" in _progress(result)
+        result = run_script("update.sh", fakebin, cwd=tmp_path, args=["--require-signature"])
+        assert result.returncode != 0
+        assert "No manifest" in result.stderr
+
+    def test_a_signed_package_without_a_key_on_the_host_warns_or_refuses(self, fakebin, tmp_path):
+        self._signed(fakebin, tmp_path)
+        (tmp_path / "RELEASE_KEY.pub").unlink()
+        result = run_script("update.sh", fakebin, cwd=tmp_path)
+        assert result.returncode == 0, result.stderr
+        assert "no release key" in result.stdout
+        assert "signature=unverifiable" in _progress(result)
+        result = run_script("update.sh", fakebin, cwd=tmp_path, args=["--require-signature"])
+        assert result.returncode != 0
+        assert "no release key" in result.stderr
+
+    def test_release_key_names_the_key_to_verify_against(self, fakebin, tmp_path):
+        _, key = self._signed(fakebin, tmp_path)
+        (tmp_path / "RELEASE_KEY.pub").unlink()
+        elsewhere = tmp_path / "keys" / "release.key.pub"
+        result = run_script(
+            "update.sh", fakebin, cwd=tmp_path, args=["--require-signature", "--release-key", str(elsewhere)]
+        )
+        assert result.returncode == 0, result.stderr
+        assert fakebin.has_call(f"-inkey {elsewhere}")
+
+    def test_a_host_that_cannot_verify_says_so(self, fakebin, tmp_path):
+        # LibreSSL cannot do Ed25519 and neither can a python3 without
+        # cryptography: the signature is reported as unverifiable, which
+        # --require-signature refuses.
+        self._signed(fakebin, tmp_path)
+        fakebin.stub("openssl", body=OPENSSL_TOO_OLD)
+        fakebin.stub("python3", exit_code=1)
+        result = run_script("update.sh", fakebin, cwd=tmp_path)
+        assert result.returncode == 0, result.stderr
+        assert "nothing on this host can check" in result.stdout
+        assert "signature=unverifiable" in _progress(result)
+        result = run_script("update.sh", fakebin, cwd=tmp_path, args=["--require-signature"])
+        assert result.returncode != 0
+        assert "nothing on this host can check" in result.stderr
+
+    def test_a_package_for_another_project_is_refused(self, fakebin, tmp_path):
+        self._signed(fakebin, tmp_path, EPICURRENTS_PROJECT="edu", project="research")
+        result = run_script("update.sh", fakebin, cwd=tmp_path)
+        assert result.returncode != 0
+        assert "built for project 'research'" in result.stderr and "runs 'edu'" in result.stderr
+        _nothing_touched(fakebin, tmp_path)
+
+    def test_a_base_package_over_a_project_deployment_is_refused(self, fakebin, tmp_path):
+        self._signed(fakebin, tmp_path, EPICURRENTS_PROJECT="edu", project="")
+        result = run_script("update.sh", fakebin, cwd=tmp_path)
+        assert result.returncode != 0
+        assert "built for project '<none>'" in result.stderr
+
+    def test_a_different_plugin_set_is_refused_and_order_does_not_matter(self, fakebin, tmp_path):
+        self._signed(fakebin, tmp_path, EPICURRENTS_PLUGINS="dicom,other", plugins="other,dicom")
+        result = run_script("update.sh", fakebin, cwd=tmp_path)
+        assert result.returncode == 0, result.stderr
+        shutil.rmtree(tmp_path / "pkg-tree")
+        _write_manifest(tmp_path / "update" / "epicurrents-test.tar.gz", version="0.2.0", plugins="dicom",
+                        sign_key=tmp_path / "keys" / "release.key")
+        result = run_script("update.sh", fakebin, cwd=tmp_path)
+        assert result.returncode != 0
+        assert "carries plugins 'dicom'" in result.stderr
+
+    def test_a_package_needing_a_newer_updater_is_refused(self, fakebin, tmp_path):
+        self._signed(fakebin, tmp_path, min_updater_version=99)
+        result = run_script("update.sh", fakebin, cwd=tmp_path)
+        assert result.returncode != 0
+        assert "needs update.sh version 99" in result.stderr
+        _nothing_touched(fakebin, tmp_path)
+
+    def test_require_newer_refuses_the_same_version_and_a_downgrade(self, fakebin, tmp_path):
+        self._signed(fakebin, tmp_path, version="0.1.0")
+        result = run_script("update.sh", fakebin, cwd=tmp_path, args=["--require-newer"])
+        assert result.returncode != 0
+        assert "the same as the installed release" in result.stderr
+        _nothing_touched(fakebin, tmp_path)
+        shutil.rmtree(tmp_path / "pkg-tree")
+        _write_manifest(tmp_path / "update" / "epicurrents-test.tar.gz", version="0.0.9",
+                        sign_key=tmp_path / "keys" / "release.key")
+        result = run_script("update.sh", fakebin, cwd=tmp_path, args=["--require-newer"])
+        assert result.returncode != 0
+        assert "OLDER" in result.stderr
+
+    def test_without_require_newer_the_same_version_is_a_warning(self, fakebin, tmp_path):
+        self._signed(fakebin, tmp_path, version="0.1.0")
+        result = run_script("update.sh", fakebin, cwd=tmp_path)
+        assert result.returncode == 0, result.stderr
+        assert "the same as the installed release" in result.stdout
+
+    def test_a_ten_sorts_after_a_nine(self, fakebin, tmp_path):
+        # Numeric per component, not lexical: 0.1.10 is newer than 0.1.9.
+        _deploy(fakebin, tmp_path, installed_version="0.1.9")
+        _build_package(tmp_path, version="0.1.10")
+        fakebin.stub("rsync")
+        result = run_script("update.sh", fakebin, cwd=tmp_path, args=["--require-newer"])
+        assert result.returncode == 0, result.stderr
+
+
+class TestArchiveContents:
+    """The member list is read before extraction and anything an overlay must
+    not receive is refused: paths that escape the tree, links, a second
+    top-level entry, and the files that belong to the deployment.
+    """
+
+    def test_a_symlink_member_is_refused(self, fakebin, tmp_path):
+        _deploy(fakebin, tmp_path)
+        tree = tmp_path / "pkg-tree" / "epicurrents-test"
+        tree.mkdir(parents=True)
+        (tree / "docker-compose.yml").write_text("services: {}\n")
+        os.symlink("/etc/passwd", tree / "link")
+        archive = tmp_path / "update" / "epicurrents-test.tar.gz"
+        archive.parent.mkdir()
+        subprocess.run(["/usr/bin/tar", "-czf", str(archive), "-C", str(tree.parent), tree.name], check=True)
+        fakebin.stub("rsync")
+        result = run_script("update.sh", fakebin, cwd=tmp_path)
+        assert result.returncode != 0
+        assert "symbolic or hard links" in result.stderr
+        _nothing_touched(fakebin, tmp_path)
+
+    def test_a_parent_reference_is_refused(self, fakebin, tmp_path):
+        _deploy(fakebin, tmp_path)
+        # GNU tar strips a leading ../ on its own; a hand-crafted archive does
+        # not, so the member is written with Python's tarfile.
+        import tarfile
+
+        archive = tmp_path / "update" / "epicurrents-test.tar.gz"
+        archive.parent.mkdir()
+        with tarfile.open(archive, "w:gz") as tf:
+            info = tarfile.TarInfo("epicurrents-test/docker-compose.yml")
+            info.size = 0
+            tf.addfile(info)
+            info = tarfile.TarInfo("epicurrents-test/../escape")
+            info.size = 0
+            tf.addfile(info)
+        fakebin.stub("rsync")
+        result = run_script("update.sh", fakebin, cwd=tmp_path)
+        assert result.returncode != 0
+        assert "'..' component" in result.stderr
+        _nothing_touched(fakebin, tmp_path)
+
+    def test_two_top_level_entries_are_refused(self, fakebin, tmp_path):
+        _deploy(fakebin, tmp_path)
+        import tarfile
+
+        archive = tmp_path / "update" / "epicurrents-test.tar.gz"
+        archive.parent.mkdir()
+        with tarfile.open(archive, "w:gz") as tf:
+            for name in ("epicurrents-test/docker-compose.yml", "other/thing"):
+                info = tarfile.TarInfo(name)
+                info.size = 0
+                tf.addfile(info)
+        fakebin.stub("rsync")
+        result = run_script("update.sh", fakebin, cwd=tmp_path)
+        assert result.returncode != 0
+        assert "exactly one top-level directory" in result.stderr
+
+    def test_appledouble_members_are_named_as_the_cause(self, fakebin, tmp_path):
+        _deploy(fakebin, tmp_path)
+        import tarfile
+
+        archive = tmp_path / "update" / "epicurrents-test.tar.gz"
+        archive.parent.mkdir()
+        with tarfile.open(archive, "w:gz") as tf:
+            for name in ("epicurrents-test/docker-compose.yml", "._epicurrents-test"):
+                info = tarfile.TarInfo(name)
+                info.size = 0
+                tf.addfile(info)
+        fakebin.stub("rsync")
+        result = run_script("update.sh", fakebin, cwd=tmp_path)
+        assert result.returncode != 0
+        assert "COPYFILE_DISABLE" in result.stderr
+
+    def test_deployment_owned_files_in_a_package_are_refused(self, fakebin, tmp_path):
+        _deploy(fakebin, tmp_path)
+        _build_package(tmp_path, files={".env": "SECRET=1\n"}, manifest=False)
+        fakebin.stub("rsync")
+        result = run_script("update.sh", fakebin, cwd=tmp_path)
+        assert result.returncode != 0
+        assert ".env, .git/ or backups/" in result.stderr
+
+    def test_a_package_packed_with_a_dot_prefix_is_accepted(self, fakebin, tmp_path):
+        # `tar -C dir .` writes ./epicurrents-test/…; the one-directory rule
+        # looks past the prefix.
+        _deploy(fakebin, tmp_path)
+        tree = tmp_path / "pkg-tree" / "epicurrents-test"
+        tree.mkdir(parents=True)
+        (tree / "docker-compose.yml").write_text("services: {}\n")
+        archive = tmp_path / "update" / "epicurrents-test.tar.gz"
+        archive.parent.mkdir()
+        subprocess.run(["/usr/bin/tar", "-czf", str(archive), "-C", str(tree.parent), "."], check=True)
+        fakebin.stub("rsync")
+        result = run_script("update.sh", fakebin, cwd=tmp_path)
+        assert result.returncode == 0, result.stderr
+
+
+class TestCheckArchive:
+    """--check-archive runs every check an update runs and stops: it drives no
+    container, extracts nothing and writes nothing, and reports what it found
+    on ``::`` lines a caller can read.
+    """
+
+    def test_makes_no_state_change_and_needs_no_runtime(self, fakebin, tmp_path):
+        _deploy(fakebin, tmp_path)
+        archive = _build_package(tmp_path)
+        fakebin.remove("docker")
+        fakebin.remove("podman")
+        fakebin.stub("rsync")
+        result = run_script("update.sh", fakebin, cwd=tmp_path, args=["--check-archive", str(archive)])
+        assert result.returncode == 0, result.stderr
+        _nothing_touched(fakebin, tmp_path)
+        assert not any(c.startswith(("docker", "podman")) for c in fakebin.calls())
+        lines = _progress(result)
+        assert "check=ok" in lines and "version=0.2.0" in lines and "installed=0.1.0" in lines
+        assert f"archive={archive}" in lines
+        assert "done" not in lines, "check mode is not an update; ::done belongs to one"
+
+    def test_reports_what_the_tree_holds_that_the_package_does_not(self, fakebin, tmp_path):
+        _deploy(fakebin, tmp_path)
+        archive = _build_package(tmp_path, files={"epicurrents/keep.py": ""})
+        # In the tree under a directory the package populates, not in the package.
+        (tmp_path / "epicurrents" / "stale.py").write_text("")
+        # Protected, so not a candidate even though the package lacks it.
+        (tmp_path / "static").mkdir()
+        (tmp_path / "static" / "old.css").write_text("")
+        result = run_script("update.sh", fakebin, cwd=tmp_path, args=["--check-archive", str(archive)])
+        assert result.returncode == 0, result.stderr
+        assert "orphan_candidates=1" in _progress(result)
+        assert "epicurrents/stale.py" in result.stdout
+        assert "old.css" not in result.stdout
+
+    def test_a_refusal_exits_nonzero_with_the_reason(self, fakebin, tmp_path):
+        _deploy(fakebin, tmp_path)
+        archive = _build_package(tmp_path, version="0.1.0")
+        result = run_script(
+            "update.sh", fakebin, cwd=tmp_path, args=["--check-archive", str(archive), "--require-newer"]
+        )
+        assert result.returncode != 0
+        assert "same as the installed release" in result.stderr
+        assert "check=ok" not in _progress(result)
+
+
+class TestOrphanPruning:
+    """After the overlay, what the previous package shipped and the new one does
+    not is removed — and only that. The first update with a file list records
+    it and deletes nothing, because there is no previous list to subtract from.
+    """
+
+    def _installed(self, tmp_path, *files):
+        for rel in files:
+            path = tmp_path / rel
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("old")
+        (tmp_path / ".epicurrents-files").write_text("\n".join(sorted(files)) + "\n")
+
+    def test_the_first_update_records_the_list_and_deletes_nothing(self, fakebin, tmp_path):
+        _deploy(fakebin, tmp_path)
+        (tmp_path / "epicurrents" / "gone.py").write_text("old")
+        _build_package(tmp_path)
+        fakebin.stub("rsync")
+        result = run_script("update.sh", fakebin, cwd=tmp_path)
+        assert result.returncode == 0, result.stderr
+        assert (tmp_path / "epicurrents" / "gone.py").exists()
+        assert "starts with the next update" in result.stdout
+        recorded = (tmp_path / ".epicurrents-files").read_text().splitlines()
+        assert "FILELIST" in recorded and "epicurrents/version.py" in recorded
+
+    def test_the_next_update_prunes_old_minus_new_only(self, fakebin, tmp_path):
+        _deploy(fakebin, tmp_path)
+        self._installed(
+            tmp_path,
+            "epicurrents/version.py",
+            "epicurrents/dropped/__init__.py",
+            "epicurrents/dropped/tasks.py",
+            "recordings/migrations/0009_removed.py",
+            "docker-compose.yml",
+        )
+        (tmp_path / "docker-compose.override.yml").write_text("operator")   # never listed
+        (tmp_path / "epicurrents" / "generated.bin").write_text("runtime")   # never listed
+        _build_package(tmp_path, files={"recordings/migrations/0009_replacement.py": ""})
+        fakebin.stub("rsync")
+        result = run_script("update.sh", fakebin, cwd=tmp_path)
+        assert result.returncode == 0, result.stderr
+        assert not (tmp_path / "epicurrents" / "dropped").exists(), "the emptied package directory was not removed"
+        assert not (tmp_path / "recordings" / "migrations" / "0009_removed.py").exists()
+        assert (tmp_path / "epicurrents" / "version.py").exists()
+        assert (tmp_path / "docker-compose.override.yml").exists(), "an operator file was pruned"
+        assert (tmp_path / "epicurrents" / "generated.bin").exists(), "an unlisted file was pruned"
+        assert "Pruned 3 file(s)" in result.stdout
+        assert (tmp_path / ".epicurrents-files").read_text().splitlines() == sorted(
+            ["FILELIST", "docker-compose.yml", "epicurrents/version.py", "recordings/migrations/0009_replacement.py"]
+        )
+
+    def test_protected_paths_are_never_pruned_even_when_listed(self, fakebin, tmp_path):
+        _deploy(fakebin, tmp_path)
+        self._installed(
+            tmp_path,
+            "epicurrents/version.py",
+            "static/old.css",
+            "frontend/vendor/pyodide/x.wasm",
+            "recordings/converters/vendored/bin",
+            "projects/mine/models.py",
+            "update/README.md",
+            "local/notes.md",
+        )
+        (tmp_path / "projects" / "mine" / ".git").mkdir()
+        _build_package(tmp_path)
+        fakebin.stub("rsync")
+        result = run_script("update.sh", fakebin, cwd=tmp_path)
+        assert result.returncode == 0, result.stderr
+        for rel in (
+            "static/old.css",
+            "frontend/vendor/pyodide/x.wasm",
+            "recordings/converters/vendored/bin",
+            "projects/mine/models.py",
+            "update/README.md",
+            "local/notes.md",
+        ):
+            assert (tmp_path / rel).exists(), f"{rel} was pruned"
+        assert "Pruned 0 file(s)" in result.stdout
+
+    def test_a_copied_project_is_the_packages_and_is_pruned(self, fakebin, tmp_path):
+        # Without a .git the project tree came from a package, so a file the new
+        # package dropped goes.
+        _deploy(fakebin, tmp_path)
+        self._installed(tmp_path, "epicurrents/version.py", "projects/mine/old.py")
+        _build_package(tmp_path)
+        fakebin.stub("rsync")
+        result = run_script("update.sh", fakebin, cwd=tmp_path)
+        assert result.returncode == 0, result.stderr
+        assert not (tmp_path / "projects" / "mine" / "old.py").exists()
+
+    def test_a_package_without_a_list_prunes_nothing_and_says_so(self, fakebin, tmp_path):
+        _deploy(fakebin, tmp_path)
+        self._installed(tmp_path, "epicurrents/version.py", "epicurrents/dropped.py")
+        _build_package(tmp_path, filelist=False)
+        fakebin.stub("rsync")
+        result = run_script("update.sh", fakebin, cwd=tmp_path)
+        assert result.returncode == 0, result.stderr
+        assert (tmp_path / "epicurrents" / "dropped.py").exists()
+        assert "no FILELIST" in result.stdout
+
+    def test_the_installed_list_travels_with_the_code_snapshot(self):
+        # A root file, so the snapshot's `tar -C . .` carries it and a rollback
+        # restores it with the code it describes; the excludes must not name it.
+        body = (SCRIPTS_DIR / "update.sh").read_text()
+        assert 'INSTALLED_FILELIST="./.epicurrents-files"' in body
+        assert ".epicurrents-files" not in body.split("snapshot_code()")[1].split("}")[0]
+
+
+class TestProgressLines:
+    """A caller that tees the output follows the ``::`` lines: which step is
+    running, when the snapshot is complete (the point past which a rollback
+    is well defined), whether the health check passed, and how the run ended.
+    """
+
+    def test_an_update_reports_its_steps_in_order_and_ends_with_done(self, fakebin, tmp_path):
+        _deploy(fakebin, tmp_path)
+        _build_package(tmp_path)
+        fakebin.stub("rsync")
+        fakebin.stub("curl")
+        result = run_script("update.sh", fakebin, cwd=tmp_path)
+        assert result.returncode == 0, result.stderr
+        lines = _progress(result)
+        steps = [line for line in lines if line.startswith("step=")]
+        assert steps == [
+            "step=check", "step=snapshot", "step=acquire", "step=backup", "step=build", "step=stop",
+            "step=migrate", "step=static", "step=vendor", "step=recreate", "step=health",
+        ], steps
+        snapshot = next(line for line in lines if line.startswith("snapshot="))
+        assert snapshot.startswith("snapshot=./backups/pre-update-")
+        assert lines.index(snapshot) > lines.index("step=backup")
+        assert lines.index(snapshot) < lines.index("step=build")
+        assert "health=ok" in lines
+        assert lines[-1] == "done"
+
+    def test_a_failed_health_check_is_reported_on_a_line(self, fakebin, tmp_path):
+        _deploy(fakebin, tmp_path)
+        fakebin.stub("curl", exit_code=1)
+        result = run_script("update.sh", fakebin, cwd=tmp_path, args=["--from", "repo", "--no-pull"])
+        assert result.returncode == 0, result.stderr
+        assert "health=failed" in _progress(result)
+
+    def test_a_failure_before_the_snapshot_completes_reports_no_snapshot(self, fakebin, tmp_path):
+        _deploy(fakebin, tmp_path)
+        fakebin.stub("docker", body=_docker_stub('*"pg_dump"*) exit 1 ;;'))
+        result = run_script("update.sh", fakebin, cwd=tmp_path, args=["--from", "repo", "--no-pull"])
+        assert result.returncode != 0
+        lines = _progress(result)
+        assert not any(line.startswith("snapshot=") for line in lines)
+        assert any(line.startswith("failed=") for line in lines)
+        assert "done" not in lines
+
+    def test_a_rollback_reports_its_steps(self, fakebin, tmp_path):
+        _deploy(fakebin, tmp_path)
+        TestRollback()._seed_snapshot(tmp_path, with_code=True)
+        fakebin.stub("rsync")
+        fakebin.stub("curl")
+        result = run_script("update.sh", fakebin, cwd=tmp_path, args=["--rollback", "--yes"])
+        assert result.returncode == 0, result.stderr
+        steps = [line for line in _progress(result) if line.startswith("step=")]
+        assert steps == [
+            "step=stop", "step=restore-db", "step=restore-env", "step=restore-code", "step=build",
+            "step=static", "step=vendor", "step=recreate", "step=health",
+        ], steps
+        assert _progress(result)[-1] == "done"
+
+
+class TestNamedSnapshots:
+    """--snapshot LABEL takes a snapshot and exits; --rollback --snapshot NAME
+    restores that one. A snapshot named for its purpose is what a caller takes
+    before rolling back, and the name is what keeps --rollback from picking it
+    in place of the pre-update one.
+    """
+
+    def test_snapshot_mode_writes_a_complete_snapshot_and_changes_nothing_else(self, fakebin, tmp_path):
+        _deploy(fakebin, tmp_path)
+        result = run_script("update.sh", fakebin, cwd=tmp_path, args=["--snapshot", "post-update"])
+        assert result.returncode == 0, result.stderr
+        snaps = list((tmp_path / "backups").glob("post-update-*"))
+        assert len(snaps) == 1, snaps
+        snap = snaps[0]
+        assert (snap / "code.tar.gz").is_file() and (snap / "db.sql.gz").is_file() and (snap / ".env").is_file()
+        manifest = (snap / "MANIFEST").read_text()
+        assert "mode=snapshot" in manifest and "label=post-update" in manifest and "version=0.1.0" in manifest
+        lines = _progress(result)
+        assert f"snapshot=./backups/{snap.name}" in lines and lines[-1] == "done"
+        assert not fakebin.has_call("stop web"), "a snapshot stops nothing"
+        assert not fakebin.has_call("--force-recreate")
+        assert not (tmp_path / "update" / "maintenance.json").exists()
+        assert f"--rollback --snapshot {snap.name}" in result.stdout
+
+    def test_a_label_is_validated(self, fakebin, tmp_path):
+        _deploy(fakebin, tmp_path)
+        result = run_script("update.sh", fakebin, cwd=tmp_path, args=["--snapshot", "../escape"])
+        assert result.returncode != 0
+        assert "a label is letters" in result.stderr
+        assert not (tmp_path / "backups").exists()
+
+    def test_snapshot_does_not_combine_with_an_update_source(self, fakebin, tmp_path):
+        _deploy(fakebin, tmp_path)
+        result = run_script("update.sh", fakebin, cwd=tmp_path, args=["--snapshot", "x", "--from", "repo"])
+        assert result.returncode != 0
+        assert "does not combine" in result.stderr
+
+    def test_rollback_ignores_named_snapshots_by_default(self, fakebin, tmp_path):
+        _deploy(fakebin, tmp_path)
+        TestRollback()._seed_snapshot(tmp_path)
+        newer = tmp_path / "backups" / "post-update-20990101-000000"
+        newer.mkdir()
+        with gzlib.open(newer / "db.sql.gz", "wt") as fh:
+            fh.write("-- post\n")
+        (newer / ".env").write_text("DJANGO_MODE=production\nHOST_PORT=8000\n")
+        result = run_script("update.sh", fakebin, cwd=tmp_path, args=["--rollback", "--yes"])
+        assert result.returncode == 0, result.stderr
+        assert "Rolling back to pre-update-20200101-000000" in result.stdout
+
+    def test_rollback_restores_the_named_snapshot(self, fakebin, tmp_path):
+        _deploy(fakebin, tmp_path)
+        TestRollback()._seed_snapshot(tmp_path)
+        named = tmp_path / "backups" / "post-update-20990101-000000"
+        named.mkdir()
+        with gzlib.open(named / "db.sql.gz", "wt") as fh:
+            fh.write("-- the named one\n")
+        (named / ".env").write_text("DJANGO_MODE=production\nHOST_PORT=8000\nNAMED=1\n")
+        capture = tmp_path / "restore-stdin.sql"
+        fakebin.stub("docker", body=_docker_stub(f'*" exec "*) cat > "{capture}" ;;'))
+        result = run_script(
+            "update.sh", fakebin, cwd=tmp_path, args=["--rollback", "--yes", "--snapshot", named.name]
+        )
+        assert result.returncode == 0, result.stderr
+        assert "-- the named one" in capture.read_text()
+        assert "NAMED=1" in (tmp_path / ".env").read_text()
+
+    def test_a_missing_or_incomplete_named_snapshot_is_refused(self, fakebin, tmp_path):
+        _deploy(fakebin, tmp_path)
+        result = run_script("update.sh", fakebin, cwd=tmp_path, args=["--rollback", "--yes", "--snapshot", "nope"])
+        assert result.returncode != 0
+        assert "No snapshot named nope" in result.stderr
+        half = tmp_path / "backups" / "post-update-1"
+        half.mkdir(parents=True)
+        (half / ".env").write_text("HOST_PORT=8000\n")
+        result = run_script("update.sh", fakebin, cwd=tmp_path, args=["--rollback", "--yes", "--snapshot", half.name])
+        assert result.returncode != 0
+        assert "incomplete" in result.stderr
+        assert not fakebin.has_call("psql")
+
+    def test_a_snapshot_name_is_a_bare_directory_name(self, fakebin, tmp_path):
+        _deploy(fakebin, tmp_path)
+        result = run_script("update.sh", fakebin, cwd=tmp_path, args=["--rollback", "--yes", "--snapshot", "../x"])
+        assert result.returncode != 0
+        assert "names a directory under" in result.stderr
+
+
+class TestPodmanAsRoot:
+    @requires_gnu_stat
+    def test_a_root_run_drives_podman_without_sudo(self, fakebin, tmp_path):
+        # A root-owned updater's host may have no sudo at all; root needs none.
+        _deploy(fakebin, tmp_path)
+        fakebin.remove("docker")
+        fakebin.stub("podman", body=PODMAN_PS_RUNNING)
+        fakebin.stub("id", body='case "${1:-}" in -u|-g) echo 0 ;; *) echo "uid=0(root) gid=0(root)" ;; esac')
+        result = run_script("update.sh", fakebin, cwd=tmp_path, args=["--from", "repo", "--no-pull"])
+        assert result.returncode == 0, result.stderr
+        assert fakebin.has_call("podman compose -f docker-compose.yml")
+        assert not fakebin.has_call("sudo")
+
+
+class TestPruningStaysInsideTheTree:
+    """The installed file list is written by whoever can write the tree, which
+    on a host with an updater is not who runs this script. An entry that
+    escapes the tree, by `..` or through a symlinked directory, must not turn
+    the prune into a deletion elsewhere.
+    """
+
+    def _lists(self, tmp_path, *old):
+        (tmp_path / ".epicurrents-files").write_text("\n".join(old) + "\n")
+        _build_package(tmp_path)
+
+    def test_a_parent_reference_in_the_old_list_is_not_followed(self, fakebin, tmp_path):
+        _deploy(fakebin, tmp_path)
+        outside = tmp_path.parent / f"{tmp_path.name}-outside"
+        outside.mkdir()
+        victim = outside / "victim"
+        victim.write_text("keep")
+        self._lists(tmp_path, "epicurrents/version.py", f"../{outside.name}/victim", "/etc/passwd")
+        fakebin.stub("rsync")
+        result = run_script("update.sh", fakebin, cwd=tmp_path)
+        assert result.returncode == 0, result.stderr
+        assert victim.exists(), "a .. entry in the old list deleted outside the tree"
+        assert "Not pruning" in result.stdout
+
+    def test_a_symlinked_directory_in_the_old_list_is_not_followed(self, fakebin, tmp_path):
+        _deploy(fakebin, tmp_path)
+        outside = tmp_path.parent / f"{tmp_path.name}-outside"
+        outside.mkdir()
+        (outside / "hosts").write_text("keep")
+        os.symlink(outside, tmp_path / "evil")
+        self._lists(tmp_path, "epicurrents/version.py", "evil/hosts")
+        fakebin.stub("rsync")
+        result = run_script("update.sh", fakebin, cwd=tmp_path)
+        assert result.returncode == 0, result.stderr
+        assert (outside / "hosts").exists(), "a symlinked directory was followed out of the tree"
+        assert outside.exists()
+
+    def test_a_symlinked_directory_inside_the_tree_is_fine(self, fakebin, tmp_path):
+        _deploy(fakebin, tmp_path)
+        (tmp_path / "real").mkdir()
+        (tmp_path / "real" / "old.py").write_text("")
+        os.symlink(tmp_path / "real", tmp_path / "alias")
+        self._lists(tmp_path, "epicurrents/version.py", "alias/old.py")
+        fakebin.stub("rsync")
+        result = run_script("update.sh", fakebin, cwd=tmp_path)
+        assert result.returncode == 0, result.stderr
+        assert not (tmp_path / "real" / "old.py").exists()
+
+    def test_the_release_key_is_never_pruned(self, fakebin, tmp_path):
+        # A later unsigned package lists no key; pruning it would leave every
+        # --require-signature run refusing.
+        _deploy(fakebin, tmp_path)
+        (tmp_path / "RELEASE_KEY.pub").write_text("key")
+        self._lists(tmp_path, "epicurrents/version.py", "RELEASE_KEY.pub")
+        fakebin.stub("rsync")
+        result = run_script("update.sh", fakebin, cwd=tmp_path)
+        assert result.returncode == 0, result.stderr
+        assert (tmp_path / "RELEASE_KEY.pub").exists()
+
+
+class TestListingHardeningEdges:
+    def _archive(self, tmp_path, members):
+        import tarfile
+
+        archive = tmp_path / "update" / "epicurrents-test.tar.gz"
+        archive.parent.mkdir(exist_ok=True)
+        with tarfile.open(archive, "w:gz") as tf:
+            for name, kind in members:
+                info = tarfile.TarInfo(name)
+                if kind == "dir":
+                    info.type = tarfile.DIRTYPE
+                elif kind == "chr":
+                    info.type = tarfile.CHRTYPE
+                    info.devmajor, info.devminor = 1, 3
+                elif kind == "setuid":
+                    info.mode = 0o4755
+                info.size = 0
+                tf.addfile(info)
+        return archive
+
+    def test_a_wrapper_name_with_a_regex_metacharacter_is_accepted(self, fakebin, tmp_path):
+        _deploy(fakebin, tmp_path)
+        _build_package(tmp_path, top="epicurrents+dist(1)", manifest=False)
+        fakebin.stub("rsync")
+        result = run_script("update.sh", fakebin, cwd=tmp_path)
+        assert result.returncode == 0, result.stderr
+
+    def test_a_dot_component_does_not_hide_a_forbidden_member(self, fakebin, tmp_path):
+        _deploy(fakebin, tmp_path)
+        self._archive(tmp_path, [("top/docker-compose.yml", "file"), ("top/./.env", "file")])
+        fakebin.stub("rsync")
+        result = run_script("update.sh", fakebin, cwd=tmp_path)
+        assert result.returncode != 0
+        assert ".env, .git/ or backups/" in result.stderr
+        self._archive(tmp_path, [("top/docker-compose.yml", "file"), ("top//backups/x", "file")])
+        result = run_script("update.sh", fakebin, cwd=tmp_path)
+        assert result.returncode != 0
+        assert ".env, .git/ or backups/" in result.stderr
+
+    def test_a_device_node_is_refused(self, fakebin, tmp_path):
+        _deploy(fakebin, tmp_path)
+        self._archive(tmp_path, [("top/docker-compose.yml", "file"), ("top/null", "chr")])
+        fakebin.stub("rsync")
+        result = run_script("update.sh", fakebin, cwd=tmp_path)
+        assert result.returncode != 0
+        assert "device node" in result.stderr
+        _nothing_touched(fakebin, tmp_path)
+
+    def test_a_setuid_file_is_refused(self, fakebin, tmp_path):
+        _deploy(fakebin, tmp_path)
+        self._archive(tmp_path, [("top/docker-compose.yml", "file"), ("top/bin/escalate", "setuid")])
+        fakebin.stub("rsync")
+        result = run_script("update.sh", fakebin, cwd=tmp_path)
+        assert result.returncode != 0
+        assert "setuid or setgid" in result.stderr
+
+    def test_help_exits_zero(self, fakebin, tmp_path):
+        # sed piped into a sed that quits early returned 141 under pipefail.
+        _deploy(fakebin, tmp_path)
+        result = run_script("update.sh", fakebin, cwd=tmp_path, args=["--help"])
+        assert result.returncode == 0, result.stderr
+        assert "--check-archive" in result.stdout
+
+    def test_a_relative_archive_path_is_taken_from_where_the_command_ran(self, fakebin, tmp_path):
+        # --root from another directory: the archive named on the command line
+        # is relative to that directory, not to the deployment.
+        deployment = tmp_path / "deployment"
+        deployment.mkdir()
+        (deployment / "docker-compose.yml").write_text("services: {}\n")
+        _deploy(fakebin, deployment)
+        elsewhere = tmp_path / "elsewhere"
+        elsewhere.mkdir()
+        _build_package(elsewhere, manifest=False)
+        result = run_script(
+            "update.sh", fakebin, cwd=elsewhere,
+            args=["--root", str(deployment), "--check-archive", "update/epicurrents-test.tar.gz"],
+        )
+        assert result.returncode == 0, result.stderr
+        assert "check=ok" in _progress(result)

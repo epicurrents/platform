@@ -75,7 +75,21 @@
 #                        is why this exists rather than being left to the caller:
 #                        tar records the *builder's* uid, an update rsyncs it onto
 #                        the deployment as root, and the deployment account then
-#                        cannot write its own deployment root.
+#                        cannot write its own deployment root. The package gets a
+#                        FILELIST at its root (every file it ships, so update.sh
+#                        can prune what the previous release shipped and this one
+#                        does not) and a manifest beside the tarball,
+#                        <dest>.tar.gz.manifest.json, naming its version, hash,
+#                        project and plugins.
+#   --sign-key PATH      Sign the manifest with this Ed25519 private key (made
+#                        with scripts/lib/release_sign.py keygen) and ship the
+#                        public key as RELEASE_KEY.pub at the package root. The
+#                        signature lands in <dest>.tar.gz.manifest.sig; update.sh
+#                        verifies it before extracting anything, and a remote
+#                        update accepts nothing else. Requires --tarball. Refused
+#                        when the platform version is not greater than the newest
+#                        release tag, because a remotely applied package must be
+#                        newer than what it replaces.
 #   --network-name NAME  Docker network the package joins. Defaults to the
 #                        destination directory name, which is what keeps a
 #                        package off any other stack on the same host — see the
@@ -220,6 +234,7 @@ WITH_ALL_PLUGINS=false
 DEMO=false
 DIST=false
 TARBALL=false
+SIGN_KEY=""
 NETWORK_NAME=""
 PROXY_DOMAIN_ARG=""
 ACME_EMAIL_ARG=""
@@ -236,6 +251,11 @@ while [ $# -gt 0 ]; do
         --demo) DEMO=true ;;
         --dist) DIST=true ;;
         --tarball) TARBALL=true ;;
+        --sign-key)
+            shift
+            [ $# -gt 0 ] || die "--sign-key requires a key file path."
+            SIGN_KEY="$1"
+            ;;
         --with-project)
             shift
             [ $# -gt 0 ] || die "--with-project requires a project name."
@@ -277,6 +297,60 @@ done
 
 [ -n "$DEST" ] || die "Destination directory required. Usage: $0 <dest> [options]"
 command -v rsync &>/dev/null || die "rsync is required but not installed."
+
+# ── Release signing ──────────────────────────────────────────────────────────
+# The manifest and the signature are produced by scripts/lib/release_sign.py.
+# The manifest needs any Python 3; signing needs the `cryptography` package,
+# because the system openssl on a Mac is LibreSSL and cannot sign Ed25519. The
+# project venv has it; a bare python3 may not. Everything here is checked
+# before a single file is copied, so a missing key or module fails in a second
+# rather than after the copy.
+RELEASE_SIGN="$SCRIPT_DIR/lib/release_sign.py"
+if [ -x "$REPO_ROOT/.venv/bin/python" ]; then
+    PYTHON="$REPO_ROOT/.venv/bin/python"
+else
+    PYTHON="$(command -v python3 || true)"
+fi
+if [ "$TARBALL" = true ]; then
+    [ -f "$RELEASE_SIGN" ] || die "scripts/lib/release_sign.py is missing; the packager cannot write a manifest without it."
+    [ -n "$PYTHON" ] || die "python3 is required to write the package manifest."
+fi
+#: What update.sh must be at least, for a package this packager writes. Bumped
+#: with UPDATER_SCRIPT_VERSION in scripts/update.sh whenever a package starts
+#: relying on something an older script does not do.
+MIN_UPDATER_VERSION=2
+
+if [ -n "$SIGN_KEY" ]; then
+    [ "$TARBALL" = true ] || die "--sign-key signs the tarball's manifest; add --tarball."
+    [ -f "$SIGN_KEY" ] || die "--sign-key: no such file: $SIGN_KEY"
+    "$PYTHON" -c 'import cryptography' 2>/dev/null \
+        || die "Signing needs the 'cryptography' package for $PYTHON. Use the project venv (.venv), or pip install cryptography."
+    SIGN_PUB="$(mktemp)"
+    trap 'rm -f "$SIGN_PUB"' EXIT
+    "$PYTHON" "$RELEASE_SIGN" pubkey "$SIGN_KEY" --out "$SIGN_PUB" \
+        || die "--sign-key: $SIGN_KEY is not a usable Ed25519 private key."
+    SIGN_KEY_ID="$("$PYTHON" "$RELEASE_SIGN" key-id "$SIGN_PUB")"
+    # A signed package is what a remote update applies, and a remote update is
+    # refused unless the package is newer than the installed release. A package
+    # carrying an already-released version would be refused everywhere it is
+    # sent, so refuse it here, where the fix (bump __version__) is one line away.
+    PLATFORM_VERSION="$("$PYTHON" "$RELEASE_SIGN" version)"
+    NEWEST_TAG=""
+    while IFS= read -r _tag; do
+        [ -n "$_tag" ] || continue
+        _tagv="${_tag#v}"
+        # Only plain MAJOR.MINOR.PATCH tags take part: the platform's parser
+        # rejects a pre-release or a partial tag, and one of those seeded as
+        # the newest would mask every later comparison.
+        "$PYTHON" "$RELEASE_SIGN" vercmp "$_tagv" "$_tagv" >/dev/null 2>&1 || continue
+        if [ -z "$NEWEST_TAG" ] || [ "$("$PYTHON" "$RELEASE_SIGN" vercmp "$_tagv" "$NEWEST_TAG")" = 1 ]; then
+            NEWEST_TAG="$_tagv"
+        fi
+    done < <(git -C "$REPO_ROOT" tag -l 'v[0-9]*' 2>/dev/null || true)
+    if [ -n "$NEWEST_TAG" ] && [ "$("$PYTHON" "$RELEASE_SIGN" vercmp "$PLATFORM_VERSION" "$NEWEST_TAG")" != 1 ]; then
+        die "Refusing to sign version $PLATFORM_VERSION: the newest release tag is v$NEWEST_TAG, and a signed package must be newer than any release it could be applied over. Bump __version__ in epicurrents/version.py first."
+    fi
+fi
 
 # Resolve DEST to an absolute path without requiring it to exist yet.
 mkdir -p "$DEST"
@@ -1469,11 +1543,16 @@ PREPARE
     cat > "$DEST/update/README.md" <<'DROP'
 # Update drop directory
 
-Drop a newer distribution tarball here (named `epicurrents*.tar.gz`) and run
+Drop a newer distribution tarball here (named `epicurrents*.tar.gz`), together
+with the `.manifest.json` and `.manifest.sig` files that came with it, and run
 `./update.sh` from the deployment root. The newest matching archive is applied
 over this deployment, preserving `.env` and your data; the database is migrated
-and the containers are recreated. A pre-update snapshot (database + `.env`) is
-written to `../backups/` first — undo with `./update.sh --rollback`.
+and the containers are recreated. A pre-update snapshot (code, database and
+`.env`) is written to `../backups/` first — undo with `./update.sh --rollback`.
+
+`./update.sh --check-archive update/<file>.tar.gz` verifies a package — its
+signature against `../RELEASE_KEY.pub`, its hash, its contents and its version —
+without touching the deployment.
 DROP
     ok "update.sh + update/ drop dir"
 
@@ -1866,6 +1945,39 @@ else
     [ ${#PLUGINS[@]} -gt 0 ] && ok "Plugins:  ${PLUGINS[*]}"
 fi
 if [ "$TARBALL" = true ]; then
+    if [ -n "$SIGN_KEY" ]; then
+        # Inside the package, so an update installs the key that verifies the
+        # next package: trust on first install. update.sh reads it from the
+        # deployment root by default; the remote updater keeps its own copy.
+        cp "$SIGN_PUB" "$DEST/RELEASE_KEY.pub"
+        chmod 0644 "$DEST/RELEASE_KEY.pub"
+        ok "RELEASE_KEY.pub (key id $SIGN_KEY_ID)"
+    fi
+
+    # update.sh overlays a package with rsync and no --delete, so a file a
+    # release removes stays on the deployment and gets baked into the image. The
+    # list of what this package ships is what lets the next update delete what
+    # this one shipped and it does not — and nothing else, since a file no
+    # package listed is the operator's or runtime-generated. Every regular file,
+    # the list itself included, sorted under one collation so the comparison on
+    # the deployment holds. Symlinks are refused rather than listed: update.sh
+    # rejects an archive carrying one, and better here than on the deployment.
+    info "Writing FILELIST"
+    if [ -n "$(find "$DEST" -type l)" ]; then
+        die "$(printf '%s\n' \
+            "The package tree contains symlinks, which update.sh refuses in an archive:" \
+            "$(find "$DEST" -type l | sed "s|^$DEST/|  |")" \
+            "Exclude or dereference them before packing.")"
+    fi
+    # The list is assembled outside the tree, or find would list the half-written
+    # list itself; the empty placeholder is what puts FILELIST in its own list.
+    : > "$DEST/FILELIST"
+    FILELIST_TMP="$(mktemp)"
+    (cd "$DEST" && find . -type f | sed 's|^\./||' | LC_ALL=C sort) > "$FILELIST_TMP"
+    mv "$FILELIST_TMP" "$DEST/FILELIST"
+    chmod 0644 "$DEST/FILELIST"
+    ok "FILELIST ($(wc -l < "$DEST/FILELIST" | tr -d ' ') files)"
+
     info "Packing the archive"
     ARCHIVE="$DEST.tar.gz"
     # COPYFILE_DISABLE keeps macOS from storing extended attributes as ._* members,
@@ -1876,6 +1988,41 @@ if [ "$TARBALL" = true ]; then
     COPYFILE_DISABLE=1 tar -czf "$ARCHIVE" $(tar_ownership_flags) \
         -C "$(dirname "$DEST")" "$(basename "$DEST")"
     ok "$ARCHIVE ($(du -h "$ARCHIVE" | cut -f1))"
+
+    # The manifest binds the tarball by hash and names what the package is; the
+    # signature is over the manifest. update.sh checks both before extracting
+    # anything. Written beside the tarball, not inside it, because a manifest
+    # inside the thing it hashes cannot hold the hash.
+    info "Writing the manifest"
+    if command -v sha256sum >/dev/null 2>&1; then
+        ARCHIVE_SHA256="$(sha256sum "$ARCHIVE" | awk '{print $1}')"
+    else
+        ARCHIVE_SHA256="$(shasum -a 256 "$ARCHIVE" | awk '{print $1}')"
+    fi
+    ARCHIVE_SIZE="$(wc -c < "$ARCHIVE" | tr -d ' ')"
+    MANIFEST="$ARCHIVE.manifest.json"
+    "$PYTHON" "$RELEASE_SIGN" manifest \
+        --package "$(basename "$ARCHIVE")" \
+        --sha256 "$ARCHIVE_SHA256" \
+        --size "$ARCHIVE_SIZE" \
+        --version "$("$PYTHON" "$RELEASE_SIGN" version)" \
+        --platform-compatible "$("$PYTHON" "$RELEASE_SIGN" compatible)" \
+        --project "$ACTIVE_PROJECT" \
+        --plugins "$ACTIVE_PLUGINS" \
+        --min-updater-version "$MIN_UPDATER_VERSION" \
+        --key-id "${SIGN_KEY_ID:-}" \
+        --out "$MANIFEST"
+    ok "$MANIFEST"
+    if [ -n "$SIGN_KEY" ]; then
+        "$PYTHON" "$RELEASE_SIGN" sign "$SIGN_KEY" "$MANIFEST" > "$MANIFEST.tmp"
+        mv "$MANIFEST.tmp" "${MANIFEST%.json}.sig"
+        ok "${MANIFEST%.json}.sig"
+    else
+        echo
+        echo "    WARNING: the package is NOT signed. update.sh applies it with a warning;" >&2
+        echo "    a remote update refuses it. Re-run with --sign-key PATH to sign it." >&2
+        echo
+    fi
 fi
 
 echo
@@ -1884,8 +2031,8 @@ if [ "$DEMO" = true ] || [ "$DIST" = true ]; then
     echo "  cd $DEST && ./start.sh"
     echo
     if [ "$TARBALL" = true ]; then
-        echo "  Ship $(basename "$ARCHIVE") to the deployment's update/ directory,"
-        echo "  then run ./update.sh there."
+        echo "  Ship $(basename "$ARCHIVE") with its .manifest.json${SIGN_KEY:+ and .manifest.sig} to the"
+        echo "  deployment's update/ directory, then run ./update.sh there."
     else
         echo "  To ship it as an archive that update.sh can apply, re-run with --tarball,"
         echo "  or pack it by hand with the ownership flags this platform needs:"

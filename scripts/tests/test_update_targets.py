@@ -13,6 +13,7 @@ the constants to match — that edit is the signal that a target moved.
 """
 
 import os
+import re
 import subprocess
 from pathlib import Path
 
@@ -161,3 +162,56 @@ def test_distribution_bundles_update_sh_for_archive_mode(tmp_path):
     assert os.access(dest / "update.sh", os.X_OK)
     assert (dest / "update").is_dir()
     assert (dest / "docker-compose.yml").is_file()
+
+
+# The machine-readable progress lines a caller that drives update.sh parses. A
+# renamed step or a dropped line breaks that caller silently — the run still
+# succeeds, the caller just stops seeing the step — so the vocabulary is pinned
+# here, in source, as the target it is.
+PROGRESS_STEPS_UPDATE = [
+    "step=check", "step=snapshot", "step=acquire", "step=backup", "step=build", "step=stop",
+    "step=migrate", "step=static", "step=vendor", "step=recreate", "step=health",
+]
+PROGRESS_STEPS_ROLLBACK = [
+    "step=restore-db", "step=restore-env", "step=restore-code", "step=build",
+]
+PROGRESS_FACTS = ["snapshot=", "health=ok", "health=failed", "done", "failed=", "check=ok",
+                  "archive=", "manifest=", "signature=", "sha256=", "version=", "installed=", "orphan_candidates="]
+
+
+def test_update_sh_emits_every_progress_line_a_caller_parses():
+    body = (SCRIPTS_DIR / "update.sh").read_text()
+    missing = [
+        token for token in (*PROGRESS_STEPS_UPDATE, *PROGRESS_STEPS_ROLLBACK, *PROGRESS_FACTS)
+        if f'emit "{token}' not in body
+    ]
+    assert not missing, f"update.sh no longer emits: {missing}"
+    # ::failed comes from die(), so every refusal carries it.
+    assert 'emit "failed=' in body.split("die()")[1].split("}")[0]
+
+
+def test_updater_script_version_matches_what_the_packager_requires():
+    # A package's manifest names the minimum update.sh it needs, and the packager
+    # writes that number; the script declares what it is. The two move together.
+    script = (SCRIPTS_DIR / "update.sh").read_text()
+    packager = FIXTURE.read_text()
+    script_version = re.search(r"^UPDATER_SCRIPT_VERSION=(\d+)$", script, re.MULTILINE).group(1)
+    packager_version = re.search(r"^MIN_UPDATER_VERSION=(\d+)$", packager, re.MULTILINE).group(1)
+    assert int(packager_version) <= int(script_version), (
+        f"the packager requires update.sh version {packager_version} but the script is version {script_version}"
+    )
+
+
+def test_update_sh_never_pipes_its_own_output_into_a_quiet_grep():
+    # `printf … | grep -q` under pipefail: grep exits on the first match, the
+    # producer takes SIGPIPE on its next write, and a listing longer than one
+    # stdio buffer reads as "no match". It refused a valid package on a real
+    # host while the identical check had passed a minute earlier. Here-strings
+    # have no producer process, so they cannot fail this way.
+    body = (SCRIPTS_DIR / "update.sh").read_text()
+    offenders = [
+        line.strip()
+        for line in body.splitlines()
+        if not line.strip().startswith("#") and re.search(r"printf .*\| *grep +-[a-zA-Z]*q", line)
+    ]
+    assert not offenders, offenders

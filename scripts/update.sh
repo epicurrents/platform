@@ -8,6 +8,8 @@
 #                    ./update/epicurrents*.tar.gz is extracted over the
 #                    deployment, preserving .env and runtime data. No host
 #                    toolchain needed — the distribution ships prebuilt bundles.
+#                    A package's manifest and signature, when they sit beside
+#                    it, are verified before anything is extracted.
 #   --from repo      Pull from git and rebuild the frontend on the host (the
 #                    path a git-checkout deployment or CI uses).
 #
@@ -25,14 +27,29 @@
 # requests for the duration, and the flag is removed at exit unless the run
 # left the stack stopped, or --keep-lock says the caller owns it.
 #
+# Progress is also reported on lines starting with "::" (::step=…, ::snapshot=…,
+# ::health=…, ::done, ::failed=…) for a caller that drives this script.
+#
 # Usage:
 #   ./update.sh                          archive mode, newest ./update/epicurrents*.tar.gz
 #   ./update.sh --archive ./foo.tar.gz   archive mode, explicit file
+#   ./update.sh --check-archive FILE     verify a package — signature, hash, contents,
+#                                        version — and report what an update would
+#                                        prune, without touching the deployment
+#   ./update.sh --require-signature      refuse a package without a signature that
+#                                        verifies
+#   ./update.sh --release-key PATH       public key to verify against (default:
+#                                        RELEASE_KEY.pub at the deployment root)
+#   ./update.sh --require-newer          refuse a package whose version is not
+#                                        greater than the installed one
 #   ./update.sh --from repo              repo mode, git pull + frontend build
 #   ./update.sh --from repo --no-pull    repo mode, rebuild the current checkout
 #   ./update.sh --no-backup              skip the pre-update snapshot (not advised —
 #                                        it is what --rollback restores from)
+#   ./update.sh --snapshot LABEL         take a snapshot (code, database, .env) named
+#                                        backups/LABEL-<stamp> and exit
 #   ./update.sh --rollback               undo the last update (database, .env, code)
+#   ./update.sh --rollback --snapshot NAME   restore backups/NAME instead of the newest
 #   ./update.sh --skip-beat              leave celery-beat stopped after the recreate,
 #                                        so no scheduled purge runs before the update
 #                                        is verified; start it yourself afterwards
@@ -43,13 +60,29 @@
 #
 set -euo pipefail
 
+# Bumped whenever a package starts relying on something an older copy of this
+# script does not do; a package's manifest names the minimum it needs.
+UPDATER_SCRIPT_VERSION=2
+
 info() { printf '\n\033[1;34m==> %s\033[0m\n' "$*"; }
 ok()   { printf '    \033[32m✓\033[0m  %s\n'  "$*"; }
 warn() { printf '    \033[33m!\033[0m  %s\n'  "$*"; }
-die()  { printf '\n\033[1;31mERROR:\033[0m %s\n' "$*" >&2; exit 1; }
+# Machine-readable progress, one fact per line, for a caller that tees this
+# script's output. Kept to a small vocabulary: step, snapshot, health, done,
+# failed, and the facts --check-archive reports.
+emit() { printf '::%s\n' "$*"; }
+die()  {
+    local msg="$*"
+    printf '\n\033[1;31mERROR:\033[0m %s\n' "$msg" >&2
+    emit "failed=${msg%%$'\n'*}"
+    exit 1
+}
 
 usage() {
-    sed -n '2,43p' "$0" | sed 's/^#\{1,2\} \{0,1\}//'
+    # The header comment, from line 2 to the first line that is not a comment.
+    # One awk, not a sed pipeline: a reader that quits early kills the writer
+    # with SIGPIPE, which pipefail turns into exit 141 from --help.
+    awk 'NR == 1 { next } /^#/ { sub(/^#{1,2} ?/, ""); print; next } { exit }' "$0"
 }
 
 require_value() {
@@ -63,7 +96,9 @@ require_value() {
 
 # ── Arguments ─────────────────────────────────────────────────────────────────
 MODE=archive
+MODE_GIVEN=false
 ARCHIVE=""
+CHECK_ARCHIVE=""
 REF=""
 PULL=true
 BACKUP=true
@@ -71,14 +106,24 @@ ROLLBACK=false
 ASSUME_YES=false
 SKIP_BEAT=false
 KEEP_LOCK=false
+REQUIRE_SIGNATURE=false
+REQUIRE_NEWER=false
+RELEASE_KEY=""
+SNAPSHOT=""
 ROOT=""
 
 while [ $# -gt 0 ]; do
     case "$1" in
-        --from)      require_value --from "${2:-}";    MODE="$2"; shift 2 ;;
-        --from=*)    MODE="${1#*=}"; shift ;;
+        --from)      require_value --from "${2:-}";    MODE="$2"; MODE_GIVEN=true; shift 2 ;;
+        --from=*)    MODE="${1#*=}"; MODE_GIVEN=true; shift ;;
         --archive)   require_value --archive "${2:-}"; ARCHIVE="$2"; shift 2 ;;
         --archive=*) ARCHIVE="${1#*=}"; shift ;;
+        --check-archive)   require_value --check-archive "${2:-}"; CHECK_ARCHIVE="$2"; shift 2 ;;
+        --check-archive=*) CHECK_ARCHIVE="${1#*=}"; shift ;;
+        --release-key)     require_value --release-key "${2:-}"; RELEASE_KEY="$2"; shift 2 ;;
+        --release-key=*)   RELEASE_KEY="${1#*=}"; shift ;;
+        --snapshot)  require_value --snapshot "${2:-}"; SNAPSHOT="$2"; shift 2 ;;
+        --snapshot=*) SNAPSHOT="${1#*=}"; shift ;;
         --ref)       require_value --ref "${2:-}";     REF="$2"; shift 2 ;;
         --ref=*)     REF="${1#*=}"; shift ;;
         --root)      require_value --root "${2:-}";    ROOT="$2"; shift 2 ;;
@@ -89,11 +134,24 @@ while [ $# -gt 0 ]; do
         --rollback)  ROLLBACK=true; shift ;;
         --skip-beat) SKIP_BEAT=true; shift ;;
         --keep-lock) KEEP_LOCK=true; shift ;;
+        --require-signature) REQUIRE_SIGNATURE=true; shift ;;
+        --require-newer)     REQUIRE_NEWER=true; shift ;;
         --yes|-y)    ASSUME_YES=true; shift ;;
         -h|--help)   usage; exit 0 ;;
         *)           die "Unknown argument: $1 (try --help)" ;;
     esac
 done
+
+# --snapshot means two things by mode: with --rollback it names the snapshot to
+# restore; alone it is the snapshot-only mode. Combined with an update source it
+# is ambiguous, so it is refused rather than guessed at.
+SNAPSHOT_ONLY=false
+if [ -n "$SNAPSHOT" ] && [ "$ROLLBACK" = false ]; then
+    if [ "$MODE_GIVEN" = true ] || [ -n "$ARCHIVE" ]; then
+        die "--snapshot LABEL takes a snapshot and exits; it does not combine with --from or --archive. An update always snapshots as pre-update-<stamp>."
+    fi
+    SNAPSHOT_ONLY=true
+fi
 
 # ── Locate the deployment root ────────────────────────────────────────────────
 # --root names it outright, for a copy of this script that lives outside the
@@ -113,7 +171,21 @@ else
         ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
     fi
 fi
+# A file named on the command line is relative to where the command was typed,
+# not to the deployment root this script is about to change into.
+absolute_from_caller() {
+    case "$1" in
+        ""|/*) printf '%s' "$1" ;;
+        *)     printf '%s/%s' "$PWD" "$1" ;;
+    esac
+}
+ARCHIVE="$(absolute_from_caller "$ARCHIVE")"
+CHECK_ARCHIVE="$(absolute_from_caller "$CHECK_ARCHIVE")"
+RELEASE_KEY="$(absolute_from_caller "$RELEASE_KEY")"
 cd "$ROOT"
+# The physical path, for deciding whether a path this script is about to
+# delete really lies under the tree.
+ROOT_REAL="$(pwd -P)"
 
 # Every compose call uses the production overlay, deliberately and without a
 # toggle. update.sh only ever updates an already-deployed stack, and a deployed
@@ -125,13 +197,19 @@ cd "$ROOT"
 # podman-docker installs a `docker` that answers by execing podman, so the name in
 # the version string is the discriminator, not whether the command exists. Podman
 # runs rootful because every service declares `user: "1000:1000"` against a bind
-# mount, and only a rootful runtime maps that uid to the deployment's owner.
+# mount, and only a rootful runtime maps that uid to the deployment's owner —
+# through sudo when this script is not root already, and directly when it is,
+# since a root-owned updater's host may not have sudo at all.
 if command -v docker >/dev/null 2>&1 && ! docker --version 2>&1 | grep -qi podman; then
     CONTAINER_RUNTIME=docker
     COMPOSE=(docker compose -f docker-compose.yml -f docker-compose.prod.yml)
 elif command -v podman >/dev/null 2>&1; then
     CONTAINER_RUNTIME=podman
-    COMPOSE=(sudo -E podman compose -f docker-compose.yml -f docker-compose.prod.yml)
+    if [ "$(id -u)" = 0 ]; then
+        COMPOSE=(podman compose -f docker-compose.yml -f docker-compose.prod.yml)
+    else
+        COMPOSE=(sudo -E podman compose -f docker-compose.yml -f docker-compose.prod.yml)
+    fi
 else
     CONTAINER_RUNTIME=""
     COMPOSE=(docker compose -f docker-compose.yml -f docker-compose.prod.yml)
@@ -149,6 +227,10 @@ UPDATE_DIR="./update"
 BACKUP_DIR="./backups"
 KEEP_BACKUPS=3
 MAINTENANCE_FLAG="$UPDATE_DIR/maintenance.json"
+# The installed release's file list, kept so the next update can prune what it
+# shipped and the new package does not. A root file, so the code snapshot
+# carries it and a rollback restores it with the code it describes.
+INSTALLED_FILELIST="./.epicurrents-files"
 # How long the restore waits for the locks the schema drop needs before giving
 # up. Anything still connected — a backup dumping the database, a stray shell —
 # holds a share lock the drop cannot get past, and without a bound the rollback
@@ -157,7 +239,9 @@ MAINTENANCE_FLAG="$UPDATE_DIR/maintenance.json"
 RESTORE_LOCK_TIMEOUT="${UPDATE_RESTORE_LOCK_TIMEOUT:-60s}"
 
 [ -f .env ] || die "No .env in $ROOT — initialize the deployment first (./start.sh in a distribution, or 'python manage.py init_env' in a checkout)."
-[ -n "$CONTAINER_RUNTIME" ] || die "No container runtime found — this needs Docker Engine or Podman, either one with Compose v2."
+# --check-archive reads the package and the tree; it drives no container.
+[ -n "$CHECK_ARCHIVE" ] || [ -n "$CONTAINER_RUNTIME" ] \
+    || die "No container runtime found — this needs Docker Engine or Podman, either one with Compose v2."
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -169,6 +253,11 @@ confirm() {
     printf '\033[1m%s [y/N] \033[0m' "$1"
     read -r reply
     [[ "${reply:-N}" =~ ^[Yy]$ ]]
+}
+
+env_value() {
+    # $1 = key in .env. Quotes and surrounding spaces dropped; empty if absent.
+    grep -E "^$1=" .env 2>/dev/null | sed -n '1{s/^[^=]*=//; s/^[[:space:]]*//; s/[[:space:]]*$//; s/^"\(.*\)"$/\1/; s/^'"'"'\(.*\)'"'"'$/\1/; p;}'
 }
 
 service_running() {
@@ -193,6 +282,44 @@ ensure_db_up() {
     done
     printf '\n'
     die "PostgreSQL did not become ready within 60s."
+}
+
+installed_version() {
+    # The version of the code in the tree, from the one module that carries it.
+    # Empty when the tree has none (a checkout that predates the module).
+    sed -n '/^__version__ = "/{s/^__version__ = "\([^"]*\)".*/\1/p;q;}' "$ROOT/epicurrents/version.py" 2>/dev/null || true
+}
+
+version_gt() {
+    # $1 > $2, both plain MAJOR.MINOR.PATCH — the only shape the platform's
+    # version module admits, so no pre-release ordering is needed here.
+    local a b i
+    IFS=. read -r -a a <<< "$1"
+    IFS=. read -r -a b <<< "$2"
+    for i in 0 1 2; do
+        if [ "${a[i]:-0}" -gt "${b[i]:-0}" ]; then return 0; fi
+        if [ "${a[i]:-0}" -lt "${b[i]:-0}" ]; then return 1; fi
+    done
+    return 1
+}
+
+is_version() {
+    [[ "$1" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+}
+
+sha256_of() {
+    # The caller has checked that one of the two exists: a die() here would
+    # exit only the command substitution it runs in.
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$1" | awk '{print $1}'
+    else
+        shasum -a 256 "$1" | awk '{print $1}'
+    fi
+}
+
+require_sha256_tool() {
+    command -v sha256sum >/dev/null 2>&1 || command -v shasum >/dev/null 2>&1 \
+        || die "Neither sha256sum nor shasum is available; the package hash cannot be checked."
 }
 
 # ── The maintenance flag ──────────────────────────────────────────────────────
@@ -246,6 +373,409 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# ── Package verification ──────────────────────────────────────────────────────
+# Everything an archive is checked for before a byte of it is extracted, in the
+# order that matters: the signature first, because it is what makes the rest
+# of the manifest worth reading; then the hash, which is what binds the tarball
+# to the manifest; then the listing, which is read but never unpacked; then the
+# versions. --check-archive runs exactly this and stops. The update path runs
+# it before the snapshot, so a refused package changes nothing.
+
+ARCHIVE_TOP=""
+ARCHIVE_PREFIX=""
+PKG_MANIFEST=""
+PKG_VERSION=""
+PKG_SHA256=""
+INSTALLED_VERSION=""
+SIGNATURE_STATE=unsigned
+
+manifest_value() {
+    # $1 = manifest path, $2 = key. Prints the value: strings unquoted, null as
+    # empty, a list as comma-separated items. Relies on the shape the packager
+    # writes — one key per line, lists inline — which release_sign.py fixes.
+    local raw
+    raw="$(sed -n "s/^  \"$2\": \(.*\)\$/\1/p" "$1")"
+    raw="${raw%$'\r'}"
+    raw="${raw%,}"
+    case "$raw" in
+        \"*\") raw="${raw#\"}"; raw="${raw%\"}" ;;
+        null)  raw="" ;;
+        \[*\]) raw="${raw#[}"; raw="${raw%]}"; raw="$(printf '%s' "$raw" | tr -d '" ')" ;;
+    esac
+    printf '%s' "$raw"
+}
+
+normalise_list() {
+    # A comma-separated list, sorted and deduplicated, so two spellings of the
+    # same plugin set compare equal.
+    printf '%s' "$1" | tr ',' '\n' | sed '/^[[:space:]]*$/d; s/^[[:space:]]*//; s/[[:space:]]*$//' | LC_ALL=C sort -u | paste -sd, - 2>/dev/null || true
+}
+
+verify_manifest_signature() {
+    # $1 = manifest, $2 = base64 signature file, $3 = public key (PEM).
+    # 0: verifies. 1: does not. 2: no tool on this host can check it.
+    # openssl pkeyutl handles Ed25519 from OpenSSL 3; LibreSSL and 1.1 do not,
+    # so a host with an older one falls back to python3 with cryptography.
+    local sigbin rc
+    sigbin="$(mktemp)"
+    if ! base64 -d < "$2" > "$sigbin" 2>/dev/null; then
+        rm -f "$sigbin"
+        return 1
+    fi
+    if command -v openssl >/dev/null 2>&1 && openssl version 2>/dev/null | grep -qE '^OpenSSL [3-9]'; then
+        if openssl pkeyutl -verify -pubin -inkey "$3" -rawin -in "$1" -sigfile "$sigbin" >/dev/null 2>&1; then
+            rc=0
+        else
+            rc=1
+        fi
+        rm -f "$sigbin"
+        return $rc
+    fi
+    if command -v python3 >/dev/null 2>&1 && python3 -c 'import cryptography' 2>/dev/null; then
+        if python3 - "$1" "$sigbin" "$3" <<'PY' >/dev/null 2>&1
+import sys
+from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives import serialization
+manifest, signature, key = (open(path, "rb").read() for path in sys.argv[1:4])
+try:
+    serialization.load_pem_public_key(key).verify(signature, manifest)
+except (InvalidSignature, ValueError):
+    sys.exit(1)
+PY
+        then
+            rc=0
+        else
+            rc=1
+        fi
+        rm -f "$sigbin"
+        return $rc
+    fi
+    rm -f "$sigbin"
+    return 2
+}
+
+inspect_archive_listing() {
+    # Reads the member list and refuses anything an overlay must not receive.
+    # Sets ARCHIVE_TOP (the single wrapper directory) and ARCHIVE_PREFIX ("./"
+    # when the archive was packed with a leading ./).
+    local names verbose tops top count inner
+    # Here-strings, never `printf … | grep -q`: under pipefail a grep that exits
+    # on its first match kills a producer still writing with SIGPIPE, and a
+    # listing longer than one stdio buffer then reads as "no match" — which
+    # refused a valid package on a real host while the same check, run a
+    # minute earlier, had passed.
+    names="$(tar -tzf "$ARCHIVE" 2>/dev/null)" || die "Cannot read the archive: $ARCHIVE is not a gzipped tar file, or is truncated."
+    [ -n "$names" ] || die "The archive is empty: $ARCHIVE"
+    # Member names as tar will extract them: `a/./b` and `a//b` both land at
+    # `a/b`, so the checks below look at the same spelling tar acts on.
+    names="$(printf '%s\n' "$names" | sed 's|/\./|/|g; s|//*|/|g; s|/\./|/|g; s|/\.$||')"
+    if grep -qE '^/|(^|/)\.\.(/|$)' <<< "$names"; then
+        die "Refusing the archive: it carries an absolute path or a '..' component, which would extract outside the deployment."
+    fi
+    case "$names" in
+        ./*) ARCHIVE_PREFIX="./" ;;
+        *)   ARCHIVE_PREFIX="" ;;
+    esac
+    tops="$(printf '%s\n' "$names" | sed 's|^\./||; /^$/d; /^\.$/d; s|/.*||' | LC_ALL=C sort -u)"
+    count="$(printf '%s\n' "$tops" | sed '/^$/d' | wc -l | tr -d ' ')"
+    if [ "$count" != 1 ]; then
+        if grep -q '^\._' <<< "$tops"; then
+            die "Refusing the archive: it carries macOS extended-attribute members (._*). Rebuild it with COPYFILE_DISABLE=1, which the packager's --tarball does."
+        fi
+        die "Refusing the archive: expected exactly one top-level directory, found $count ($(printf '%s' "$tops" | tr '\n' ' ')). A distribution wraps its files in one versioned directory."
+    fi
+    top="$tops"
+    # The paths inside the wrapper. Every member starts with the wrapper by
+    # construction, so it is cut off rather than matched: a directory name is
+    # data, and data built into a regular expression is a regular expression.
+    inner="$(printf '%s\n' "$names" | sed 's|^\./||' | cut -s -d/ -f2- | sed '/^$/d')"
+    if [ -z "$inner" ]; then
+        die "Refusing the archive: its only top-level entry ($top) is not a directory."
+    fi
+    if grep -qE '^(\.env|\.git|backups)(/|$)' <<< "$inner"; then
+        die "Refusing the archive: it carries .env, .git/ or backups/, which belong to the deployment and never to a package."
+    fi
+    if grep -qE '(^|/)\.git(/|$)' <<< "$names"; then
+        die "Refusing the archive: it carries a .git directory."
+    fi
+    verbose="$(tar -tzvf "$ARCHIVE" 2>/dev/null)" || die "Cannot list the archive: $ARCHIVE"
+    if grep -qE '^[lh]' <<< "$verbose"; then
+        die "Refusing the archive: it carries symbolic or hard links. An overlay that follows a link can write outside the tree; the packager refuses to build one."
+    fi
+    # Device nodes and pipes have no place in a code tree, and an extraction run
+    # as root would create them; setuid or setgid bits survive rsync -a the
+    # same way and turn a file in a uid-1000 tree into something else.
+    if grep -qE '^[bcp]' <<< "$verbose"; then
+        die "Refusing the archive: it carries a device node or a named pipe."
+    fi
+    if grep -qE '^.{3}[sS]|^.{6}[sS]' <<< "$verbose"; then
+        die "Refusing the archive: it carries a setuid or setgid file."
+    fi
+    ARCHIVE_TOP="$top"
+}
+
+archive_member() {
+    # $1 = path inside the wrapper directory. Streams the member to stdout, or
+    # nothing when the archive has no such member; nothing touches the disk.
+    tar -xzOf "$ARCHIVE" "${ARCHIVE_PREFIX}${ARCHIVE_TOP}/$1" 2>/dev/null || true
+}
+
+check_archive() {
+    local manifest="$ARCHIVE.manifest.json" sig="$ARCHIVE.manifest.sig" key="$RELEASE_KEY"
+    local rc msg want have size want_size field pkg_project pkg_plugins my_project my_plugins
+    info "Checking archive: $ARCHIVE"
+    [ -n "$key" ] || key="$ROOT/RELEASE_KEY.pub"
+
+    if [ -f "$manifest" ]; then
+        PKG_MANIFEST="$manifest"
+        if [ -f "$sig" ]; then
+            if [ ! -f "$key" ]; then
+                SIGNATURE_STATE=unverifiable
+                msg="The package is signed, but there is no release key to verify it against (looked for $key; pass --release-key PATH)."
+                [ "$REQUIRE_SIGNATURE" = false ] || die "$msg"
+                warn "$msg"
+            else
+                verify_manifest_signature "$manifest" "$sig" "$key" && rc=0 || rc=$?
+                case "$rc" in
+                    0)
+                        SIGNATURE_STATE=verified
+                        ok "Signature verified against $key"
+                        ;;
+                    1)
+                        die "The package signature does NOT verify against $key. Refusing it: the manifest or the signature was altered, or the package was signed with a different key."
+                        ;;
+                    *)
+                        SIGNATURE_STATE=unverifiable
+                        msg="The package is signed, but nothing on this host can check an Ed25519 signature (needs OpenSSL 3, or python3 with the cryptography package)."
+                        [ "$REQUIRE_SIGNATURE" = false ] || die "$msg"
+                        warn "$msg"
+                        ;;
+                esac
+            fi
+        else
+            [ "$REQUIRE_SIGNATURE" = false ] || die "The package is not signed (no $sig), and --require-signature is set."
+            warn "The package is not signed; its manifest is checked for consistency only."
+        fi
+
+        want="$(manifest_value "$manifest" sha256)"
+        [ -n "$want" ] || die "The manifest names no sha256; it is not a package manifest."
+        require_sha256_tool
+        have="$(sha256_of "$ARCHIVE")"
+        [ "$want" = "$have" ] || die "The archive does not match its manifest: sha256 $have, manifest says $want. The file was altered or corrupted in transit."
+        want_size="$(manifest_value "$manifest" size)"
+        size="$(wc -c < "$ARCHIVE" | tr -d ' ')"
+        [ -z "$want_size" ] || [ "$want_size" = "$size" ] || die "The archive does not match its manifest: $size bytes, manifest says $want_size."
+        PKG_SHA256="$have"
+        ok "Archive matches the manifest (sha256 ${have:0:12}…)"
+
+        field="$(manifest_value "$manifest" manifest_version)"
+        [ "$field" = 1 ] || die "The manifest is version '$field'; this script understands version 1. Update update.sh first — the package carries a newer one at its root."
+        field="$(manifest_value "$manifest" min_updater_version)"
+        [[ "$field" =~ ^[0-9]+$ ]] || die "The manifest's min_updater_version is not a number ('$field')."
+        if [ "$field" -gt "$UPDATER_SCRIPT_VERSION" ]; then
+            die "The package needs update.sh version $field and this is version $UPDATER_SCRIPT_VERSION. Replace this script with the package's copy (update.sh at its root) and re-run."
+        fi
+        PKG_VERSION="$(manifest_value "$manifest" version)"
+
+        # A package for another project, or with another plugin set, applied
+        # over this deployment would drop or add whole applications. The
+        # manifest says what the package is; .env says what runs here.
+        pkg_project="$(manifest_value "$manifest" project)"
+        pkg_plugins="$(normalise_list "$(manifest_value "$manifest" plugins)")"
+        my_project="$(env_value EPICURRENTS_PROJECT)"
+        my_plugins="$(normalise_list "$(env_value EPICURRENTS_PLUGINS)")"
+        if [ "$pkg_project" != "$my_project" ]; then
+            die "The package is built for project '${pkg_project:-<none>}' and this deployment runs '${my_project:-<none>}'. Build a package for this deployment's project."
+        fi
+        if [ "$pkg_plugins" != "$my_plugins" ]; then
+            die "The package carries plugins '${pkg_plugins:-<none>}' and this deployment runs '${my_plugins:-<none>}'. Build a package with this deployment's plugins."
+        fi
+        ok "Package is for project '${pkg_project:-<none>}', plugins '${pkg_plugins:-<none>}' — matches this deployment"
+    else
+        [ "$REQUIRE_SIGNATURE" = false ] || die "No manifest beside the archive ($manifest), and --require-signature is set. A signed package ships as three files: the tarball, .manifest.json and .manifest.sig."
+        warn "No manifest beside the archive ($manifest); the package cannot be verified. Its contents are still checked."
+    fi
+
+    inspect_archive_listing
+    ok "Archive contents are safe to overlay (one directory: $ARCHIVE_TOP)"
+
+    if [ -z "$PKG_VERSION" ]; then
+        PKG_VERSION="$(archive_member epicurrents/version.py | sed -n '/^__version__ = "/{s/^__version__ = "\([^"]*\)".*/\1/p;q;}')"
+    fi
+    INSTALLED_VERSION="$(installed_version)"
+    if [ -n "$PKG_VERSION" ]; then
+        is_version "$PKG_VERSION" || die "The package version '$PKG_VERSION' is not a plain MAJOR.MINOR.PATCH version."
+    fi
+    if [ -n "$PKG_VERSION" ] && [ -n "$INSTALLED_VERSION" ]; then
+        is_version "$INSTALLED_VERSION" || die "The installed version '$INSTALLED_VERSION' is not a plain MAJOR.MINOR.PATCH version."
+        if version_gt "$PKG_VERSION" "$INSTALLED_VERSION"; then
+            ok "Package version $PKG_VERSION is newer than the installed $INSTALLED_VERSION"
+        elif [ "$PKG_VERSION" = "$INSTALLED_VERSION" ]; then
+            msg="The package is version $PKG_VERSION, the same as the installed release."
+            [ "$REQUIRE_NEWER" = false ] || die "$msg --require-newer refuses it."
+            warn "$msg"
+        else
+            msg="The package is version $PKG_VERSION, OLDER than the installed $INSTALLED_VERSION."
+            [ "$REQUIRE_NEWER" = false ] || die "$msg --require-newer refuses a downgrade."
+            warn "$msg Applying it is a downgrade; the database will not be migrated backwards."
+        fi
+    elif [ "$REQUIRE_NEWER" = true ]; then
+        die "--require-newer: cannot compare versions (package: '${PKG_VERSION:-unknown}', installed: '${INSTALLED_VERSION:-unknown}')."
+    fi
+
+    emit "archive=$ARCHIVE"
+    emit "manifest=${PKG_MANIFEST:-none}"
+    emit "signature=$SIGNATURE_STATE"
+    emit "sha256=${PKG_SHA256:-unknown}"
+    emit "version=${PKG_VERSION:-unknown}"
+    emit "installed=${INSTALLED_VERSION:-unknown}"
+}
+
+# ── Orphaned files ────────────────────────────────────────────────────────────
+# The overlay never deletes, so a file a release removes stays in the tree and
+# is baked into the image. The package's FILELIST names every file it ships;
+# the installed release's list is kept at .epicurrents-files. After the overlay,
+# old minus new is what the previous package shipped and this one does not —
+# and only those are removed. A file no package listed is the operator's, or
+# generated at runtime, and is never a candidate. The protect list is a second
+# fence on top of that.
+
+is_protected() {
+    # $1 = path relative to the deployment root.
+    case "$1" in
+        .env|.env.*|RELEASE_KEY.pub|backups/*|update/*|static/*|frontend/vendor/*|frontend/node_modules/*|.git/*|local/*|testdata/*|recordings/converters/*/*)
+            return 0 ;;
+        projects/*/*)
+            # A project checked out by the operator is theirs; a copied one is
+            # the package's. `.git` may be a file in a worktree, hence -e.
+            local p="${1#projects/}"
+            p="${p%%/*}"
+            [ -e "$ROOT/projects/$p/.git" ] && return 0
+            ;;
+    esac
+    return 1
+}
+
+inside_tree() {
+    # $1 = a path from a file list. True when it is a plain relative path — no
+    # leading slash, no `..`, no `.` or empty component — whose parent directory
+    # resolves, links followed, to somewhere under the deployment root. The
+    # lists are written by whoever can write the tree, which is not who runs
+    # this script on a host with an updater: an entry of `../etc/x`, or
+    # `link/x` where `link` points outside, must not turn a prune into a
+    # deletion elsewhere.
+    case "$1" in
+        ""|/*|.|..|./*|../*|*/.|*/..|*/./*|*/../*|*//*) return 1 ;;
+    esac
+    local parent
+    parent="$(cd "$ROOT/$(dirname "$1")" 2>/dev/null && pwd -P)" || return 1
+    case "$parent/" in
+        "$ROOT_REAL/"*) return 0 ;;
+    esac
+    return 1
+}
+
+remove_empty_parents() {
+    # $1 = path relative to the root whose parents may now be empty.
+    local d
+    d="$(dirname "$1")"
+    while [ "$d" != "." ] && [ "$d" != "/" ]; do
+        rmdir "$ROOT/$d" 2>/dev/null || break
+        d="$(dirname "$d")"
+    done
+}
+
+record_installed_filelist() {
+    # $1 = the list to keep as the installed release's. Handed to the tree's
+    # owner when this runs as root, like the snapshot: a root-owned copy could
+    # not be replaced by a later run as the deployment account, which would
+    # die on the copy after the overlay — the worst place to stop.
+    cp "$1" "$INSTALLED_FILELIST"
+    hand_to_tree_owner "$INSTALLED_FILELIST"
+}
+
+prune_orphans() {
+    # $1 = the new package's FILELIST (in the extracted tree).
+    local removed=0 rel
+    if [ ! -f "$1" ]; then
+        warn "The package carries no FILELIST; files the previous release shipped and this one dropped are not pruned."
+        return 0
+    fi
+    if [ ! -f "$INSTALLED_FILELIST" ]; then
+        record_installed_filelist "$1"
+        ok "Recorded the package's file list; pruning of dropped files starts with the next update"
+        return 0
+    fi
+    while IFS= read -r rel; do
+        [ -n "$rel" ] || continue
+        is_protected "$rel" && continue
+        inside_tree "$rel" || { warn "Not pruning '$rel': it does not name a file inside the deployment tree."; continue; }
+        if [ -f "$ROOT/$rel" ] && [ ! -L "$ROOT/$rel" ]; then
+            rm -f "$ROOT/$rel"
+            removed=$((removed + 1))
+            remove_empty_parents "$rel"
+        fi
+    done < <(LC_ALL=C comm -23 <(LC_ALL=C sort -u "$INSTALLED_FILELIST") <(LC_ALL=C sort -u "$1"))
+    record_installed_filelist "$1"
+    ok "Pruned $removed file(s) the previous release shipped and this one does not"
+}
+
+report_orphan_candidates() {
+    # For --check-archive: what is in the tree, under the directories the
+    # package populates, that the package does not carry. Informational —
+    # an update prunes only what the previous package listed — so an operator
+    # with a shell can clean by hand. frontend/dist and viewer-dist are left
+    # out: the update empties and refills those two.
+    local new tops top existing candidates count shown
+    new="$(archive_member FILELIST)"
+    if [ -z "$new" ]; then
+        warn "The package carries no FILELIST; nothing to compare the tree against."
+        return 0
+    fi
+    tops="$(printf '%s\n' "$new" | grep '/' | sed 's|/.*||' | LC_ALL=C sort -u)"
+    existing=""
+    while IFS= read -r top; do
+        [ -n "$top" ] && [ -d "$ROOT/$top" ] || continue
+        # Run from the root so find prints relative paths and nothing has to
+        # strip a prefix that could read as a pattern.
+        existing="$existing$(cd "$ROOT" && find "$top" \( -name .git -o -name node_modules -o -name __pycache__ \
+            -o -path frontend/vendor -o -path frontend/dist -o -path frontend/viewer-dist \) -prune \
+            -o -type f -print)"$'\n'
+    done <<< "$tops"
+    candidates="$(LC_ALL=C comm -23 <(printf '%s' "$existing" | sed '/^$/d' | LC_ALL=C sort -u) <(printf '%s\n' "$new" | LC_ALL=C sort -u) \
+        | while IFS= read -r rel; do is_protected "$rel" || printf '%s\n' "$rel"; done)"
+    count="$(printf '%s' "$candidates" | grep -c . || true)"
+    emit "orphan_candidates=$count"
+    if [ "$count" = 0 ]; then
+        ok "No file in the tree that the package does not carry"
+        return 0
+    fi
+    warn "$count file(s) in the tree that the package does not carry (an update prunes only what the previous package listed):"
+    shown=0
+    while IFS= read -r rel; do
+        [ -n "$rel" ] || continue
+        if [ "$shown" -ge 40 ]; then
+            warn "  … and $((count - shown)) more"
+            break
+        fi
+        warn "  $rel"
+        shown=$((shown + 1))
+    done <<< "$candidates"
+}
+
+# ── --check-archive ───────────────────────────────────────────────────────────
+
+if [ -n "$CHECK_ARCHIVE" ]; then
+    ARCHIVE="$CHECK_ARCHIVE"
+    [ -f "$ARCHIVE" ] || die "Archive not found: $ARCHIVE"
+    check_archive
+    report_orphan_candidates
+    echo
+    ok "Archive check passed. Nothing was changed."
+    emit "check=ok"
+    exit 0
+fi
+
 # ── Shared steps ──────────────────────────────────────────────────────────────
 # Used by both the update and the rollback path, so a rollback reproduces every
 # step an update runs after the image build. A rollback that skipped them left
@@ -273,6 +803,7 @@ stop_app_services() {
         mkdir -p "$UPDATE_DIR"
         : > "$BORG_MARKER"
     fi
+    emit "step=stop"
     info "Stopping application services"
     "${COMPOSE[@]}" stop web celery celery-beat borg || true
     SERVICES_STOPPED=true
@@ -280,6 +811,7 @@ stop_app_services() {
 }
 
 collect_static() {
+    emit "step=static"
     info "Collecting static files"
     "${COMPOSE[@]}" run --rm --no-deps web python manage.py collectstatic --no-input
     ok "Static files collected"
@@ -305,6 +837,7 @@ refresh_vendored_assets() {
     # the Pyodide tree, while viewer-dist is inside the code snapshot a rollback
     # restores with rsync as the deploy user — root-owned files there would
     # survive the rollback.
+    emit "step=vendor"
     if "${COMPOSE[@]}" --profile vendor run --rm --no-deps -T --user 1000:1000 vendor \
             python manage.py vendor_viewer --check > /dev/null 2>&1; then
         ok "Viewer edition matches the pin"
@@ -391,6 +924,7 @@ recreate_stack() {
     if [ "$SKIP_BEAT" = false ]; then
         services+=(celery-beat)
     fi
+    emit "step=recreate"
     info "Recreating containers"
     "${COMPOSE[@]}" up -d --force-recreate "${services[@]}"
     # Caddy serves /assets/, /viewer/ and /static/ straight off bind mounts, so
@@ -420,8 +954,9 @@ recreate_stack() {
 
 wait_for_health() {
     local port ready asset domain spa_served
-    port="$(grep -E '^HOST_PORT=' .env | head -1 | cut -d= -f2- | tr -d ' "' || true)"
+    port="$(env_value HOST_PORT)"
     port="${port:-8000}"
+    emit "step=health"
     info "Waiting for the platform to become ready"
     ready=false
     for _ in $(seq 1 60); do
@@ -433,8 +968,10 @@ wait_for_health() {
     done
     if [ "$ready" = true ]; then
         ok "Health check passed"
+        emit "health=ok"
     else
         warn "Health check did not pass within the timeout; check '${COMPOSE[*]} logs web'."
+        emit "health=failed"
     fi
 
     # The health endpoint says Django is answering. It says nothing about whether
@@ -447,7 +984,7 @@ wait_for_health() {
     # first-time visitor would hit.
     if [ "$PROXY_ENABLED" = true ] && [ -f frontend/dist/index.html ]; then
         asset="$(grep -oE '/assets/[A-Za-z0-9._-]+\.js' frontend/dist/index.html | head -1 || true)"
-        domain="$(grep -E '^PROXY_DOMAIN=' .env | head -1 | cut -d= -f2- | tr -d ' "' || true)"
+        domain="$(env_value PROXY_DOMAIN)"
         if [ -n "$asset" ] && [ -n "$domain" ]; then
             info "Verifying the SPA bundle is servable"
             # --resolve pins the name to this host so the check tests the local
@@ -480,6 +1017,24 @@ wait_for_health() {
     fi
 }
 
+# ── Snapshots ─────────────────────────────────────────────────────────────────
+
+snapshot_complete() {
+    # $1 = snapshot directory. A snapshot that can actually be restored from:
+    # database and .env present, and a code archive that reads if there is one.
+    # Warnings go to stderr deliberately: callers run inside a command
+    # substitution, where anything on stdout becomes part of the returned path.
+    if [ ! -f "$1/db.sql.gz" ] || [ ! -f "$1/.env" ]; then
+        warn "Skipping incomplete snapshot $(basename "$1") (no database or .env)" >&2
+        return 1
+    fi
+    if [ -f "$1/code.tar.gz" ] && ! tar -tzf "$1/code.tar.gz" >/dev/null 2>&1; then
+        warn "Skipping snapshot $(basename "$1") — its code archive is unreadable" >&2
+        return 1
+    fi
+    return 0
+}
+
 find_latest_complete_snapshot() {
     # The newest snapshot that can actually be restored from — not simply the
     # newest. A run that dies between the code snapshot (step 0) and the
@@ -488,25 +1043,17 @@ find_latest_complete_snapshot() {
     # perfectly good snapshot sitting behind it, which is the opposite of what
     # a recovery path should do when it meets damage.
     #
-    # Warnings go to stderr deliberately: this runs inside a command
-    # substitution, so anything on stdout becomes part of the returned path.
     # A glob rather than `ls -t`: the directory names are UTC timestamps this
     # script writes, so lexical order is chronological, and a glob cannot be
     # confused by a name containing whitespace. Iterated backwards for
-    # newest-first.
+    # newest-first. Only pre-update-* snapshots: a snapshot taken with
+    # --snapshot LABEL is named for its purpose and restored by name.
     local dirs=("$BACKUP_DIR"/pre-update-*)
     local i d
     for ((i = ${#dirs[@]} - 1; i >= 0; i--)); do
         d="${dirs[i]}"
         [ -d "$d" ] || continue   # no matches: the glob stayed literal
-        if [ ! -f "$d/db.sql.gz" ] || [ ! -f "$d/.env" ]; then
-            warn "Skipping incomplete snapshot $(basename "$d") (no database or .env)" >&2
-            continue
-        fi
-        if [ -f "$d/code.tar.gz" ] && ! tar -tzf "$d/code.tar.gz" >/dev/null 2>&1; then
-            warn "Skipping snapshot $(basename "$d") — its code archive is unreadable" >&2
-            continue
-        fi
+        snapshot_complete "$d" || continue
         printf '%s' "$d"
         return 0
     done
@@ -516,6 +1063,8 @@ find_latest_complete_snapshot() {
 prune_backups() {
     # Keep the newest $KEEP_BACKUPS pre-update snapshots; drop the rest. ls -t
     # over our own timestamped dir names is fine — no untrusted filenames here.
+    # Named snapshots (--snapshot LABEL) are not touched: whoever took one
+    # removes it.
     # shellcheck disable=SC2012
     ls -1dt "$BACKUP_DIR"/pre-update-* 2>/dev/null | tail -n +$((KEEP_BACKUPS + 1)) | while read -r old; do
         rm -rf "$old"
@@ -526,6 +1075,76 @@ prune_backups() {
     ls -1dt "$BACKUP_DIR"/pre-update-* 2>/dev/null | while read -r d; do
         [ -f "$d/db.sql.gz" ] || { warn "Discarding half-written snapshot $(basename "$d")"; rm -rf "$d"; }
     done || true
+}
+
+snapshot_code() {
+    # $1 = snapshot directory. The code tree as it is now, before anything
+    # overwrites it.
+    #
+    # Excluded: the snapshots themselves (which would nest), the archive drop
+    # directory, .env (saved with the database), git history, build caches — and
+    # static/ plus frontend/vendor, which the containers write as root, so an
+    # unprivileged restore cannot set their timestamps and tar fails the whole
+    # extraction on "Cannot utime". static/ is regenerated by the collectstatic
+    # step; frontend/vendor is not, which is why the vendoring step re-vendors
+    # it whenever the tree does not match its own lock.
+    mkdir -p "$1"
+    info "Snapshotting current code to $1"
+    if tar -czf "$1/code.tar.gz" \
+            --exclude="./backups" \
+            --exclude="./update" \
+            --exclude="./.env" \
+            --exclude="./.git" \
+            --exclude="./frontend/node_modules" \
+            --exclude="./static" \
+            --exclude="./frontend/vendor" \
+            --exclude="__pycache__" \
+            -C . . 2>/dev/null; then
+        ok "Code snapshotted ($(du -h "$1/code.tar.gz" | cut -f1))"
+        hand_to_tree_owner "$1"
+    else
+        rm -rf "$1"
+        die "Code snapshot failed; aborting before any change. (Pass --no-backup to override.)"
+    fi
+}
+
+hand_to_tree_owner() {
+    # $1 = a path this script wrote. Run as root, it belongs to root, and the
+    # deploy account can then neither prune a snapshot nor restore from it, nor
+    # replace the installed file list. Hand it to whoever owns the tree. GNU
+    # stat only, like the ownership preflight. Called after each write, not
+    # once per run: the database dump lands in a snapshot directory minutes
+    # after the code archive did, and a single chown after the archive left
+    # the dump, .env and MANIFEST root-owned.
+    if [ "$(id -u)" = 0 ]; then
+        local owner
+        owner="$(stat -c %u:%g . 2>/dev/null || true)"
+        [ -n "$owner" ] && chown -R "$owner" "$1"
+    fi
+    return 0
+}
+
+snapshot_database() {
+    # $1 = snapshot directory, $2 = the MANIFEST body (lines) describing why.
+    # Local snapshot = database + .env: small, fast, and the part an update can
+    # destroy. Recording / media file volumes are out of scope here — they are
+    # untouched by migrations; enable borg for full data-volume backups.
+    ensure_db_up
+    info "Backing up the database to $1"
+    # SC2016: $POSTGRES_* must expand inside the db container's shell, not here.
+    # shellcheck disable=SC2016
+    if "${COMPOSE[@]}" exec -T db sh -c 'pg_dump --clean --if-exists --no-owner -U "$POSTGRES_USER" "$POSTGRES_DB"' \
+            | gzip > "$1/db.sql.gz"; then
+        ok "Database dumped ($(du -h "$1/db.sql.gz" | cut -f1))"
+    else
+        rm -rf "$1"
+        die "Database dump failed; aborting before any change. (Pass --no-backup to override.)"
+    fi
+    cp .env "$1/.env"
+    printf '%s\n' "$2" > "$1/MANIFEST"
+    hand_to_tree_owner "$1"
+    ok ".env + manifest saved"
+    emit "snapshot=$1"
 }
 
 restore_sql_preamble() {
@@ -548,17 +1167,51 @@ CREATE SCHEMA public;
 SQL
 }
 
+# ── Snapshot-only mode ────────────────────────────────────────────────────────
+# A named snapshot, taken without changing anything: what a caller takes before
+# rolling back, so that whatever the live database gained since the update is
+# recoverable from somewhere. Named for its purpose so --rollback never picks
+# it in place of the pre-update one.
+
+if [ "$SNAPSHOT_ONLY" = true ]; then
+    [[ "$SNAPSHOT" =~ ^[A-Za-z0-9][A-Za-z0-9_-]*$ ]] \
+        || die "--snapshot: a label is letters, digits, '-' and '_' (got '$SNAPSHOT')."
+    stamp="$(date -u +%Y%m%d-%H%M%S)"
+    snap="$BACKUP_DIR/$SNAPSHOT-$stamp"
+    [ ! -e "$snap" ] || die "Snapshot $snap already exists."
+    emit "step=snapshot"
+    snapshot_code "$snap"
+    snapshot_database "$snap" "timestamp_utc=$stamp
+mode=snapshot
+label=$SNAPSHOT
+code_snapshot=yes
+version=$(installed_version)"
+    echo
+    ok "Snapshot complete: $snap"
+    echo "    Restore it with: ./update.sh --rollback --snapshot $(basename "$snap")"
+    emit "done"
+    exit 0
+fi
+
 # ── Rollback path ─────────────────────────────────────────────────────────────
 
 if [ "$ROLLBACK" = true ]; then
-    # shellcheck disable=SC2012  # mtime sort over our own snapshot dir names.
     # Every piece is verified before anything is touched — including that the
     # code archive actually reads, since it is restored *after* the database
     # and a truncated one would otherwise strand the deployment half rolled
-    # back. An incomplete snapshot is skipped rather than fatal; see
-    # find_latest_complete_snapshot.
-    latest="$(find_latest_complete_snapshot || true)"
-    [ -n "$latest" ] || die "No complete pre-update snapshot found under $BACKUP_DIR (a snapshot needs db.sql.gz and .env, and a readable code.tar.gz if it has one)."
+    # back. An incomplete snapshot is skipped rather than fatal when the newest
+    # is being looked for; a named one is what was asked for, so it is refused.
+    if [ -n "$SNAPSHOT" ]; then
+        case "$SNAPSHOT" in
+            */*|.|..) die "--snapshot NAME names a directory under $BACKUP_DIR (got '$SNAPSHOT')." ;;
+        esac
+        latest="$BACKUP_DIR/$SNAPSHOT"
+        [ -d "$latest" ] || die "No snapshot named $SNAPSHOT under $BACKUP_DIR."
+        snapshot_complete "$latest" || die "Snapshot $SNAPSHOT is incomplete or unreadable and cannot be restored from."
+    else
+        latest="$(find_latest_complete_snapshot || true)"
+        [ -n "$latest" ] || die "No complete pre-update snapshot found under $BACKUP_DIR (a snapshot needs db.sql.gz and .env, and a readable code.tar.gz if it has one)."
+    fi
     info "Rolling back to $(basename "$latest")"
     [ -f "$latest/MANIFEST" ] && cat "$latest/MANIFEST"
     confirm "Restore database + .env from this snapshot? Current data will be overwritten." \
@@ -566,6 +1219,7 @@ if [ "$ROLLBACK" = true ]; then
     write_maintenance_flag rolling_back "The platform is being rolled back to the previous release."
     ensure_db_up
     stop_app_services
+    emit "step=restore-db"
     info "Restoring database (single transaction — all or nothing)"
     # --single-transaction + ON_ERROR_STOP: the schema drop and the restore commit
     # or roll back as one unit, so a failure leaves the database exactly as it
@@ -580,6 +1234,7 @@ if [ "$ROLLBACK" = true ]; then
         die "Database restore FAILED and was rolled back — the database is unchanged, .env was not touched, and the stack was not recreated. If the error above is a lock timeout, something is still connected to the database (a backup in progress, a shell); see pg_stat_activity. Investigate before retrying."
     fi
     ok "Database restored"
+    emit "step=restore-env"
     cp "$latest/.env" ./.env
     ok ".env restored"
 
@@ -589,6 +1244,7 @@ if [ "$ROLLBACK" = true ]; then
     # if not what was asked for. The reverse order would leave new code with no
     # way back.
     if [ -f "$latest/code.tar.gz" ]; then
+        emit "step=restore-code"
         info "Restoring code"
         # A replace, not an overlay. Extracting the snapshot over the tree would
         # restore every old file and delete none of the new ones — so a
@@ -629,6 +1285,7 @@ if [ "$ROLLBACK" = true ]; then
         # that before this line said `build` instead of `build web`. The vendor
         # profile for the same reason the update build names it: the vendoring
         # steps below run from that image.
+        emit "step=build"
         info "Rebuilding images from the restored code"
         "${COMPOSE[@]}" --profile vendor build
         ok "Images rebuilt"
@@ -657,6 +1314,7 @@ if [ "$ROLLBACK" = true ]; then
         warn "Rolled back the database and .env, not the code/image."
         ok "Rollback complete."
     fi
+    emit "done"
     exit 0
 fi
 
@@ -710,6 +1368,24 @@ would then fail on its first write. Fix the ownership and re-run:
     fi
 fi
 
+# ── Preflight: the archive, verified before anything is touched ───────────────
+# Everything a package is refused for happens here, before the flag goes up and
+# before the snapshot: a refused package leaves no trace. The extraction itself
+# is step 1, after the snapshot, because the snapshot must capture the tree the
+# package is about to overwrite.
+
+if [ "$MODE" = archive ]; then
+    if [ -z "$ARCHIVE" ]; then
+        # shellcheck disable=SC2012  # newest-by-mtime over a controlled glob.
+        ARCHIVE="$(ls -1t "$UPDATE_DIR"/epicurrents*.tar.gz 2>/dev/null | head -1 || true)"
+        [ -n "$ARCHIVE" ] || die "No archive in $UPDATE_DIR/ (looked for epicurrents*.tar.gz). Drop the distribution there or pass --archive FILE."
+    fi
+    [ -f "$ARCHIVE" ] || die "Archive not found: $ARCHIVE"
+    command -v rsync >/dev/null 2>&1 || die "rsync is required for archive mode (apt-get install rsync)."
+    emit "step=check"
+    check_archive
+fi
+
 # ── 0. Snapshot the current code, BEFORE anything overwrites it ───────────────
 # The maintenance flag goes up first. The database dump is taken in step 2 and
 # the services keep running until step 4, with the image build in between —
@@ -727,80 +1403,34 @@ write_maintenance_flag updating "The platform is being updated."
 # Retaining "the previous archive" instead would be cheaper and does not work:
 # this script never moves, copies or records the archive it applied, so after a
 # few updates nothing identifies the deployed lineage.
-#
-# Excluded: the snapshots themselves (which would nest), the archive drop
-# directory, .env (saved with the database), git history, build caches — and
-# static/ plus frontend/vendor, which the containers write as root, so an
-# unprivileged restore cannot set their timestamps and tar fails the whole
-# extraction on "Cannot utime". static/ is regenerated by the collectstatic step
-# below; frontend/vendor is not, which is why the vendoring step re-vendors it
-# whenever the tree does not match its own lock.
 stamp="$(date -u +%Y%m%d-%H%M%S)"
 snap="$BACKUP_DIR/pre-update-$stamp"
 if [ "$BACKUP" = true ]; then
-    mkdir -p "$snap"
-    info "Snapshotting current code to $snap"
-    if tar -czf "$snap/code.tar.gz" \
-            --exclude="./backups" \
-            --exclude="./update" \
-            --exclude="./.env" \
-            --exclude="./.git" \
-            --exclude="./frontend/node_modules" \
-            --exclude="./static" \
-            --exclude="./frontend/vendor" \
-            --exclude="__pycache__" \
-            -C . . 2>/dev/null; then
-        ok "Code snapshotted ($(du -h "$snap/code.tar.gz" | cut -f1))"
-        # Run as root, the snapshot belongs to root, and the deploy account can
-        # then neither prune it nor restore from it later. Hand it to whoever
-        # owns the tree. GNU stat only, like the ownership preflight.
-        if [ "$(id -u)" = 0 ]; then
-            owner="$(stat -c %u:%g . 2>/dev/null || true)"
-            [ -n "$owner" ] && chown -R "$owner" "$snap"
-        fi
-    else
-        rm -rf "$snap"
-        die "Code snapshot failed; aborting before any change. (Pass --no-backup to override.)"
-    fi
+    emit "step=snapshot"
+    snapshot_code "$snap"
 fi
 
 # ── 1. Acquire source ─────────────────────────────────────────────────────────
 
+emit "step=acquire"
 if [ "$MODE" = archive ]; then
-    if [ -z "$ARCHIVE" ]; then
-        # shellcheck disable=SC2012  # newest-by-mtime over a controlled glob.
-        ARCHIVE="$(ls -1t "$UPDATE_DIR"/epicurrents*.tar.gz 2>/dev/null | head -1 || true)"
-        [ -n "$ARCHIVE" ] || die "No archive in $UPDATE_DIR/ (looked for epicurrents*.tar.gz). Drop the distribution there or pass --archive FILE."
-    fi
-    [ -f "$ARCHIVE" ] || die "Archive not found: $ARCHIVE"
-    command -v rsync >/dev/null 2>&1 || die "rsync is required for archive mode (apt-get install rsync)."
-
     info "Applying archive: $ARCHIVE"
     tmp="$(mktemp -d)"   # removed by the exit trap
     tar -xzf "$ARCHIVE" -C "$tmp"
-    # Distribution tars wrap their contents in a single versioned top-level dir;
-    # descend into it so the sync targets the deployment files, not the wrapper.
-    src="$tmp"
-    if [ ! -f "$src/docker-compose.yml" ]; then
-        # Descend into the wrapper. Directories only, and AppleDouble siblings
-        # excluded: macOS tar stores extended attributes as ._* members, which
-        # GNU tar materialises as real files on extraction. A counting test
-        # ("exactly one entry, so it is the wrapper") then sees two entries and
-        # declines to descend, and the archive is rejected as malformed — so a
-        # distribution built on a Mac cannot be applied on Linux, with an error
-        # naming the wrong cause.
-        only="$(find "$tmp" -mindepth 1 -maxdepth 1 -type d ! -name '._*' | head -1)"
-        [ -n "$only" ] && src="$only"
-    fi
-    [ -f "$src/docker-compose.yml" ] || die "Archive does not look like an Epicurrents distribution (no docker-compose.yml at its root)."
+    # Distribution tars wrap their contents in a single versioned top-level dir,
+    # which the listing check established; descend into it so the sync targets
+    # the deployment files, not the wrapper.
+    src="$tmp/$ARCHIVE_TOP"
+    [ -f "$src/docker-compose.yml" ] || die "Archive does not look like an Epicurrents distribution (no docker-compose.yml under $ARCHIVE_TOP/)."
 
     # Refresh the platform-owned, regenerable bundle dirs so stale content-hashed
     # chunks from prior releases don't pile up. These are the only trees we
-    # actively prune; the root sync below is overlay-only (no --delete), so any
+    # actively empty; the root sync below is overlay-only (no --delete), so any
     # file the operator added that the archive doesn't carry — a
     # docker-compose.override.yml, certs, a .env.local, a .git checkout — is
     # always preserved. A denylist --delete at the deployment root would silently
-    # wipe exactly those.
+    # wipe exactly those. What a release removed is pruned afterwards, from the
+    # file lists, which name only what a package shipped.
     # Empty these, do not replace them. `rm -rf` followed by rsync recreates the
     # directory with a NEW inode, and the running caddy container bind-mounts the
     # old one — which it keeps, now orphaned and empty, so every /assets/ and
@@ -830,6 +1460,7 @@ if [ "$MODE" = archive ]; then
         --exclude='/static/' \
         "$src"/ "$ROOT"/
     ok "Files updated"
+    prune_orphans "$src/FILELIST"
 else
     git rev-parse --is-inside-work-tree >/dev/null 2>&1 \
         || die "repo mode needs a git checkout. In a distribution deployment use archive mode (the default)."
@@ -862,7 +1493,7 @@ else
         # remedy differs and each looks the same from the build's side. `rev-parse
         # --git-dir` is the repo test rather than a check for a .git directory: a
         # worktree or a submodule checkout has .git as a *file*.
-        project="$(grep -E '^EPICURRENTS_PROJECT=' .env | head -1 | cut -d= -f2 | tr -d ' "'"'"'' || true)"
+        project="$(env_value EPICURRENTS_PROJECT)"
         if [ -n "$project" ] && [ -d "projects/$project" ]; then
             if ! git -C "projects/$project" rev-parse --git-dir > /dev/null 2>&1; then
                 warn "projects/$project is not a git checkout — update it yourself before the build."
@@ -886,34 +1517,19 @@ fi
 # ── 2. Back up before mutating the database ───────────────────────────────────
 
 if [ "$BACKUP" = true ]; then
-    ensure_db_up
+    emit "step=backup"
     # $snap already exists and holds code.tar.gz from step 0.
-    info "Backing up to $snap"
-    # Local snapshot = database + .env: small, fast, and the part an update can
-    # destroy. Recording / media file volumes are out of scope here — they are
-    # untouched by migrations; enable borg for full data-volume backups.
-    # SC2016: $POSTGRES_* must expand inside the db container's shell, not here.
-    # shellcheck disable=SC2016
-    if "${COMPOSE[@]}" exec -T db sh -c 'pg_dump --clean --if-exists --no-owner -U "$POSTGRES_USER" "$POSTGRES_DB"' \
-            | gzip > "$snap/db.sql.gz"; then
-        ok "Database dumped ($(du -h "$snap/db.sql.gz" | cut -f1))"
+    if [ "$MODE" = archive ]; then
+        source_line="archive=$ARCHIVE
+archive_sha256=${PKG_SHA256:-unknown}
+package_version=${PKG_VERSION:-unknown}"
     else
-        rm -rf "$snap"
-        die "Database dump failed; aborting before any change. (Pass --no-backup to override.)"
+        source_line="git_ref=$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
     fi
-    cp .env "$snap/.env"
-
-    {
-        echo "timestamp_utc=$stamp"
-        echo "mode=$MODE"
-        echo "code_snapshot=yes"
-        if [ "$MODE" = archive ]; then
-            echo "archive=$ARCHIVE"
-        else
-            echo "git_ref=$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
-        fi
-    } > "$snap/MANIFEST"
-    ok ".env + manifest saved"
+    snapshot_database "$snap" "timestamp_utc=$stamp
+mode=$MODE
+code_snapshot=yes
+$source_line"
 
     # If borgmatic is wired up and running, take a full backup too (data volumes).
     if [ -x ./scripts/backup.sh ] && service_running borg; then
@@ -928,6 +1544,7 @@ fi
 
 # ── 3. Build the image ────────────────────────────────────────────────────────
 
+emit "step=build"
 info "Building Docker images"
 # --profile vendor so the one-shot writer used by the vendoring step is built
 # here with everything else. Its image is the same one web runs, so this costs a
@@ -943,6 +1560,7 @@ stop_app_services
 # ── 5. Apply ALL pending migrations ───────────────────────────────────────────
 
 ensure_db_up
+emit "step=migrate"
 info "Applying database migrations"
 "${COMPOSE[@]}" run --rm --no-deps web python manage.py migrate
 ok "Migrations applied"
@@ -968,3 +1586,4 @@ ok "Update complete."
 if [ "$BACKUP" = true ]; then
     echo "    Roll back with: ./update.sh --rollback"
 fi
+emit "done"

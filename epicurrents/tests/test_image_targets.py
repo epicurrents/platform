@@ -171,6 +171,24 @@ class TestStageLayout:
         for name in ("test", "runtime"):
             assert "USER appuser" in stages[name], f"{name} runs as root by default"
 
+    def test_the_viewer_pin_is_the_one_frontend_file_in_the_build_context(self):
+        """The production `vendor` service has no bind mount of the code and
+        reads the pin baked into the image, so `frontend/` being excluded
+        wholesale left every production update failing the viewer step with
+        "No pin file" — and nothing else noticed, because the step is not
+        fatal. The re-include has to follow the exclusion, since the last
+        matching pattern wins.
+        """
+        patterns = [
+            line.strip() for line in (REPO / ".dockerignore").read_text().splitlines()
+            if line.strip() and not line.startswith("#")
+        ]
+        assert "frontend/" in patterns, "the frontend tree is no longer excluded from the image"
+        assert "!frontend/viewer-pin.json" in patterns, "the viewer pin no longer reaches the image"
+        assert patterns.index("frontend/") < patterns.index("!frontend/viewer-pin.json"), (
+            "the re-include must come after the exclusion it carves out of"
+        )
+
 
 class TestDependencyLock:
     """Version pins alone let two builds of one commit install different

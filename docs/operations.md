@@ -512,9 +512,23 @@ Re-export after any `borg key change-passphrase`, and after initialising any fur
 
 ### Update to a new release
 
-`scripts/update.sh` updates a running deployment and recreates its stack from one of two sources, then runs a shared tail: back up, rebuild the image, apply **all** pending migrations, collect static files, and recreate the application containers on the production overlay.
+`scripts/update.sh` updates a running deployment and recreates its stack from one of two sources, then runs a shared tail: back up, rebuild the image, apply all pending migrations, collect static files, and recreate the application containers on the production overlay.
 
-**From a distribution archive (default)** — for a deployment installed from a distribution tarball, with no git checkout. Drop the newer `epicurrents*.tar.gz` into `./update/`, then run `./update.sh` from the deployment root. The newest matching archive is applied over the deployment, preserving `.env` and the data volumes. The glob looks at `./update/` itself, not its subdirectories; a package that sits anywhere else is named with `--archive FILE`.
+**From a distribution archive (default)** — for a deployment installed from a distribution tarball, with no git checkout. Drop the newer `epicurrents*.tar.gz` into `./update/`, with the `.manifest.json` and `.manifest.sig` files the packager wrote beside it, then run `./update.sh` from the deployment root. The newest matching archive is applied over the deployment, preserving `.env` and the data volumes. The glob looks at `./update/` itself, not its subdirectories; a package that sits anywhere else is named with `--archive FILE`.
+
+**A package is verified before anything is extracted.** The manifest names the package's version, project, plugins and sha256; the signature is over the manifest, made with the release key the packager was given (`--sign-key`, see [packaging](getting-started.md#packaging-a-distribution-to-share)). `update.sh` verifies the signature against `RELEASE_KEY.pub` at the deployment root, which the previous package installed there (or `--release-key PATH` names another), checks the hash, and refuses a package for a different project or plugin set, one that needs a newer `update.sh` than the installed one, and any archive that carries a link, a device node, a setuid file, a parent reference, a second top-level entry, or a `.env`, `.git/` or `backups/` member. On the manual path a missing manifest or signature is a warning, so a hand-built package keeps working; `--require-signature` makes either a refusal, and `--require-newer` refuses a package whose version is not greater than the installed one. Every check runs before the snapshot, so a refused package changes nothing. A host verifies with OpenSSL 3, or with `python3` and the `cryptography` package where the system OpenSSL is older; with neither the signature is reported as unverifiable, which `--require-signature` also refuses.
+
+```bash
+./update.sh --check-archive update/epicurrents-myproject.tar.gz
+```
+
+runs every check and stops: nothing is extracted, no container is touched, and it needs no container runtime. It also lists what sits under the package's directories in the tree that the package does not carry, for an operator who wants to clean by hand.
+
+**Files a release removes are pruned.** The overlay never deletes, so a module or migration a release dropped used to stay in the tree and get baked into the image. A package built with `--tarball` carries a `FILELIST` naming every file it ships, and the script keeps the installed release's list at `.epicurrents-files` in the deployment root. After the overlay it deletes what the previous package shipped and the new one does not, and nothing else: a file no package ever listed, whether the operator added it or the runtime generated it, is never a candidate, and `.env`, `backups/`, `update/`, `static/`, the vendored asset trees, a project with its own `.git`, vendored converters, `local/` and `testdata/` are never touched even when listed. The first update to a deployment that has no installed list records the package's list and deletes nothing; pruning starts with the update after it.
+
+**Named snapshots.** `./update.sh --snapshot LABEL` takes a snapshot named `backups/LABEL-<stamp>` (code, database, `.env`) and exits, without stopping anything; `./update.sh --rollback --snapshot NAME` restores that one. A plain `--rollback` still picks the newest complete `pre-update-*` snapshot and ignores named ones, which is the point of the name: a snapshot taken before rolling back, so that what the database gained since the update stays recoverable, must not be the one the rollback restores.
+
+The script also reports its progress on lines starting with `::` (`::step=`, `::snapshot=` once the snapshot is complete, `::health=`, `::done`, `::failed=`, and the facts `--check-archive` establishes) for a caller that drives it; the vocabulary is pinned in [scripts/tests/test_update_targets.py](../scripts/tests/test_update_targets.py).
 
 **From git** — for a checkout that follows the upstream platform:
 
