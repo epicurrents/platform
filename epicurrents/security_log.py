@@ -145,6 +145,18 @@ Event types in current use:
   here because a rollback restores the database dump and erases the audit rows
   written since the update's snapshot; the log stream survives. Fields:
   ``job_id``, ``operation``, ``state``, ``reason``.
+- ``maintenance.package_uploaded`` — a superuser uploaded an update package
+  that passed every check and now sits in the spool, where a request may name
+  it; the moment new code enters a deployment. Fields: ``sha256``,
+  ``version``, ``pruned`` (older packages removed to make room), ``actor_id``.
+- ``maintenance.package_rejected`` — an uploaded package was refused before it
+  reached the spool. ``reason`` is one of ``key_missing``, ``signature``,
+  ``manifest``, ``hash``, ``too_large``, ``version_not_newer``,
+  ``incompatible``, ``duplicate``, ``disk``, ``spool``; a run of ``signature`` or
+  ``hash`` refusals from one account is worth a look. Fields: ``reason``,
+  ``version`` (as the manifest declared it, when readable), ``actor_id``.
+- ``maintenance.package_removed`` — a superuser removed an uploaded package.
+  Fields: ``sha256``, ``version``, ``actor_id``.
 - ``throttle.rate_limited`` — an API request exceeded the global
   per-identity request-rate ceiling and was rejected with 429. Fields:
   ``scope`` (the throttle scope the path mapped to), ``identity_kind``

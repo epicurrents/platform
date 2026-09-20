@@ -3,11 +3,12 @@
 import json
 
 import pytest
+from django.conf import settings
 
 from activity.models import Activity
 from maintenance import spool
 from maintenance.models import MaintenanceJob, MaintenancePackage
-from maintenance.tests.conftest import PASSWORD
+from maintenance.tests.conftest import PASSWORD, place_package_files
 
 BASE = "/api/v1/maintenance"
 
@@ -17,6 +18,7 @@ def _post(client, path, data=None):
 
 
 def _package(sha="b" * 64, version="0.9.9"):
+    place_package_files(sha, version)
     return MaintenancePackage.objects.create(sha256=sha, version=version)
 
 
@@ -136,7 +138,12 @@ class TestCreateHostJob:
             "operation": "platform.update",
             "requested_by_id": user.pk,
             "requested_at": request["requested_at"],
-            "args": {"package_sha256": package.sha256},
+            # The deployment default is filled in so the agent applies this
+            # platform's window rather than its own.
+            "args": {
+                "package_sha256": package.sha256,
+                "verify_window_minutes": settings.REMOTE_UPDATE_VERIFY_WINDOW_MINUTES,
+            },
         }
 
     def test_an_unknown_package_is_400_and_writes_nothing(

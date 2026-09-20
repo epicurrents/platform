@@ -1,13 +1,21 @@
 <script setup lang="ts">
 /**
- * Maintenance — the deployment's state, the operations a superuser may run, and recent jobs.
+ * Maintenance — the deployment's state, the operations a superuser may run, uploaded update packages, and recent jobs.
  *
- * Staff read everything here; only a superuser sees the run controls, matching
- * the tier the API enforces. An operation's form is built from the argument
- * schema the server publishes, so a project's registered operation gets a
- * form without a frontend change. The step-up inputs come from the method the
- * status reports for this account, and an account that cannot confirm is told
- * so instead of failing at the submit.
+ * Staff read everything here; only a superuser sees the run, upload and
+ * remove controls, matching the tier the API enforces. An operation's form is
+ * built from the argument schema the server publishes, so a project's
+ * registered operation gets a form without a frontend change; the one
+ * argument the form knows by name is `package_sha256`, which it renders as a
+ * choice among the applicable packages rather than a hash to type. The
+ * step-up inputs come from the method the status reports for this account,
+ * and an account that cannot confirm is told so instead of failing at the
+ * submit.
+ *
+ * A package is uploaded as the three files the packager writes, picked
+ * together from one file input and sorted by name; the server verifies the
+ * signature and the manifest before it keeps anything, and its refusal is
+ * shown as it was worded.
  *
  * @package    epicurrents-platform
  */
@@ -17,12 +25,18 @@ import AdminTabs from '#components/AdminTabs.vue'
 import JobStateBadge from '#components/JobStateBadge.vue'
 import StepUpFields from '#components/StepUpFields.vue'
 import {
+    classifyPackageFiles,
     createJob,
+    deletePackage,
     listJobs,
     listOperations,
+    listPackages,
+    uploadPackage,
     type ArgSchemaProperty,
     type MaintenanceJob,
     type MaintenanceOperation,
+    type MaintenancePackage,
+    type PackageFiles,
 } from '#api/maintenance'
 import { usePolling } from '#composables/usePolling'
 import { t } from '#i18n'
@@ -33,12 +47,17 @@ import { useMaintenanceStore } from '#stores/maintenance'
 
 const SCOPE = 'AdminMaintenanceView'
 
+/** The argument of `platform.update` the form renders as a package choice. */
+const PACKAGE_ARG = 'package_sha256'
+const UPDATE_OPERATION = 'platform.update'
+
 const authStore = useAuthStore()
 const maintenanceStore = useMaintenanceStore()
 const router = useRouter()
 
 const operations = ref<MaintenanceOperation[]>([])
 const jobs = ref<MaintenanceJob[]>([])
+const packages = ref<MaintenancePackage[]>([])
 const loading = ref(true)
 const loadError = ref('')
 
@@ -50,12 +69,31 @@ const selected = ref<MaintenanceOperation | null>(null)
 const argValues = reactive<Record<string, unknown>>({})
 const credentials = reactive({ password: '', totp_code: '' })
 
+const showUpload = ref(false)
+const uploading = ref(false)
+const uploadError = ref('')
+const uploadProgress = ref(0)
+/** The parts picked so far; the upload is enabled once all three are present. */
+const picked = reactive<Partial<PackageFiles>>({})
+const packageInputRef = ref<HTMLInputElement | null>(null)
+
+const removing = ref<MaintenancePackage | null>(null)
+const removeLoading = ref(false)
+const removeError = ref('')
+
 const canWrite = computed(() => authStore.isSuperuser)
 const status = computed(() => maintenanceStore.status)
 const stepUp = computed(() => status.value?.step_up ?? { method: null, available: false, reason: null })
+const hostTier = computed(() => status.value?.remote_update_enabled === true)
 
 /** What the in-flight job is, when there is one, so the page can say why the run controls are off. */
 const inFlight = computed(() => jobs.value.find(job => job.in_flight) ?? null)
+
+const updateOperation = computed(() => operations.value.find(operation => operation.key === UPDATE_OPERATION) ?? null)
+const applicablePackages = computed(() => packages.value.filter(pkg => pkg.applicable))
+/** The section shows once the host tier is on, and stays for the history once anything was uploaded. */
+const showPackages = computed(() => hostTier.value || packages.value.length > 0)
+const uploadReady = computed(() => Boolean(picked.package && picked.manifest && picked.signature))
 
 const agentSummary = computed(() => {
     const agent = status.value?.agent
@@ -76,12 +114,17 @@ function fingerprint (rows: MaintenanceJob[]) {
     return rows.map(job => `${job.job_id}:${job.state}:${job.step}:${job.finished_at ?? ''}`).join('|')
 }
 
+async function loadPackages () {
+    packages.value = await listPackages()
+}
+
 async function loadJobs (): Promise<boolean> {
     const rows = await listJobs()
     const changed = fingerprint(rows) !== fingerprint(jobs.value)
     jobs.value = rows
     if (changed) {
-        await maintenanceStore.refreshStatus()
+        // A job that settled may have applied a package; the list says so.
+        await Promise.all([maintenanceStore.refreshStatus(), loadPackages()])
     }
     return changed
 }
@@ -92,7 +135,7 @@ async function load () {
     loading.value = true
     loadError.value = ''
     try {
-        const [ops] = await Promise.all([listOperations(), maintenanceStore.refreshStatus(), loadJobs()])
+        const [ops] = await Promise.all([listOperations(), maintenanceStore.refreshStatus(), loadJobs(), loadPackages()])
         operations.value = ops
         poll.start()
     } catch (err) {
@@ -120,7 +163,11 @@ function argLabel (name: string, property: ArgSchemaProperty) {
     return property.title ?? name.replace(/_/g, ' ')
 }
 
-function openRun (operation: MaintenanceOperation) {
+function isPackageArg (name: string) {
+    return name === PACKAGE_ARG
+}
+
+function openRun (operation: MaintenanceOperation, preset: Record<string, unknown> = {}) {
     runError.value = ''
     selected.value = operation
     for (const key of Object.keys(argValues)) {
@@ -129,6 +176,12 @@ function openRun (operation: MaintenanceOperation) {
     for (const [name, property] of Object.entries(operation.args_schema.properties ?? {})) {
         argValues[name] = property.default ?? (argType(property) === 'boolean' ? false : '')
     }
+    // A package choice defaults to the newest applicable one, since that is
+    // nearly always the one meant; the select still lets another be picked.
+    if (PACKAGE_ARG in argValues && applicablePackages.value.length > 0) {
+        argValues[PACKAGE_ARG] = applicablePackages.value[0]!.sha256
+    }
+    Object.assign(argValues, preset)
     credentials.password = ''
     credentials.totp_code = ''
     showRun.value = true
@@ -183,6 +236,138 @@ async function confirmRun () {
         runError.value = errorDetail(err, t('The operation could not be requested.', SCOPE))
     } finally {
         running.value = false
+    }
+}
+
+/** Open the update form with this package chosen. */
+function applyPackage (pkg: MaintenancePackage) {
+    const operation = updateOperation.value
+    if (!operation) {
+        return
+    }
+    openRun(operation, { [PACKAGE_ARG]: pkg.sha256 })
+}
+
+function canApply (pkg: MaintenancePackage) {
+    const operation = updateOperation.value
+    return pkg.applicable && operation !== null && operation.available && inFlight.value === null && stepUp.value.available
+}
+
+function canRemove (pkg: MaintenancePackage) {
+    return pkg.state !== 'pruned' && inFlight.value?.package_sha256 !== pkg.sha256
+}
+
+function packageStateLabel (pkg: MaintenancePackage) {
+    switch (pkg.state) {
+        case 'applied':
+            return t('Applied', SCOPE)
+        case 'pruned':
+            return t('Removed', SCOPE)
+        default:
+            return pkg.applicable ? t('Available', SCOPE) : t('Not newer than the installed version', SCOPE)
+    }
+}
+
+function packageStateVariant (pkg: MaintenancePackage) {
+    if (pkg.state === 'applied') {
+        return 'success'
+    }
+    if (pkg.state === 'available' && pkg.applicable) {
+        return 'brand'
+    }
+    return 'neutral'
+}
+
+function formatSize (bytes: number) {
+    if (bytes < 1024 * 1024) {
+        return `${(bytes / 1024).toFixed(0)} KB`
+    }
+    return `${(bytes / 1024 / 1024).toFixed(1)} MB`
+}
+
+function shortHash (sha256: string) {
+    return sha256.slice(0, 12)
+}
+
+function openUpload () {
+    uploadError.value = ''
+    uploadProgress.value = 0
+    delete picked.package
+    delete picked.manifest
+    delete picked.signature
+    showUpload.value = true
+}
+
+function closeUpload () {
+    if (uploading.value) {
+        return
+    }
+    showUpload.value = false
+}
+
+function triggerPackageSelect () {
+    packageInputRef.value?.click()
+}
+
+/** Sort the picked files into the three parts; a later pick replaces only the kinds it carries. */
+function onPackageFilesChange (event: Event) {
+    const input = event.target as HTMLInputElement
+    Object.assign(picked, classifyPackageFiles(input.files ?? []))
+    input.value = ''
+}
+
+async function confirmUpload () {
+    if (!uploadReady.value || !picked.package || !picked.manifest || !picked.signature) {
+        return
+    }
+    uploadError.value = ''
+    uploading.value = true
+    uploadProgress.value = 0
+    try {
+        const pkg = await uploadPackage(
+            { package: picked.package, manifest: picked.manifest, signature: picked.signature },
+            fraction => { uploadProgress.value = Math.round(fraction * 100) },
+        )
+        showUpload.value = false
+        showToast(t('Package {version} uploaded and verified.', SCOPE, { version: pkg.version }), 'success')
+        await loadPackages()
+    } catch (err) {
+        // The server names the refusal: a signature that does not verify, a
+        // version that is not newer, a package for another deployment.
+        uploadError.value = errorDetail(err, t('The package could not be uploaded.', SCOPE))
+    } finally {
+        uploading.value = false
+    }
+}
+
+function openRemove (pkg: MaintenancePackage) {
+    removeError.value = ''
+    removing.value = pkg
+}
+
+function closeRemove () {
+    if (removeLoading.value) {
+        return
+    }
+    removing.value = null
+}
+
+async function confirmRemove () {
+    if (!removing.value) {
+        return
+    }
+    removeError.value = ''
+    removeLoading.value = true
+    try {
+        await deletePackage(removing.value.sha256)
+        removing.value = null
+        showToast(t('Package removed.', SCOPE), 'neutral')
+        await loadPackages()
+    } catch (err) {
+        // A job may have picked the package up between the list and the click.
+        removeError.value = errorDetail(err, t('The package could not be removed.', SCOPE))
+    } finally {
+        removeLoading.value = false
     }
 }
 
@@ -280,6 +465,71 @@ onMounted(load)
                 </p>
             </section>
 
+            <section v-if="showPackages" class="maintenance-section">
+                <div class="section-header">
+                    <h2>{{ t('Update packages', SCOPE) }}</h2>
+                    <wa-button v-if="canWrite && hostTier"
+                        appearance="plain"
+                        size="s"
+                        variant="brand"
+                        @click="openUpload"
+                    >
+                        <wa-icon name="cloud-arrow-up" slot="start"></wa-icon>
+                        {{ t('Upload package', SCOPE) }}
+                    </wa-button>
+                </div>
+                <p v-if="status && !status.release_key_present" class="maintenance-hint">
+                    {{ t('No release key is installed on this deployment, so no package can be verified. The key ships at the root of every distribution package.', SCOPE) }}
+                </p>
+                <p v-if="!packages.length" class="empty-state">
+                    {{ t('No package has been uploaded yet. A release is uploaded as its three files: the archive, its manifest and the signature.', SCOPE) }}
+                </p>
+                <div v-else class="list-rows">
+                    <div v-for="pkg in packages" :key="pkg.sha256" class="list-row">
+                        <div class="list-row-main operation-row">
+                            <div class="operation-text">
+                                <span class="list-row-name">{{ t('Version {version}', SCOPE, { version: pkg.version }) }}</span>
+                                <span class="operation-description">
+                                    {{ formatSize(pkg.size) }} · {{ shortHash(pkg.sha256) }}
+                                    <template v-if="pkg.project"> · {{ pkg.project }}</template>
+                                    <template v-if="pkg.plugins.length"> · {{ pkg.plugins.join(', ') }}</template>
+                                </span>
+                                <div class="row-badges">
+                                    <wa-badge appearance="outlined" :variant="packageStateVariant(pkg)">
+                                        {{ packageStateLabel(pkg) }}
+                                    </wa-badge>
+                                    <span class="list-row-meta">
+                                        <wa-relative-time :date="pkg.uploaded_at"></wa-relative-time>
+                                        <template v-if="pkg.uploaded_by"> · {{ pkg.uploaded_by }}</template>
+                                    </span>
+                                </div>
+                            </div>
+                            <div v-if="canWrite" class="package-actions">
+                                <wa-button
+                                    appearance="plain"
+                                    :disabled="!canApply(pkg)"
+                                    size="s"
+                                    variant="brand"
+                                    @click="applyPackage(pkg)"
+                                >
+                                    <wa-icon name="play" slot="start"></wa-icon>
+                                    {{ t('Apply', SCOPE) }}
+                                </wa-button>
+                                <wa-button
+                                    appearance="plain"
+                                    :disabled="!canRemove(pkg)"
+                                    size="s"
+                                    @click="openRemove(pkg)"
+                                >
+                                    <wa-icon name="trash" slot="start"></wa-icon>
+                                    {{ t('Remove', SCOPE) }}
+                                </wa-button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </section>
+
             <section class="maintenance-section">
                 <div class="section-header">
                     <h2>{{ t('Jobs', SCOPE) }}</h2>
@@ -317,7 +567,21 @@ onMounted(load)
             </wa-callout>
             <p class="maintenance-hint">{{ selected.description }}</p>
             <template v-for="name in argNames(selected)" :key="name">
-                <wa-switch v-if="argType(selected.args_schema.properties![name]!) === 'boolean'" v-wa="[argValues, name]">
+                <template v-if="isPackageArg(name)">
+                    <wa-select v-if="applicablePackages.length"
+                        :help-text="selected.args_schema.properties![name]!.description"
+                        :label="t('Package', SCOPE)"
+                        v-wa="[argValues, name]"
+                    >
+                        <wa-option v-for="pkg in applicablePackages" :key="pkg.sha256" :value="pkg.sha256">
+                            {{ t('Version {version} ({hash})', SCOPE, { version: pkg.version, hash: shortHash(pkg.sha256) }) }}
+                        </wa-option>
+                    </wa-select>
+                    <wa-callout v-else variant="warning">
+                        {{ t('No uploaded package is newer than the installed version. Upload one first.', SCOPE) }}
+                    </wa-callout>
+                </template>
+                <wa-switch v-else-if="argType(selected.args_schema.properties![name]!) === 'boolean'" v-wa="[argValues, name]">
                     {{ argLabel(name, selected.args_schema.properties![name]!) }}
                 </wa-switch>
                 <wa-input v-else-if="['integer', 'number'].includes(argType(selected.args_schema.properties![name]!))"
@@ -354,6 +618,93 @@ onMounted(load)
                 @click="confirmRun"
             >
                 {{ t('Run', SCOPE) }}
+            </wa-button>
+        </div>
+    </wa-dialog>
+
+    <wa-dialog :label="t('Upload package', SCOPE)" :open="showUpload" @wa-hide.self="closeUpload">
+        <div class="maintenance-form">
+            <wa-callout v-if="uploadError" variant="danger">
+                {{ uploadError }}
+            </wa-callout>
+            <p class="maintenance-hint">
+                {{ t('Select the three files of a release together: the archive (.tar.gz), its manifest (.manifest.json) and the signature (.manifest.sig). The package is verified before it is kept, and can be applied from this page afterwards.', SCOPE) }}
+            </p>
+            <wa-button appearance="filled-outlined" :disabled="uploading" variant="neutral" @click="triggerPackageSelect">
+                <wa-icon name="folder-open" slot="start"></wa-icon>
+                {{ t('Select files', SCOPE) }}
+            </wa-button>
+            <input
+                ref="packageInputRef"
+                accept=".tar.gz,.tgz,.json,.sig"
+                class="hidden-input"
+                multiple
+                type="file"
+                @change="onPackageFilesChange"
+            />
+            <ul class="package-parts">
+                <li :class="{ 'package-part-present': picked.package }">
+                    <wa-icon :name="picked.package ? 'circle-check' : 'file'"></wa-icon>
+                    <span>{{ t('Archive', SCOPE) }}</span>
+                    <span v-if="picked.package" class="package-part-name">{{ picked.package.name }}</span>
+                </li>
+                <li :class="{ 'package-part-present': picked.manifest }">
+                    <wa-icon :name="picked.manifest ? 'circle-check' : 'file'"></wa-icon>
+                    <span>{{ t('Manifest', SCOPE) }}</span>
+                    <span v-if="picked.manifest" class="package-part-name">{{ picked.manifest.name }}</span>
+                </li>
+                <li :class="{ 'package-part-present': picked.signature }">
+                    <wa-icon :name="picked.signature ? 'circle-check' : 'file'"></wa-icon>
+                    <span>{{ t('Signature', SCOPE) }}</span>
+                    <span v-if="picked.signature" class="package-part-name">{{ picked.signature.name }}</span>
+                </li>
+            </ul>
+            <wa-progress-bar v-if="uploading" :value="uploadProgress"></wa-progress-bar>
+        </div>
+        <div slot="footer" class="form-actions">
+            <wa-button
+                appearance="filled-outlined"
+                :disabled="uploading"
+                variant="neutral"
+                @click="closeUpload"
+            >
+                {{ t('Cancel', SCOPE) }}
+            </wa-button>
+            <wa-button
+                appearance="filled-outlined"
+                :disabled="!uploadReady"
+                :loading="uploading"
+                variant="brand"
+                @click="confirmUpload"
+            >
+                {{ t('Upload', SCOPE) }}
+            </wa-button>
+        </div>
+    </wa-dialog>
+
+    <wa-dialog :label="t('Remove package', SCOPE)" :open="!!removing" @wa-hide.self="closeRemove">
+        <wa-callout v-if="removeError" variant="danger">
+            {{ removeError }}
+        </wa-callout>
+        <p class="dialog-text">
+            {{ t('Remove the package for version {version}? Its files are deleted from the server; the record of jobs that used it stays.', SCOPE, { version: removing?.version ?? '' }) }}
+        </p>
+        <div slot="footer" class="form-actions">
+            <wa-button
+                appearance="filled-outlined"
+                :disabled="removeLoading"
+                variant="neutral"
+                @click="closeRemove"
+            >
+                {{ t('Cancel', SCOPE) }}
+            </wa-button>
+            <wa-button
+                appearance="filled-outlined"
+                :loading="removeLoading"
+                variant="danger"
+                @click="confirmRemove"
+            >
+                {{ t('Remove package', SCOPE) }}
             </wa-button>
         </div>
     </wa-dialog>
@@ -398,7 +749,7 @@ onMounted(load)
     margin: 0;
 }
 
-/* The run button sits at the row's end; the text column takes the rest. */
+/* The buttons sit at the row's end; the text column takes the rest. */
 .operation-row {
     align-items: flex-start;
     justify-content: space-between;
@@ -415,5 +766,48 @@ onMounted(load)
 .operation-description {
     color: var(--wa-color-text-quiet);
     font-size: var(--wa-font-size-s);
+}
+
+.package-actions {
+    display: flex;
+    flex-shrink: 0;
+    gap: var(--wa-space-2xs);
+}
+
+.package-parts {
+    display: flex;
+    flex-direction: column;
+    gap: var(--wa-space-2xs);
+    list-style: none;
+    margin: 0;
+    padding: 0;
+}
+
+.package-parts li {
+    align-items: center;
+    color: var(--wa-color-text-quiet);
+    display: flex;
+    gap: var(--wa-space-xs);
+}
+
+.package-parts li.package-part-present {
+    color: var(--wa-color-text-normal);
+}
+
+.package-part-name {
+    color: var(--wa-color-text-quiet);
+    font-size: var(--wa-font-size-s);
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.hidden-input {
+    display: none;
+}
+
+.dialog-text {
+    margin: 0;
 }
 </style>

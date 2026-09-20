@@ -66,14 +66,14 @@ Then run `npm run dev` as normal. Log in with any credentials — the mock accep
 - 2 collections: *Sleep Studies* (2 items, 1 share token), *Epilepsy Cases* (1 item)
 - 2 datasets: *Public EEG Dataset* (2 items, 1 share token), *Research Cohort A* (1 item)
 - 4 accounts and 2 groups for the administration surface, including one deactivated and unnamed account, and one group carrying access grants so a delete is refused
-- 2 maintenance jobs (a finished audit check and a rolled-back update) and three registered operations, including a host-tier update against the mock package `MOCK_PACKAGE_SHA256`
+- 2 maintenance jobs (a finished audit check and a rolled-back update), three registered operations including a host-tier update, and one uploaded update package (`MOCK_PACKAGE_SHA256`, version 0.1.2 against an installed 0.1.1)
 
 **Behaviour notes:**
 - The pending recording flips to `ready` on its second status poll, exercising the upload-progress UI.
 - Renaming a recording propagates immediately to any collection/dataset items that reference it.
 - `mockuser` is a superuser, which is what makes the staff- and superuser-gated surfaces (administration, viewer settings, annotation export) reachable at all in mock mode.
 - All CRUD is fully in-memory — nothing is persisted between page reloads.
-- A requested maintenance job walks through its states on a timer: a worker job finishes in a few seconds, a host update reaches the confirmation window and waits for verify or rollback. Step-up confirmations accept the password `password`.
+- A requested maintenance job walks through its states on a timer: a worker job finishes in a few seconds, a host update reaches the confirmation window and waits for verify or rollback. Step-up confirmations accept the password `password`. A package upload accepts any three files and reads the version and hash from the manifest part when it can parse one; nothing is verified.
 
 **Project roles.** `MOCK_ROLE_PROVIDERS` at the top of [mocks.ts](mocks.ts) is what `GET /admin/roles` answers with. Its keys and values are deliberately fictional, since a real one sitting in a fixture is how a role the platform must not know quietly becomes load-bearing. Set it to `[]` to exercise the roleless deployment, where no role UI may render at all — that is the shape a dev stack with a project active never shows by eye, and the one most likely to be broken without anyone noticing.
 
@@ -162,7 +162,7 @@ resolve through the default icon library.
 | `/admin/accounts/:id` | `AdminAccountView` | Account detail — fields, groups, password, second factor (staff) |
 | `/admin/groups` | `AdminGroupsView` | Group roster — member and grant counts, create, delete (staff) |
 | `/admin/groups/:id` | `AdminGroupView` | Group detail — rename, roles, member roll (staff) |
-| `/admin/maintenance` | `AdminMaintenanceView` | Maintenance — deployment state, registered operations, job history (staff; hidden unless the deployment enables the feature) |
+| `/admin/maintenance` | `AdminMaintenanceView` | Maintenance — deployment state, registered operations, uploaded update packages, job history (staff; hidden unless the deployment enables the feature) |
 | `/admin/maintenance/:id` | `AdminMaintenanceJobView` | Maintenance job — timeline, log, confirm / roll back / cancel (staff) |
 | `/profile` | `ProfileView` | User profile / password change |
 | `/login` | `LoginView` | Login form |

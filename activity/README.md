@@ -510,6 +510,10 @@ To check the table against the tree, walk the AST for `log_activity` / `with_sys
 | `maintenance.job.sync` | `spool.sync` † |
 | `maintenance.job.verify` | `verify_job` |
 | `maintenance.operation.list` | `list_operations` |
+| `maintenance.package.create` | `upload_package` |
+| `maintenance.package.delete` | `delete_package` |
+| `maintenance.package.list` | `list_packages` |
+| `maintenance.package.sync` | `packaging.reconcile` † |
 | `maintenance.status.read` | `get_status` |
 
 ### `media`

@@ -22,6 +22,9 @@ GET  /jobs/{job_id}/log      the host agent's log tail, or the command output   
 POST /jobs/{job_id}/cancel   withdraw a request the executor has not picked up        (superuser)
 POST /jobs/{job_id}/verify   confirm an update                                        (superuser, password)
 POST /jobs/{job_id}/rollback ask for a rollback                                       (superuser, step-up)
+GET  /packages               uploaded update packages                                 (staff)
+POST /packages               upload a package: tarball, manifest, signature           (superuser)
+DELETE /packages/{sha256}    remove an uploaded package                               (superuser)
 """
 
 import os
@@ -30,17 +33,17 @@ import uuid
 from django.conf import settings
 from django.db import IntegrityError, transaction
 from django.utils import timezone
-from ninja import NinjaAPI, Schema
+from ninja import File, NinjaAPI, Schema, UploadedFile
 from ninja.errors import HttpError
 from pydantic import ValidationError
 
 from activity.audit import log_activity
 from epicurrents.auth import enforce_session_csrf
 from epicurrents.security_log import get_client_ip, log_security_event
-from epicurrents.version import __version__
-from maintenance import spool
+from epicurrents.version import VERSION_INFO, __version__
+from maintenance import packaging, spool
 from maintenance.lock import current_lock
-from maintenance.models import MaintenanceJob
+from maintenance.models import MaintenanceJob, MaintenancePackage
 from maintenance.operations import HOST, get_operation, registered_operations
 from user.stepup import confirm_step_up, step_up_method
 
@@ -67,6 +70,8 @@ class AgentOut(Schema):
     runtime: str | None
     last_run: str | None
     stale: bool | None
+    capabilities: list[str]
+    updater_script: int | None
 
 
 class LockOut(Schema):
@@ -171,6 +176,31 @@ class LogOut(Schema):
     bytes: int
 
 
+class PackageOut(Schema):
+    """One uploaded package. The hash is the identifier; no path is ever returned."""
+
+    sha256: str
+    version: str
+    project: str
+    plugins: list[str]
+    platform_compatible: str
+    built_at: str | None
+    size: int
+    key_id: str
+    agent_version: int
+    uploaded_by: str | None
+    uploaded_at: str
+    state: str
+    applicable: bool
+
+
+class RejectionOut(Schema):
+    """Why an upload was refused: a message for the reader and a stable token for the client."""
+
+    detail: str
+    reason: str
+
+
 # ── Guards ───────────────────────────────────────────────────────────────────
 
 
@@ -262,6 +292,48 @@ def _get_job(job_id: str):
     if job is None:
         raise HttpError(404, "No such job")
     return job
+
+
+def _serialize_package(package) -> dict:
+    return {
+        "sha256": package.sha256,
+        "version": package.version,
+        "project": package.project,
+        "plugins": list(package.plugins or []),
+        "platform_compatible": package.platform_compatible,
+        "built_at": _iso(package.built_at),
+        "size": package.size,
+        "key_id": package.key_id,
+        "agent_version": _manifest_agent_version(package.manifest),
+        "uploaded_by": package.uploaded_by.username if package.uploaded_by is not None else None,
+        "uploaded_at": package.uploaded_at.isoformat(),
+        "state": package.state,
+        "applicable": _package_applicable(package),
+    }
+
+
+def _manifest_agent_version(manifest) -> int:
+    value = manifest.get("agent_version") if isinstance(manifest, dict) else None
+    return value if isinstance(value, int) and not isinstance(value, bool) else 0
+
+
+def _package_applicable(package) -> bool:
+    """Whether a request may name this package now: available, and newer than what runs."""
+    if package.state != MaintenancePackage.State.AVAILABLE:
+        return False
+    try:
+        return packaging.parse_version(package.version) > VERSION_INFO
+    except packaging.InvalidVersion:
+        return False
+
+
+def _get_package(sha256: str):
+    if len(sha256) != 64 or any(c not in "0123456789abcdef" for c in sha256):
+        raise HttpError(404, "No such package")
+    package = MaintenancePackage.objects.select_related("uploaded_by").filter(sha256=sha256).first()
+    if package is None:
+        raise HttpError(404, "No such package")
+    return package
 
 
 def _step_up_status(user) -> dict:
@@ -395,14 +467,19 @@ def create_job(request, payload: JobCreateIn):
         confirm_step_up(request, user, password=payload.password, totp_code=payload.totp_code)
 
     package = None
+    request_args = args.model_dump(exclude_none=True)
     if operation.executor == HOST:
-        from maintenance.models import MaintenancePackage
-
         sha256 = getattr(args, "package_sha256", None)
         if sha256:
             package = MaintenancePackage.objects.filter(sha256=sha256, state=MaintenancePackage.State.AVAILABLE).first()
             if package is None:
                 raise HttpError(400, "No uploaded package has that hash.")
+            if not _package_applicable(package):
+                raise HttpError(400, f"Package {package.version} is not newer than the installed {__version__}.")
+        # The agent reads the window from the request, and a request that
+        # leaves it out means the deployment's default, not the agent's.
+        if "verify_window_minutes" in type(args).model_fields and request_args.get("verify_window_minutes") is None:
+            request_args["verify_window_minutes"] = int(getattr(settings, "REMOTE_UPDATE_VERIFY_WINDOW_MINUTES", 30))
     if MaintenanceJob.objects.filter(in_flight=True).exists():
         raise HttpError(409, "Another maintenance job is in flight.")
 
@@ -411,7 +488,7 @@ def create_job(request, payload: JobCreateIn):
         executor=operation.executor,
         requested_by=user,
         package=package,
-        args=args.model_dump(exclude_none=True),
+        args=request_args,
         target_version=package.version if package is not None else "",
     )
     try:
@@ -522,3 +599,116 @@ def rollback_job(request, job_id: str, payload: ConfirmIn):
         reason=job.state,
     )
     return _serialize_job(job, for_superuser=True)
+
+
+# ── Packages ─────────────────────────────────────────────────────────────────
+
+
+@api.get("/packages", response=list[PackageOut])
+def list_packages(request):
+    """The uploaded packages, newest first, pruned ones included so the history reads whole."""
+    _gate_enabled(request)
+    _require_staff(request)
+    spool.sync()
+    packages = MaintenancePackage.objects.select_related("uploaded_by")[:JOB_LIST_LIMIT]
+    log_activity(verb="maintenance.package.list")
+    return [_serialize_package(package) for package in packages]
+
+
+def _reject_package(request, user, exc: packaging.PackageRejected, *, declared_version: str = ""):
+    log_security_event(
+        "maintenance.package_rejected",
+        ip=get_client_ip(request),
+        actor_id=user.pk,
+        reason=exc.reason,
+        version=declared_version or None,
+    )
+    return exc.status, {"detail": exc.message, "reason": exc.reason}
+
+
+@api.post("/packages", response={201: PackageOut, 400: RejectionOut, 409: RejectionOut, 413: RejectionOut})
+def upload_package(
+    request,
+    package: UploadedFile = File(...),
+    manifest: UploadedFile = File(...),
+    signature: UploadedFile = File(...),
+):
+    """Upload a release: the tarball, its manifest and the signature over the manifest, as three parts.
+
+    The signature is checked against ``REMOTE_UPDATE_RELEASE_KEY_PATH`` and
+    the manifest against what this deployment is — newer than the installed
+    version, the same project and plugins, within every installed pin — before
+    the tarball is copied into the spool and hashed against the manifest. A
+    refusal names its reason, leaves nothing in the packages directory and is
+    written to the security log. The host agent repeats the checks on its own
+    copy before anything runs; this is the immediate answer, not the boundary.
+    """
+    _gate_enabled(request)
+    user = _require_superuser(request)
+    if not _host_tier_enabled():
+        raise HttpError(403, "Remote updates are disabled on this deployment (REMOTE_UPDATE_ENABLED).")
+    spool.sync()
+    declared = ""
+    try:
+        if manifest.size > packaging.MANIFEST_LIMIT or signature.size > packaging.SIGNATURE_LIMIT:
+            raise packaging.PackageRejected(
+                "manifest", "The manifest or the signature is far larger than either can be."
+            )
+        manifest_bytes = manifest.read()
+        signature_bytes = signature.read()
+        key = packaging.load_release_key()
+        if key is None:
+            raise packaging.PackageRejected(
+                "key_missing",
+                "This deployment has no release key to verify packages against (REMOTE_UPDATE_RELEASE_KEY_PATH).",
+                status=409,
+            )
+        packaging.verify_signature(manifest_bytes, signature_bytes, key)
+        parsed = packaging.read_manifest(manifest_bytes)
+        declared = parsed.version
+        packaging.check_manifest(parsed)
+        with transaction.atomic():
+            row = packaging.store(package, manifest_bytes, signature_bytes, parsed, uploaded_by=user)
+            # The target row carries the hash and the version; nothing to repeat.
+            log_activity(verb="maintenance.package.create", target=row)
+            pruned = packaging.prune()
+    except packaging.PackageRejected as exc:
+        return _reject_package(request, user, exc, declared_version=declared)
+    log_security_event(
+        "maintenance.package_uploaded",
+        ip=get_client_ip(request),
+        actor_id=user.pk,
+        sha256=row.sha256,
+        version=row.version,
+        pruned=len(pruned),
+    )
+    return 201, _serialize_package(row)
+
+
+@api.delete("/packages/{sha256}", response=PackageOut)
+def delete_package(request, sha256: str):
+    """Remove an uploaded package's files. The row stays as ``pruned``, since jobs refer to it."""
+    _gate_enabled(request)
+    user = _require_superuser(request)
+    spool.sync()
+    package = _get_package(sha256)
+    if MaintenanceJob.objects.filter(in_flight=True, package=package).exists():
+        raise HttpError(409, "A job in flight refers to this package.")
+    if package.state == MaintenancePackage.State.PRUNED:
+        raise HttpError(409, "This package has already been removed.")
+    try:
+        packaging.remove_files(package.sha256)
+    except OSError as exc:
+        raise HttpError(409, f"The package files could not be removed: {exc.strerror or exc}") from None
+    with transaction.atomic():
+        package.state = MaintenancePackage.State.PRUNED
+        package.save(update_fields=["state"])
+        log_activity(verb="maintenance.package.delete", target=package)
+    log_security_event(
+        "maintenance.package_removed",
+        ip=get_client_ip(request),
+        actor_id=user.pk,
+        sha256=package.sha256,
+        version=package.version,
+    )
+    return _serialize_package(package)

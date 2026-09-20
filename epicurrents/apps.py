@@ -349,16 +349,24 @@ class EpicurrentsConfig(AppConfig):
 
         from django.conf import settings as django_settings
 
-        app_limit = getattr(django_settings, "RECORDINGS_MAX_UPLOAD_SIZE", 0)
+        # Every application-side upload ceiling the proxy must clear. The
+        # package cap counts only while remote updates are on, since the
+        # endpoint answers 403 otherwise and no body reaches it.
+        ceilings = [("RECORDINGS_MAX_UPLOAD_SIZE", getattr(django_settings, "RECORDINGS_MAX_UPLOAD_SIZE", 0))]
+        if getattr(django_settings, "REMOTE_UPDATE_ENABLED", False):
+            ceilings.append(
+                ("REMOTE_UPDATE_MAX_PACKAGE_SIZE", getattr(django_settings, "REMOTE_UPDATE_MAX_PACKAGE_SIZE", 0))
+            )
+        name, app_limit = max(ceilings, key=lambda pair: pair[1])
         if proxy_limit >= app_limit:
             return
 
         raise ImproperlyConfigured(
             f"PROXY_MAX_BODY_SIZE={raw!r} resolves to {proxy_limit:,} bytes, which is below "
-            f"RECORDINGS_MAX_UPLOAD_SIZE ({app_limit:,} bytes). Uploads between the two would pass "
+            f"{name} ({app_limit:,} bytes). Uploads between the two would pass "
             f"the application's own limit and then be rejected by the proxy with a bare 413. "
             f"Raise PROXY_MAX_BODY_SIZE to at least {app_limit:,} bytes (note that Caddy reads "
-            f"'GB' as 1000^3 and only 'GiB' as 1024^3), or lower RECORDINGS_MAX_UPLOAD_SIZE to match."
+            f"'GB' as 1000^3 and only 'GiB' as 1024^3), or lower {name} to match."
         )
 
     def _guard_placeholder_frontend_url(self):

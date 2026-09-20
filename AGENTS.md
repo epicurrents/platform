@@ -638,7 +638,7 @@ Neurophysiological signal viewer — Django 6 + Django Ninja REST API, Celery wo
 /api/v1/notifications/  vapid-public-key, subscribe, unsubscribe
 /api/v1/library/        collections + datasets CRUD, items (generic), access rights, tags
 /api/v1/federation/     peers, grants, inbound object check
-/api/v1/maintenance/    status, operations, jobs (request, cancel, verify, rollback)
+/api/v1/maintenance/    status, operations, jobs (request, cancel, verify, rollback), packages (upload, list, remove)
 /.well-known/epicurrents-federation.json   public key document
 /recordings/api/v1/     upload, list, status, download, delete (soft)
 /media/api/v1/          upload, list, detail, file download, patch, delete (soft)

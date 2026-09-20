@@ -9,6 +9,7 @@ from django.utils import timezone
 from activity.models import Activity, ObjectChangeLog
 from maintenance import spool
 from maintenance.models import MaintenanceJob, MaintenancePackage
+from maintenance.tests.conftest import place_package_files
 
 
 def _host_job(user=None, state="requested", **fields):
@@ -78,7 +79,14 @@ class TestApplyStatus:
     def test_nothing_to_do_opens_no_audited_scope(self, spool_dir, superuser, no_push):
         _host_job(superuser)
         before = Activity.objects.count()
-        assert spool.sync(force=True) == {"applied": 0, "created": 0, "orphaned": 0, "notified": 0, "skipped": False}
+        assert spool.sync(force=True) == {
+            "applied": 0,
+            "created": 0,
+            "orphaned": 0,
+            "notified": 0,
+            "skipped": False,
+            "packages": {"created": 0, "pruned": 0, "swept": 0},
+        }
         assert Activity.objects.count() == before
 
     def test_a_change_is_audited_under_the_sync_verb(self, spool_dir, superuser, write_status, no_push):
@@ -104,6 +112,7 @@ class TestRestore:
     def test_rows_are_recreated_from_the_spool_after_a_database_restore(
         self, spool_dir, superuser, write_status, no_push
     ):
+        place_package_files("d" * 64, "0.2.0")
         package = MaintenancePackage.objects.create(sha256="d" * 64, version="0.2.0")
         job = _host_job(superuser, args={"package_sha256": package.sha256}, package=package)
         spool.write_request(job)

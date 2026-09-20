@@ -215,11 +215,27 @@ def agent_summary(now: datetime | None = None) -> dict:
     """What the status endpoint says about the agent, from its heartbeat file."""
     data = read_agent()
     if data is None:
-        return {"installed": False, "enabled": None, "version": None, "runtime": None, "last_run": None, "stale": None}
+        return {
+            "installed": False,
+            "enabled": None,
+            "version": None,
+            "runtime": None,
+            "last_run": None,
+            "stale": None,
+            "capabilities": [],
+            "updater_script": None,
+        }
     now = now or timezone.now()
     last_run = data.get("last_run") if isinstance(data.get("last_run"), str) else None
     seen = parse_timestamp(last_run)
     stale = seen is None or (now - seen).total_seconds() > AGENT_STALE_SECONDS
+    capabilities = data.get("capabilities")
+    # The agent writes numbers as strings; either spelling is accepted.
+    updater_script = data.get("updater_script")
+    if isinstance(updater_script, str) and updater_script.isdigit():
+        updater_script = int(updater_script)
+    elif isinstance(updater_script, bool) or not isinstance(updater_script, int):
+        updater_script = None
     return {
         "installed": True,
         "enabled": bool(data.get("enabled")),
@@ -227,6 +243,8 @@ def agent_summary(now: datetime | None = None) -> dict:
         "runtime": str(data.get("runtime")) if data.get("runtime") is not None else None,
         "last_run": last_run,
         "stale": stale,
+        "capabilities": [str(item) for item in capabilities] if isinstance(capabilities, list) else [],
+        "updater_script": updater_script,
     }
 
 
@@ -370,6 +388,12 @@ def sync(*, force: bool = False) -> dict:
         counts["skipped"] = True
         return counts
 
+    # Package rows first: a request re-created below links to its package by
+    # hash, and the same restore that erased the job rows erased those.
+    from maintenance import packaging
+
+    counts["packages"] = packaging.reconcile()
+
     requests, statuses = _scan_jobs()
     # The in-flight rows (orphan candidates) and the rows the spool names; not
     # every host-tier row ever, which the audit record keeps indefinitely.
@@ -420,6 +444,8 @@ def sync(*, force: bool = False) -> dict:
             if announced:
                 counts["notified"] += 1
             _log_state(job)
+            if job.state == MaintenanceJob.State.SUCCEEDED:
+                packaging.mark_applied(job.package)
             counts["applied"] += 1
         for job in to_orphan:
             job.state = MaintenanceJob.State.FAILED
@@ -445,5 +471,7 @@ def sync(*, force: bool = False) -> dict:
                 job.last_notified_state = announced
                 job.save(update_fields=["last_notified_state"])
                 counts["notified"] += 1
+            if job.state == MaintenanceJob.State.SUCCEEDED:
+                packaging.mark_applied(job.package)
             counts["created"] += 1
     return counts

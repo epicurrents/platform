@@ -36,6 +36,9 @@
  *   POST   /api/v1/maintenance/jobs/{id}/cancel
  *   POST   /api/v1/maintenance/jobs/{id}/verify
  *   POST   /api/v1/maintenance/jobs/{id}/rollback
+ *   GET    /api/v1/maintenance/packages
+ *   POST   /api/v1/maintenance/packages
+ *   DELETE /api/v1/maintenance/packages/{sha256}
  *
  *   GET    /annotations/api/v1/content-types
  *
@@ -189,8 +192,24 @@ interface MockJob {
     output: string
 }
 
+interface MockPackage {
+    sha256: string
+    version: string
+    project: string
+    plugins: string[]
+    platform_compatible: string
+    built_at: string | null
+    size: number
+    key_id: string
+    agent_version: number
+    uploaded_by: string | null
+    uploaded_at: string
+    state: 'available' | 'applied' | 'pruned'
+}
+
 interface MockState {
     jobs: MockJob[]
+    packages: MockPackage[]
     user: MockUser
     accounts: MockAccount[]
     authGroups: MockAuthGroup[]
@@ -246,7 +265,10 @@ const _jobTimers = new Set<ReturnType<typeof setTimeout>>()
 
 const IN_FLIGHT_STATES = new Set(['requested', 'accepted', 'running', 'awaiting_verification', 'rolling_back'])
 
-/** The package a mock `platform.update` may name; the real one is uploaded through the API. */
+/** What the mock deployment runs; a package must be newer to be applicable. */
+const MOCK_INSTALLED_VERSION = '0.1.1'
+
+/** The package the seed holds; more are uploaded through the API, which accepts any three files. */
 const MOCK_PACKAGE_SHA256 = 'f'.repeat(64)
 
 /** The operation registry as the server publishes it, argument schemas included. */
@@ -745,6 +767,22 @@ function buildSeed(): MockState {
         datasetItems,
         datasetAccess,
         seq: { rec: 17, coll: 3, ds: 3, item: 4, access: 2, account: 7, group: 3 },
+        packages: [
+            {
+                sha256: MOCK_PACKAGE_SHA256,
+                version: '0.1.2',
+                project: '',
+                plugins: [],
+                platform_compatible: '>=0.1,<0.2',
+                built_at: ago(3600 * 24 * 4),
+                size: 48_300_000,
+                key_id: '0123456789abcdef',
+                agent_version: 1,
+                uploaded_by: user.username,
+                uploaded_at: ago(3600 * 24 * 3 + 600),
+                state: 'available',
+            },
+        ],
         jobs: [
             {
                 job_id: '3f2c1a2e-9d4b-4c6e-8a1f-0b7d5e6c9a10',
@@ -821,6 +859,40 @@ function readBody(req: IncomingMessage): Promise<Record<string, unknown>> {
         })
         req.on('error', reject)
     })
+}
+
+function readRaw(req: IncomingMessage): Promise<Buffer> {
+    return new Promise((resolve, reject) => {
+        const chunks: Buffer[] = []
+        req.on('data', (chunk: Buffer) => chunks.push(chunk))
+        req.on('end', () => resolve(Buffer.concat(chunks)))
+        req.on('error', reject)
+    })
+}
+
+/**
+ * The `manifest` part of a multipart package upload, parsed, or `null`. Enough
+ * of a parser for the mock: the part's headers end at the first blank line and
+ * its body at the next boundary. Nothing else in the body is read.
+ */
+function manifestFromUpload(raw: Buffer, contentType: string): Record<string, unknown> | null {
+    const boundary = /boundary=("?)([^";]+)\1/.exec(contentType)?.[2]
+    if (!boundary) return null
+    const text = raw.toString('latin1')
+    for (const part of text.split(`--${boundary}`)) {
+        if (!/name="manifest"/.test(part)) continue
+        const start = part.indexOf('\r\n\r\n')
+        if (start < 0) continue
+        const body = part.slice(start + 4).replace(/\r\n$/, '')
+        try { return JSON.parse(Buffer.from(body, 'latin1').toString('utf-8')) as Record<string, unknown> }
+        catch { return null }
+    }
+    return null
+}
+
+/** A package as the API returns it; `applicable` is derived, as on the server. */
+function packageOut(pkg: MockPackage) {
+    return { ...pkg, applicable: pkg.state === 'available' && pkg.version > MOCK_INSTALLED_VERSION }
 }
 
 function send(res: ServerResponse, status: number, data: unknown): true {
@@ -1364,7 +1436,7 @@ export async function handleMock(
             return send(res, 200, {
                 remote_maintenance_enabled: true,
                 remote_update_enabled: true,
-                installed_version: '0.1.1',
+                installed_version: MOCK_INSTALLED_VERSION,
                 server_now: new Date().toISOString(),
                 spool_writable: true,
                 release_key_present: true,
@@ -1387,8 +1459,60 @@ export async function handleMock(
             return send(res, 200, rows.map(jobOut))
         }
 
+        if (tail === 'packages' && method === 'GET') {
+            const rows = [..._state.packages].sort((a, b) => b.uploaded_at.localeCompare(a.uploaded_at))
+            return send(res, 200, rows.map(packageOut))
+        }
+
         if (method !== 'GET' && !_state.user.is_superuser) {
             return send(res, 403, { detail: 'Superuser access required.' })
+        }
+
+        if (tail === 'packages' && method === 'POST') {
+            // The real endpoint verifies a signature; the mock accepts any three
+            // parts and reads what it can from the manifest so the list looks right.
+            const raw = await readRaw(req)
+            const manifest = manifestFromUpload(raw, String(req.headers['content-type'] ?? '')) ?? {}
+            const version = typeof manifest.version === 'string' ? manifest.version : '0.1.3'
+            if (version <= MOCK_INSTALLED_VERSION) {
+                return send(res, 400, {
+                    detail: `The package is version ${version} and the installed platform is ${MOCK_INSTALLED_VERSION}; a remote update applies only a newer release.`,
+                    reason: 'version_not_newer',
+                })
+            }
+            const sha256 = typeof manifest.sha256 === 'string' && manifest.sha256.length === 64
+                ? manifest.sha256
+                : randomUUID().replace(/-/g, '').repeat(2)
+            if (_state.packages.some(p => p.sha256 === sha256 && p.state !== 'pruned')) {
+                return send(res, 409, { detail: 'This package has already been uploaded.', reason: 'duplicate' })
+            }
+            const pkg: MockPackage = {
+                sha256,
+                version,
+                project: typeof manifest.project === 'string' ? manifest.project : '',
+                plugins: Array.isArray(manifest.plugins) ? manifest.plugins.map(String) : [],
+                platform_compatible: typeof manifest.platform_compatible === 'string' ? manifest.platform_compatible : '',
+                built_at: typeof manifest.built_at === 'string' ? manifest.built_at : null,
+                size: typeof manifest.size === 'number' ? manifest.size : raw.length,
+                key_id: typeof manifest.key_id === 'string' ? manifest.key_id : '',
+                agent_version: typeof manifest.agent_version === 'number' ? manifest.agent_version : 0,
+                uploaded_by: _state.user.username,
+                uploaded_at: ago(0),
+                state: 'available',
+            }
+            _state.packages = _state.packages.filter(p => p.sha256 !== sha256)
+            _state.packages.push(pkg)
+            return send(res, 201, packageOut(pkg))
+        }
+
+        const packageMatch = /^packages\/([0-9a-f]{64})$/.exec(tail)
+        if (packageMatch && method === 'DELETE') {
+            const pkg = _state.packages.find(p => p.sha256 === packageMatch[1])
+            if (!pkg) return send(res, 404, { detail: 'No such package' })
+            if (pkg.state === 'pruned') return conflict(res, 'This package has already been removed.')
+            if (inFlight?.package_sha256 === pkg.sha256) return conflict(res, 'A job in flight refers to this package.')
+            pkg.state = 'pruned'
+            return send(res, 200, packageOut(pkg))
         }
 
         if (tail === 'jobs' && method === 'POST') {
@@ -1399,8 +1523,14 @@ export async function handleMock(
             if (operation.requires_step_up && body.password !== 'password') {
                 return send(res, 400, { detail: 'Confirmation failed.' })
             }
-            if (operation.key === 'platform.update' && args.package_sha256 !== MOCK_PACKAGE_SHA256) {
-                return send(res, 400, { detail: `No uploaded package has that hash. The mock package is ${MOCK_PACKAGE_SHA256}.` })
+            const chosen = operation.key === 'platform.update'
+                ? _state.packages.find(p => p.sha256 === args.package_sha256 && p.state === 'available')
+                : undefined
+            if (operation.key === 'platform.update' && !chosen) {
+                return send(res, 400, { detail: 'No uploaded package has that hash.' })
+            }
+            if (chosen && !packageOut(chosen).applicable) {
+                return send(res, 400, { detail: `Package ${chosen.version} is not newer than the installed ${MOCK_INSTALLED_VERSION}.` })
             }
             if (inFlight) return conflict(res, 'Another maintenance job is in flight.')
             const job: MockJob = {
@@ -1411,7 +1541,7 @@ export async function handleMock(
                 reason: '',
                 step: '',
                 requested_by: _state.user.username,
-                package_sha256: operation.executor === 'host' ? MOCK_PACKAGE_SHA256 : null,
+                package_sha256: chosen?.sha256 ?? null,
                 args,
                 created_at: ago(0),
                 started_at: null,
@@ -1420,7 +1550,7 @@ export async function handleMock(
                 verify_requested_at: null,
                 rollback_requested_at: null,
                 installed_version_before: '',
-                target_version: operation.executor === 'host' ? '0.1.2' : '',
+                target_version: chosen?.version ?? '',
                 running_version: '',
                 snapshot: '',
                 post_snapshot: '',
@@ -1463,6 +1593,8 @@ export async function handleMock(
                     if (job.state !== 'awaiting_verification') return
                     job.state = 'succeeded'
                     job.finished_at = ago(0)
+                    const applied = _state.packages.find(p => p.sha256 === job.package_sha256)
+                    if (applied) applied.state = 'applied'
                 })
                 return send(res, 200, jobOut(job))
             }

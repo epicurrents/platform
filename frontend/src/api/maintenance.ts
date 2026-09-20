@@ -20,6 +20,10 @@ export interface AgentStatus {
     runtime: string | null
     last_run: string | null
     stale: boolean | null
+    /** The operation keys the agent carries out; a request for anything else is refused. */
+    capabilities: string[]
+    /** The `UPDATER_SCRIPT_VERSION` of the update script the agent runs, when it reported one. */
+    updater_script: number | null
 }
 
 /** The maintenance flag, when the platform is locked. */
@@ -136,6 +140,39 @@ export interface JobRequest extends StepUpCredentials {
     args: Record<string, unknown>
 }
 
+export type PackageState = 'available' | 'applied' | 'pruned'
+
+/** An uploaded update package. The hash is the identifier; the server never returns a path. */
+export interface MaintenancePackage {
+    sha256: string
+    version: string
+    project: string
+    plugins: string[]
+    platform_compatible: string
+    built_at: string | null
+    size: number
+    key_id: string
+    agent_version: number
+    uploaded_by: string | null
+    uploaded_at: string
+    state: PackageState
+    /** Whether a `platform.update` request may name it now: available and newer than what runs. */
+    applicable: boolean
+}
+
+/** The three files the packager writes for a release, as picked from the file input. */
+export interface PackageFiles {
+    package: File
+    manifest: File
+    signature: File
+}
+
+/** A refused upload: the server's message and its stable reason token. */
+export interface PackageRejection {
+    detail: string
+    reason: string
+}
+
 const BASE = '/api/v1/maintenance'
 
 export async function fetchMaintenanceStatus(): Promise<MaintenanceStatus> {
@@ -184,6 +221,62 @@ export async function verifyJob(jobId: string, credentials: StepUpCredentials): 
 export async function rollbackJob(jobId: string, credentials: StepUpCredentials): Promise<MaintenanceJob> {
     const response = await http.post<MaintenanceJob>(`${BASE}/jobs/${encodeURIComponent(jobId)}/rollback`, credentials)
     return response.data
+}
+
+export async function listPackages(): Promise<MaintenancePackage[]> {
+    const response = await http.get<MaintenancePackage[]>(`${BASE}/packages`)
+    return response.data
+}
+
+/**
+ * Upload a release as its three parts. The server verifies the signature and
+ * the manifest before it keeps anything; a refusal is a 400, 409 or 413 whose
+ * body is a `PackageRejection`. `onProgress` receives the upload fraction.
+ */
+export async function uploadPackage(
+    files: PackageFiles,
+    onProgress?: (fraction: number) => void,
+): Promise<MaintenancePackage> {
+    const form = new FormData()
+    form.append('package', files.package)
+    form.append('manifest', files.manifest)
+    form.append('signature', files.signature)
+    const response = await http.post<MaintenancePackage>(`${BASE}/packages`, form, {
+        onUploadProgress: (event) => {
+            if (onProgress && event.total) {
+                onProgress(event.loaded / event.total)
+            }
+        },
+    })
+    return response.data
+}
+
+export async function deletePackage(sha256: string): Promise<MaintenancePackage> {
+    const response = await http.delete<MaintenancePackage>(`${BASE}/packages/${encodeURIComponent(sha256)}`)
+    return response.data
+}
+
+/**
+ * Sort a file selection into the three parts of a package by name. The
+ * packager writes `<name>.tar.gz`, `<name>.tar.gz.manifest.json` and
+ * `<name>.tar.gz.manifest.sig`, so the suffix says which is which; when a
+ * kind is picked more than once the last one wins, and a file matching no
+ * kind is ignored. Returns the parts found, which the form completes before
+ * it enables the upload.
+ */
+export function classifyPackageFiles(files: Iterable<File>): Partial<PackageFiles> {
+    const parts: Partial<PackageFiles> = {}
+    for (const file of files) {
+        const name = file.name.toLowerCase()
+        if (name.endsWith('.manifest.json')) {
+            parts.manifest = file
+        } else if (name.endsWith('.manifest.sig')) {
+            parts.signature = file
+        } else if (name.endsWith('.tar.gz') || name.endsWith('.tgz')) {
+            parts.package = file
+        }
+    }
+    return parts
 }
 
 /**

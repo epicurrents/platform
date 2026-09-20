@@ -101,3 +101,20 @@ def no_push(monkeypatch):
 
     monkeypatch.setattr(send_push_to_user, "delay", _delay)
     return sent
+
+
+def place_package_files(sha256: str, version: str = "0.9.9") -> None:
+    """Write the directory the reconciliation expects for a package row: a manifest naming ``sha256`` and a tarball.
+
+    A row created directly by a test has no files, and the sync marks such a
+    row ``pruned`` on its next run, which is the right answer for a deployment
+    and the wrong one for a test that only needs a package to refer to.
+    """
+    from maintenance import packaging
+
+    directory = packaging.package_dir(sha256)
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / packaging.TARBALL_NAME).write_bytes(b"not a real tarball")
+    (directory / packaging.MANIFEST_NAME).write_text(
+        json.dumps({"manifest_version": 1, "sha256": sha256, "size": 18, "version": version, "project": ""})
+    )
