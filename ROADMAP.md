@@ -24,6 +24,7 @@ The two security entries below were gated on the evidence host, which is now in 
 
 ### 🟡 Medium
 
+- User / Infrastructure — outbound mail: three classes, one delivery path, and the externally-authenticated accounts that must never receive a password link (see the entry below; the OIDC half is security-relevant but inert while `OIDC_ENABLED` is off, which is what keeps this out of the High tier)
 - Infrastructure — relabel the checkout for SELinux in [scripts/bootstrap-podman.sh](scripts/bootstrap-podman.sh), or refuse with an explanation: on an Enforcing RHEL host the containers cannot read the bind mount and the run dies on a bare `Permission denied` for `/code/manage.py`
 - Infrastructure — make the first bootstrap pass atomic: it copies `.env.example` to `.env` before `init_env` populates it, so a failure in between leaves a file that makes every later run take the second-pass branch and die on a missing `REDIS_PASSWORD` instead of resuming
 - Infrastructure — support Podman on Debian/Ubuntu, which today falls between the two bootstraps: [scripts/bootstrap-podman.sh](scripts/bootstrap-podman.sh) refuses anything that is not RHEL-like, [scripts/bootstrap.sh](scripts/bootstrap.sh) installs Docker Engine, and the packaged prepare-host.sh is Debian/Ubuntu-only and also installs Docker — so the combination is reached by following the RHEL steps by hand, which is where the aardvark-dns gap came from (verified on Ubuntu 24.04, 2026-09-18: `apt install podman` with recommends is fine, and `--no-install-recommends` produces a stack that stalls in silence). The generated start.sh now refuses that host, so this is the branch that would install the package rather than name it — noting that the preflight answers for the package only, while a host firewall filtering the container bridge produces the same unresolvable name and is what a managed host tends to hit; the bounded wait in the migrate service is what covers the rest. The installation guide for the RHEL family is the second half: the packaged README and two start.sh errors point a reader at INSTALL-RHEL.md, but it is in neither `ROOT_FILES` nor any heredoc in [scripts/make-bootstrap-fixture.sh](scripts/make-bootstrap-fixture.sh), so a package built from the current tree ships a pointer to a file it does not contain
@@ -1462,3 +1463,47 @@ Sequence the heavy Docker jobs (PRs to main + nightly) separately from the fast 
 ### Other
 
 - **Restore drill in CI.** [scripts/restore-drill.sh](scripts/restore-drill.sh) validates the restore path end-to-end and runs on demand; wiring it into the integration-CI tier would catch a regression in the backup or restore path without anyone remembering to run it.
+
+---
+
+## 🟡 User / Infrastructure — outbound mail: three classes, one delivery path
+
+**Planned 2026-09-20, not started.** The deployment is moving from Django's console backend to a real relay (Scaleway Transactional Email, `fr-par`; provider decision, credentials shape and DNS in the active project's own documentation), which turns mail from a thing that silently goes nowhere into a thing that can fail in public. Three classes of message are in scope, two of which exist today.
+
+| Class | Today |
+|---|---|
+| Welcome / invite for a new account, carrying a set-password link | Does not exist |
+| Password reset the user asked for | [user/tasks.py](user/tasks.py), hardened |
+| Maintenance job lifecycle to superusers | [maintenance/notify.py](maintenance/notify.py), synchronous, fail-silent |
+
+### Foundations, independent of everything else
+
+- **`EMAIL_TIMEOUT` is set nowhere**, so Django waits forever on a relay that accepts a connection and stalls. It matters more than it looks: [maintenance/notify.py](maintenance/notify.py) sends synchronously inside Celery and `sync_spool` runs every minute, so one hung send holds a worker child and the next minute's brings another, with recording processing queueing behind them.
+- **One delivery helper**, hashed recipients and exception class only, shared by all three classes. `_deliver` in [user/tasks.py](user/tasks.py) already does this correctly and the maintenance notifier does not; a third class would otherwise be a third copy. Core is the right home, since two apps need it.
+- **The notifier logs what the reset path deliberately does not.** It reports failures with `logger.exception`, which writes the SMTP traceback — and rejection messages routinely echo the recipient address, which the cross-cutting rule in [AGENTS.md](AGENTS.md) says must never reach the log stream. It also passes `fail_silently=True`, so Django swallows most failures before that handler runs: an "Update needs your confirmation" mail can fail to send with nothing logged, the window then closes, and the update rolls back for want of a message nobody knew was lost.
+
+### Welcome / invite, and the account-creation change under it
+
+Decided with the deployment owner on 2026-09-20: **the invite link replaces the operator-issued password.** `password` on `POST /admin/accounts` ([user/api/v1/accounts.py](user/api/v1/accounts.py)) becomes optional; absent, the account is created with an unusable password and the welcome mail carries a set-password link. This removes the step where an operator knows a password they then have to convey out of band. Link validity stays at Django's three-day `PASSWORD_RESET_TIMEOUT` rather than growing a second token type, paired with a resend action on the account page for the person who was away.
+
+The task takes a primary key and mints the token at send time, as the reset task does and for the same reason — the broker persists to an append-only file, so a payload carrying a link outlives the token it embeds. The contract test in [user/tests/test_reset_email_payload.py](user/tests/test_reset_email_payload.py) is the shape to copy.
+
+### The gap this uncovers: externally-authenticated accounts
+
+An account provisioned through OIDC has an unusable password on purpose. Nothing currently stops it being given one:
+
+- **Password reset does not exclude it.** `request_password_reset` filters on `email__iexact` and `is_active` only, and an OIDC account always carries an email from its claims — so it receives a link, and confirming it mints a local password that bypasses the tenant (`tid`) and email-domain gates in [user/oidc.py](user/oidc.py). Inert while `OIDC_ENABLED` is off; live the day it is turned on.
+- **Change-password refuses it by accident.** `check_password` against an unusable password is always false, so the caller is told their current password is incorrect, which is not what happened.
+- **The profile page cannot know.** `UserOut` carries no signal, so [ProfileView.vue](frontend/src/views/ProfileView.vue) renders a form that can never succeed.
+
+**`has_usable_password()` is not the discriminator**, and this is the trap to remember: after the change above, an invited account also has an unusable password until the person sets one. The identity is what separates them — an account with an [ExternalIdentity](user/models.py) row is externally authenticated — and that test keeps working when a second provider is added. [user/stepup.py](user/stepup.py) already reasons this way and is the pattern to follow.
+
+So: the reset endpoint skips such accounts while still answering `ok` (no change to enumeration behaviour) and records a security event; change-password refuses them with a message naming the identity provider; `UserOut` grows the flag and the profile page hides the form; and invite mail is never sent to them.
+
+### Verifying it on a deployment with no shell
+
+The managed instance this is for has no shell access, so "did the relay work" cannot be answered by a management command. The maintenance app's operation registry already carries superuser gating, step-up confirmation, an audited job row and captured output shown in its tab — so a celery-tier `mail.send_test` operation, backed by a command that mails the requesting superuser, answers it from a browser and shows the SMTP error class when it fails.
+
+### Deliberately not in this entry
+
+Bounce and complaint webhooks from the relay (a new signed, unauthenticated endpoint — its own decision), and the branding and language of the messages: all three classes hardcode "Epicurrents" in subject and body and are English-only, which is wrong for a deployment branded otherwise and serving Finnish speakers. One brand setting read by all three would close the first half; the second needs a decision about the audience before it needs code.
