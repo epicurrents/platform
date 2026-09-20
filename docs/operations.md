@@ -523,7 +523,7 @@ scripts/update.sh --from repo            # git pull + frontend build, then the t
 scripts/update.sh --from repo --no-pull  # rebuild the current checkout (e.g. in CI, or after a manual checkout)
 ```
 
-Before migrating, `update.sh` writes a pre-update snapshot — a database dump plus `.env` — under `./backups/` (and a full borg backup when borg is enabled). Undo the last update with `./update.sh --rollback`, which restores the most recent snapshot's database and `.env` and recreates the stack. Rollback covers data and config, not the code/image; re-apply the previous archive or git ref if a new build is itself the problem.
+Before touching anything, `update.sh` writes a pre-update snapshot — the code tree, then a database dump plus `.env` — under `./backups/` (and a full borg backup when borg is enabled). Undo the last update with `./update.sh --rollback`, which restores the most recent complete snapshot's database, `.env` and code, rebuilds the images from the restored code and recreates the stack. The rebuild is what makes the rollback real: the image carries the code, so restoring the tree alone would leave the new code running against the old schema. Only a snapshot from before code snapshots existed falls back to data and config alone, and the script says so. Writes made between the snapshot and the rollback are lost from the database, so roll back promptly or not at all.
 
 For development checkouts where you want manual control:
 
