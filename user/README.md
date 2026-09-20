@@ -206,6 +206,14 @@ Three of the four management writes re-check the password (`_confirm_password`).
 
 Turning either on does not lock anybody out. The blocker they once had — that an account required to enrol cannot reach the session-authenticated endpoints above, because it has no session yet — is what `POST /login/2fa/setup` solves: it enrols from the pending-login state, and `POST /login/2fa` then completes the same login with the first code. Accounts with no usable password are exempt, since enrolment re-confirms the password and an externally-authenticated account could never satisfy that.
 
+### Step-up confirmation
+
+A session proves someone signed in once, not that the person at the keyboard now is the one who did. Before an action that changes the platform itself — the maintenance app's requests and rollbacks — the caller confirms with a fresh credential through `confirm_step_up` in [stepup.py](stepup.py): the password, plus a TOTP or recovery code when the account has a confirmed second factor. It generalises the `_confirm_password` re-check the two-factor management endpoints make.
+
+Which credentials an account has decides the method, and `step_up_method` reports it ahead of time so a UI can ask for the right ones: `password`, `password+totp`, or `totp` alone for an account with no usable password (provisioned through an external provider). An account with neither answers 409, since the state of the account rather than the request is the problem; such an account cannot use the feature, and re-authenticating against the provider was rejected for now as a second login flow to maintain. A caller may waive the second factor (`second_factor=False`) for a confirmation that only closes a window rather than opening one.
+
+A wrong or missing credential answers 400 without saying which, is logged as `auth.stepup_failed` with the reason, and counts towards a lockout: five failures lock the account out of step-up for five minutes (429), mirroring the login lockout, and a success clears the count. The codes are spent the same way as at login, so an observed TOTP does not replay.
+
 ### Password validation
 
 All new passwords (from `/me/change-password` and `/reset-password/confirm`) are run through Django's `validate_password` with the validators configured in `AUTH_PASSWORD_VALIDATORS`. Default validators (set in [epicurrents/settings/common.py](../epicurrents/settings/common.py)):

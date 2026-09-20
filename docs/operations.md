@@ -562,6 +562,18 @@ git submodule update --init --recursive
 scripts/apply-changes.sh
 ```
 
+### The maintenance lock
+
+While `update.sh` runs, and while a remote update is in flight, the platform is suspended. The flag file described above is read by a middleware that answers `503` with `{"detail": "maintenance", "phase", "since", "expected_until", "message"}` and a `Retry-After`: while the phase is `updating` or `rolling_back` every API request is refused except a superuser's reads, so the database dump the rollback would restore is not written to; while it is `verifying` (a remote update waiting for confirmation) other users may read but not write, login and logout still work, and superusers are exempt so they can test the release. The health and readiness probes, the SPA document, the asset routes and the federation key document answer in every phase, so the login page renders and shows the message. The policy table is in [maintenance/README.md](../maintenance/README.md#the-maintenance-lock).
+
+The flag is a file rather than a database row because the rollback restores the dump and would erase a row half-way through the operation it announces. A flag left behind by a failed run keeps the platform suspended until the file is removed by hand, which is the right direction: the message says why the platform is not serving.
+
+### Remote maintenance
+
+A superuser can run registered management commands from the Maintenance tab of the account administration pages once `REMOTE_MAINTENANCE_ENABLED=True` is set in `.env` and `web`, `celery` and `celery-beat` are recreated. Each request is a `MaintenanceJob` row, audited under the requester, and carries a step-up confirmation (the password, plus the second factor when enrolled) for any operation that writes. The commands available out of the box are the audit-integrity check, the originals-volume validation and the signal-metadata refresh; a project registers its own. The endpoints answer 404 while the flag is off.
+
+Applying an update from the tab needs the host agent as well, which is the next phase of the design in [docs/engineering-notes/remote-maintenance-design.md](engineering-notes/remote-maintenance-design.md); `REMOTE_UPDATE_ENABLED` stays off until it is installed. The spool the two sides share is `./update/`, the package drop directory, bind-mounted into `web` and `celery` by the production overlay.
+
 ### Dev vs production compose
 
 The platform uses a base [docker-compose.yml](../docker-compose.yml) plus a [docker-compose.prod.yml](../docker-compose.prod.yml) overlay. The Python image is identical in both — what differs is what gets mounted at runtime and how the frontend bundles arrive on disk.

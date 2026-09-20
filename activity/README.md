@@ -496,6 +496,22 @@ To check the table against the tree, walk the AST for `log_activity` / `with_sys
 | `library.tag.read` | `get_tag_detail` |
 | `library.tag.update` | `update_tag` |
 
+### `maintenance`
+
+| Verb | Emitted by |
+|---|---|
+| `maintenance.job.cancel` | `cancel_job` |
+| `maintenance.job.create` | `create_job` |
+| `maintenance.job.list` | `list_jobs` |
+| `maintenance.job.log` | `get_job_log` |
+| `maintenance.job.read` | `get_job` |
+| `maintenance.job.rollback` | `rollback_job` |
+| `maintenance.job.run` | `run_job` † |
+| `maintenance.job.sync` | `spool.sync` † |
+| `maintenance.job.verify` | `verify_job` |
+| `maintenance.operation.list` | `list_operations` |
+| `maintenance.status.read` | `get_status` |
+
 ### `media`
 
 | Verb | Emitted by |

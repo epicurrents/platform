@@ -124,6 +124,19 @@ Event types in current use:
   time. Operational signal, not a tamper alarm: usually means a
   module deregistered a digester or a row predates a digester
   rename. Fields: ``change_id``, ``content_type``, ``digest_key``.
+- ``auth.stepup_failed`` — a step-up confirmation (``user.stepup``) before a
+  sensitive request was refused. ``reason`` is ``password``, ``second_factor``
+  or ``locked_out``; ``actor_id`` identifies the account.
+- ``maintenance.job_requested`` — a superuser requested a maintenance
+  operation. Fields: ``job_id``, ``operation``, ``executor``, ``actor_id``.
+- ``maintenance.rollback_requested`` — a superuser asked for an update to be
+  rolled back; ``reason`` carries the job's state at the time
+  (``awaiting_verification`` or ``succeeded``). Fields: ``job_id``, ``actor_id``.
+- ``maintenance.job_state`` — a job changed state as reported by its executor:
+  the celery tier at completion, the host agent through the spool. Recorded
+  here because a rollback restores the database dump and erases the audit rows
+  written since the update's snapshot; the log stream survives. Fields:
+  ``job_id``, ``operation``, ``state``, ``reason``.
 - ``throttle.rate_limited`` — an API request exceeded the global
   per-identity request-rate ceiling and was rejected with 429. Fields:
   ``scope`` (the throttle scope the path mapped to), ``identity_kind``

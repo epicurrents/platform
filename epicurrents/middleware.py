@@ -23,6 +23,16 @@ What counts as an "API request" is the load-bearing decision here, because
 silently mis-classifying a path leaves entire apps without an audit trail.
 See :data:`_API_PATH_RE` for the recognised mount shape.
 
+⚠️ LOAD-BEARING — the maintenance lock, second contract in this module.
+``MaintenanceLockMiddleware`` and ``maintenance_verdict`` at the bottom keep
+writes off the database while ``update.sh`` or a remote update is between
+its pre-update dump and the recreate. A verdict that lets an unsafe API
+request through while the phase is ``updating`` or ``rolling_back`` accepts
+writes the next rollback silently discards; one that refuses the probes or
+the SPA document turns the maintenance message into a blank page. Contract
+test ``maintenance/tests/test_maintenance_lock.py``; see AGENTS.md →
+*Load-bearing files*.
+
 Some paths match the regex but are deliberately exempt from creating
 ``Activity`` rows — health checks and the public VAPID key are the
 canonical examples; they operate on no user data and would drown the
@@ -66,6 +76,7 @@ from django.http import JsonResponse
 from activity.models import Activity
 from activity.request_context import reset_request_context, set_request_context
 from epicurrents.throttle import check_request_throttle
+from maintenance.lock import PHASE_VERIFYING, current_lock
 
 logger = logging.getLogger(__name__)
 
@@ -301,5 +312,72 @@ class ApiThrottleMiddleware:
         if retry_after is not None:
             response = JsonResponse({"detail": "Rate limit exceeded. Please slow down."}, status=429)
             response["Retry-After"] = str(retry_after)
+            return response
+        return self.get_response(request)
+
+
+# ── Maintenance lock ─────────────────────────────────────────────────────────
+
+_SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
+# API paths that answer while the platform is locked, whatever the phase: the
+# probes an orchestrator and the host agent gate on.
+_LOCK_EXEMPT_PATHS = frozenset({"/api/v1/health", "/api/v1/ready", "/api/v1/health/", "/api/v1/ready/"})
+# Unsafe API paths allowed during the verification window for everyone, so a
+# superuser can sign in to confirm and anyone can sign out.
+_LOCK_LOGIN_PREFIXES = ("/api/v1/user/login", "/api/v1/user/logout")
+
+
+def maintenance_verdict(lock, request) -> bool:
+    """Whether ``request`` is refused under ``lock``; the policy of the maintenance lock.
+
+    Non-API paths — the SPA document, the asset routes, the federation key
+    document — pass when the method is safe, so the login page renders and shows
+    the message; an unsafe non-API request is refused, since a project's public
+    view could write. API paths follow the phase. While ``updating`` or
+    ``rolling_back``, a superuser's safe requests pass (so progress and the log
+    stay visible) and everything else is refused. While ``verifying``, a
+    superuser is exempt, safe requests pass, and unsafe ones are refused except
+    login and logout. Anything the flag says that is not one of those phases is
+    treated as ``updating``.
+    """
+    path = request.path
+    method = request.method.upper()
+    safe = method in _SAFE_METHODS
+    if path in _LOCK_EXEMPT_PATHS:
+        return False
+    if not _API_PATH_RE.match(path):
+        return not safe
+    user = getattr(request, "user", None)
+    superuser = bool(user is not None and getattr(user, "is_authenticated", False) and user.is_superuser)
+    if lock.phase == PHASE_VERIFYING:
+        if superuser or safe:
+            return False
+        return not path.startswith(_LOCK_LOGIN_PREFIXES)
+    return not (superuser and safe)
+
+
+class MaintenanceLockMiddleware:
+    """Answer 503 while the maintenance flag under the spool exists.
+
+    Runs after ``AuthenticationMiddleware`` because the policy depends on
+    whether the caller is a superuser, and before ``ApiThrottleMiddleware`` and
+    ``ApiActivityLoggingMiddleware`` so a refused request burns no throttle
+    budget and writes no ``Activity`` row. The flag is read through
+    :func:`maintenance.lock.current_lock`, which caches for a second. The
+    response is the same shape in every phase — ``detail: "maintenance"``, the
+    phase, when it began, when it is expected to end, and a message — with a
+    ``Retry-After`` derived from the expected end. It never passes through the
+    inner middleware, so it sets ``Cache-Control: no-store`` itself.
+    """
+
+    def __init__(self, get_response):
+        self.get_response = get_response
+
+    def __call__(self, request):
+        lock = current_lock()
+        if lock is not None and maintenance_verdict(lock, request):
+            response = JsonResponse(lock.as_response_body(), status=503)
+            response["Retry-After"] = str(lock.retry_after())
+            response["Cache-Control"] = "no-store"
             return response
         return self.get_response(request)
