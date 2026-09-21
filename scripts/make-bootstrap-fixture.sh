@@ -467,9 +467,12 @@ ROOT_FILES=(
 # the runtime reports: Docker creates the path as an empty directory, so the
 # container starts with a directory where its serve config should be and the
 # tailnet node comes up serving nothing.
+# Every platform app in INSTALLED_APPS must be here, or a package's image cannot
+# boot: scripts/tests/test_make_bootstrap_fixture.py derives the expected set
+# from the settings module and fails when this list falls behind it.
 PLATFORM_DIRS=(
     user activity annotations compute epicurrents recordings
-    media notifications library federation borgmatic caddy tailscale
+    media notifications library federation maintenance borgmatic caddy tailscale
 )
 
 # Caches, VCS metadata, build outputs, and developer residue never belong here.

@@ -38,7 +38,40 @@ PLATFORM_APPS = [
     "notifications",
     "library",
     "federation",
+    "maintenance",
 ]
+
+
+def _installed_platform_apps() -> list[str]:
+    """The platform's own apps as INSTALLED_APPS names them: every ``<app>.apps.<Config>`` whose tree is in the repo."""
+    source = (REPO_ROOT / "epicurrents" / "settings" / "common.py").read_text()
+    names = re.findall(r'^\s*"([a-z_]+)\.apps\.[A-Za-z]+Config",', source, flags=re.MULTILINE)
+    return [name for name in names if (REPO_ROOT / name / "apps.py").is_file()]
+
+
+def _packaged_platform_dirs() -> list[str]:
+    match = re.search(r"^PLATFORM_DIRS=\(\n(.*?)^\)", FIXTURE.read_text(), flags=re.MULTILINE | re.DOTALL)
+    assert match, "PLATFORM_DIRS not found in the packager"
+    return match.group(1).split()
+
+
+class TestEveryInstalledAppShips:
+    """A platform app missing from the packager's list is an image that dies at django.setup().
+
+    Found by the first remote-update run against a real host: the maintenance app
+    had been installed for a day and every package built since could not boot.
+    Nothing in the mocked suites imports the package's settings, so the list is
+    checked against the settings module directly.
+    """
+
+    def test_the_packager_copies_every_app_the_settings_install(self):
+        installed = _installed_platform_apps()
+        assert installed, "the settings scan found no platform apps; the regex has drifted"
+        missing = sorted(set(installed) - set(_packaged_platform_dirs()))
+        assert not missing, f"apps in INSTALLED_APPS that make-bootstrap-fixture.sh does not ship: {missing}"
+
+    def test_the_expected_list_here_matches_the_settings(self):
+        assert sorted(PLATFORM_APPS) == sorted(_installed_platform_apps())
 
 
 def _run(dest, *args):
