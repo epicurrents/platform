@@ -30,21 +30,29 @@ INSTALLER = SCRIPTS_DIR / "updater" / "install-updater.sh"
 # $FAKE_DIR/calls, and speaks the :: lines the agent follows. Marker files in
 # $FAKE_DIR change its behaviour: refuse-<token> makes --check-archive refuse
 # with that token, fail-before and fail-after make an update exit non-zero
-# before or after its snapshot, snapshot-fail fails --snapshot, rollback-fail
-# fails --rollback. Versions come from $FAKE_DIR/installed and /package.
+# before or after its snapshot, no-migrations makes the update report that it
+# applied none, snapshot-fail fails --snapshot, rollback-fail fails --rollback,
+# decline-code-only makes --rollback --code-only refuse by name, and
+# verified-by-next reports the second --release-key as the one that verified.
+# Versions come from $FAKE_DIR/installed and /package.
 FAKE_UPDATE_SH = r"""#!/bin/sh
+UPDATER_SCRIPT_VERSION=3
 printf '%s\n' "$*" >> "$FAKE_DIR/calls"
 ROOT=""
 MODE=update
 LABEL=""
+ROLLBACK=0
+CODE_ONLY=0
+KEYS=""
 while [ $# -gt 0 ]; do
     case "$1" in
         --root) ROOT="$2"; shift 2 ;;
         --check-archive) MODE=check; shift 2 ;;
-        --snapshot) MODE=snapshot; LABEL="$2"; shift 2 ;;
-        --rollback) MODE=rollback; shift ;;
+        --snapshot) LABEL="$2"; shift 2 ;;
+        --rollback) ROLLBACK=1; shift ;;
+        --code-only) CODE_ONLY=1; shift ;;
         --archive) shift 2 ;;
-        --release-key) shift 2 ;;
+        --release-key) KEYS="$KEYS $2"; shift 2 ;;
         *) shift ;;
     esac
 done
@@ -52,57 +60,65 @@ done
 cd "$ROOT" || exit 2
 installed="$(cat "$FAKE_DIR/installed")"
 package="$(cat "$FAKE_DIR/package")"
-case "$MODE" in
-    check)
-        for marker in "$FAKE_DIR"/refuse-*; do
-            [ -e "$marker" ] || continue
-            token="${marker##*/refuse-}"
-            echo "::refused=$token"
-            echo "::failed=refused ($token) by the stand-in"
-            exit 1
-        done
-        if [ -e "$FAKE_DIR/check-fail-unnamed" ]; then
-            echo "::failed=the stand-in refused without a reason"
-            exit 1
-        fi
-        echo "::installed=$installed"
-        echo "::version=$package"
-        echo "::check=ok"
-        exit 0
-        ;;
-    snapshot)
-        if [ "$MODE" = snapshot ] && [ "$LABEL" != post-update ]; then
-            # --rollback --snapshot NAME is parsed as MODE=snapshot too; tell them apart by the label.
-            :
-        fi
-        if [ -e "$FAKE_DIR/rollback-mode" ]; then :; fi
-        ;;
-esac
-if [ "$MODE" = snapshot ] && [ "$LABEL" = post-update ]; then
-    if [ -e "$FAKE_DIR/snapshot-fail" ]; then
-        echo "::failed=the stand-in could not snapshot"
+if [ "$MODE" = check ]; then
+    for marker in "$FAKE_DIR"/refuse-*; do
+        [ -e "$marker" ] || continue
+        token="${marker##*/refuse-}"
+        echo "::refused=$token"
+        echo "::failed=refused ($token) by the stand-in"
+        exit 1
+    done
+    if [ -e "$FAKE_DIR/check-fail-unnamed" ]; then
+        echo "::failed=the stand-in refused without a reason"
         exit 1
     fi
-    mkdir -p "backups/post-update-20260920-120000"
-    echo "::step=snapshot"
-    echo "::snapshot=./backups/post-update-20260920-120000"
-    echo "::done"
+    echo "::installed=$installed"
+    echo "::version=$package"
+    if [ -e "$FAKE_DIR/verified-by-next" ]; then
+        echo "::key=$(printf '%s\n' $KEYS | sed -n 2p)"
+    else
+        echo "::key=$(printf '%s\n' $KEYS | sed -n 1p)"
+    fi
+    echo "::check=ok"
     exit 0
 fi
-if [ "$MODE" = snapshot ] || [ "$MODE" = rollback ]; then
-    # --rollback --snapshot NAME
-    echo "::step=stop"
-    echo "::step=restore-db"
-    if [ -e "$FAKE_DIR/rollback-fail" ]; then
-        echo "::failed=the stand-in could not restore"
+if [ "$ROLLBACK" = 1 ]; then
+    if [ "$CODE_ONLY" = 1 ] && [ -e "$FAKE_DIR/decline-code-only" ]; then
+        echo "::refused=code_only"
+        echo "::failed=migrations were applied since the snapshot (stand-in)"
         exit 1
+    fi
+    echo "::step=stop"
+    if [ "$CODE_ONLY" != 1 ]; then
+        echo "::step=restore-db"
+        if [ -e "$FAKE_DIR/rollback-fail" ]; then
+            echo "::failed=the stand-in could not restore"
+            exit 1
+        fi
     fi
     echo "::step=restore-code"
     echo "::step=build"
+    echo "::restored=$installed"
     echo "::step=recreate"
     echo "::step=health"
     echo "::health=ok"
     printf '%s' "$installed" > "$FAKE_DIR/running-version"
+    echo "::done"
+    exit 0
+fi
+if [ -n "$LABEL" ]; then
+    if [ -e "$FAKE_DIR/snapshot-fail" ]; then
+        echo "::failed=the stand-in could not snapshot"
+        exit 1
+    fi
+    case "$LABEL" in
+        post-update) stamp=20260920-120000 ;;
+        pre-rollback) stamp=20260920-130000 ;;
+        *) stamp="$(cat "$FAKE_DIR/snapshot-stamp" 2>/dev/null || echo 20260920-140000)" ;;
+    esac
+    mkdir -p "backups/$LABEL-$stamp"
+    echo "::step=snapshot"
+    echo "::snapshot=./backups/$LABEL-$stamp"
     echo "::done"
     exit 0
 fi
@@ -129,6 +145,11 @@ if [ -e "$FAKE_DIR/chatty" ]; then
     done
 fi
 echo "::step=migrate"
+if [ -e "$FAKE_DIR/no-migrations" ]; then
+    echo "::migrations=none"
+else
+    echo "::migrations=applied"
+fi
 echo "::step=recreate"
 echo "::step=health"
 echo "::health=ok"
@@ -323,6 +344,7 @@ def _to_window(staged: Staged) -> str:
 STATUS_FIELDS = {
     "protocol",
     "job_id",
+    "operation",
     "state",
     "reason",
     "step",
@@ -332,6 +354,7 @@ STATUS_FIELDS = {
     "verify_deadline",
     "snapshot",
     "post_snapshot",
+    "migrations_applied",
     "agent_version",
     "installed_version_before",
     "target_version",
@@ -356,9 +379,10 @@ class TestHeartbeatAndConfig:
         result = _run(staged)
         assert result.returncode == 0, result.stderr
         beat = staged.heartbeat()
-        assert beat["protocol"] == 1 and beat["enabled"] is False and beat["version"] == "1"
+        assert beat["protocol"] == 1 and beat["enabled"] is False and beat["version"] == "2"
         assert beat["runtime"] == "docker" and beat["last_run"].endswith("Z")
-        assert beat["capabilities"] == ["platform.update"]
+        assert beat["capabilities"] == ["platform.update", "platform.backup", "platform.rollback"]
+        assert beat["self_update"] is False and beat["snapshots"] == []
         status = staged.status(job_id)
         assert status["state"] == "failed" and status["reason"] == "refused_disabled"
         assert staged.update_sh_calls() == []
@@ -413,7 +437,8 @@ class TestAcceptance:
         assert status["running_version"] == "0.2.0"
         assert status["snapshot"] == "pre-update-20260920-100000"
         assert status["started_at"].endswith("Z") and status["finished_at"] is None
-        assert status["verify_deadline"].endswith("Z") and status["agent_version"] == "1"
+        assert status["verify_deadline"].endswith("Z") and status["agent_version"] == "2"
+        assert status["operation"] == "platform.update" and status["migrations_applied"] is True
 
         calls = staged.update_sh_calls()
         assert len(calls) == 2
@@ -535,7 +560,7 @@ class TestRefusals:
 
     def test_operation(self, fakebin, tmp_path):
         staged = _stage(tmp_path, fakebin)
-        job_id = _request(staged, _package(staged), operation="platform.rollback")
+        job_id = _request(staged, _package(staged), operation="platform.reboot")
         _run(staged)
         self._refused(staged, job_id, "operation")
 
@@ -890,6 +915,477 @@ class TestStaleLock:
         assert not (staged.spool / "lock").exists()
 
 
+def _tarball(tmp_path, files: dict[str, str], *, top="epicurrents-0.2.0") -> bytes:
+    """A real gzipped tarball of ``files`` (path → content) under one top directory."""
+    import tarfile
+
+    tree = tmp_path / "pkg-src" / top
+    if tree.exists():
+        shutil.rmtree(tree)
+    tree.mkdir(parents=True)
+    for rel, content in files.items():
+        path = tree / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content)
+    archive = tmp_path / "pkg-src" / "pkg.tar.gz"
+    with tarfile.open(archive, "w:gz") as tf:
+        tf.add(tree, arcname=top)
+    return archive.read_bytes()
+
+
+def _snapshot(staged: Staged, name: str, *, manifest: str = "", code: bool = True) -> None:
+    """A restorable snapshot directory under the staged deployment's backups/."""
+    path = staged.root / "backups" / name
+    path.mkdir(parents=True, exist_ok=True)
+    (path / "db.sql.gz").write_bytes(b"x")
+    (path / ".env").write_text("HOST_PORT=8001\n")
+    if code:
+        (path / "code.tar.gz").write_bytes(b"x")
+    if manifest:
+        (path / "MANIFEST").write_text(manifest)
+
+
+class TestCodeOnlyRollback:
+    """An update that applied no migration is rolled back with --code-only,
+    which keeps the database and everything written since; update.sh may
+    still decline, and then the database is restored after all.
+    """
+
+    def test_an_update_that_applied_nothing_keeps_the_database_on_rollback(self, fakebin, tmp_path):
+        staged = _stage(tmp_path, fakebin)
+        staged.mark("no-migrations")
+        job_id = _to_window(staged)
+        assert staged.status(job_id)["migrations_applied"] is False
+        (staged.jobs / f"{job_id}.rollback").write_text('{"protocol": 1, "by_user_id": 1}')
+        _run(staged)
+        status = staged.status(job_id)
+        assert status["state"] == "rolled_back" and status["reason"] == "requested"
+        restore = [c for c in staged.update_sh_calls() if "--rollback" in c]
+        assert len(restore) == 1 and "--code-only" in restore[0], restore
+        assert "keeping the database" in staged.log(job_id)
+        assert status["post_snapshot"] == "post-update-20260920-120000", "the safety snapshot is still taken"
+
+    def test_a_declined_code_only_restores_the_database_after_all(self, fakebin, tmp_path):
+        staged = _stage(tmp_path, fakebin)
+        staged.mark("no-migrations")
+        staged.mark("decline-code-only")
+        job_id = _to_window(staged)
+        (staged.jobs / f"{job_id}.rollback").write_text('{"protocol": 1, "by_user_id": 1}')
+        _run(staged)
+        assert staged.status(job_id)["state"] == "rolled_back"
+        restore = [c for c in staged.update_sh_calls() if "--rollback" in c]
+        assert len(restore) == 2 and "--code-only" in restore[0] and "--code-only" not in restore[1], restore
+        assert "declined to keep the database" in staged.log(job_id)
+
+    def test_an_update_that_migrated_restores_the_database(self, fakebin, tmp_path):
+        staged = _stage(tmp_path, fakebin)
+        job_id = _to_window(staged)
+        assert staged.status(job_id)["migrations_applied"] is True
+        (staged.jobs / f"{job_id}.rollback").write_text('{"protocol": 1, "by_user_id": 1}')
+        _run(staged)
+        assert staged.status(job_id)["state"] == "rolled_back"
+        assert not any("--code-only" in c for c in staged.update_sh_calls())
+
+    def test_an_update_sh_too_old_for_code_only_never_gets_the_flag(self, fakebin, tmp_path):
+        staged = _stage(tmp_path, fakebin)
+        staged.mark("no-migrations")
+        (staged.lib_dir / "update.sh").write_text(
+            "#!/bin/sh\nUPDATER_SCRIPT_VERSION=2\n" + FAKE_UPDATE_SH[len("#!/bin/sh\n") :]
+        )
+        job_id = _to_window(staged)
+        (staged.jobs / f"{job_id}.rollback").write_text('{"protocol": 1, "by_user_id": 1}')
+        _run(staged)
+        assert staged.status(job_id)["state"] == "rolled_back"
+        assert not any("--code-only" in c for c in staged.update_sh_calls())
+
+
+class TestBackups:
+    """platform.backup takes a snapshot without a flag, a stop or a drain."""
+
+    def _backup(self, staged: Staged) -> str:
+        job_id = str(uuid.uuid4())
+        body = {
+            "protocol": 1,
+            "job_id": job_id,
+            "operation": "platform.backup",
+            "requested_by_id": 1,
+            "requested_at": "2026-09-20T10:00:00Z",
+            "args": {},
+        }
+        (staged.jobs / f"{job_id}.json").write_text(json.dumps(body))
+        return job_id
+
+    def test_a_backup_snapshots_and_touches_nothing_else(self, fakebin, tmp_path):
+        staged = _stage(tmp_path, fakebin)
+        job_id = self._backup(staged)
+        result = _run(staged)
+        assert result.returncode == 0, result.stderr
+        status = staged.status(job_id)
+        assert status["state"] == "succeeded" and status["operation"] == "platform.backup"
+        assert status["snapshot"] == "backup-20260920-140000" and status["installed_version_before"] == "0.1.0"
+        assert staged.update_sh_calls() == [f"--root {staged.root} --snapshot backup"]
+        assert staged.flag() is None
+        assert not fakebin.has_call("stop celery-beat") and not fakebin.has_call("inspect active")
+        assert not (staged.spool / "lock").exists()
+        assert (staged.root / "backups" / "backup-20260920-140000").is_dir()
+
+    def test_a_failed_snapshot_fails_the_job(self, fakebin, tmp_path):
+        staged = _stage(tmp_path, fakebin)
+        staged.mark("snapshot-fail")
+        job_id = self._backup(staged)
+        _run(staged)
+        status = staged.status(job_id)
+        assert status["state"] == "failed" and status["reason"] == "snapshot_failed"
+        assert not (staged.spool / "lock").exists()
+
+    def test_backups_are_pruned_to_the_newest_three(self, fakebin, tmp_path):
+        staged = _stage(tmp_path, fakebin)
+        for stamp in ("20260901-000000", "20260902-000000", "20260903-000000"):
+            (staged.root / "backups" / f"backup-{stamp}").mkdir(parents=True)
+        (staged.root / "backups" / "pre-update-20260101-000000").mkdir()
+        job_id = self._backup(staged)
+        _run(staged)
+        assert staged.status(job_id)["state"] == "succeeded"
+        kept = sorted(p.name for p in (staged.root / "backups").iterdir())
+        assert kept == [
+            "backup-20260902-000000",
+            "backup-20260903-000000",
+            "backup-20260920-140000",
+            "pre-update-20260101-000000",
+        ], kept
+
+    def test_too_little_disk_refuses_a_backup(self, fakebin, tmp_path):
+        staged = _stage(tmp_path, fakebin, MIN_FREE_BYTES=10**18)
+        job_id = self._backup(staged)
+        _run(staged)
+        assert staged.status(job_id)["reason"] == "refused_disk"
+        assert staged.update_sh_calls() == []
+
+    def test_a_stale_backup_is_failed_and_the_lock_removed(self, fakebin, tmp_path):
+        staged = _stage(tmp_path, fakebin)
+        job_id = self._backup(staged)
+        status = {
+            "protocol": 1,
+            "job_id": job_id,
+            "operation": "platform.backup",
+            "state": "running",
+            "reason": "",
+            "step": "snapshot",
+            "updated_at": "2026-09-20T10:05:00Z",
+            "retries": 0,
+        }
+        (staged.jobs / f"{job_id}.status.json").write_text(json.dumps(status))
+        (staged.spool / "lock").write_text(
+            json.dumps({"protocol": 1, "pid": 4000000, "boot_id": "gone", "job_id": job_id})
+        )
+        _run(staged)
+        after = staged.status(job_id)
+        assert after["state"] == "failed" and after["reason"] == "stale"
+        assert not (staged.spool / "lock").exists()
+
+
+class TestStandaloneRollback:
+    """platform.rollback restores a snapshot the request names, behind a
+    safety snapshot, with the database unless the request keeps it.
+    """
+
+    def _rollback(self, staged: Staged, snapshot: str, *, restore_database=None) -> str:
+        job_id = str(uuid.uuid4())
+        args: dict = {"snapshot": snapshot}
+        if restore_database is not None:
+            args["restore_database"] = restore_database
+        body = {
+            "protocol": 1,
+            "job_id": job_id,
+            "operation": "platform.rollback",
+            "requested_by_id": 1,
+            "requested_at": "2026-09-20T10:00:00Z",
+            "args": args,
+        }
+        (staged.jobs / f"{job_id}.json").write_text(json.dumps(body))
+        return job_id
+
+    def test_restores_the_named_snapshot_behind_a_safety_snapshot(self, fakebin, tmp_path):
+        staged = _stage(tmp_path, fakebin)
+        _snapshot(staged, "backup-20260901-000000")
+        job_id = self._rollback(staged, "backup-20260901-000000")
+        result = _run(staged)
+        assert result.returncode == 0, result.stderr
+        status = staged.status(job_id)
+        assert status["state"] == "succeeded" and status["operation"] == "platform.rollback"
+        assert status["snapshot"] == "backup-20260901-000000"
+        assert status["post_snapshot"] == "pre-rollback-20260920-130000"
+        assert status["running_version"] == "0.1.0"
+        calls = staged.update_sh_calls()
+        assert calls[0].startswith(f"--root {staged.root} --snapshot pre-rollback") and "--keep-lock" in calls[0]
+        assert calls[1].startswith(f"--root {staged.root} --rollback --snapshot backup-20260901-000000")
+        assert "--yes" in calls[1] and "--skip-beat" in calls[1] and "--keep-lock" in calls[1]
+        assert "--code-only" not in calls[1]
+        assert staged.flag() is None
+        assert fakebin.has_call("stop celery-beat") and fakebin.has_call("up -d celery-beat")
+        assert not (staged.spool / "lock").exists()
+
+    def test_keeps_the_database_when_asked(self, fakebin, tmp_path):
+        staged = _stage(tmp_path, fakebin)
+        _snapshot(staged, "pre-update-20260901-000000")
+        job_id = self._rollback(staged, "pre-update-20260901-000000", restore_database=False)
+        _run(staged)
+        assert staged.status(job_id)["state"] == "succeeded"
+        restore = [c for c in staged.update_sh_calls() if "--rollback" in c]
+        assert len(restore) == 1 and "--code-only" in restore[0]
+        assert "the database is kept" in staged.log(job_id)
+
+    def test_a_declined_code_only_fails_the_job_and_changes_nothing(self, fakebin, tmp_path):
+        staged = _stage(tmp_path, fakebin)
+        staged.mark("decline-code-only")
+        _snapshot(staged, "pre-update-20260901-000000")
+        job_id = self._rollback(staged, "pre-update-20260901-000000", restore_database=False)
+        _run(staged)
+        status = staged.status(job_id)
+        assert status["state"] == "failed" and status["reason"] == "refused_code_only"
+        restore = [c for c in staged.update_sh_calls() if "--rollback" in c]
+        assert len(restore) == 1, "no second, database-restoring attempt without being asked"
+        assert staged.flag() is None and fakebin.has_call("up -d celery-beat")
+        assert not (staged.spool / "lock").exists()
+
+    def test_a_snapshot_without_code_cannot_keep_the_database(self, fakebin, tmp_path):
+        staged = _stage(tmp_path, fakebin)
+        _snapshot(staged, "backup-20260901-000000", code=False)
+        job_id = self._rollback(staged, "backup-20260901-000000", restore_database=False)
+        _run(staged)
+        assert staged.status(job_id)["reason"] == "refused_snapshot"
+        assert staged.update_sh_calls() == []
+
+    def test_an_unknown_or_malformed_snapshot_is_refused(self, fakebin, tmp_path):
+        staged = _stage(tmp_path, fakebin)
+        job_id = self._rollback(staged, "backup-20260901-000000")
+        _run(staged)
+        assert staged.status(job_id)["reason"] == "refused_snapshot"
+        job_id = self._rollback(staged, "../../etc/passwd")
+        _run(staged)
+        assert staged.status(job_id)["reason"] == "refused_snapshot"
+        assert staged.update_sh_calls() == []
+
+    def test_a_failed_safety_snapshot_stops_before_the_restore(self, fakebin, tmp_path):
+        staged = _stage(tmp_path, fakebin)
+        staged.mark("snapshot-fail")
+        _snapshot(staged, "backup-20260901-000000")
+        job_id = self._rollback(staged, "backup-20260901-000000")
+        _run(staged)
+        status = staged.status(job_id)
+        assert status["state"] == "failed" and status["reason"] == "snapshot_failed"
+        assert not any("--rollback" in c for c in staged.update_sh_calls())
+        assert staged.flag() is None and fakebin.has_call("up -d celery-beat")
+
+    def test_a_failed_restore_needs_a_shell(self, fakebin, tmp_path):
+        staged = _stage(tmp_path, fakebin)
+        staged.mark("rollback-fail")
+        _snapshot(staged, "backup-20260901-000000")
+        job_id = self._rollback(staged, "backup-20260901-000000")
+        _run(staged)
+        assert staged.status(job_id)["state"] == "rollback_failed"
+        assert staged.flag()["phase"] == "rolling_back"
+
+    def test_a_stale_rollback_is_retried_once_with_its_request(self, fakebin, tmp_path):
+        staged = _stage(tmp_path, fakebin)
+        _snapshot(staged, "backup-20260901-000000")
+        job_id = self._rollback(staged, "backup-20260901-000000", restore_database=False)
+        status = {
+            "protocol": 1,
+            "job_id": job_id,
+            "operation": "platform.rollback",
+            "state": "running",
+            "reason": "",
+            "step": "restore-code",
+            "updated_at": "2026-09-20T10:05:00Z",
+            "snapshot": "backup-20260901-000000",
+            "post_snapshot": "pre-rollback-20260920-130000",
+            "retries": 0,
+        }
+        (staged.root / "backups" / "pre-rollback-20260920-130000").mkdir(parents=True)
+        (staged.jobs / f"{job_id}.status.json").write_text(json.dumps(status))
+        (staged.spool / "lock").write_text(
+            json.dumps({"protocol": 1, "pid": 4000000, "boot_id": "gone", "job_id": job_id})
+        )
+        _run(staged)
+        after = staged.status(job_id)
+        assert after["state"] == "succeeded" and after["retries"] == 1
+        calls = staged.update_sh_calls()
+        assert len(calls) == 1 and "--rollback" in calls[0] and "--code-only" in calls[0], calls
+        assert "keeping the safety snapshot already taken" in staged.log(job_id)
+        (staged.jobs / f"{job_id}.status.json").write_text(json.dumps({**status, "retries": 1}))
+        (staged.spool / "lock").write_text(
+            json.dumps({"protocol": 1, "pid": 4000000, "boot_id": "gone", "job_id": job_id})
+        )
+        _run(staged)
+        assert staged.status(job_id)["state"] == "rollback_failed"
+
+
+class TestKeyRotation:
+    """A release may announce its successor key inside the signed manifest;
+    the agent installs it beside the current key and promotes it the first
+    time a package verifies with it.
+    """
+
+    SUCCESSOR = "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAnext\n-----END PUBLIC KEY-----\n"
+
+    def _package_with_manifest(self, staged: Staged, extra: dict) -> str:
+        content = b"a package announcing a successor"
+        digest = hashlib.sha256(content).hexdigest()
+        pkgdir = staged.packages / digest
+        pkgdir.mkdir(parents=True)
+        (pkgdir / "package.tar.gz").write_bytes(content)
+        (pkgdir / "manifest.json").write_text(json.dumps({"sha256": digest, **extra}, indent=2))
+        (pkgdir / "manifest.sig").write_text("c2lnbmF0dXJl\n")
+        return digest
+
+    def test_a_successor_in_the_manifest_is_installed_beside_the_current_key(self, fakebin, tmp_path):
+        staged = _stage(tmp_path, fakebin)
+        fakebin.stub("openssl", exit_code=1)
+        sha = self._package_with_manifest(staged, {"successor_key": self.SUCCESSOR, "successor_key_id": "abcd"})
+        job_id = _request(staged, sha)
+        _run(staged)
+        assert staged.status(job_id)["state"] == "awaiting_verification"
+        assert (staged.config_dir / "release.pub.next").read_text() == self.SUCCESSOR
+        assert (staged.config_dir / "release.pub.next").stat().st_mode & 0o777 == 0o600
+        assert "successor release key installed" in staged.log(job_id)
+        # The current key is what verified; it stays in force.
+        assert "test" in (staged.config_dir / "release.pub").read_text()
+
+    def test_both_keys_are_offered_to_update_sh_while_a_successor_is_installed(self, fakebin, tmp_path):
+        staged = _stage(tmp_path, fakebin)
+        (staged.config_dir / "release.pub.next").write_text(self.SUCCESSOR)
+        _to_window(staged)
+        for call in staged.update_sh_calls():
+            assert (
+                f"--release-key {staged.config_dir}/release.pub --release-key {staged.config_dir}/release.pub.next"
+                in call
+            )
+
+    def test_a_package_the_successor_verifies_promotes_it(self, fakebin, tmp_path):
+        staged = _stage(tmp_path, fakebin)
+        fakebin.stub("openssl", exit_code=1)
+        (staged.config_dir / "release.pub.next").write_text(self.SUCCESSOR)
+        staged.mark("verified-by-next")
+        job_id = _to_window(staged)
+        assert (staged.config_dir / "release.pub").read_text() == self.SUCCESSOR
+        assert not (staged.config_dir / "release.pub.next").exists()
+        assert "release key rotated" in staged.log(job_id)
+        # The update itself is then verified against the promoted key alone.
+        assert "release.pub.next" not in staged.update_sh_calls()[1]
+
+    def test_a_successor_that_is_not_a_pem_key_is_ignored(self, fakebin, tmp_path):
+        staged = _stage(tmp_path, fakebin)
+        sha = self._package_with_manifest(staged, {"successor_key": "not a key", "successor_key_id": "x"})
+        job_id = _request(staged, sha)
+        _run(staged)
+        assert staged.status(job_id)["state"] == "awaiting_verification"
+        assert not (staged.config_dir / "release.pub.next").exists()
+        assert "not a PEM public key" in staged.log(job_id)
+
+    def test_the_heartbeat_reports_the_key_ids_the_host_can_read(self, fakebin, tmp_path):
+        staged = _stage(tmp_path, fakebin)
+        (staged.config_dir / "release.pub.next").write_text(self.SUCCESSOR)
+        # An openssl whose DER output is 44 bytes of zero: the id is then the
+        # SHA-256 of 32 zero bytes, whatever key it was asked about.
+        fakebin.stub(
+            "openssl",
+            body='out=""; while [ $# -gt 0 ]; do case "$1" in -out) out="$2"; shift 2 ;; *) shift ;; esac; done; '
+            'head -c 44 /dev/zero > "$out"',
+        )
+        _run(staged)
+        beat = staged.heartbeat()
+        assert beat["key_id"] == "66687aadf862bd77" and beat["next_key_id"] == "66687aadf862bd77"
+
+    def test_without_openssl_the_key_ids_are_null(self, fakebin, tmp_path):
+        staged = _stage(tmp_path, fakebin)
+        fakebin.remove("openssl")
+        _run(staged)
+        beat = staged.heartbeat()
+        assert beat["key_id"] is None and beat["next_key_id"] is None
+
+
+class TestSelfUpdate:
+    """With SELF_UPDATE=1 the agent replaces itself with a newer copy a
+    verified package ships; off by default, and never a downgrade."""
+
+    def _agent(self, version: str, *, body: str = 'echo "hello"\n') -> str:
+        return f"#!/usr/bin/env bash\nAGENT_VERSION={version}\n{body}"
+
+    def test_off_by_default_the_agent_keeps_itself(self, fakebin, tmp_path):
+        staged = _stage(tmp_path, fakebin)
+        before = (staged.lib_dir / "epicurrents-updater.sh").read_text()
+        sha = _package(staged, _tarball(tmp_path, {"updater/epicurrents-updater.sh": self._agent("99")}))
+        job_id = _request(staged, sha)
+        _run(staged)
+        assert staged.status(job_id)["state"] == "awaiting_verification"
+        assert (staged.lib_dir / "epicurrents-updater.sh").read_text() == before
+
+    def test_on_a_newer_agent_replaces_this_one_after_the_gate(self, fakebin, tmp_path):
+        staged = _stage(tmp_path, fakebin, SELF_UPDATE=1)
+        before = (staged.lib_dir / "epicurrents-updater.sh").read_text()
+        files = {"updater/epicurrents-updater.sh": self._agent("99"), "updater/README.md": "# new readme\n"}
+        sha = _package(staged, _tarball(tmp_path, files))
+        job_id = _request(staged, sha)
+        _run(staged)
+        assert staged.status(job_id)["state"] == "awaiting_verification"
+        assert (staged.lib_dir / "epicurrents-updater.sh").read_text() == self._agent("99")
+        assert os.access(staged.lib_dir / "epicurrents-updater.sh", os.X_OK)
+        assert (staged.lib_dir / "epicurrents-updater.sh.previous").read_text() == before
+        assert (staged.lib_dir / "README.md").read_text() == "# new readme\n"
+        assert "agent updated to version 99" in staged.log(job_id)
+        assert staged.heartbeat()["self_update"] is True
+
+    def test_an_older_or_equal_agent_is_kept(self, fakebin, tmp_path):
+        staged = _stage(tmp_path, fakebin, SELF_UPDATE=1)
+        before = (staged.lib_dir / "epicurrents-updater.sh").read_text()
+        sha = _package(staged, _tarball(tmp_path, {"updater/epicurrents-updater.sh": self._agent("2")}))
+        job_id = _request(staged, sha)
+        _run(staged)
+        assert (staged.lib_dir / "epicurrents-updater.sh").read_text() == before
+        assert "this is 2; this one stays" in staged.log(job_id)
+
+    def test_an_agent_that_does_not_parse_is_kept(self, fakebin, tmp_path):
+        staged = _stage(tmp_path, fakebin, SELF_UPDATE=1)
+        before = (staged.lib_dir / "epicurrents-updater.sh").read_text()
+        broken = self._agent("99", body="if then fi\n")
+        sha = _package(staged, _tarball(tmp_path, {"updater/epicurrents-updater.sh": broken}))
+        job_id = _request(staged, sha)
+        _run(staged)
+        assert (staged.lib_dir / "epicurrents-updater.sh").read_text() == before
+        assert "does not parse" in staged.log(job_id)
+
+
+class TestHeartbeatSnapshots:
+    def test_the_heartbeat_lists_restorable_snapshots_newest_first(self, fakebin, tmp_path):
+        staged = _stage(tmp_path, fakebin)
+        _snapshot(
+            staged,
+            "pre-update-20260901-100000",
+            manifest="timestamp_utc=20260901-100000\nmode=archive\nversion=0.1.0\nmigrations=none\n",
+        )
+        _snapshot(staged, "backup-20260902-110000", manifest="mode=snapshot\nlabel=backup\nversion=0.1.1\n", code=False)
+        (staged.root / "backups" / "pre-update-20260903-000000").mkdir()  # half-written: no dump
+        (staged.root / "backups" / "notes.txt").write_text("")
+        _run(staged)
+        assert staged.heartbeat()["snapshots"] == [
+            {
+                "name": "backup-20260902-110000",
+                "taken_at": "2026-09-02T11:00:00Z",
+                "version": "0.1.1",
+                "code": False,
+                "migrations": None,
+            },
+            {
+                "name": "pre-update-20260901-100000",
+                "taken_at": "2026-09-01T10:00:00Z",
+                "version": "0.1.0",
+                "code": True,
+                "migrations": "none",
+            },
+        ]
+
+
 class TestInstaller:
     def _install(self, fakebin, tmp_path, *args, key=True, as_root=True):
         root = tmp_path / "deploy"
@@ -975,7 +1471,21 @@ exec /usr/bin/install "$@"
         result, _, etc, _, _ = self._install(fakebin, tmp_path, "--enable", "--allow-checkout")
         assert result.returncode == 0, result.stderr
         config = (etc / "config").read_text()
-        assert "ENABLED=1" in config and "ALLOW_CHECKOUT=1" in config
+        assert "ENABLED=1" in config and "ALLOW_CHECKOUT=1" in config and "SELF_UPDATE=0" in config
+
+    def test_self_update_is_off_unless_asked_for(self, fakebin, tmp_path):
+        result, _, etc, _, _ = self._install(fakebin, tmp_path, "--self-update")
+        assert result.returncode == 0, result.stderr
+        assert "SELF_UPDATE=1" in (etc / "config").read_text()
+        # A config from before the setting existed gains the line on a re-run with the flag.
+        (etc / "config").write_text(
+            "".join(
+                line + "\n" for line in (etc / "config").read_text().splitlines() if not line.startswith("SELF_UPDATE")
+            )
+        )
+        result, _, etc, _, _ = self._install(fakebin, tmp_path, "--self-update")
+        assert result.returncode == 0, result.stderr
+        assert (etc / "config").read_text().count("SELF_UPDATE=1") == 1
 
     def test_a_rerun_keeps_the_config(self, fakebin, tmp_path):
         result, root, etc, lib, units = self._install(fakebin, tmp_path, "--enable")
@@ -1014,5 +1524,6 @@ def test_the_agent_and_installer_parse_and_carry_a_version():
     for script in (AGENT, INSTALLER):
         subprocess.run(["bash", "-n", str(script)], check=True)
     body = AGENT.read_text()
-    assert "AGENT_VERSION=1" in body
+    assert "AGENT_VERSION=2" in body
     assert 'OPERATION_UPDATE="platform.update"' in body
+    assert 'OPERATION_BACKUP="platform.backup"' in body and 'OPERATION_ROLLBACK="platform.rollback"' in body

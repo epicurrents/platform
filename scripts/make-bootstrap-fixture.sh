@@ -90,6 +90,12 @@
 #                        when the platform version is not greater than the newest
 #                        release tag, because a remotely applied package must be
 #                        newer than what it replaces.
+#   --successor-key PATH Announce the next release key: the public key at PATH
+#                        (the .pub file keygen writes) goes into the signed
+#                        manifest and ships as RELEASE_KEY.next.pub, so a
+#                        deployment that applies this package trusts packages
+#                        signed with it from then on. Sign the release after
+#                        this one with the new key. Requires --sign-key.
 #   --network-name NAME  Docker network the package joins. Defaults to the
 #                        destination directory name, which is what keeps a
 #                        package off any other stack on the same host — see the
@@ -235,6 +241,8 @@ DEMO=false
 DIST=false
 TARBALL=false
 SIGN_KEY=""
+SIGN_KEY_ID=""
+SUCCESSOR_KEY=""
 NETWORK_NAME=""
 PROXY_DOMAIN_ARG=""
 ACME_EMAIL_ARG=""
@@ -255,6 +263,11 @@ while [ $# -gt 0 ]; do
             shift
             [ $# -gt 0 ] || die "--sign-key requires a key file path."
             SIGN_KEY="$1"
+            ;;
+        --successor-key)
+            shift
+            [ $# -gt 0 ] || die "--successor-key requires a public key file path."
+            SUCCESSOR_KEY="$1"
             ;;
         --with-project)
             shift
@@ -355,6 +368,14 @@ if [ -n "$SIGN_KEY" ]; then
     if [ -n "$NEWEST_TAG" ] && [ "$("$PYTHON" "$RELEASE_SIGN" vercmp "$PLATFORM_VERSION" "$NEWEST_TAG")" != 1 ]; then
         die "Refusing to sign version $PLATFORM_VERSION: the newest release tag is v$NEWEST_TAG, and a signed package must be newer than any release it could be applied over. Bump __version__ in epicurrents/version.py first."
     fi
+fi
+SUCCESSOR_KEY_ID=""
+if [ -n "$SUCCESSOR_KEY" ]; then
+    [ -n "$SIGN_KEY" ] || die "--successor-key announces the key that signs the next release; it needs --sign-key for this one."
+    [ -f "$SUCCESSOR_KEY" ] || die "--successor-key: no such file: $SUCCESSOR_KEY"
+    SUCCESSOR_KEY_ID="$("$PYTHON" "$RELEASE_SIGN" key-id "$SUCCESSOR_KEY" 2>/dev/null)" \
+        || die "--successor-key: $SUCCESSOR_KEY is not an Ed25519 public key (pass the .pub file keygen wrote)."
+    [ "$SUCCESSOR_KEY_ID" != "$SIGN_KEY_ID" ] || die "--successor-key names the key that signs this release; a successor is a different key."
 fi
 
 # Resolve DEST to an absolute path without requiring it to exist yet.
@@ -2027,6 +2048,15 @@ if [ "$TARBALL" = true ]; then
         cp "$SIGN_PUB" "$DEST/RELEASE_KEY.pub"
         chmod 0644 "$DEST/RELEASE_KEY.pub"
         ok "RELEASE_KEY.pub (key id $SIGN_KEY_ID)"
+        if [ -n "$SUCCESSOR_KEY" ]; then
+            # The platform trusts this key beside the current one once the
+            # package is installed, so the next release, signed with it, is
+            # accepted at upload; the manifest carries the same key for the
+            # host agent, which keeps its own root-owned copies.
+            cp "$SUCCESSOR_KEY" "$DEST/RELEASE_KEY.next.pub"
+            chmod 0644 "$DEST/RELEASE_KEY.next.pub"
+            ok "RELEASE_KEY.next.pub (successor key id $SUCCESSOR_KEY_ID)"
+        fi
     fi
 
     # update.sh overlays a package with rsync and no --delete, so a file a
@@ -2087,6 +2117,7 @@ if [ "$TARBALL" = true ]; then
         --min-updater-version "$MIN_UPDATER_VERSION" \
         --agent-version "${AGENT_VERSION:-0}" \
         --key-id "${SIGN_KEY_ID:-}" \
+        ${SUCCESSOR_KEY:+--successor-key "$SUCCESSOR_KEY"} \
         --out "$MANIFEST"
     ok "$MANIFEST"
     if [ -n "$SIGN_KEY" ]; then

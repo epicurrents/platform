@@ -1708,6 +1708,213 @@ class TestNamedSnapshots:
         assert "names a directory under" in result.stderr
 
 
+class TestCodeOnlyRollback:
+    """--rollback --code-only restores the code and rebuilds, keeping the
+    database and .env, and only while the migrations the database records as
+    applied are the ones the snapshot recorded — checked before anything is
+    touched, and refused by name so a caller can key on it.
+    """
+
+    def _seed(self, tmp_path, *, migrations="", with_code=True, record=True):
+        snap = TestRollback()._seed_snapshot(tmp_path, with_code=with_code)
+        if record:
+            (snap / "migrations.txt").write_text(migrations)
+        return snap
+
+    def _psql_answers(self, lines: str):
+        """A docker stub whose `exec … psql` prints ``lines`` (the applied migrations)."""
+        return _docker_stub(f'*" psql "*) cat >/dev/null 2>&1; printf \'{lines}\' ;;')
+
+    def test_restores_the_code_and_leaves_the_database_and_env_alone(self, fakebin, tmp_path):
+        _deploy(fakebin, tmp_path)
+        fakebin.stub("docker", body=self._psql_answers("a.0001\\n"))
+        fakebin.stub("rsync")
+        self._seed(tmp_path, migrations="a.0001\n")
+        env_before = (tmp_path / ".env").read_text()
+        result = run_script("update.sh", fakebin, cwd=tmp_path, args=["--rollback", "--yes", "--code-only"])
+        assert result.returncode == 0, result.stderr
+        lines = _progress(result)
+        assert "step=restore-code" in lines and "step=build" in lines and "restored=0.1.0" in lines
+        assert "step=restore-db" not in lines and "step=restore-env" not in lines
+        assert not any("psql --single-transaction" in c for c in fakebin.calls())
+        assert (tmp_path / ".env").read_text() == env_before
+        assert "the database and .env were kept" in result.stdout
+        assert lines[-1] == "done"
+
+    def test_refuses_when_a_migration_was_applied_since_the_snapshot(self, fakebin, tmp_path):
+        _deploy(fakebin, tmp_path)
+        fakebin.stub("docker", body=self._psql_answers("a.0001\\na.0002\\n"))
+        self._seed(tmp_path, migrations="a.0001\n")
+        result = run_script("update.sh", fakebin, cwd=tmp_path, args=["--rollback", "--yes", "--code-only"])
+        assert result.returncode != 0
+        lines = _progress(result)
+        assert "refused=code_only" in lines and lines.index("refused=code_only") < lines.index(next(l for l in lines if l.startswith("failed=")))
+        assert "Migrations were applied since" in result.stderr
+        assert not fakebin.has_call("stop web") and not fakebin.has_call("--force-recreate")
+        assert not (tmp_path / "update" / "maintenance.json").exists()
+
+    def test_the_record_is_compared_as_a_set_not_as_text(self, fakebin, tmp_path):
+        _deploy(fakebin, tmp_path)
+        fakebin.stub("docker", body=self._psql_answers("b.0001\\na.0001\\n"))
+        fakebin.stub("rsync")
+        self._seed(tmp_path, migrations="b.0001\na.0001\n")
+        result = run_script("update.sh", fakebin, cwd=tmp_path, args=["--rollback", "--yes", "--code-only"])
+        assert result.returncode == 0, result.stderr
+
+    def test_refuses_a_snapshot_without_a_migration_record(self, fakebin, tmp_path):
+        _deploy(fakebin, tmp_path)
+        self._seed(tmp_path, record=False)
+        result = run_script("update.sh", fakebin, cwd=tmp_path, args=["--rollback", "--yes", "--code-only"])
+        assert result.returncode != 0
+        assert "refused=code_only" in _progress(result) and "predates migration records" in result.stderr
+
+    def test_needs_a_snapshot_with_code(self, fakebin, tmp_path):
+        _deploy(fakebin, tmp_path)
+        self._seed(tmp_path, with_code=False)
+        result = run_script("update.sh", fakebin, cwd=tmp_path, args=["--rollback", "--yes", "--code-only"])
+        assert result.returncode != 0 and "needs a snapshot with a code archive" in result.stderr
+
+    def test_code_only_belongs_to_rollback(self, fakebin, tmp_path):
+        _deploy(fakebin, tmp_path)
+        result = run_script("update.sh", fakebin, cwd=tmp_path, args=["--code-only"])
+        assert result.returncode != 0 and "applies to --rollback only" in result.stderr
+
+    def test_a_full_rollback_still_restores_the_database_and_reports_the_version(self, fakebin, tmp_path):
+        _deploy(fakebin, tmp_path)
+        fakebin.stub("rsync")
+        TestRollback()._seed_snapshot(tmp_path, with_code=True)
+        result = run_script("update.sh", fakebin, cwd=tmp_path, args=["--rollback", "--yes"])
+        assert result.returncode == 0, result.stderr
+        lines = _progress(result)
+        assert "step=restore-db" in lines and "restored=0.1.0" in lines
+
+
+class TestMigrationRecords:
+    """Every snapshot records the migrations the database had applied, and an
+    update reports whether it applied any, which is what decides a code-only
+    rollback later.
+    """
+
+    def _counting_psql(self, tmp_path, *, changes_at: int):
+        """A docker stub whose psql answers grow by one migration from its ``changes_at``-th call on."""
+        counter = tmp_path / "psql-calls"
+        return _docker_stub(
+            f'*" psql "*) cat >/dev/null 2>&1; n=$(cat "{counter}" 2>/dev/null || echo 0); n=$((n + 1)); '
+            f'echo "$n" > "{counter}"; if [ "$n" -ge {changes_at} ]; then printf \'a.0001\\na.0002\\n\'; '
+            f'else printf \'a.0001\\n\'; fi ;;'
+        )
+
+    def test_a_named_snapshot_records_the_applied_migrations_sorted(self, fakebin, tmp_path):
+        _deploy(fakebin, tmp_path)
+        fakebin.stub("docker", body=_docker_stub('*" psql "*) cat >/dev/null 2>&1; printf \'b.0001\\na.0001\\n\' ;;'))
+        result = run_script("update.sh", fakebin, cwd=tmp_path, args=["--snapshot", "post-update"])
+        assert result.returncode == 0, result.stderr
+        snap = next((tmp_path / "backups").glob("post-update-*"))
+        assert (snap / "migrations.txt").read_text() == "a.0001\nb.0001\n"
+        assert any("django_migrations" in c for c in fakebin.calls())
+
+    def test_an_update_that_migrates_says_so_in_its_snapshot(self, fakebin, tmp_path):
+        _deploy(fakebin, tmp_path)
+        _build_package(tmp_path)
+        fakebin.stub("rsync")
+        fakebin.stub("curl")
+        # The snapshot reads once, the migrate step reads before and after:
+        # the third answer is the one that grew.
+        fakebin.stub("docker", body=self._counting_psql(tmp_path, changes_at=3))
+        result = run_script("update.sh", fakebin, cwd=tmp_path)
+        assert result.returncode == 0, result.stderr
+        lines = _progress(result)
+        assert "migrations=applied" in lines
+        assert lines.index("migrations=applied") > lines.index("step=migrate")
+        snap = next((tmp_path / "backups").glob("pre-update-*"))
+        manifest = (snap / "MANIFEST").read_text()
+        assert "migrations=applied" in manifest and "version=0.1.0" in manifest
+        assert (snap / "migrations.txt").read_text() == "a.0001\n"
+
+    def test_an_update_that_applies_nothing_says_none(self, fakebin, tmp_path):
+        _deploy(fakebin, tmp_path)
+        _build_package(tmp_path)
+        fakebin.stub("rsync")
+        fakebin.stub("curl")
+        fakebin.stub("docker", body=self._counting_psql(tmp_path, changes_at=99))
+        result = run_script("update.sh", fakebin, cwd=tmp_path)
+        assert result.returncode == 0, result.stderr
+        assert "migrations=none" in _progress(result)
+        snap = next((tmp_path / "backups").glob("pre-update-*"))
+        assert "migrations=none" in (snap / "MANIFEST").read_text()
+        assert "can be rolled back with --code-only" in result.stdout
+
+
+class TestSeveralReleaseKeys:
+    """--release-key is repeatable and the first key that verifies wins; by
+    default the key at the root and the successor beside it are both tried.
+    A successor a release announced is what lets the next release, signed with
+    it, verify on a deployment that never saw the new key by hand.
+    """
+
+    def _real_verification(self, fakebin):
+        # No usable openssl, so the check goes through python3 with cryptography
+        # — the suite's own interpreter — and a wrong key really fails.
+        fakebin.stub("openssl", body=OPENSSL_TOO_OLD)
+        fakebin.stub("python3", body=f'exec {sys.executable} "$@"')
+
+    def _other_key(self, tmp_path):
+        other = tmp_path / "keys" / "other.key"
+        _helper("keygen", str(other))
+        return other.with_name("other.key.pub")
+
+    def test_the_first_key_that_verifies_is_named(self, fakebin, tmp_path):
+        _deploy(fakebin, tmp_path)
+        key, pub = _sign_key(tmp_path)
+        wrong = self._other_key(tmp_path)
+        _build_package(tmp_path, sign_key=key)
+        fakebin.stub("rsync")
+        self._real_verification(fakebin)
+        result = run_script(
+            "update.sh", fakebin, cwd=tmp_path,
+            args=["--require-signature", "--release-key", str(wrong), "--release-key", str(pub)],
+        )
+        assert result.returncode == 0, result.stderr
+        lines = _progress(result)
+        assert "signature=verified" in lines and f"key={pub}" in lines
+
+    def test_the_successor_beside_the_root_key_is_tried_by_default(self, fakebin, tmp_path):
+        _deploy(fakebin, tmp_path)
+        key, pub = _sign_key(tmp_path)
+        shutil.copy(self._other_key(tmp_path), tmp_path / "RELEASE_KEY.pub")
+        shutil.copy(pub, tmp_path / "RELEASE_KEY.next.pub")
+        _build_package(tmp_path, sign_key=key)
+        fakebin.stub("rsync")
+        self._real_verification(fakebin)
+        result = run_script("update.sh", fakebin, cwd=tmp_path, args=["--require-signature"])
+        assert result.returncode == 0, result.stderr
+        assert f"key={tmp_path}/RELEASE_KEY.next.pub" in _progress(result)
+
+    def test_no_key_verifying_is_refused_by_name(self, fakebin, tmp_path):
+        _deploy(fakebin, tmp_path)
+        key, _ = _sign_key(tmp_path)
+        shutil.copy(self._other_key(tmp_path), tmp_path / "RELEASE_KEY.pub")
+        _build_package(tmp_path, sign_key=key)
+        self._real_verification(fakebin)
+        result = run_script("update.sh", fakebin, cwd=tmp_path, args=["--require-signature"])
+        assert result.returncode != 0
+        assert "refused=signature" in _progress(result) and "does NOT verify against" in result.stderr
+        assert not (tmp_path / "backups").exists()
+
+    def test_a_missing_key_among_several_is_skipped(self, fakebin, tmp_path):
+        _deploy(fakebin, tmp_path)
+        key, pub = _sign_key(tmp_path)
+        _build_package(tmp_path, sign_key=key)
+        fakebin.stub("rsync")
+        self._real_verification(fakebin)
+        result = run_script(
+            "update.sh", fakebin, cwd=tmp_path,
+            args=["--require-signature", "--release-key", str(tmp_path / "nope.pub"), "--release-key", str(pub)],
+        )
+        assert result.returncode == 0, result.stderr
+        assert f"key={pub}" in _progress(result)
+
+
 class TestPodmanAsRoot:
     @requires_gnu_stat
     def test_a_root_run_drives_podman_without_sudo(self, fakebin, tmp_path):

@@ -61,14 +61,20 @@ const clockOffset = ref(0)
 const now = ref(Date.now())
 let clockTimer: ReturnType<typeof setInterval> | undefined
 
+/** The one operation with a verification window; the confirm and roll-back actions belong to it alone. */
+const UPDATE_OPERATION = 'platform.update'
+
 const canCancel = computed(() => job.value?.state === 'requested')
-const canVerify = computed(() => job.value?.executor === 'host' && job.value.state === 'awaiting_verification')
+const isUpdate = computed(() => job.value?.operation === UPDATE_OPERATION)
+const canVerify = computed(() => isUpdate.value && job.value?.state === 'awaiting_verification')
 const canRollback = computed(() => {
-    if (job.value?.executor !== 'host') {
+    if (!isUpdate.value || !job.value) {
         return false
     }
     return job.value.state === 'awaiting_verification' || (job.value.state === 'succeeded' && job.value.snapshot !== '')
 })
+/** An update that applied no migration is rolled back with the database kept; the dialog says which it is. */
+const keepsDatabase = computed(() => job.value?.migrations_applied === false)
 
 /** Seconds left in the confirmation window, or null when there is none. */
 const secondsLeft = computed(() => {
@@ -125,7 +131,18 @@ const facts = computed(() => {
         rows.push({ label: t('Snapshot', SCOPE), value: current.snapshot })
     }
     if (current.post_snapshot) {
-        rows.push({ label: t('Post-update snapshot', SCOPE), value: current.post_snapshot })
+        rows.push({
+            label: current.operation === UPDATE_OPERATION ? t('Post-update snapshot', SCOPE) : t('Safety snapshot', SCOPE),
+            value: current.post_snapshot,
+        })
+    }
+    if (current.operation === UPDATE_OPERATION && current.migrations_applied !== null) {
+        rows.push({
+            label: t('Database', SCOPE),
+            value: current.migrations_applied
+                ? t('Migrated by this update; a rollback restores it', SCOPE)
+                : t('Unchanged by this update; a rollback keeps it', SCOPE),
+        })
     }
     if (Object.keys(current.args).length) {
         rows.push({ label: t('Arguments', SCOPE), value: JSON.stringify(current.args) })
@@ -386,7 +403,10 @@ onBeforeUnmount(() => {
             <wa-callout v-if="actionError" variant="danger">
                 {{ actionError }}
             </wa-callout>
-            <wa-callout variant="danger">
+            <wa-callout v-if="keepsDatabase" variant="warning">
+                {{ t('This update applied no migration, so rolling back restores the previous code and keeps the database; nothing written since the update is lost. The platform is unavailable while the previous release is rebuilt.', SCOPE) }}
+            </wa-callout>
+            <wa-callout v-else variant="danger">
                 {{ t('Rolling back restores the database as it was before the update. Everything written since then is lost, including your own changes. The platform is unavailable while the previous release is rebuilt.', SCOPE) }}
             </wa-callout>
             <StepUpFields :credentials="credentials" :step-up="stepUp" />

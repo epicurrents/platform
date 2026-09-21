@@ -137,6 +137,9 @@ class MaintenanceJob(models.Model):
     running_version = models.CharField(max_length=32, blank=True)
     snapshot = models.CharField(max_length=128, blank=True)
     post_snapshot = models.CharField(max_length=128, blank=True)
+    # Whether the update applied a migration; null until the agent has run
+    # migrate. False is what lets a rollback keep the database.
+    migrations_applied = models.BooleanField(null=True, blank=True)
     last_notified_state = models.CharField(max_length=32, blank=True)
 
     class Meta:

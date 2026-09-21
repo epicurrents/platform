@@ -135,6 +135,8 @@ its snapshot (a reboot mid-update, typically); nothing was changed and the
 platform is serving the previous release. Nothing to repair — check the job's
 log for what was attempted, then request the update again.
 
+**A rollback requested from the snapshots section ended in `rollback_failed`.** The same recovery as above: the job page names the snapshot, and the safety snapshot the agent took first is `pre-rollback-<stamp>` under `backups/`, holding what the database had before the attempt. A job that ended `failed` with `refused_code_only` or `snapshot_failed` changed nothing: the first means the database could not be kept because a migration was applied since the snapshot (request the rollback again with the database restored), the second that a snapshot did not complete (check the host's disk).
+
 **"Agent not running" on the Maintenance tab.** The timer is stopped or the
 agent is failing before it writes its heartbeat:
 

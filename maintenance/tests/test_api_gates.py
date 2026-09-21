@@ -6,6 +6,7 @@ import pytest
 from django.test import override_settings
 
 from epicurrents.throttle import _scope_for_path
+from maintenance import spool
 from maintenance.models import MaintenanceJob
 
 BASE = "/api/v1/maintenance"
@@ -94,6 +95,29 @@ class TestHostTierFlag:
         listing = {op["key"]: op for op in client.get(f"{BASE}/operations").json()}
         assert listing["platform.update"]["available"] is False
         assert listing["activity.verify_audit_integrity"]["available"] is True
+
+    def test_a_host_operation_the_agent_does_not_carry_out_is_unavailable(self, host_enabled, staff_client):
+        client, _ = staff_client
+        spool.write_json_atomic(
+            spool.spool_path() / "agent.json",
+            {
+                "protocol": 1,
+                "version": "1",
+                "enabled": True,
+                "last_run": spool.now_iso(),
+                "capabilities": ["platform.update"],
+            },
+        )
+        listing = {op["key"]: op for op in client.get(f"{BASE}/operations").json()}
+        assert listing["platform.update"]["available"] is True
+        assert listing["platform.backup"]["available"] is False
+        assert listing["platform.rollback"]["available"] is False
+        assert listing["activity.verify_audit_integrity"]["available"] is True
+
+    def test_before_any_heartbeat_the_tier_alone_decides(self, host_enabled, staff_client):
+        client, _ = staff_client
+        listing = {op["key"]: op for op in client.get(f"{BASE}/operations").json()}
+        assert all(listing[key]["available"] for key in ("platform.update", "platform.backup", "platform.rollback"))
 
     def test_and_available_once_it_is_on(self, host_enabled, staff_client):
         client, _ = staff_client

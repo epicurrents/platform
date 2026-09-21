@@ -559,6 +559,62 @@ class TestRequestingAnUpdate:
 
 
 @pytest.mark.django_db
+class TestSuccessorKey:
+    """A release announces its successor by shipping RELEASE_KEY.next.pub beside
+    the current key; the platform then accepts uploads signed with either.
+    """
+
+    def _successor(self, tmp_path):
+        from cryptography.hazmat.primitives import serialization
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+        private = Ed25519PrivateKey.generate()
+        (tmp_path / "RELEASE_KEY.next.pub").write_bytes(
+            private.public_key().public_bytes(
+                serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo
+            )
+        )
+        return Signer(private)
+
+    def test_a_package_signed_with_the_successor_is_accepted(self, ready, tmp_path):
+        successor = self._successor(tmp_path)
+        data = tarball()
+        manifest = manifest_for(data)
+        assert post_package(ready.client, data, manifest, successor.sign(manifest)).status_code == 201
+        # And the current key still works for the release that announced it.
+        other = tarball(filler=b"x")
+        manifest = manifest_for(other)
+        assert post_package(ready.client, other, manifest, ready.key.sign(manifest)).status_code == 201
+
+    def test_a_key_nobody_announced_is_still_refused(self, ready, tmp_path):
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+        stranger = Signer(Ed25519PrivateKey.generate())
+        data = tarball()
+        manifest = manifest_for(data)
+        response = post_package(ready.client, data, manifest, stranger.sign(manifest))
+        assert response.status_code == 400 and response.json()["reason"] == "signature"
+
+    def test_a_successor_that_cannot_be_read_is_ignored(self, ready, tmp_path):
+        (tmp_path / "RELEASE_KEY.next.pub").write_text("not a key")
+        assert upload(ready).status_code == 201
+        status = ready.client.get(f"{BASE}/status").json()
+        assert status["release_key_present"] is True and len(status["release_key_ids"]) == 1
+
+    def test_status_lists_the_ids_of_both_keys(self, ready, tmp_path):
+        self._successor(tmp_path)
+        ids = ready.client.get(f"{BASE}/status").json()["release_key_ids"]
+        assert len(ids) == 2 and all(len(item) == 16 for item in ids)
+        assert ids[0] == packaging.key_id(packaging.load_release_key())
+
+    def test_the_successor_path_sits_beside_the_current_key(self):
+        from pathlib import Path
+
+        assert packaging.successor_key_path(Path("/x/RELEASE_KEY.pub")) == Path("/x/RELEASE_KEY.next.pub")
+        assert packaging.successor_key_path(Path("/x/release")) == Path("/x/release.next")
+
+
+@pytest.mark.django_db
 class TestAgentSummary:
     def test_capabilities_and_the_updater_script_version_pass_through(self, enabled, staff_client):
         client, _ = staff_client

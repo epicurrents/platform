@@ -176,12 +176,13 @@ PROGRESS_STEPS_ROLLBACK = [
     "step=restore-db", "step=restore-env", "step=restore-code", "step=build",
 ]
 PROGRESS_FACTS = ["snapshot=", "health=ok", "health=failed", "done", "failed=", "check=ok", "refused=",
-                  "archive=", "manifest=", "signature=", "sha256=", "version=", "installed=", "orphan_candidates="]
+                  "archive=", "manifest=", "signature=", "sha256=", "version=", "installed=", "orphan_candidates=",
+                  "key=", "migrations=", "restored="]
 
 # The reasons a refusal can name on a ::refused= line. The host agent turns the
 # token into the job's failure reason (refused_<token>), so its README and the
 # script move together.
-REFUSAL_TOKENS = ["signature", "hash", "manifest", "updater_too_old", "incompatible", "version_not_newer"]
+REFUSAL_TOKENS = ["signature", "hash", "manifest", "updater_too_old", "incompatible", "version_not_newer", "code_only"]
 
 
 def test_update_sh_emits_every_progress_line_a_caller_parses():

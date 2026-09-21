@@ -139,6 +139,9 @@ class TestEveryEndpointIsGated:
         for operation in registered_operations():
             assert not FORBIDDEN_ARG_FIELDS & set(operation.args_schema.model_fields), operation.key
             for name, info in operation.args_schema.model_fields.items():
-                assert info.annotation is not str or name == "package_sha256", (
+                if info.annotation is not str:
+                    continue
+                # A string reaches argv or a spool request; every one is pinned to a shape.
+                assert any(getattr(item, "pattern", None) for item in info.metadata), (
                     f"{operation.key}.{name} is a free string; strings reach argv and need a pattern"
                 )

@@ -170,6 +170,114 @@ class TestCreateHostJob:
         assert not MaintenanceJob.objects.exists()
 
 
+def _heartbeat(snapshots=None, capabilities=("platform.update", "platform.backup", "platform.rollback")):
+    spool.write_json_atomic(
+        spool.spool_path() / "agent.json",
+        {
+            "protocol": 1,
+            "version": "2",
+            "enabled": True,
+            "runtime": "docker",
+            "last_run": spool.now_iso(),
+            "capabilities": list(capabilities),
+            "snapshots": snapshots or [],
+        },
+    )
+
+
+SNAPSHOT = {
+    "name": "backup-20260901-100000",
+    "taken_at": "2026-09-01T10:00:00Z",
+    "version": "0.1.0",
+    "code": True,
+    "migrations": None,
+}
+
+
+@pytest.mark.django_db
+class TestSnapshotOperations:
+    """platform.backup takes nothing; platform.rollback names a snapshot the agent reports."""
+
+    def test_a_rollback_request_names_a_reported_snapshot(
+        self, host_enabled, superuser_client, django_capture_on_commit_callbacks
+    ):
+        client, user = superuser_client
+        _heartbeat([SNAPSHOT])
+        with django_capture_on_commit_callbacks(execute=True):
+            response = _post(
+                client,
+                f"{BASE}/jobs",
+                {
+                    "operation": "platform.rollback",
+                    "args": {"snapshot": SNAPSHOT["name"], "restore_database": False},
+                    "password": PASSWORD,
+                },
+            )
+        assert response.status_code == 202, response.content
+        body = response.json()
+        assert body["target_version"] == "0.1.0" and body["package_sha256"] is None
+        request = spool.read_request(body["job_id"])
+        assert request["operation"] == "platform.rollback"
+        assert request["args"] == {"snapshot": SNAPSHOT["name"], "restore_database": False}
+
+    def test_a_snapshot_the_agent_does_not_report_is_400(self, host_enabled, superuser_client):
+        client, _ = superuser_client
+        _heartbeat([SNAPSHOT])
+        response = _post(
+            client,
+            f"{BASE}/jobs",
+            {"operation": "platform.rollback", "args": {"snapshot": "backup-20260902-100000"}, "password": PASSWORD},
+        )
+        assert response.status_code == 400 and "no snapshot by that name" in response.json()["detail"]
+        assert not MaintenanceJob.objects.exists()
+
+    def test_a_malformed_snapshot_name_never_reaches_the_spool(self, host_enabled, superuser_client):
+        client, _ = superuser_client
+        _heartbeat([SNAPSHOT])
+        for bad in ("../../etc/passwd", "backup-x", "", "backup-20260901-100000; rm -rf /"):
+            response = _post(
+                client,
+                f"{BASE}/jobs",
+                {"operation": "platform.rollback", "args": {"snapshot": bad}, "password": PASSWORD},
+            )
+            assert response.status_code == 400, bad
+            assert "Invalid arguments" in response.json()["detail"], bad
+        assert not MaintenanceJob.objects.exists()
+
+    def test_without_a_heartbeat_the_agent_is_left_to_decide(
+        self, host_enabled, superuser_client, django_capture_on_commit_callbacks
+    ):
+        client, _ = superuser_client
+        with django_capture_on_commit_callbacks(execute=True):
+            response = _post(
+                client,
+                f"{BASE}/jobs",
+                {"operation": "platform.rollback", "args": {"snapshot": SNAPSHOT["name"]}, "password": PASSWORD},
+            )
+        assert response.status_code == 202, response.content
+        assert response.json()["target_version"] == ""
+
+    def test_a_backup_request_takes_no_arguments(
+        self, host_enabled, superuser_client, django_capture_on_commit_callbacks
+    ):
+        client, _ = superuser_client
+        _heartbeat()
+        with django_capture_on_commit_callbacks(execute=True):
+            response = _post(client, f"{BASE}/jobs", {"operation": "platform.backup", "password": PASSWORD})
+        assert response.status_code == 202, response.content
+        request = spool.read_request(response.json()["job_id"])
+        assert request["args"] == {} and request["operation"] == "platform.backup"
+
+    def test_the_row_carries_the_migrations_fact_the_agent_reports(
+        self, host_enabled, staff_client, superuser, write_status
+    ):
+        client, _ = staff_client
+        job = _host_job(superuser, state=MaintenanceJob.State.RUNNING)
+        write_status(job.job_id, "awaiting_verification", migrations_applied=False)
+        body = client.get(f"{BASE}/jobs/{job.job_id}").json()
+        assert body["migrations_applied"] is False
+
+
 @pytest.mark.django_db
 class TestReadJobs:
     def test_staff_see_jobs_without_output_and_superusers_with_it(self, enabled, staff_client, superuser):
@@ -301,6 +409,22 @@ class TestVerifyAndRollback:
         job = MaintenanceJob.objects.create(operation="a.b", executor="celery", state="succeeded", in_flight=False)
         assert _post(client, f"{BASE}/jobs/{job.job_id}/verify", {"password": PASSWORD}).status_code == 409
         assert _post(client, f"{BASE}/jobs/{job.job_id}/rollback", {"password": PASSWORD}).status_code == 409
+
+    def test_a_job_that_is_not_an_update_has_neither_action(self, host_enabled, superuser_client):
+        client, user = superuser_client
+        job = MaintenanceJob.objects.create(
+            operation="platform.backup",
+            executor=MaintenanceJob.Executor.HOST,
+            requested_by=user,
+            state=MaintenanceJob.State.SUCCEEDED,
+            in_flight=False,
+            snapshot="backup-20260901-100000",
+        )
+        response = _post(client, f"{BASE}/jobs/{job.job_id}/rollback", {"password": PASSWORD})
+        assert response.status_code == 409 and "Only an update" in response.json()["detail"]
+        response = _post(client, f"{BASE}/jobs/{job.job_id}/verify", {"password": PASSWORD})
+        assert response.status_code == 409 and "Only an update" in response.json()["detail"]
+        assert not spool.marker_path(job.job_id, "rollback").exists()
 
     def test_the_host_tier_flag_does_not_gate_verify_or_rollback(self, enabled, superuser_client):
         """A window opened while the flag was on must still be closable after an operator turns it off."""

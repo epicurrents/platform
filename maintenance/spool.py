@@ -21,6 +21,7 @@ the ones a restore removed, and is the only reader of ``status.json``.
 
 import logging
 import os
+import re
 import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -49,6 +50,9 @@ ORPHAN_GRACE = timedelta(seconds=60)
 AGENT_STALE_SECONDS = 120
 # Byte cap on the log tail an API caller receives.
 LOG_TAIL_BYTES = 64 * 1024
+# A snapshot name as the agent reports them; anything else in a heartbeat's
+# snapshot list is dropped rather than shown.
+SNAPSHOT_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*-[0-9]{8}-[0-9]{6}$")
 
 # The status.json fields copied onto the row, by name.
 _STATUS_TEXT_FIELDS = (
@@ -70,6 +74,7 @@ _STATUS_ROW_FIELDS = (
     "in_flight",
     *_STATUS_TEXT_FIELDS,
     *_STATUS_TIME_FIELDS,
+    "migrations_applied",
     "spool_updated_at",
     "last_notified_state",
 )
@@ -211,6 +216,35 @@ def read_agent() -> dict | None:
     return read_json(spool_path() / "agent.json")
 
 
+def _snapshot_rows(value) -> list[dict]:
+    """The heartbeat's snapshot list, kept to rows of the expected shape; anything else is dropped."""
+    rows: list[dict] = []
+    if not isinstance(value, list):
+        return rows
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        name = item.get("name")
+        if not isinstance(name, str) or not SNAPSHOT_NAME_RE.match(name):
+            continue
+        migrations = item.get("migrations")
+        version = item.get("version")
+        rows.append(
+            {
+                "name": name,
+                "taken_at": item["taken_at"] if isinstance(item.get("taken_at"), str) else None,
+                "version": str(version) if version not in (None, "") else None,
+                "code": bool(item.get("code")),
+                "migrations": migrations if migrations in ("none", "applied") else None,
+            }
+        )
+    return rows
+
+
+def _optional_str(value) -> str | None:
+    return str(value) if value not in (None, "") else None
+
+
 def agent_summary(now: datetime | None = None) -> dict:
     """What the status endpoint says about the agent, from its heartbeat file."""
     data = read_agent()
@@ -224,6 +258,10 @@ def agent_summary(now: datetime | None = None) -> dict:
             "stale": None,
             "capabilities": [],
             "updater_script": None,
+            "self_update": None,
+            "key_id": None,
+            "next_key_id": None,
+            "snapshots": [],
         }
     now = now or timezone.now()
     last_run = data.get("last_run") if isinstance(data.get("last_run"), str) else None
@@ -245,6 +283,10 @@ def agent_summary(now: datetime | None = None) -> dict:
         "stale": stale,
         "capabilities": [str(item) for item in capabilities] if isinstance(capabilities, list) else [],
         "updater_script": updater_script,
+        "self_update": data["self_update"] if isinstance(data.get("self_update"), bool) else None,
+        "key_id": _optional_str(data.get("key_id")),
+        "next_key_id": _optional_str(data.get("next_key_id")),
+        "snapshots": _snapshot_rows(data.get("snapshots")),
     }
 
 
@@ -331,6 +373,8 @@ def _apply_status(job, status: dict) -> bool:
         setattr(job, name, str(value) if value is not None else "")
     for name in _STATUS_TIME_FIELDS:
         setattr(job, name, parse_timestamp(status.get(name)))
+    applied = status.get("migrations_applied")
+    job.migrations_applied = applied if isinstance(applied, bool) else None
     job.spool_updated_at = updated_at
     return True
 

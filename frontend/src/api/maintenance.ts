@@ -12,6 +12,18 @@
 
 import { http } from '#lib/http'
 
+/** A snapshot on the host, as the agent's heartbeat lists it. The name is what a roll-back request sends. */
+export interface HostSnapshot {
+    name: string
+    taken_at: string | null
+    /** The platform version the snapshot's code carries, when its manifest records one. */
+    version: string | null
+    /** Whether the snapshot holds a code archive; without one only the database can be restored. */
+    code: boolean
+    /** What the update after a pre-update snapshot did to the schema; 'none' lets a rollback keep the database. */
+    migrations: 'none' | 'applied' | null
+}
+
 /** The host agent as its heartbeat describes it; `installed` false when no heartbeat exists. */
 export interface AgentStatus {
     installed: boolean
@@ -24,6 +36,13 @@ export interface AgentStatus {
     capabilities: string[]
     /** The `UPDATER_SCRIPT_VERSION` of the update script the agent runs, when it reported one. */
     updater_script: number | null
+    /** Whether the agent replaces itself from a verified package (`SELF_UPDATE=1`). */
+    self_update: boolean | null
+    /** The id of the release key the agent verifies packages against, when its host can compute it. */
+    key_id: string | null
+    /** The id of a successor key a release announced, trusted until a package signed with it verifies. */
+    next_key_id: string | null
+    snapshots: HostSnapshot[]
 }
 
 /** The maintenance flag, when the platform is locked. */
@@ -49,6 +68,8 @@ export interface MaintenanceStatus {
     server_now: string
     spool_writable: boolean
     release_key_present: boolean
+    /** The ids of the keys the platform accepts uploads from: the current one and, when announced, its successor. */
+    release_key_ids: string[]
     agent: AgentStatus
     lock: MaintenanceLockInfo | null
     in_flight_job: string | null
@@ -118,6 +139,8 @@ export interface MaintenanceJob {
     running_version: string
     snapshot: string
     post_snapshot: string
+    /** Whether the update applied a migration; null until it has migrated. False lets a rollback keep the database. */
+    migrations_applied: boolean | null
     /** Present for superusers only. */
     output: string | null
 }

@@ -1,16 +1,17 @@
 <script setup lang="ts">
 /**
- * Maintenance — the deployment's state, the operations a superuser may run, uploaded update packages, and recent jobs.
+ * Maintenance — the deployment's state, the operations a superuser may run, uploaded update packages, the
+ * snapshots the host holds, and recent jobs.
  *
  * Staff read everything here; only a superuser sees the run, upload and
  * remove controls, matching the tier the API enforces. An operation's form is
  * built from the argument schema the server publishes, so a project's
- * registered operation gets a form without a frontend change; the one
- * argument the form knows by name is `package_sha256`, which it renders as a
- * choice among the applicable packages rather than a hash to type. The
- * step-up inputs come from the method the status reports for this account,
- * and an account that cannot confirm is told so instead of failing at the
- * submit.
+ * registered operation gets a form without a frontend change; the two
+ * arguments the form knows by name are `package_sha256`, rendered as a choice
+ * among the applicable packages rather than a hash to type, and `snapshot`,
+ * rendered as a choice among the snapshots the agent reports. The step-up
+ * inputs come from the method the status reports for this account, and an
+ * account that cannot confirm is told so instead of failing at the submit.
  *
  * A package is uploaded as the three files the packager writes, picked
  * together from one file input and sorted by name; the server verifies the
@@ -33,6 +34,7 @@ import {
     listPackages,
     uploadPackage,
     type ArgSchemaProperty,
+    type HostSnapshot,
     type MaintenanceJob,
     type MaintenanceOperation,
     type MaintenancePackage,
@@ -49,7 +51,11 @@ const SCOPE = 'AdminMaintenanceView'
 
 /** The argument of `platform.update` the form renders as a package choice. */
 const PACKAGE_ARG = 'package_sha256'
+/** The argument of `platform.rollback` the form renders as a snapshot choice. */
+const SNAPSHOT_ARG = 'snapshot'
 const UPDATE_OPERATION = 'platform.update'
+const BACKUP_OPERATION = 'platform.backup'
+const ROLLBACK_OPERATION = 'platform.rollback'
 
 const authStore = useAuthStore()
 const maintenanceStore = useMaintenanceStore()
@@ -90,9 +96,29 @@ const hostTier = computed(() => status.value?.remote_update_enabled === true)
 const inFlight = computed(() => jobs.value.find(job => job.in_flight) ?? null)
 
 const updateOperation = computed(() => operations.value.find(operation => operation.key === UPDATE_OPERATION) ?? null)
+const backupOperation = computed(() => operations.value.find(operation => operation.key === BACKUP_OPERATION) ?? null)
+const rollbackOperation = computed(() => operations.value.find(operation => operation.key === ROLLBACK_OPERATION) ?? null)
 const applicablePackages = computed(() => packages.value.filter(pkg => pkg.applicable))
 /** The section shows once the host tier is on, and stays for the history once anything was uploaded. */
 const showPackages = computed(() => hostTier.value || packages.value.length > 0)
+/** The snapshots the agent reports; the section shows once an agent has reported and the host tier is on. */
+const snapshots = computed(() => status.value?.agent.snapshots ?? [])
+const showSnapshots = computed(() => hostTier.value && status.value?.agent.installed === true)
+
+/** The release keys in play: what the platform accepts uploads from, and what the agent trusts. */
+const releaseKeySummary = computed(() => {
+    const current = status.value
+    if (!current) {
+        return ''
+    }
+    const platform = current.release_key_ids.length ? current.release_key_ids.join(', ') : t('none', SCOPE)
+    const agent = current.agent
+    if (!agent.installed || !agent.key_id) {
+        return platform
+    }
+    const trusted = agent.next_key_id ? `${agent.key_id}, ${agent.next_key_id}` : agent.key_id
+    return t('{platform} (agent trusts {trusted})', SCOPE, { platform, trusted })
+})
 const uploadReady = computed(() => Boolean(picked.package && picked.manifest && picked.signature))
 
 const agentSummary = computed(() => {
@@ -167,6 +193,10 @@ function isPackageArg (name: string) {
     return name === PACKAGE_ARG
 }
 
+function isSnapshotArg (name: string) {
+    return name === SNAPSHOT_ARG
+}
+
 function openRun (operation: MaintenanceOperation, preset: Record<string, unknown> = {}) {
     runError.value = ''
     selected.value = operation
@@ -180,6 +210,9 @@ function openRun (operation: MaintenanceOperation, preset: Record<string, unknow
     // nearly always the one meant; the select still lets another be picked.
     if (PACKAGE_ARG in argValues && applicablePackages.value.length > 0) {
         argValues[PACKAGE_ARG] = applicablePackages.value[0]!.sha256
+    }
+    if (SNAPSHOT_ARG in argValues && snapshots.value.length > 0) {
+        argValues[SNAPSHOT_ARG] = snapshots.value[0]!.name
     }
     Object.assign(argValues, preset)
     credentials.password = ''
@@ -248,9 +281,50 @@ function applyPackage (pkg: MaintenancePackage) {
     openRun(operation, { [PACKAGE_ARG]: pkg.sha256 })
 }
 
+/** Whether a host operation can be requested now: registered, its tier and agent ready, nothing in flight, step-up possible. */
+function canRunHost (operation: MaintenanceOperation | null) {
+    return operation !== null && operation.available && inFlight.value === null && stepUp.value.available
+}
+
 function canApply (pkg: MaintenancePackage) {
-    const operation = updateOperation.value
-    return pkg.applicable && operation !== null && operation.available && inFlight.value === null && stepUp.value.available
+    return pkg.applicable && canRunHost(updateOperation.value)
+}
+
+const canTakeSnapshot = computed(() => canRunHost(backupOperation.value))
+const canRestoreSnapshot = computed(() => canRunHost(rollbackOperation.value))
+
+function takeSnapshot () {
+    const operation = backupOperation.value
+    if (!operation) {
+        return
+    }
+    openRun(operation)
+}
+
+/** Open the roll-back form with this snapshot chosen. */
+function restoreSnapshot (snapshot: HostSnapshot) {
+    const operation = rollbackOperation.value
+    if (!operation) {
+        return
+    }
+    openRun(operation, { [SNAPSHOT_ARG]: snapshot.name })
+}
+
+/** How a snapshot came to be, from the label update.sh gave it. */
+function snapshotKindLabel (snapshot: HostSnapshot) {
+    if (snapshot.name.startsWith('pre-update-')) {
+        return t('Before an update', SCOPE)
+    }
+    if (snapshot.name.startsWith('post-update-')) {
+        return t('Before a rollback', SCOPE)
+    }
+    if (snapshot.name.startsWith('pre-rollback-')) {
+        return t('Before a rollback', SCOPE)
+    }
+    if (snapshot.name.startsWith('backup-')) {
+        return t('Requested', SCOPE)
+    }
+    return t('Manual', SCOPE)
 }
 
 function canRemove (pkg: MaintenancePackage) {
@@ -408,6 +482,10 @@ onMounted(load)
                         {{ agentSummary.text }}
                     </wa-badge>
                 </dd>
+                <template v-if="hostTier">
+                    <dt>{{ t('Release key', SCOPE) }}</dt>
+                    <dd>{{ releaseKeySummary }}</dd>
+                </template>
             </dl>
 
             <wa-callout v-if="status && !status.spool_writable" variant="warning">
@@ -530,6 +608,62 @@ onMounted(load)
                 </div>
             </section>
 
+            <section v-if="showSnapshots" class="maintenance-section">
+                <div class="section-header">
+                    <h2>{{ t('Snapshots on the host', SCOPE) }}</h2>
+                    <wa-button v-if="canWrite && backupOperation"
+                        appearance="plain"
+                        :disabled="!canTakeSnapshot"
+                        size="s"
+                        variant="brand"
+                        @click="takeSnapshot"
+                    >
+                        <wa-icon name="camera" slot="start"></wa-icon>
+                        {{ t('Take a snapshot', SCOPE) }}
+                    </wa-button>
+                </div>
+                <p class="maintenance-hint">
+                    {{ t('A snapshot holds the code, the database and the configuration as they were. Rolling back to one restores the database too unless it is kept, and the platform is unavailable while the release is rebuilt.', SCOPE) }}
+                </p>
+                <p v-if="!snapshots.length" class="empty-state">
+                    {{ t('The host holds no snapshot. One is taken before every update, and one can be requested here.', SCOPE) }}
+                </p>
+                <div v-else class="list-rows">
+                    <div v-for="snapshot in snapshots" :key="snapshot.name" class="list-row">
+                        <div class="list-row-main operation-row">
+                            <div class="operation-text">
+                                <span class="list-row-name">{{ snapshot.name }}</span>
+                                <span class="operation-description">
+                                    {{ snapshotKindLabel(snapshot) }}
+                                    <template v-if="snapshot.version"> · {{ t('version {version}', SCOPE, { version: snapshot.version }) }}</template>
+                                </span>
+                                <div class="row-badges">
+                                    <wa-badge v-if="!snapshot.code" appearance="outlined" variant="warning">
+                                        {{ t('Database only', SCOPE) }}
+                                    </wa-badge>
+                                    <wa-badge v-if="snapshot.migrations === 'none'" appearance="outlined" variant="success">
+                                        {{ t('No migration since', SCOPE) }}
+                                    </wa-badge>
+                                    <span v-if="snapshot.taken_at" class="list-row-meta">
+                                        <wa-relative-time :date="snapshot.taken_at"></wa-relative-time>
+                                    </span>
+                                </div>
+                            </div>
+                            <wa-button v-if="canWrite && rollbackOperation"
+                                appearance="plain"
+                                :disabled="!canRestoreSnapshot"
+                                size="s"
+                                variant="danger"
+                                @click="restoreSnapshot(snapshot)"
+                            >
+                                <wa-icon name="rotate-left" slot="start"></wa-icon>
+                                {{ t('Roll back to this', SCOPE) }}
+                            </wa-button>
+                        </div>
+                    </div>
+                </div>
+            </section>
+
             <section class="maintenance-section">
                 <div class="section-header">
                     <h2>{{ t('Jobs', SCOPE) }}</h2>
@@ -579,6 +713,23 @@ onMounted(load)
                     </wa-select>
                     <wa-callout v-else variant="warning">
                         {{ t('No uploaded package is newer than the installed version. Upload one first.', SCOPE) }}
+                    </wa-callout>
+                </template>
+                <template v-else-if="isSnapshotArg(name)">
+                    <wa-select v-if="snapshots.length"
+                        :help-text="selected.args_schema.properties![name]!.description"
+                        :label="t('Snapshot', SCOPE)"
+                        v-wa="[argValues, name]"
+                    >
+                        <wa-option v-for="snapshot in snapshots" :key="snapshot.name" :value="snapshot.name">
+                            {{ snapshot.version ? t('{name} (version {version})', SCOPE, { name: snapshot.name, version: snapshot.version }) : snapshot.name }}
+                        </wa-option>
+                    </wa-select>
+                    <wa-callout v-else variant="warning">
+                        {{ t('The host holds no snapshot to roll back to.', SCOPE) }}
+                    </wa-callout>
+                    <wa-callout variant="danger">
+                        {{ t('Rolling back restores the snapshot over the running platform. Unless the database is kept, everything written since the snapshot is lost. The platform is unavailable while the release is rebuilt.', SCOPE) }}
                     </wa-callout>
                 </template>
                 <wa-switch v-else-if="argType(selected.args_schema.properties![name]!) === 'boolean'" v-wa="[argValues, name]">

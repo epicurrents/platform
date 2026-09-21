@@ -152,6 +152,7 @@ const FA_TO_MATERIAL: Record<string, string> = {
     'bell':                        'notifications',
     'book-open':                   'menu_book',
     'check':                       'check',
+    'camera':                      'photo_camera',
     'circle-check':                'check_circle',
     'circle-exclamation':          'error',
     'circle-info':                 'info',

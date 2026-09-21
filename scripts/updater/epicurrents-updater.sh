@@ -18,14 +18,28 @@
 # it onto the job row, and to the system journal, which survives the database
 # restore a rollback performs.
 #
+# Three operations. platform.update applies a package as above; a release
+# that applied no migration is rolled back with --code-only, which keeps the
+# database and everything written since. platform.backup takes a snapshot of
+# code, database and .env without stopping anything. platform.rollback
+# restores a named snapshot, the database too unless the request says to keep
+# it. A release may announce the key that signs the next one; the agent
+# installs that successor beside the current key and promotes it the first
+# time a package verifies with it. With SELF_UPDATE=1 the agent replaces
+# itself with the copy a verified package ships.
+#
 # Configuration: /etc/epicurrents-updater/config (see install-updater.sh).
 # The full protocol is in docs/engineering-notes/remote-maintenance-design.md.
 #
 set -euo pipefail
 
-AGENT_VERSION=1
+AGENT_VERSION=2
 PROTOCOL=1
 OPERATION_UPDATE="platform.update"
+OPERATION_BACKUP="platform.backup"
+OPERATION_ROLLBACK="platform.rollback"
+# update.sh from this version on takes --code-only and several --release-key.
+UPDATER_SCRIPT_CODE_ONLY=3
 
 CONFIG_DIR="${EPICURRENTS_UPDATER_CONFIG_DIR:-/etc/epicurrents-updater}"
 LIB_DIR="${EPICURRENTS_UPDATER_LIB_DIR:-/usr/local/lib/epicurrents-updater}"
@@ -40,12 +54,19 @@ LOG_CAP="${EPICURRENTS_UPDATER_LOG_CAP:-8388608}"
 POLL_SECONDS="${EPICURRENTS_UPDATER_POLL_SECONDS:-5}"
 
 UPDATE_SH="$LIB_DIR/update.sh"
+AGENT_SELF="$LIB_DIR/epicurrents-updater.sh"
 RELEASE_KEY="$CONFIG_DIR/release.pub"
+# The successor a release announced, trusted beside the current key until a
+# package signed with it verifies, at which point it becomes the current key.
+RELEASE_KEY_NEXT="$CONFIG_DIR/release.pub.next"
+# A snapshot name as update.sh writes them: a label, a UTC date and a time.
+SNAPSHOT_NAME_RE='^[A-Za-z0-9][A-Za-z0-9_-]*-[0-9]{8}-[0-9]{6}$'
 
 # Defaults the config file may override.
 DEPLOY_ROOT=""
 ENABLED=0
 ALLOW_CHECKOUT=0
+SELF_UPDATE=0
 MIN_FREE_BYTES=1073741824
 HEALTH_TIMEOUT=300
 DRAIN_TIMEOUT=60
@@ -179,11 +200,11 @@ PY
 }
 
 json_write() {
-    # $1 = target file, then key=value pairs. A value of @null, @true, @false
-    # or @int:N is typed; everything else is a string. Written to a temporary
-    # file beside the target, handed to the tree owner, then renamed into
-    # place, so a reader never sees a partial file and the deployment account
-    # can always read what root wrote.
+    # $1 = target file, then key=value pairs. A value of @null, @true, @false,
+    # @int:N, @list:a,b or @json:<document> is typed; everything else is a
+    # string. Written to a temporary file beside the target, handed to the
+    # tree owner, then renamed into place, so a reader never sees a partial
+    # file and the deployment account can always read what root wrote.
     local target="$1" tmp
     shift
     tmp="$target.tmp"
@@ -203,6 +224,11 @@ for pair in sys.argv[2:]:
         value = int(raw[5:])
     elif raw.startswith("@list:"):
         value = [item for item in raw[6:].split(",") if item]
+    elif raw.startswith("@json:"):
+        try:
+            value = json.loads(raw[6:])
+        except ValueError:
+            value = None
     else:
         value = raw
     data[key] = value
@@ -244,19 +270,107 @@ sha256_of() {
     fi
 }
 
+key_id_of() {
+    # $1 = a PEM public key. The identifier release_sign.py prints: the leading
+    # hex of the SHA-256 of the raw 32-byte key, which ends the DER encoding.
+    # Nothing when the file is absent or the host cannot decode it.
+    local tmp id=""
+    [ -f "$1" ] || return 0
+    command -v openssl >/dev/null 2>&1 || return 0
+    tmp="$(mktemp)"
+    if openssl pkey -pubin -in "$1" -outform DER -out "$tmp" 2>/dev/null && [ "$(wc -c < "$tmp" | tr -d ' ')" -ge 32 ]; then
+        id="$(tail -c 32 "$tmp" | sha256_of /dev/stdin 2>/dev/null | cut -c1-16 || true)"
+    fi
+    rm -f "$tmp"
+    printf '%s' "$id"
+}
+
+updater_script_version() {
+    # The UPDATER_SCRIPT_VERSION of the agent's own copy of update.sh; 0 when
+    # it declares none.
+    local version
+    version="$(sed -n '/^UPDATER_SCRIPT_VERSION=/{s/^UPDATER_SCRIPT_VERSION=\([0-9]*\)$/\1/p;q;}' "$UPDATE_SH" 2>/dev/null || true)"
+    [[ "$version" =~ ^[0-9]+$ ]] || version=0
+    printf '%s' "$version"
+}
+
+updater_supports_code_only() {
+    [ "$(updater_script_version)" -ge "$UPDATER_SCRIPT_CODE_ONLY" ]
+}
+
+KEY_ARGS=()
+
+set_key_args() {
+    # The --release-key arguments update.sh gets: the current key and, while a
+    # successor is installed, that one too.
+    KEY_ARGS=(--release-key "$RELEASE_KEY")
+    [ ! -f "$RELEASE_KEY_NEXT" ] || KEY_ARGS+=(--release-key "$RELEASE_KEY_NEXT")
+}
+
+snapshots_json() {
+    # The snapshots under the deployment's backups/, newest first, as a JSON
+    # list for the heartbeat: name, when it was taken, the version its code
+    # carries, whether it holds a code archive, and what the update after it
+    # did to the schema. Read from each MANIFEST; nothing there is executed.
+    python3 - "$DEPLOY_ROOT/backups" <<'PY' 2>/dev/null || printf '[]'
+import json, os, re, sys
+root = sys.argv[1]
+pattern = re.compile(r"^([A-Za-z0-9][A-Za-z0-9_-]*)-(\d{8})-(\d{6})$")
+rows = []
+try:
+    names = os.listdir(root)
+except OSError:
+    names = []
+for name in names:
+    match = pattern.match(name)
+    path = os.path.join(root, name)
+    if not match or not os.path.isdir(path):
+        continue
+    if not (os.path.isfile(os.path.join(path, "db.sql.gz")) and os.path.isfile(os.path.join(path, ".env"))):
+        continue
+    manifest = {}
+    try:
+        with open(os.path.join(path, "MANIFEST"), encoding="utf-8") as fh:
+            for line in fh:
+                key, sep, value = line.rstrip("\n").partition("=")
+                if sep:
+                    manifest[key] = value
+    except OSError:
+        pass
+    date, time = match.group(2), match.group(3)
+    migrations = manifest.get("migrations")
+    rows.append({
+        "name": name,
+        "taken_at": f"{date[:4]}-{date[4:6]}-{date[6:]}T{time[:2]}:{time[2:4]}:{time[4:]}Z",
+        "version": manifest.get("version") or None,
+        "code": os.path.isfile(os.path.join(path, "code.tar.gz")),
+        "migrations": migrations if migrations in ("none", "applied") else None,
+    })
+rows.sort(key=lambda row: row["taken_at"], reverse=True)
+print(json.dumps(rows[:50]))
+PY
+}
+
 # ── The heartbeat ─────────────────────────────────────────────────────────────
 
 write_heartbeat() {
-    local enabled=@false
+    local enabled=@false self_update=@false key_id next_key_id
     [ "$ENABLED" = 1 ] && enabled=@true
+    [ "$SELF_UPDATE" = 1 ] && self_update=@true
+    key_id="$(key_id_of "$RELEASE_KEY")"
+    next_key_id="$(key_id_of "$RELEASE_KEY_NEXT")"
     json_write "$SPOOL/agent.json" \
         "protocol=@int:$PROTOCOL" \
         "version=$AGENT_VERSION" \
         "enabled=$enabled" \
+        "self_update=$self_update" \
         "runtime=${CONTAINER_RUNTIME:-@null}" \
         "last_run=$(now_iso)" \
-        "capabilities=@list:$OPERATION_UPDATE" \
-        "updater_script=$(sed -n '/^UPDATER_SCRIPT_VERSION=/{s/^UPDATER_SCRIPT_VERSION=\([0-9]*\)$/\1/p;q;}' "$UPDATE_SH" 2>/dev/null || true)"
+        "capabilities=@list:$OPERATION_UPDATE,$OPERATION_BACKUP,$OPERATION_ROLLBACK" \
+        "updater_script=$(updater_script_version)" \
+        "key_id=$(opt "$key_id")" \
+        "next_key_id=$(opt "$next_key_id")" \
+        "snapshots=@json:$(snapshots_json)"
 }
 
 # ── Job state ─────────────────────────────────────────────────────────────────
@@ -265,6 +379,7 @@ write_heartbeat() {
 # file does not carry.
 
 JOB_ID=""
+JOB_OPERATION=""
 JOB_STATE=""
 JOB_REASON=""
 JOB_STEP=""
@@ -278,6 +393,8 @@ JOB_TARGET=""
 JOB_RUNNING=""
 JOB_RETRIES=0
 JOB_WINDOW=""
+# What the update did to the schema: none, applied, or empty when unknown.
+JOB_MIGRATIONS=""
 
 job_log() {
     printf '%s\n' "$JOBS/$JOB_ID.log"
@@ -313,6 +430,16 @@ opt() {
     fi
 }
 
+migrations_applied_json() {
+    # JOB_MIGRATIONS as the status file spells it: a boolean, or null when
+    # the run never got as far as migrating.
+    case "$JOB_MIGRATIONS" in
+        none) printf '@false' ;;
+        applied) printf '@true' ;;
+        *) printf '@null' ;;
+    esac
+}
+
 write_status() {
     # $1 = state, $2 = reason (may be empty). Stamps updated_at from this
     # clock; the platform applies a status only when it is newer than the one
@@ -322,6 +449,7 @@ write_status() {
     json_write "$(job_status)" \
         "protocol=@int:$PROTOCOL" \
         "job_id=$JOB_ID" \
+        "operation=$JOB_OPERATION" \
         "state=$JOB_STATE" \
         "reason=$JOB_REASON" \
         "step=$JOB_STEP" \
@@ -331,6 +459,7 @@ write_status() {
         "verify_deadline=$(opt "$JOB_DEADLINE")" \
         "snapshot=$JOB_SNAPSHOT" \
         "post_snapshot=$JOB_POST_SNAPSHOT" \
+        "migrations_applied=$(migrations_applied_json)" \
         "agent_version=$AGENT_VERSION" \
         "installed_version_before=$JOB_INSTALLED_BEFORE" \
         "target_version=$JOB_TARGET" \
@@ -344,6 +473,9 @@ load_status() {
     # previous tick left in flight.
     local path
     path="$(job_status)"
+    JOB_OPERATION="$(json_get "$path" operation)"
+    # A status file from before operations were recorded is an update's.
+    [ -n "$JOB_OPERATION" ] || JOB_OPERATION="$OPERATION_UPDATE"
     JOB_STATE="$(json_get "$path" state)"
     JOB_REASON="$(json_get "$path" reason)"
     JOB_STEP="$(json_get "$path" step)"
@@ -357,13 +489,18 @@ load_status() {
     JOB_RUNNING="$(json_get "$path" running_version)"
     JOB_RETRIES="$(json_get "$path" retries)"
     [[ "$JOB_RETRIES" =~ ^[0-9]+$ ]] || JOB_RETRIES=0
+    case "$(json_get "$path" migrations_applied)" in
+        false) JOB_MIGRATIONS=none ;;
+        true) JOB_MIGRATIONS=applied ;;
+        *) JOB_MIGRATIONS="" ;;
+    esac
 }
 
 reset_job() {
     JOB_ID="$1"
-    JOB_STATE="" JOB_REASON="" JOB_STEP="" JOB_STARTED_AT="" JOB_FINISHED_AT="" JOB_DEADLINE=""
+    JOB_OPERATION="" JOB_STATE="" JOB_REASON="" JOB_STEP="" JOB_STARTED_AT="" JOB_FINISHED_AT="" JOB_DEADLINE=""
     JOB_SNAPSHOT="" JOB_POST_SNAPSHOT="" JOB_INSTALLED_BEFORE="" JOB_TARGET="" JOB_RUNNING=""
-    JOB_RETRIES=0 JOB_WINDOW=""
+    JOB_RETRIES=0 JOB_WINDOW="" JOB_MIGRATIONS=""
 }
 
 finish() {
@@ -474,8 +611,9 @@ running_version() {
 }
 
 gate() {
-    # $1 = the version that must be serving. 0 when the readiness probe answers
-    # 200 within HEALTH_TIMEOUT and the running version is the expected one.
+    # $1 = the version that must be serving, or empty to accept whatever
+    # serves. 0 when the readiness probe answers 200 within HEALTH_TIMEOUT
+    # and the running version is the expected one.
     local port waited=0 code version
     port="$(env_value HOST_PORT)"
     port="${port:-8000}"
@@ -500,7 +638,7 @@ gate() {
         job_note "could not read the running version from the web container"
         return 1
     fi
-    if [ "$version" != "$1" ]; then
+    if [ -n "$1" ] && [ "$version" != "$1" ]; then
         job_note "the platform is serving version $version, expected $1"
         return 1
     fi
@@ -541,7 +679,7 @@ stream_log() {
                             write_status "$JOB_STATE" "$JOB_REASON"
                         fi
                         ;;
-                    snapshot|health|failed|refused|done|installed|version)
+                    snapshot|health|failed|refused|done|installed|version|migrations|key|restored)
                         printf '%s=%s\n' "$key" "$value" >> "$FACTS"
                         ;;
                 esac
@@ -583,14 +721,21 @@ refuse() {
     finish failed "refused_$1"
 }
 
+free_bytes() {
+    df -Pk "$DEPLOY_ROOT" | awk 'NR==2{print $4 * 1024}'
+}
+
 accept_or_refuse() {
     # $1 = the request file. Every check a request must pass before anything
-    # is touched, in the order that matters.
-    local request="$1" protocol operation sha pkgdir work copy have free size need rc token
+    # is touched, in the order that matters: the checks every operation
+    # shares, then the operation's own.
+    local request="$1" protocol operation
     protocol="$(json_get "$request" protocol)"
     operation="$(json_get "$request" operation)"
-    sha="$(json_get "$request" args package_sha256)"
-    JOB_WINDOW="$(json_get "$request" args verify_window_minutes)"
+    case "$operation" in
+        "$OPERATION_UPDATE"|"$OPERATION_BACKUP"|"$OPERATION_ROLLBACK") JOB_OPERATION="$operation" ;;
+        *) JOB_OPERATION="${operation:-unknown}" ;;
+    esac
 
     if [ "$ENABLED" != 1 ]; then
         refuse disabled "the agent is installed but not enabled (ENABLED=1 in $CONFIG_DIR/config)"
@@ -600,16 +745,81 @@ accept_or_refuse() {
         refuse protocol "the request carries protocol '${protocol:-none}'; this agent speaks $PROTOCOL"
         return
     fi
-    if [ "$operation" != "$OPERATION_UPDATE" ]; then
-        refuse operation "operation '${operation:-none}' is not one this agent carries out"
+    case "$operation" in
+        "$OPERATION_UPDATE"|"$OPERATION_BACKUP"|"$OPERATION_ROLLBACK") ;;
+        *)
+            refuse operation "operation '${operation:-none}' is not one this agent carries out"
+            return
+            ;;
+    esac
+    if [ -e "$DEPLOY_ROOT/.git" ] && [ "$ALLOW_CHECKOUT" != 1 ]; then
+        refuse checkout "$DEPLOY_ROOT is a git checkout; remote operations are for distribution deployments (ALLOW_CHECKOUT=1 overrides)"
         return
     fi
+    case "$operation" in
+        "$OPERATION_BACKUP") accept_backup ;;
+        "$OPERATION_ROLLBACK") accept_rollback "$request" ;;
+        *) accept_update "$request" ;;
+    esac
+}
+
+accept_backup() {
+    local free
+    free="$(free_bytes)"
+    if [ "${free:-0}" -lt "$MIN_FREE_BYTES" ]; then
+        refuse disk "$free bytes free under $DEPLOY_ROOT; a snapshot needs at least $MIN_FREE_BYTES"
+        return
+    fi
+    JOB_INSTALLED_BEFORE="$(installed_tree_version)"
+    write_status accepted ""
+    run_backup
+}
+
+accept_rollback() {
+    # $1 = the request file. The snapshot is named by a shape this agent
+    # checks and must exist as a restorable directory; whether the database
+    # is restored with the code is the request's choice, restore by default.
+    local request="$1" snapshot restore_db free
+    snapshot="$(json_get "$request" args snapshot)"
+    restore_db="$(json_get "$request" args restore_database)"
+    if ! [[ "$snapshot" =~ $SNAPSHOT_NAME_RE ]]; then
+        refuse snapshot "the request names no snapshot"
+        return
+    fi
+    if [ ! -f "$DEPLOY_ROOT/backups/$snapshot/db.sql.gz" ] || [ ! -f "$DEPLOY_ROOT/backups/$snapshot/.env" ]; then
+        refuse snapshot "no complete snapshot named $snapshot under $DEPLOY_ROOT/backups"
+        return
+    fi
+    if [ "$restore_db" = false ] && [ ! -f "$DEPLOY_ROOT/backups/$snapshot/code.tar.gz" ]; then
+        refuse snapshot "snapshot $snapshot holds no code archive, so there is nothing to restore while keeping the database"
+        return
+    fi
+    if [ "$restore_db" = false ] && ! updater_supports_code_only; then
+        refuse code_only "the agent's update.sh (version $(updater_script_version)) cannot keep the database on a rollback; apply a release carrying update.sh $UPDATER_SCRIPT_CODE_ONLY or newer first"
+        return
+    fi
+    free="$(free_bytes)"
+    if [ "${free:-0}" -lt "$MIN_FREE_BYTES" ]; then
+        refuse disk "$free bytes free under $DEPLOY_ROOT; a rollback needs at least $MIN_FREE_BYTES for its safety snapshot"
+        return
+    fi
+    JOB_SNAPSHOT="$snapshot"
+    JOB_INSTALLED_BEFORE="$(installed_tree_version)"
+    write_status accepted ""
+    run_standalone_rollback "$restore_db"
+}
+
+installed_tree_version() {
+    sed -n '/^__version__ = "/{s/^__version__ = "\([^"]*\)".*/\1/p;q;}' "$DEPLOY_ROOT/epicurrents/version.py" 2>/dev/null || true
+}
+
+accept_update() {
+    # $1 = the request file.
+    local request="$1" sha pkgdir work copy have free size need rc token key
+    sha="$(json_get "$request" args package_sha256)"
+    JOB_WINDOW="$(json_get "$request" args verify_window_minutes)"
     if ! [[ "$sha" =~ ^[0-9a-f]{64}$ ]]; then
         refuse hash "the request names no package hash"
-        return
-    fi
-    if [ -e "$DEPLOY_ROOT/.git" ] && [ "$ALLOW_CHECKOUT" != 1 ]; then
-        refuse checkout "$DEPLOY_ROOT is a git checkout; remote updates are for distribution deployments (ALLOW_CHECKOUT=1 overrides)"
         return
     fi
     pkgdir="$PACKAGES/$sha"
@@ -634,7 +844,7 @@ accept_or_refuse() {
     fi
 
     size="$(wc -c < "$copy" | tr -d ' ')"
-    free="$(df -Pk "$DEPLOY_ROOT" | awk 'NR==2{print $4 * 1024}')"
+    free="$(free_bytes)"
     need=$((size * 2 + MIN_FREE_BYTES))
     if [ "${free:-0}" -lt "$need" ]; then
         refuse disk "$free bytes free under $DEPLOY_ROOT; an update needs $need (twice the package plus $MIN_FREE_BYTES)"
@@ -642,7 +852,8 @@ accept_or_refuse() {
     fi
 
     job_note "checking the package ($sha)"
-    run_update_sh --check-archive "$copy" --require-signature --release-key "$RELEASE_KEY" --require-newer && rc=0 || rc=$?
+    set_key_args
+    run_update_sh --check-archive "$copy" --require-signature "${KEY_ARGS[@]}" --require-newer && rc=0 || rc=$?
     if [ "$rc" -ne 0 ]; then
         token="$(fact refused)"
         refuse "${token:-check}" "update.sh refused the package: $(fact failed)"
@@ -650,8 +861,53 @@ accept_or_refuse() {
     fi
     JOB_INSTALLED_BEFORE="$(fact installed)"
     JOB_TARGET="$(fact version)"
+    # The package verified. A signature by the successor key is what settles
+    # a rotation: from here on that key is the current one. And a manifest
+    # may announce the next successor, which the signature just vouched for.
+    key="$(fact key)"
+    if [ -n "$key" ] && [ "$key" = "$RELEASE_KEY_NEXT" ] && [ -f "$RELEASE_KEY_NEXT" ]; then
+        mv -f "$RELEASE_KEY_NEXT" "$RELEASE_KEY"
+        job_note "release key rotated: the package is signed with the successor key (id $(key_id_of "$RELEASE_KEY")), which is now the current key"
+    fi
+    install_successor_key "$copy.manifest.json"
     write_status accepted ""
     run_update
+}
+
+install_successor_key() {
+    # $1 = the verified manifest copy. The successor's PEM travels inside the
+    # signed manifest, so its bytes are as trusted as the package. Installed
+    # beside the current key, root-owned; the current key stays in force
+    # until a package signed with the successor verifies.
+    local manifest="$1" pem id have tmp
+    pem="$(json_get "$manifest" successor_key)"
+    [ -n "$pem" ] || return 0
+    id="$(json_get "$manifest" successor_key_id)"
+    case "$pem" in
+        *"BEGIN PUBLIC KEY"*) ;;
+        *)
+            job_note "the manifest announces a successor key that is not a PEM public key; ignored"
+            return 0
+            ;;
+    esac
+    if [ "$(cat "$RELEASE_KEY" 2>/dev/null)" = "$pem" ]; then
+        return 0
+    fi
+    if [ -f "$RELEASE_KEY_NEXT" ] && [ "$(cat "$RELEASE_KEY_NEXT")" = "$pem" ]; then
+        return 0
+    fi
+    tmp="$(mktemp "$CONFIG_DIR/.release.pub.XXXXXX")"
+    printf '%s\n' "$pem" > "$tmp"
+    chmod 0600 "$tmp"
+    have="$(key_id_of "$tmp")"
+    if [ -n "$have" ] && [ -n "$id" ] && [ "$have" != "$id" ]; then
+        rm -f "$tmp"
+        job_note "the manifest's successor key has id $have but claims $id; not installed"
+        return 0
+    fi
+    mv -f "$tmp" "$RELEASE_KEY_NEXT"
+    job_note "successor release key installed (id ${have:-${id:-unknown}}); the next package may be signed with it"
+    return 0
 }
 
 # ── The update ────────────────────────────────────────────────────────────────
@@ -673,10 +929,12 @@ run_update() {
     drain_worker
     JOB_STARTED_AT="$(now_iso)"
     write_status running ""
-    run_update_sh --archive "$copy" --require-signature --release-key "$RELEASE_KEY" --require-newer \
+    set_key_args
+    run_update_sh --archive "$copy" --require-signature "${KEY_ARGS[@]}" --require-newer \
         --skip-beat --keep-lock --yes && rc=0 || rc=$?
     snapshot="$(fact snapshot)"
     JOB_SNAPSHOT="${snapshot##*/}"
+    JOB_MIGRATIONS="$(fact migrations)"
     if [ "$rc" -ne 0 ]; then
         if [ -n "$JOB_SNAPSHOT" ]; then
             job_note "update.sh failed (exit $rc) after the snapshot; rolling back"
@@ -693,6 +951,7 @@ run_update() {
         return
     fi
     refresh_update_sh "$copy"
+    refresh_agent "$copy"
     JOB_DEADLINE="$(deadline_iso "$(window_minutes)")"
     write_flag verifying "The platform was updated and is waiting for a superuser to confirm it." "$JOB_DEADLINE"
     remove_active_lock
@@ -733,6 +992,130 @@ refresh_update_sh() {
         job_note "the package carries no usable update.sh; the agent keeps its copy"
     fi
     return 0
+}
+
+refresh_agent() {
+    # $1 = the verified package copy. Opt-in (SELF_UPDATE=1): the agent
+    # replaces itself with the copy the package ships when that one is newer
+    # and parses. A rename onto a new inode, never a write into this file,
+    # since bash reads a script as it runs it; the copy being replaced is
+    # kept beside it for an operator who needs to go back. The new agent runs
+    # from the next tick.
+    [ "$SELF_UPDATE" = 1 ] || return 0
+    local top tmp version readme
+    top="$( (tar -tzf "$1" 2>/dev/null || true) | awk -F/ 'NR==1{sub(/^\.\//, ""); print $1}')"
+    [ -n "$top" ] || return 0
+    tmp="$(mktemp)"
+    if ! tar -xzOf "$1" "$top/updater/epicurrents-updater.sh" > "$tmp" 2>/dev/null || [ ! -s "$tmp" ]; then
+        rm -f "$tmp"
+        job_note "the package carries no agent; this one stays"
+        return 0
+    fi
+    if ! bash -n "$tmp" 2>/dev/null; then
+        rm -f "$tmp"
+        job_note "the package's agent does not parse; this one stays"
+        return 0
+    fi
+    version="$(sed -n '/^AGENT_VERSION=/{s/^AGENT_VERSION=\([0-9]*\)$/\1/p;q;}' "$tmp")"
+    if ! [[ "$version" =~ ^[0-9]+$ ]] || [ "$version" -le "$AGENT_VERSION" ]; then
+        rm -f "$tmp"
+        job_note "the package's agent is version ${version:-unknown}, this is $AGENT_VERSION; this one stays"
+        return 0
+    fi
+    cp -p "$AGENT_SELF" "$AGENT_SELF.previous" 2>/dev/null || true
+    chmod 0755 "$tmp"
+    mv -f "$tmp" "$AGENT_SELF"
+    readme="$(mktemp)"
+    if tar -xzOf "$1" "$top/updater/README.md" > "$readme" 2>/dev/null && [ -s "$readme" ]; then
+        chmod 0644 "$readme"
+        mv -f "$readme" "$LIB_DIR/README.md"
+    else
+        rm -f "$readme"
+    fi
+    job_note "agent updated to version $version from the package; it runs from the next tick (the previous copy is $AGENT_SELF.previous)"
+    return 0
+}
+
+# ── A snapshot on request ─────────────────────────────────────────────────────
+
+run_backup() {
+    # code + database + .env under backups/backup-<stamp>, without a flag or
+    # a stop: the dump is one transaction and the platform keeps serving.
+    local rc snapshot
+    write_active_lock
+    JOB_STARTED_AT="$(now_iso)"
+    write_status running ""
+    run_update_sh --snapshot backup && rc=0 || rc=$?
+    snapshot="$(fact snapshot)"
+    JOB_SNAPSHOT="${snapshot##*/}"
+    remove_active_lock
+    JOB_STEP=""
+    if [ "$rc" -ne 0 ] || [ -z "$JOB_SNAPSHOT" ]; then
+        job_note "update.sh --snapshot failed (exit $rc)"
+        finish failed snapshot_failed
+        return
+    fi
+    prune_labelled_snapshots backup "$KEEP_BACKUP_SNAPSHOTS"
+    finish succeeded ""
+}
+
+# ── A rollback on request ─────────────────────────────────────────────────────
+
+run_standalone_rollback() {
+    # $1 = whether to restore the database ("false" keeps it). A safety
+    # snapshot first, so what the live database holds now is recoverable
+    # from somewhere; then update.sh restores the named snapshot; then the
+    # gate against whatever version the restored tree carries.
+    local restore_db="$1" rc post restored
+    write_active_lock
+    write_flag rolling_back "The platform is being rolled back to an earlier snapshot." ""
+    stop_beat
+    drain_worker
+    JOB_STARTED_AT="$(now_iso)"
+    write_status running ""
+    if [ -n "$JOB_POST_SNAPSHOT" ] && [ -d "$DEPLOY_ROOT/backups/$JOB_POST_SNAPSHOT" ]; then
+        job_note "keeping the safety snapshot already taken: $JOB_POST_SNAPSHOT"
+    elif job_note "taking a safety snapshot before the rollback" && run_update_sh --snapshot pre-rollback --keep-lock; then
+        post="$(fact snapshot)"
+        JOB_POST_SNAPSHOT="${post##*/}"
+        job_note "safety snapshot: $JOB_POST_SNAPSHOT"
+    else
+        job_note "the safety snapshot failed; nothing was changed"
+        settle_failed snapshot_failed
+        return
+    fi
+    if [ "$restore_db" = false ]; then
+        job_note "restoring the code of $JOB_SNAPSHOT; the database is kept"
+    else
+        job_note "restoring $JOB_SNAPSHOT"
+    fi
+    if [ "$restore_db" = false ]; then
+        run_update_sh --rollback --snapshot "$JOB_SNAPSHOT" --code-only --yes --skip-beat --keep-lock && rc=0 || rc=$?
+        if [ "$rc" -ne 0 ] && [ "$(fact refused)" = code_only ]; then
+            job_note "update.sh declined to keep the database: $(fact failed)"
+            settle_failed refused_code_only
+            return
+        fi
+    else
+        run_update_sh --rollback --snapshot "$JOB_SNAPSHOT" --yes --skip-beat --keep-lock && rc=0 || rc=$?
+    fi
+    if [ "$rc" -ne 0 ]; then
+        job_note "update.sh --rollback failed (exit $rc); the deployment needs a shell"
+        settle_rollback_failed
+        return
+    fi
+    restored="$(fact restored)"
+    if ! gate "$restored"; then
+        job_note "the rollback applied but the platform did not pass the gate; the deployment needs a shell"
+        settle_rollback_failed
+        return
+    fi
+    prune_labelled_snapshots pre-rollback "$KEEP_POST_SNAPSHOTS"
+    remove_flag
+    start_beat
+    remove_active_lock
+    JOB_STEP=""
+    finish succeeded ""
 }
 
 # ── The verification window ───────────────────────────────────────────────────
@@ -805,7 +1188,20 @@ rollback() {
         job_note "the post-update snapshot failed; nothing was served since the snapshot, so the rollback goes ahead"
     fi
     job_note "restoring $JOB_SNAPSHOT"
-    run_update_sh --rollback --snapshot "$JOB_SNAPSHOT" --yes --skip-beat --keep-lock && rc=0 || rc=$?
+    if [ "$JOB_MIGRATIONS" = none ] && updater_supports_code_only; then
+        # The release applied no migration, so the database still fits the
+        # code being restored: keep it, and with it everything written since
+        # the update. update.sh checks the same fact against the database
+        # and may decline, in which case the database is restored after all.
+        job_note "the update applied no migration; restoring the code and keeping the database"
+        run_update_sh --rollback --snapshot "$JOB_SNAPSHOT" --code-only --yes --skip-beat --keep-lock && rc=0 || rc=$?
+        if [ "$rc" -ne 0 ] && [ "$(fact refused)" = code_only ]; then
+            job_note "update.sh declined to keep the database ($(fact failed)); restoring it too"
+            run_update_sh --rollback --snapshot "$JOB_SNAPSHOT" --yes --skip-beat --keep-lock && rc=0 || rc=$?
+        fi
+    else
+        run_update_sh --rollback --snapshot "$JOB_SNAPSHOT" --yes --skip-beat --keep-lock && rc=0 || rc=$?
+    fi
     if [ "$rc" -ne 0 ]; then
         job_note "update.sh --rollback failed (exit $rc); the deployment needs a shell"
         settle_rollback_failed
@@ -816,7 +1212,7 @@ rollback() {
         settle_rollback_failed
         return
     fi
-    prune_post_snapshots
+    prune_labelled_snapshots post-update "$KEEP_POST_SNAPSHOTS"
     remove_flag
     start_beat
     remove_active_lock
@@ -825,17 +1221,22 @@ rollback() {
     finish rolled_back "$reason"
 }
 
-# Snapshots update.sh names for its purpose are never pruned by update.sh
-# itself, so the post-update ones would accumulate a database dump per
-# rollback. The newest two are kept: the one just taken, and the one before
-# it in case the rollback was of a rollback.
+# Snapshots update.sh names for their purpose are never pruned by update.sh
+# itself, so the ones this agent takes would accumulate a database dump each.
+# Of the post-update and pre-rollback ones the newest two are kept: the one
+# just taken, and the one before it in case the rollback was of a rollback.
+# Of the backups a superuser asked for, the newest three.
 KEEP_POST_SNAPSHOTS=2
+KEEP_BACKUP_SNAPSHOTS=3
 
-prune_post_snapshots() {
-    local dirs=("$DEPLOY_ROOT"/backups/post-update-*) i
+prune_labelled_snapshots() {
+    # $1 = label, $2 = how many to keep. The names carry a UTC stamp, so the
+    # glob's order is chronological.
+    local label="$1" keep="$2" dirs i
+    dirs=("$DEPLOY_ROOT"/backups/"$label"-*)
     [ -d "${dirs[0]}" ] || return 0
-    for ((i = 0; i < ${#dirs[@]} - KEEP_POST_SNAPSHOTS; i++)); do
-        job_note "pruning old post-update snapshot $(basename "${dirs[i]}")"
+    for ((i = 0; i < ${#dirs[@]} - keep; i++)); do
+        job_note "pruning old $label snapshot $(basename "${dirs[i]}")"
         rm -rf "${dirs[i]}"
     done
     return 0
@@ -870,6 +1271,27 @@ handle_stale_lock() {
     reset_job "$job"
     load_status
     job_note "the run executing this job (pid ${pid:-?}, boot ${boot:-?}) is gone; the lock is stale"
+    case "$JOB_OPERATION" in
+        "$OPERATION_BACKUP")
+            # A snapshot that did not complete is a directory update.sh
+            # prunes as half-written; nothing else was touched.
+            job_note "the snapshot did not complete; nothing was changed"
+            remove_active_lock
+            finish failed stale
+            return 0
+            ;;
+        "$OPERATION_ROLLBACK")
+            if [ "$JOB_RETRIES" -lt 1 ]; then
+                JOB_RETRIES=$((JOB_RETRIES + 1))
+                job_note "retrying the interrupted rollback"
+                run_standalone_rollback "$(json_get "$JOBS/$JOB_ID.json" args restore_database)"
+            else
+                job_note "the rollback was interrupted and already retried once; the deployment needs a shell"
+                settle_rollback_failed
+            fi
+            return 0
+            ;;
+    esac
     case "$JOB_STATE" in
         accepted|running)
             if [ -n "$JOB_SNAPSHOT" ] || grep -q '^::snapshot=' "$(job_log)" 2>/dev/null; then
@@ -953,6 +1375,7 @@ tick() {
         [[ "$id" =~ ^[0-9a-f-]{36}$ ]] || continue
         reset_job "$id"
         load_status
+        [ "$JOB_OPERATION" = "$OPERATION_UPDATE" ] || continue
         case "$JOB_STATE" in
             awaiting_verification) handle_awaiting ;;
             succeeded) handle_succeeded ;;

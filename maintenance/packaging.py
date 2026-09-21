@@ -123,38 +123,98 @@ def deployment_identity() -> tuple[str, tuple[str, ...]]:
     return get_active_project(), normalise_plugins(get_active_plugins())
 
 
-def load_release_key():
-    """The release public key at ``REMOTE_UPDATE_RELEASE_KEY_PATH``, or ``None`` when absent or unusable."""
+def successor_key_path(current: Path) -> Path:
+    """Where a successor key sits beside the current one: ``RELEASE_KEY.pub`` → ``RELEASE_KEY.next.pub``.
+
+    A release announces the key that signs the next one by shipping it under
+    that name; the packager writes it and the image carries it, so the
+    platform trusts the successor as soon as the announcing release runs.
+    """
+    if current.suffix == ".pub":
+        return current.with_name(f"{current.stem}.next.pub")
+    return current.with_name(f"{current.name}.next")
+
+
+def release_key_paths() -> list[Path]:
+    """The current key at ``REMOTE_UPDATE_RELEASE_KEY_PATH`` and the successor's place beside it."""
+    path = getattr(settings, "REMOTE_UPDATE_RELEASE_KEY_PATH", "")
+    if not path:
+        return []
+    current = Path(path)
+    return [current, successor_key_path(current)]
+
+
+def _load_key(path: Path, *, optional: bool = False):
+    """The Ed25519 public key at ``path``, or ``None``; a missing optional key is silent."""
     from cryptography.hazmat.primitives import serialization
     from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
-    path = getattr(settings, "REMOTE_UPDATE_RELEASE_KEY_PATH", "")
-    if not path:
-        return None
     try:
-        key = serialization.load_pem_public_key(Path(path).read_bytes())
+        key = serialization.load_pem_public_key(path.read_bytes())
+    except FileNotFoundError:
+        if not optional:
+            logger.warning("The release key at REMOTE_UPDATE_RELEASE_KEY_PATH cannot be read: no such file")
+        return None
     except (OSError, ValueError) as exc:
-        logger.warning("The release key at REMOTE_UPDATE_RELEASE_KEY_PATH cannot be read: %s", exc)
+        logger.warning("The release key at %s cannot be read: %s", path.name, exc)
         return None
     if not isinstance(key, Ed25519PublicKey):
-        logger.warning("The release key at REMOTE_UPDATE_RELEASE_KEY_PATH is not an Ed25519 public key")
+        logger.warning("The release key at %s is not an Ed25519 public key", path.name)
         return None
     return key
 
 
-def verify_signature(manifest_bytes: bytes, signature_bytes: bytes, key) -> None:
-    """Check the base64 detached signature over the manifest's exact bytes."""
+def load_release_key():
+    """The current release key at ``REMOTE_UPDATE_RELEASE_KEY_PATH``, or ``None`` when absent or unusable."""
+    paths = release_key_paths()
+    return _load_key(paths[0]) if paths else None
+
+
+def load_release_keys() -> list:
+    """Every usable release key: the current one first, then the successor when a release announced one."""
+    paths = release_key_paths()
+    if not paths:
+        return []
+    keys = []
+    current = _load_key(paths[0])
+    if current is not None:
+        keys.append(current)
+    successor = _load_key(paths[1], optional=True)
+    if successor is not None:
+        keys.append(successor)
+    return keys
+
+
+def key_id(key) -> str:
+    """The short identifier the packager prints for a key: leading hex of the SHA-256 of its raw bytes."""
+    from cryptography.hazmat.primitives import serialization
+
+    raw = key.public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+    return hashlib.sha256(raw).hexdigest()[:16]
+
+
+def verify_signature(manifest_bytes: bytes, signature_bytes: bytes, keys) -> None:
+    """Check the base64 detached signature over the manifest's exact bytes against ``keys``, one key or a list."""
     from cryptography.exceptions import InvalidSignature
 
+    if not isinstance(keys, list | tuple):
+        keys = [keys]
     try:
         signature = base64.b64decode(signature_bytes.strip(), validate=True)
-        key.verify(signature, manifest_bytes)
-    except (InvalidSignature, ValueError):
-        raise PackageRejected(
-            "signature",
-            "The package signature does not verify against this deployment's release key: the manifest or the "
-            "signature was altered, or the package was signed with a different key.",
-        ) from None
+    except ValueError:
+        signature = None
+    if signature is not None:
+        for key in keys:
+            try:
+                key.verify(signature, manifest_bytes)
+            except InvalidSignature:
+                continue
+            return
+    raise PackageRejected(
+        "signature",
+        "The package signature does not verify against this deployment's release key: the manifest or the "
+        "signature was altered, or the package was signed with a different key.",
+    )
 
 
 def read_manifest(raw: bytes) -> Manifest:

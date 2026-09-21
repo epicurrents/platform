@@ -89,7 +89,20 @@ class TestCoreOperations:
             "recordings.validate_originals",
             "recordings.refresh_signal_metadata",
             "platform.update",
+            "platform.backup",
+            "platform.rollback",
         } <= keys
+
+    def test_the_snapshot_operations_take_a_name_of_the_agents_shape_and_nothing_else(self):
+        op = get_operation("platform.backup")
+        assert op.executor == "host" and op.requires_step_up and not op.args_schema.model_fields
+        op = get_operation("platform.rollback")
+        assert op.executor == "host" and op.requires_step_up
+        args = op.args_schema(snapshot="backup-20260901-100000")
+        assert args.restore_database is True
+        for bad in ("../x", "backup", "backup-2026-09-01", "backup-20260901-100000/", "x y-20260901-100000"):
+            with pytest.raises(ValidationError):
+                op.args_schema(snapshot=bad)
 
     def test_celery_operations_turn_arguments_into_argv(self):
         op = get_operation("activity.verify_audit_integrity")

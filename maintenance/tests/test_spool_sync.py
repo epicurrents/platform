@@ -259,6 +259,65 @@ class TestSpoolFiles:
         )
         assert spool.agent_summary()["stale"] is False
 
+    def test_the_agent_summary_keeps_only_snapshots_of_the_expected_shape(self, spool_dir):
+        spool.write_json_atomic(
+            spool.spool_path() / "agent.json",
+            {
+                "protocol": 1,
+                "version": "2",
+                "enabled": True,
+                "last_run": spool.now_iso(),
+                "self_update": True,
+                "key_id": "0123456789abcdef",
+                "next_key_id": None,
+                "snapshots": [
+                    {
+                        "name": "pre-update-20260901-100000",
+                        "taken_at": "2026-09-01T10:00:00Z",
+                        "version": "0.1.0",
+                        "code": True,
+                        "migrations": "none",
+                    },
+                    {"name": "../etc", "taken_at": "x", "version": "1", "code": True, "migrations": None},
+                    "junk",
+                    {"name": "backup-20260902-110000", "version": 3, "code": 1, "migrations": "maybe", "taken_at": 5},
+                ],
+            },
+        )
+        summary = spool.agent_summary()
+        assert (
+            summary["self_update"] is True
+            and summary["key_id"] == "0123456789abcdef"
+            and summary["next_key_id"] is None
+        )
+        assert summary["snapshots"] == [
+            {
+                "name": "pre-update-20260901-100000",
+                "taken_at": "2026-09-01T10:00:00Z",
+                "version": "0.1.0",
+                "code": True,
+                "migrations": "none",
+            },
+            {"name": "backup-20260902-110000", "taken_at": None, "version": "3", "code": True, "migrations": None},
+        ]
+        spool.write_json_atomic(
+            spool.spool_path() / "agent.json",
+            {"protocol": 1, "version": "1", "enabled": True, "last_run": spool.now_iso()},
+        )
+        summary = spool.agent_summary()
+        assert summary["snapshots"] == [] and summary["self_update"] is None and summary["key_id"] is None
+
+    def test_migrations_applied_follows_the_status_file(self, spool_dir, superuser, write_status, no_push):
+        job = _host_job(superuser, state="running")
+        write_status(job.job_id, "awaiting_verification", migrations_applied=False)
+        spool.sync(force=True)
+        job.refresh_from_db()
+        assert job.migrations_applied is False
+        write_status(job.job_id, "succeeded", updated_at="2026-09-20T10:06:00Z", migrations_applied="no")
+        spool.sync(force=True)
+        job.refresh_from_db()
+        assert job.migrations_applied is None
+
     def test_prune_removes_the_files_of_long_finished_jobs_only(self, spool_dir, superuser):
         from maintenance.tasks import prune_spool
 

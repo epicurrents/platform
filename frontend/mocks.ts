@@ -189,7 +189,17 @@ interface MockJob {
     running_version: string
     snapshot: string
     post_snapshot: string
+    migrations_applied?: boolean | null
     output: string
+}
+
+/** A snapshot the mock host holds, as the agent's heartbeat would list it. */
+interface MockSnapshot {
+    name: string
+    taken_at: string | null
+    version: string | null
+    code: boolean
+    migrations: 'none' | 'applied' | null
 }
 
 interface MockPackage {
@@ -210,6 +220,7 @@ interface MockPackage {
 interface MockState {
     jobs: MockJob[]
     packages: MockPackage[]
+    snapshots: MockSnapshot[]
     user: MockUser
     accounts: MockAccount[]
     authGroups: MockAuthGroup[]
@@ -324,7 +335,46 @@ const MOCK_OPERATIONS = [
             required: ['package_sha256'],
         },
     },
+    {
+        key: 'platform.backup',
+        executor: 'host',
+        label: 'Take a snapshot',
+        description: 'Snapshot the code, the database and the configuration on the host, without interrupting the platform. The newest three are kept. Needs the host agent.',
+        requires_step_up: true,
+        available: true,
+        args_schema: { properties: {} },
+    },
+    {
+        key: 'platform.rollback',
+        executor: 'host',
+        label: 'Roll back to a snapshot',
+        description: 'Restore a snapshot the host holds: the code, and the database unless it is kept. The platform is suspended while it runs. Needs the host agent.',
+        requires_step_up: true,
+        available: true,
+        args_schema: {
+            properties: {
+                snapshot: {
+                    type: 'string',
+                    pattern: '^[A-Za-z0-9][A-Za-z0-9_-]*-[0-9]{8}-[0-9]{6}$',
+                    description: 'A snapshot on the host, by the name the agent reports.',
+                    title: 'Snapshot',
+                },
+                restore_database: {
+                    type: 'boolean',
+                    default: true,
+                    description: 'Restore the database from the snapshot as well; everything written since it is lost. Off, the database is kept, which the agent allows only when no migration was applied since the snapshot.',
+                    title: 'Restore Database',
+                },
+            },
+            required: ['snapshot'],
+        },
+    },
 ]
+
+/** The snapshot names the mock agent reports, newest first. */
+function snapshotsOut(): MockSnapshot[] {
+    return [..._state.snapshots].sort((a, b) => (b.taken_at ?? '').localeCompare(a.taken_at ?? ''))
+}
 
 // ─── Session cookie ───────────────────────────────────────────────────────────
 
@@ -767,6 +817,22 @@ function buildSeed(): MockState {
         datasetItems,
         datasetAccess,
         seq: { rec: 17, coll: 3, ds: 3, item: 4, access: 2, account: 7, group: 3 },
+        snapshots: [
+            {
+                name: 'pre-update-20260917-101500',
+                taken_at: '2026-09-17T10:15:00Z',
+                version: '0.1.0',
+                code: true,
+                migrations: 'applied',
+            },
+            {
+                name: 'backup-20260910-080000',
+                taken_at: '2026-09-10T08:00:00Z',
+                version: '0.1.0',
+                code: true,
+                migrations: null,
+            },
+        ],
         packages: [
             {
                 sha256: MOCK_PACKAGE_SHA256,
@@ -1091,6 +1157,7 @@ function enrichItem(contentTypeId: number, objectId: string): { object_name: str
 function jobOut(job: MockJob) {
     return {
         ...job,
+        migrations_applied: job.migrations_applied ?? null,
         in_flight: IN_FLIGHT_STATES.has(job.state),
         // Staff see no output; the mock user is a superuser, so it is included.
         output: _state.user.is_superuser ? job.output : null,
@@ -1128,7 +1195,41 @@ function driveJob(job: MockJob): void {
             })
             return
         }
-        job.installed_version_before = '0.1.1'
+        job.installed_version_before = MOCK_INSTALLED_VERSION
+        if (job.operation === 'platform.backup') {
+            later(2500, () => {
+                if (job.state !== 'running') return
+                const stamp = new Date().toISOString().replace(/[-:T]/g, '').slice(0, 15).replace(/^(\d{8})(\d{6}).*$/, '$1-$2')
+                job.snapshot = `backup-${stamp}`
+                job.state = 'succeeded'
+                job.finished_at = ago(0)
+                _state.snapshots.push({
+                    name: job.snapshot,
+                    taken_at: new Date().toISOString().replace(/\.\d+Z$/, 'Z'),
+                    version: MOCK_INSTALLED_VERSION,
+                    code: true,
+                    migrations: null,
+                })
+            })
+            return
+        }
+        if (job.operation === 'platform.rollback') {
+            job.snapshot = String(job.args.snapshot ?? '')
+            job.step = 'snapshot'
+            later(2000, () => {
+                if (job.state !== 'running') return
+                job.post_snapshot = 'pre-rollback-20260920-130000'
+                job.step = job.args.restore_database === false ? 'restore-code' : 'restore-db'
+                later(2500, () => {
+                    if (job.state !== 'running') return
+                    job.state = 'succeeded'
+                    job.step = 'health'
+                    job.running_version = job.target_version || MOCK_INSTALLED_VERSION
+                    job.finished_at = ago(0)
+                })
+            })
+            return
+        }
         job.snapshot = 'pre-update-20260920-120000'
         later(2000, () => {
             if (job.state !== 'running') return
@@ -1138,6 +1239,8 @@ function driveJob(job: MockJob): void {
                 job.state = 'awaiting_verification'
                 job.step = 'health'
                 job.running_version = job.target_version
+                // An odd patch version migrates, an even one does not: both rollback shapes can be seen.
+                job.migrations_applied = Number(job.target_version.split('.')[2] ?? 1) % 2 === 1
                 const minutes = typeof job.args.verify_window_minutes === 'number' ? job.args.verify_window_minutes : 30
                 job.verify_deadline = new Date(Date.now() + minutes * 60_000).toISOString()
             })
@@ -1440,7 +1543,21 @@ export async function handleMock(
                 server_now: new Date().toISOString(),
                 spool_writable: true,
                 release_key_present: true,
-                agent: { installed: true, enabled: true, version: '1', runtime: 'docker', last_run: ago(20), stale: false },
+                release_key_ids: ['0123456789abcdef'],
+                agent: {
+                    installed: true,
+                    enabled: true,
+                    version: '2',
+                    runtime: 'docker',
+                    last_run: ago(20),
+                    stale: false,
+                    capabilities: ['platform.update', 'platform.backup', 'platform.rollback'],
+                    updater_script: 3,
+                    self_update: false,
+                    key_id: '0123456789abcdef',
+                    next_key_id: null,
+                    snapshots: snapshotsOut(),
+                },
                 lock: inFlight?.state === 'awaiting_verification'
                     ? { phase: 'verifying', since: inFlight.started_at, expected_until: inFlight.verify_deadline, message: 'The platform was updated and waits for confirmation.', job_id: inFlight.job_id }
                     : null,
@@ -1532,6 +1649,12 @@ export async function handleMock(
             if (chosen && !packageOut(chosen).applicable) {
                 return send(res, 400, { detail: `Package ${chosen.version} is not newer than the installed ${MOCK_INSTALLED_VERSION}.` })
             }
+            const snapshot = operation.key === 'platform.rollback'
+                ? _state.snapshots.find(s => s.name === args.snapshot)
+                : undefined
+            if (operation.key === 'platform.rollback' && !snapshot) {
+                return send(res, 400, { detail: 'The host agent reports no snapshot by that name.' })
+            }
             if (inFlight) return conflict(res, 'Another maintenance job is in flight.')
             const job: MockJob = {
                 job_id: randomUUID(),
@@ -1550,10 +1673,11 @@ export async function handleMock(
                 verify_requested_at: null,
                 rollback_requested_at: null,
                 installed_version_before: '',
-                target_version: chosen?.version ?? '',
+                target_version: chosen?.version ?? snapshot?.version ?? '',
                 running_version: '',
                 snapshot: '',
                 post_snapshot: '',
+                migrations_applied: null,
                 output: '',
             }
             _state.jobs.push(job)
@@ -1600,6 +1724,9 @@ export async function handleMock(
             }
 
             if (suffix === '/rollback' && method === 'POST') {
+                if (job.operation !== 'platform.update') {
+                    return conflict(res, 'Only an update can be rolled back here; a snapshot is restored with the roll-back operation.')
+                }
                 if (job.state !== 'awaiting_verification' && !(job.state === 'succeeded' && job.snapshot)) {
                     return conflict(res, `A job in state '${job.state}' cannot be rolled back.`)
                 }

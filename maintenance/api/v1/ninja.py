@@ -27,7 +27,6 @@ POST /packages               upload a package: tarball, manifest, signature     
 DELETE /packages/{sha256}    remove an uploaded package                               (superuser)
 """
 
-import os
 import uuid
 
 from django.conf import settings
@@ -56,9 +55,22 @@ api = NinjaAPI(
 )
 
 JOB_LIST_LIMIT = 50
+# The one operation with a verification window, and so the one the verify and
+# rollback endpoints act on.
+UPDATE_OPERATION = "platform.update"
 
 
 # ── Schemas ──────────────────────────────────────────────────────────────────
+
+
+class SnapshotOut(Schema):
+    """A snapshot on the host, as the agent's heartbeat lists it. Only the name is ever sent back."""
+
+    name: str
+    taken_at: str | None
+    version: str | None
+    code: bool
+    migrations: str | None
 
 
 class AgentOut(Schema):
@@ -72,6 +84,10 @@ class AgentOut(Schema):
     stale: bool | None
     capabilities: list[str]
     updater_script: int | None
+    self_update: bool | None
+    key_id: str | None
+    next_key_id: str | None
+    snapshots: list[SnapshotOut]
 
 
 class LockOut(Schema):
@@ -101,6 +117,7 @@ class StatusOut(Schema):
     server_now: str
     spool_writable: bool
     release_key_present: bool
+    release_key_ids: list[str]
     agent: AgentOut
     lock: LockOut | None
     in_flight_job: str | None
@@ -143,6 +160,7 @@ class JobOut(Schema):
     running_version: str
     snapshot: str
     post_snapshot: str
+    migrations_applied: bool | None
     output: str | None = None
 
 
@@ -279,6 +297,7 @@ def _serialize_job(job, *, for_superuser: bool) -> dict:
         "running_version": job.running_version,
         "snapshot": job.snapshot,
         "post_snapshot": job.post_snapshot,
+        "migrations_applied": job.migrations_applied,
         "output": job.output if for_superuser else None,
     }
 
@@ -358,7 +377,7 @@ def get_status(request):
     spool.sync()
     lock = current_lock()
     in_flight = MaintenanceJob.objects.filter(in_flight=True).only("job_id").first()
-    release_key = getattr(settings, "REMOTE_UPDATE_RELEASE_KEY_PATH", "")
+    keys = packaging.load_release_keys()
     log_activity(verb="maintenance.status.read")
     return {
         "remote_maintenance_enabled": True,
@@ -366,7 +385,8 @@ def get_status(request):
         "installed_version": __version__,
         "server_now": timezone.now().isoformat(),
         "spool_writable": spool.is_writable(),
-        "release_key_present": bool(release_key) and os.path.isfile(release_key),
+        "release_key_present": bool(keys),
+        "release_key_ids": [packaging.key_id(key) for key in keys],
         "agent": spool.agent_summary(),
         "lock": {
             "phase": lock.phase,
@@ -388,7 +408,19 @@ def list_operations(request):
     _gate_enabled(request)
     _require_staff(request)
     host_enabled = _host_tier_enabled()
+    agent = spool.agent_summary()
     log_activity(verb="maintenance.operation.list")
+
+    def available(operation) -> bool:
+        # A host operation needs the tier on and, once an agent reports, an
+        # agent that carries it out; before any heartbeat the tier alone
+        # decides, since the banner already says the agent is not installed.
+        if operation.executor != HOST:
+            return True
+        if not host_enabled:
+            return False
+        return not agent["installed"] or operation.key in agent["capabilities"]
+
     return [
         {
             "key": operation.key,
@@ -396,7 +428,7 @@ def list_operations(request):
             "label": operation.label,
             "description": operation.description,
             "requires_step_up": operation.requires_step_up,
-            "available": operation.executor != HOST or host_enabled,
+            "available": available(operation),
             "args_schema": operation.args_schema.model_json_schema(),
         }
         for operation in registered_operations()
@@ -467,6 +499,7 @@ def create_job(request, payload: JobCreateIn):
         confirm_step_up(request, user, password=payload.password, totp_code=payload.totp_code)
 
     package = None
+    target_version = ""
     request_args = args.model_dump(exclude_none=True)
     if operation.executor == HOST:
         sha256 = getattr(args, "package_sha256", None)
@@ -476,6 +509,16 @@ def create_job(request, payload: JobCreateIn):
                 raise HttpError(400, "No uploaded package has that hash.")
             if not _package_applicable(package):
                 raise HttpError(400, f"Package {package.version} is not newer than the installed {__version__}.")
+            target_version = package.version
+        snapshot = getattr(args, "snapshot", None)
+        if snapshot:
+            # The agent is the authority on what the host holds; its heartbeat
+            # is checked here so a mistyped name answers now, not a tick later.
+            agent = spool.agent_summary()
+            known = {row["name"]: row for row in agent["snapshots"]}
+            if agent["installed"] and snapshot not in known:
+                raise HttpError(400, "The host agent reports no snapshot by that name.")
+            target_version = (known.get(snapshot) or {}).get("version") or ""
         # The agent reads the window from the request, and a request that
         # leaves it out means the deployment's default, not the agent's.
         if "verify_window_minutes" in type(args).model_fields and request_args.get("verify_window_minutes") is None:
@@ -489,7 +532,7 @@ def create_job(request, payload: JobCreateIn):
         requested_by=user,
         package=package,
         args=request_args,
-        target_version=package.version if package is not None else "",
+        target_version=target_version,
     )
     try:
         with transaction.atomic():
@@ -552,8 +595,8 @@ def verify_job(request, job_id: str, payload: ConfirmIn):
     user = _require_superuser(request)
     spool.sync()
     job = _get_job(job_id)
-    if job.executor != MaintenanceJob.Executor.HOST:
-        raise HttpError(409, "Only a host-tier job has a verification window.")
+    if job.operation != UPDATE_OPERATION:
+        raise HttpError(409, "Only an update has a verification window.")
     if job.state != MaintenanceJob.State.AWAITING_VERIFICATION:
         raise HttpError(409, f"A job in state {job.state!r} is not awaiting verification.")
     confirm_step_up(request, user, password=payload.password, totp_code=payload.totp_code, second_factor=False)
@@ -578,8 +621,10 @@ def rollback_job(request, job_id: str, payload: ConfirmIn):
     user = _require_superuser(request)
     spool.sync()
     job = _get_job(job_id)
-    if job.executor != MaintenanceJob.Executor.HOST:
-        raise HttpError(409, "Only a host-tier job can be rolled back.")
+    if job.operation != UPDATE_OPERATION:
+        raise HttpError(
+            409, "Only an update can be rolled back here; a snapshot is restored with the roll-back operation."
+        )
     allowed = (MaintenanceJob.State.AWAITING_VERIFICATION, MaintenanceJob.State.SUCCEEDED)
     if job.state not in allowed:
         raise HttpError(409, f"A job in state {job.state!r} cannot be rolled back.")
@@ -635,8 +680,9 @@ def upload_package(
 ):
     """Upload a release: the tarball, its manifest and the signature over the manifest, as three parts.
 
-    The signature is checked against ``REMOTE_UPDATE_RELEASE_KEY_PATH`` and
-    the manifest against what this deployment is — newer than the installed
+    The signature is checked against ``REMOTE_UPDATE_RELEASE_KEY_PATH``, or
+    the successor key a release announced beside it, and the manifest against
+    what this deployment is — newer than the installed
     version, the same project and plugins, within every installed pin — before
     the tarball is copied into the spool and hashed against the manifest. A
     refusal names its reason, leaves nothing in the packages directory and is
@@ -656,14 +702,14 @@ def upload_package(
             )
         manifest_bytes = manifest.read()
         signature_bytes = signature.read()
-        key = packaging.load_release_key()
-        if key is None:
+        keys = packaging.load_release_keys()
+        if not keys:
             raise packaging.PackageRejected(
                 "key_missing",
                 "This deployment has no release key to verify packages against (REMOTE_UPDATE_RELEASE_KEY_PATH).",
                 status=409,
             )
-        packaging.verify_signature(manifest_bytes, signature_bytes, key)
+        packaging.verify_signature(manifest_bytes, signature_bytes, keys)
         parsed = packaging.read_manifest(manifest_bytes)
         declared = parsed.version
         packaging.check_manifest(parsed)

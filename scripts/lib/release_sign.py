@@ -14,8 +14,9 @@ The manifest is written here rather than in the packager so its shape is fixed
 in one place: keys sorted, one key per line, lists on one line. ``update.sh``
 reads it with ``sed``, and that only works while the shape holds.
 
-Subcommands that touch a key need ``cryptography``; ``manifest``, ``version``,
-``compatible`` and ``vercmp`` run on any Python 3.
+Subcommands that touch a key need ``cryptography``; ``manifest`` (without
+``--successor-key``), ``version``, ``compatible`` and ``vercmp`` run on any
+Python 3.
 """
 
 from __future__ import annotations
@@ -146,8 +147,21 @@ def cmd_verify(args: argparse.Namespace) -> None:
 
 
 def cmd_manifest(args: argparse.Namespace) -> None:
-    """Write the package manifest: sorted keys, one per line, lists inline."""
+    """Write the package manifest: sorted keys, one per line, lists inline.
+
+    ``--successor-key`` embeds a public key the release announces as the next
+    signing key. The manifest is signed by the current key, so a deployment
+    that verifies it may trust the successor from then on; that is the whole
+    rotation mechanism, and why the key travels inside the signed bytes rather
+    than beside them.
+    """
     plugins = [p for p in (args.plugins or "").split(",") if p]
+    successor = None
+    successor_id = None
+    if args.successor_key:
+        public = _load_public(Path(args.successor_key))
+        successor = _public_pem(public).decode()
+        successor_id = key_id(public)
     fields = {
         "built_at": args.built_at or _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "agent_version": args.agent_version or None,
@@ -160,6 +174,8 @@ def cmd_manifest(args: argparse.Namespace) -> None:
         "project": args.project or "",
         "sha256": args.sha256,
         "size": args.size,
+        "successor_key": successor,
+        "successor_key_id": successor_id,
         "version": args.version,
     }
     if len(fields["sha256"]) != 64 or any(c not in "0123456789abcdef" for c in fields["sha256"]):
@@ -233,6 +249,7 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--min-updater-version", required=True, type=int)
     p.add_argument("--agent-version", default=0, type=int, help="the host agent the package ships; 0 for none")
     p.add_argument("--key-id", default="")
+    p.add_argument("--successor-key", default="", help="PEM public key of the next signing key, announced by this release")
     p.add_argument("--built-at", default="")
     p.add_argument("--out")
     p.set_defaults(func=cmd_manifest)

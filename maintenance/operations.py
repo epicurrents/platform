@@ -149,6 +149,28 @@ class PlatformUpdateArgs(Schema):
     )
 
 
+# A snapshot name as update.sh writes them: a label, a UTC date and a time. The
+# agent reports the names and checks a request against the same shape.
+SNAPSHOT_NAME_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9_-]*-[0-9]{8}-[0-9]{6}$"
+
+
+class PlatformRollbackArgs(Schema):
+    """Arguments of ``platform.rollback``: a snapshot on the host, by name, and whether the database goes with it."""
+
+    snapshot: str = Field(
+        ...,
+        pattern=SNAPSHOT_NAME_PATTERN,
+        description="A snapshot on the host, by the name the agent reports.",
+    )
+    restore_database: bool = Field(
+        True,
+        description=(
+            "Restore the database from the snapshot as well; everything written since it is lost. Off, the "
+            "database is kept, which the agent allows only when no migration was applied since the snapshot."
+        ),
+    )
+
+
 def register_core_operations() -> None:
     """Register the platform's own operations; called from ``MaintenanceConfig.ready``."""
     register_operation(
@@ -207,5 +229,29 @@ def register_core_operations() -> None:
             label="Update the platform",
             description="Apply an uploaded, signed package with a verification window and automatic rollback. Needs the host agent.",
             args_schema=PlatformUpdateArgs,
+        )
+    )
+    register_operation(
+        Operation(
+            key="platform.backup",
+            executor=HOST,
+            label="Take a snapshot",
+            description=(
+                "Snapshot the code, the database and the configuration on the host, without interrupting the "
+                "platform. The newest three are kept. Needs the host agent."
+            ),
+            args_schema=NoArgs,
+        )
+    )
+    register_operation(
+        Operation(
+            key="platform.rollback",
+            executor=HOST,
+            label="Roll back to a snapshot",
+            description=(
+                "Restore a snapshot the host holds: the code, and the database unless it is kept. The platform is "
+                "suspended while it runs. Needs the host agent."
+            ),
+            args_schema=PlatformRollbackArgs,
         )
     )

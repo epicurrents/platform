@@ -20,7 +20,9 @@
 #                    stack. The rebuild is not optional: the image carries the
 #                    code, so without it the recreate runs the new code against
 #                    the restored database and re-applies the migrations being
-#                    rolled back.
+#                    rolled back. With --code-only the database and .env are
+#                    kept, which is allowed only while the set of applied
+#                    migrations is the one the snapshot recorded.
 #
 # While it runs, the script keeps a maintenance flag at update/maintenance.json
 # (phase "updating" or "rolling_back"). The platform reads it to suspend
@@ -28,8 +30,9 @@
 # left the stack stopped, or --keep-lock says the caller owns it.
 #
 # Progress is also reported on lines starting with "::" (::step=…, ::snapshot=…,
-# ::health=…, ::done, ::failed=…, and ::refused=<reason> ahead of a refusal the
-# checks can name) for a caller that drives this script.
+# ::health=…, ::migrations=…, ::restored=…, ::done, ::failed=…, and
+# ::refused=<reason> ahead of a refusal the checks can name) for a caller that
+# drives this script.
 #
 # Usage:
 #   ./update.sh                          archive mode, newest ./update/epicurrents*.tar.gz
@@ -39,8 +42,10 @@
 #                                        prune, without touching the deployment
 #   ./update.sh --require-signature      refuse a package without a signature that
 #                                        verifies
-#   ./update.sh --release-key PATH       public key to verify against (default:
-#                                        RELEASE_KEY.pub at the deployment root)
+#   ./update.sh --release-key PATH       public key to verify against; repeatable,
+#                                        the first that verifies wins (default:
+#                                        RELEASE_KEY.pub at the deployment root and
+#                                        RELEASE_KEY.next.pub beside it when present)
 #   ./update.sh --require-newer          refuse a package whose version is not
 #                                        greater than the installed one
 #   ./update.sh --from repo              repo mode, git pull + frontend build
@@ -51,6 +56,9 @@
 #                                        backups/LABEL-<stamp> and exit
 #   ./update.sh --rollback               undo the last update (database, .env, code)
 #   ./update.sh --rollback --snapshot NAME   restore backups/NAME instead of the newest
+#   ./update.sh --rollback --code-only   restore the code and rebuild, keeping the
+#                                        database and .env; refused when a migration
+#                                        was applied since the snapshot
 #   ./update.sh --skip-beat              leave celery-beat stopped after the recreate,
 #                                        so no scheduled purge runs before the update
 #                                        is verified; start it yourself afterwards
@@ -62,8 +70,9 @@
 set -euo pipefail
 
 # Bumped whenever a package starts relying on something an older copy of this
-# script does not do; a package's manifest names the minimum it needs.
-UPDATER_SCRIPT_VERSION=2
+# script does not do; a package's manifest names the minimum it needs. 3 added
+# --code-only, repeatable --release-key and the migrations record in snapshots.
+UPDATER_SCRIPT_VERSION=3
 
 info() { printf '\n\033[1;34m==> %s\033[0m\n' "$*"; }
 ok()   { printf '    \033[32m✓\033[0m  %s\n'  "$*"; }
@@ -81,8 +90,8 @@ die()  {
 # A refusal with a reason a caller can key on: the host agent turns the token
 # into the job's failure reason, where the free text of the message would not
 # survive as a stable identifier. The vocabulary is the one the agent knows —
-# signature, hash, manifest, updater_too_old, incompatible, version_not_newer —
-# and is pinned in scripts/tests/test_update_targets.py.
+# signature, hash, manifest, updater_too_old, incompatible, version_not_newer,
+# code_only — and is pinned in scripts/tests/test_update_targets.py.
 refuse() {
     emit "refused=$1"
     shift
@@ -119,7 +128,8 @@ SKIP_BEAT=false
 KEEP_LOCK=false
 REQUIRE_SIGNATURE=false
 REQUIRE_NEWER=false
-RELEASE_KEY=""
+RELEASE_KEYS=()
+CODE_ONLY=false
 SNAPSHOT=""
 ROOT=""
 
@@ -131,8 +141,9 @@ while [ $# -gt 0 ]; do
         --archive=*) ARCHIVE="${1#*=}"; shift ;;
         --check-archive)   require_value --check-archive "${2:-}"; CHECK_ARCHIVE="$2"; shift 2 ;;
         --check-archive=*) CHECK_ARCHIVE="${1#*=}"; shift ;;
-        --release-key)     require_value --release-key "${2:-}"; RELEASE_KEY="$2"; shift 2 ;;
-        --release-key=*)   RELEASE_KEY="${1#*=}"; shift ;;
+        --release-key)     require_value --release-key "${2:-}"; RELEASE_KEYS+=("$2"); shift 2 ;;
+        --release-key=*)   RELEASE_KEYS+=("${1#*=}"); shift ;;
+        --code-only) CODE_ONLY=true; shift ;;
         --snapshot)  require_value --snapshot "${2:-}"; SNAPSHOT="$2"; shift 2 ;;
         --snapshot=*) SNAPSHOT="${1#*=}"; shift ;;
         --ref)       require_value --ref "${2:-}";     REF="$2"; shift 2 ;;
@@ -163,6 +174,9 @@ if [ -n "$SNAPSHOT" ] && [ "$ROLLBACK" = false ]; then
     fi
     SNAPSHOT_ONLY=true
 fi
+if [ "$CODE_ONLY" = true ] && [ "$ROLLBACK" = false ]; then
+    die "--code-only applies to --rollback only."
+fi
 
 # ── Locate the deployment root ────────────────────────────────────────────────
 # --root names it outright, for a copy of this script that lives outside the
@@ -192,7 +206,11 @@ absolute_from_caller() {
 }
 ARCHIVE="$(absolute_from_caller "$ARCHIVE")"
 CHECK_ARCHIVE="$(absolute_from_caller "$CHECK_ARCHIVE")"
-RELEASE_KEY="$(absolute_from_caller "$RELEASE_KEY")"
+if [ "${#RELEASE_KEYS[@]}" -gt 0 ]; then
+    for i in "${!RELEASE_KEYS[@]}"; do
+        RELEASE_KEYS[i]="$(absolute_from_caller "${RELEASE_KEYS[i]}")"
+    done
+fi
 cd "$ROOT"
 # The physical path, for deciding whether a path this script is about to
 # delete really lies under the tree.
@@ -299,6 +317,17 @@ installed_version() {
     # The version of the code in the tree, from the one module that carries it.
     # Empty when the tree has none (a checkout that predates the module).
     sed -n '/^__version__ = "/{s/^__version__ = "\([^"]*\)".*/\1/p;q;}' "$ROOT/epicurrents/version.py" 2>/dev/null || true
+}
+
+applied_migrations() {
+    # The migrations the database records as applied, one app.name per line,
+    # sorted. Read from the table rather than through showmigrations, which
+    # lists only the migration files the current code carries. Empty when the
+    # table does not exist yet, which is a database nothing has migrated.
+    # SC2016: $POSTGRES_* must expand inside the db container's shell, not here.
+    # shellcheck disable=SC2016
+    "${COMPOSE[@]}" exec -T db sh -c 'psql -At -F . -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "SELECT app, name FROM django_migrations ORDER BY 1, 2"' 2>/dev/null \
+        | LC_ALL=C sort || true
 }
 
 version_gt() {
@@ -465,6 +494,28 @@ PY
     return 2
 }
 
+VERIFIED_KEY=""
+
+verify_against_keys() {
+    # $1 = manifest, $2 = signature file, then the keys to try, in order.
+    # 0 when one verifies (VERIFIED_KEY names it), 1 when none does, 2 when
+    # nothing on this host can check a signature. A key that is not there is
+    # skipped: the successor a release announces exists only after that
+    # release was applied.
+    local manifest="$1" sig="$2" key rc
+    shift 2
+    for key in "$@"; do
+        [ -f "$key" ] || continue
+        verify_manifest_signature "$manifest" "$sig" "$key" && rc=0 || rc=$?
+        case "$rc" in
+            0) VERIFIED_KEY="$key"; return 0 ;;
+            1) ;;
+            *) return 2 ;;
+        esac
+    done
+    return 1
+}
+
 inspect_archive_listing() {
     # Reads the member list and refuses anything an overlay must not receive.
     # Sets ARCHIVE_TOP (the single wrapper directory) and ARCHIVE_PREFIX ("./"
@@ -532,28 +583,41 @@ archive_member() {
 }
 
 check_archive() {
-    local manifest="$ARCHIVE.manifest.json" sig="$ARCHIVE.manifest.sig" key="$RELEASE_KEY"
-    local rc msg want have size want_size field pkg_project pkg_plugins my_project my_plugins
+    local manifest="$ARCHIVE.manifest.json" sig="$ARCHIVE.manifest.sig"
+    local rc msg want have size want_size field pkg_project pkg_plugins my_project my_plugins keys present key
     info "Checking archive: $ARCHIVE"
-    [ -n "$key" ] || key="$ROOT/RELEASE_KEY.pub"
+    # The keys to try, in order. Without --release-key: the key at the
+    # deployment root and, when a release announced a successor, the successor
+    # beside it — the same pair the platform trusts at upload.
+    keys=()
+    if [ "${#RELEASE_KEYS[@]}" -gt 0 ]; then
+        keys=("${RELEASE_KEYS[@]}")
+    else
+        keys=("$ROOT/RELEASE_KEY.pub")
+        [ ! -f "$ROOT/RELEASE_KEY.next.pub" ] || keys+=("$ROOT/RELEASE_KEY.next.pub")
+    fi
+    present=""
+    for key in "${keys[@]}"; do
+        [ -f "$key" ] && present="$present${present:+, }$key"
+    done
 
     if [ -f "$manifest" ]; then
         PKG_MANIFEST="$manifest"
         if [ -f "$sig" ]; then
-            if [ ! -f "$key" ]; then
+            if [ -z "$present" ]; then
                 SIGNATURE_STATE=unverifiable
-                msg="The package is signed, but there is no release key to verify it against (looked for $key; pass --release-key PATH)."
+                msg="The package is signed, but there is no release key to verify it against (looked for ${keys[*]}; pass --release-key PATH)."
                 [ "$REQUIRE_SIGNATURE" = false ] || refuse signature "$msg"
                 warn "$msg"
             else
-                verify_manifest_signature "$manifest" "$sig" "$key" && rc=0 || rc=$?
+                verify_against_keys "$manifest" "$sig" "${keys[@]}" && rc=0 || rc=$?
                 case "$rc" in
                     0)
                         SIGNATURE_STATE=verified
-                        ok "Signature verified against $key"
+                        ok "Signature verified against $VERIFIED_KEY"
                         ;;
                     1)
-                        refuse signature "The package signature does NOT verify against $key. Refusing it: the manifest or the signature was altered, or the package was signed with a different key."
+                        refuse signature "The package signature does NOT verify against $present. Refusing it: the manifest or the signature was altered, or the package was signed with a different key."
                         ;;
                     *)
                         SIGNATURE_STATE=unverifiable
@@ -640,6 +704,7 @@ check_archive() {
     emit "sha256=${PKG_SHA256:-unknown}"
     emit "version=${PKG_VERSION:-unknown}"
     emit "installed=${INSTALLED_VERSION:-unknown}"
+    emit "key=${VERIFIED_KEY:-none}"
 }
 
 # ── Orphaned files ────────────────────────────────────────────────────────────
@@ -1152,6 +1217,9 @@ snapshot_database() {
         die "Database dump failed; aborting before any change. (Pass --no-backup to override.)"
     fi
     cp .env "$1/.env"
+    # Which migrations the dump has applied, so a later rollback can tell
+    # whether the database still matches the snapshot's code and keep it.
+    applied_migrations > "$1/migrations.txt"
     printf '%s\n' "$2" > "$1/MANIFEST"
     hand_to_tree_owner "$1"
     ok ".env + manifest saved"
@@ -1225,29 +1293,47 @@ if [ "$ROLLBACK" = true ]; then
     fi
     info "Rolling back to $(basename "$latest")"
     [ -f "$latest/MANIFEST" ] && cat "$latest/MANIFEST"
-    confirm "Restore database + .env from this snapshot? Current data will be overwritten." \
-        || die "Rollback aborted."
+    if [ "$CODE_ONLY" = true ]; then
+        # The database is kept only while it is the one the snapshot's code ran
+        # against: the set of applied migrations must not have moved since the
+        # snapshot recorded it. Checked before anything is touched, so a
+        # refusal changes nothing, and named so a caller can key on it.
+        [ -f "$latest/code.tar.gz" ] || die "--code-only needs a snapshot with a code archive, and $(basename "$latest") has none."
+        [ -f "$latest/migrations.txt" ] || refuse code_only "Snapshot $(basename "$latest") predates migration records, so whether the database still matches its code cannot be told. Roll back without --code-only, which restores the database too."
+        ensure_db_up
+        if [ "$(applied_migrations)" != "$(LC_ALL=C sort "$latest/migrations.txt")" ]; then
+            refuse code_only "Migrations were applied since snapshot $(basename "$latest") was taken, so its code cannot run against the current database. Roll back without --code-only, which restores the database too."
+        fi
+        ok "No migration was applied since the snapshot; the database and .env are kept"
+        confirm "Restore the code from this snapshot? The database and .env are kept." \
+            || die "Rollback aborted."
+    else
+        confirm "Restore database + .env from this snapshot? Current data will be overwritten." \
+            || die "Rollback aborted."
+    fi
     write_maintenance_flag rolling_back "The platform is being rolled back to the previous release."
     ensure_db_up
     stop_app_services
-    emit "step=restore-db"
-    info "Restoring database (single transaction — all or nothing)"
-    # --single-transaction + ON_ERROR_STOP: the schema drop and the restore commit
-    # or roll back as one unit, so a failure leaves the database exactly as it
-    # was rather than half-restored. On failure we stop here — .env is untouched
-    # and the stack is not recreated — so the operator never lands in a
-    # partially-recovered state.
-    # SC2016: $POSTGRES_* must expand inside the db container's shell, not here.
-    # shellcheck disable=SC2016
-    if ! { restore_sql_preamble; gunzip -c "$latest/db.sql.gz"; } \
-            | "${COMPOSE[@]}" exec -T db sh -c 'psql --single-transaction -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB"' \
-                >/dev/null; then
-        die "Database restore FAILED and was rolled back — the database is unchanged, .env was not touched, and the stack was not recreated. If the error above is a lock timeout, something is still connected to the database (a backup in progress, a shell); see pg_stat_activity. Investigate before retrying."
+    if [ "$CODE_ONLY" = false ]; then
+        emit "step=restore-db"
+        info "Restoring database (single transaction — all or nothing)"
+        # --single-transaction + ON_ERROR_STOP: the schema drop and the restore
+        # commit or roll back as one unit, so a failure leaves the database
+        # exactly as it was rather than half-restored. On failure we stop here —
+        # .env is untouched and the stack is not recreated — so the operator
+        # never lands in a partially-recovered state.
+        # SC2016: $POSTGRES_* must expand inside the db container's shell, not here.
+        # shellcheck disable=SC2016
+        if ! { restore_sql_preamble; gunzip -c "$latest/db.sql.gz"; } \
+                | "${COMPOSE[@]}" exec -T db sh -c 'psql --single-transaction -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB"' \
+                    >/dev/null; then
+            die "Database restore FAILED and was rolled back — the database is unchanged, .env was not touched, and the stack was not recreated. If the error above is a lock timeout, something is still connected to the database (a backup in progress, a shell); see pg_stat_activity. Investigate before retrying."
+        fi
+        ok "Database restored"
+        emit "step=restore-env"
+        cp "$latest/.env" ./.env
+        ok ".env restored"
     fi
-    ok "Database restored"
-    emit "step=restore-env"
-    cp "$latest/.env" ./.env
-    ok ".env restored"
 
     # Code after the database, deliberately. A failed database restore leaves
     # everything untouched (above); a failure here leaves the old database under
@@ -1309,6 +1395,9 @@ if [ "$ROLLBACK" = true ]; then
         warn "data, it is about to destroy it again. Re-apply a known-good archive first."
     fi
 
+    # The version the tree now carries, for a caller that gates on it.
+    emit "restored=$(installed_version)"
+
     # The same tail an update runs after its build. Static storage is not
     # manifest-based, so a stale hashed file would merely linger; the vendored
     # trees are what matter, since a newer Pyodide closure vendored by the
@@ -1319,7 +1408,9 @@ if [ "$ROLLBACK" = true ]; then
     wait_for_health
     report_vendor_failures
     echo
-    if [ "$CODE_RESTORED" = true ]; then
+    if [ "$CODE_ONLY" = true ]; then
+        ok "Rollback complete — code restored; the database and .env were kept."
+    elif [ "$CODE_RESTORED" = true ]; then
         ok "Rollback complete — database, .env and code restored."
     else
         warn "Rolled back the database and .env, not the code/image."
@@ -1416,6 +1507,9 @@ write_maintenance_flag updating "The platform is being updated."
 # few updates nothing identifies the deployed lineage.
 stamp="$(date -u +%Y%m%d-%H%M%S)"
 snap="$BACKUP_DIR/pre-update-$stamp"
+# The version the tree carries now, before the overlay replaces it: what the
+# snapshot's code is, recorded in its MANIFEST the way a named snapshot does.
+PRE_VERSION="$(installed_version)"
 if [ "$BACKUP" = true ]; then
     emit "step=snapshot"
     snapshot_code "$snap"
@@ -1540,6 +1634,7 @@ package_version=${PKG_VERSION:-unknown}"
     snapshot_database "$snap" "timestamp_utc=$stamp
 mode=$MODE
 code_snapshot=yes
+version=${PRE_VERSION:-unknown}
 $source_line"
 
     # If borgmatic is wired up and running, take a full backup too (data volumes).
@@ -1573,8 +1668,23 @@ stop_app_services
 ensure_db_up
 emit "step=migrate"
 info "Applying database migrations"
+# What the database had applied before, so the run can say whether this release
+# changed the schema: a release that applied nothing can be rolled back with
+# --code-only, which keeps the database and everything written since.
+before_migrate="$(applied_migrations)"
 "${COMPOSE[@]}" run --rm --no-deps web python manage.py migrate
 ok "Migrations applied"
+if [ "$before_migrate" = "$(applied_migrations)" ]; then
+    MIGRATIONS=none
+    ok "No migration was applied; this release can be rolled back with --code-only"
+else
+    MIGRATIONS=applied
+fi
+emit "migrations=$MIGRATIONS"
+if [ "$BACKUP" = true ] && [ -f "$snap/MANIFEST" ]; then
+    printf 'migrations=%s\n' "$MIGRATIONS" >> "$snap/MANIFEST"
+    hand_to_tree_owner "$snap/MANIFEST"
+fi
 
 # ── 6. Collect static files, refresh the vendored trees ───────────────────────
 

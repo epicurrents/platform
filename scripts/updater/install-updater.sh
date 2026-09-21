@@ -26,6 +26,9 @@
 #   --enable           Write ENABLED=1 into the config.
 #   --allow-checkout   Let the agent update a git checkout (ALLOW_CHECKOUT=1).
 #                      Remote updates are meant for distribution deployments.
+#   --self-update      Let the agent replace itself with the copy a verified
+#                      package ships (SELF_UPDATE=1). Off, a newer agent is
+#                      installed by re-running this installer from the package.
 #   --update-sh PATH   The update.sh to install as the agent's copy. Default:
 #                      update.sh beside this updater/ directory.
 #
@@ -41,6 +44,7 @@ DEPLOY_ROOT=""
 KEY=""
 ENABLE=false
 ALLOW_CHECKOUT=false
+SELF_UPDATE=false
 UPDATE_SH_SOURCE=""
 
 die() {
@@ -64,6 +68,7 @@ while [ $# -gt 0 ]; do
         --update-sh=*) UPDATE_SH_SOURCE="${1#*=}"; shift ;;
         --enable)      ENABLE=true; shift ;;
         --allow-checkout) ALLOW_CHECKOUT=true; shift ;;
+        --self-update) SELF_UPDATE=true; shift ;;
         -h|--help)
             awk 'NR == 1 { next } /^#/ { sub(/^#{1,2} ?/, ""); print; next } { exit }' "$0"
             exit 0
@@ -124,6 +129,8 @@ else
         echo "ENABLED=0"
         echo "# 1 to update a git checkout; remote updates are meant for distribution deployments."
         echo "ALLOW_CHECKOUT=0"
+        echo "# 1 to let the agent replace itself with the copy a verified package ships."
+        echo "SELF_UPDATE=0"
         echo "# Free space required under DEPLOY_ROOT beyond twice the package size, in bytes."
         echo "MIN_FREE_BYTES=1073741824"
         echo "# Seconds to wait for the readiness probe after an update or a rollback."
@@ -143,6 +150,14 @@ fi
 if [ "$ALLOW_CHECKOUT" = true ]; then
     sed -i.bak 's/^ALLOW_CHECKOUT=.*/ALLOW_CHECKOUT=1/' "$CONFIG_DIR/config" && rm -f "$CONFIG_DIR/config.bak"
     echo "    ALLOW_CHECKOUT=1"
+fi
+if [ "$SELF_UPDATE" = true ]; then
+    if grep -q '^SELF_UPDATE=' "$CONFIG_DIR/config"; then
+        sed -i.bak 's/^SELF_UPDATE=.*/SELF_UPDATE=1/' "$CONFIG_DIR/config" && rm -f "$CONFIG_DIR/config.bak"
+    else
+        echo "SELF_UPDATE=1" >> "$CONFIG_DIR/config"
+    fi
+    echo "    SELF_UPDATE=1"
 fi
 
 echo "==> Agent in $LIB_DIR"

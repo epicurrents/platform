@@ -170,6 +170,39 @@ class TestSignedPackage:
         assert manifest["manifest_version"] == 1
         assert manifest["key_id"] == _helper("key-id", str(key.with_name("release.key.pub"))).stdout.strip()
         assert manifest["built_at"].endswith("Z")
+        assert manifest["successor_key"] is None and manifest["successor_key_id"] is None
+
+    def test_a_successor_key_is_announced_in_the_manifest_and_shipped(self, tmp_path):
+        key = _key(tmp_path)
+        _helper("keygen", str(tmp_path / "keys" / "next.key"))
+        nxt = tmp_path / "keys" / "next.key.pub"
+        dest = tmp_path / "demo"
+        result = _run(dest, "--demo", "--tarball", "--sign-key", str(key), "--successor-key", str(nxt))
+        assert result.returncode == 0, result.stderr
+        archive = tmp_path / "demo.tar.gz"
+        manifest = _manifest(archive)
+        assert manifest["successor_key"] == nxt.read_text()
+        assert manifest["successor_key_id"] == _helper("key-id", str(nxt)).stdout.strip()
+        assert manifest["key_id"] == _helper("key-id", str(key.with_name("release.key.pub"))).stdout.strip()
+        # The current key still signs; the successor rides inside the signed bytes.
+        pub = key.with_name("release.key.pub")
+        signature = archive.with_name(archive.name + ".manifest.sig")
+        assert _helper("verify", str(pub), str(archive.with_name(archive.name + ".manifest.json")), str(signature)).returncode == 0
+        assert (dest / "RELEASE_KEY.next.pub").read_bytes() == nxt.read_bytes()
+        assert (dest / "RELEASE_KEY.pub").read_bytes() == pub.read_bytes()
+        with tarfile.open(archive) as tf:
+            assert "demo/RELEASE_KEY.next.pub" in tf.getnames()
+        assert "successor key id" in result.stdout
+
+    def test_a_successor_needs_a_signing_key_and_must_be_another_key(self, tmp_path):
+        key = _key(tmp_path)
+        pub = key.with_name("release.key.pub")
+        result = _run(tmp_path / "demo", "--demo", "--tarball", "--successor-key", str(pub))
+        assert result.returncode != 0 and "needs --sign-key" in result.stderr
+        result = _run(tmp_path / "demo", "--demo", "--tarball", "--sign-key", str(key), "--successor-key", str(pub))
+        assert result.returncode != 0 and "a successor is a different key" in result.stderr
+        result = _run(tmp_path / "demo", "--demo", "--tarball", "--sign-key", str(key), "--successor-key", str(key))
+        assert result.returncode != 0 and "not an Ed25519 public key" in result.stderr
 
     def test_filelist_names_every_regular_file_including_itself_sorted(self, tmp_path):
         dest, archive, _ = self._signed_demo(tmp_path)
