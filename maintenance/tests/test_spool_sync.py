@@ -45,6 +45,25 @@ class TestApplyStatus:
         assert job.snapshot == "pre-update-20260920-100100" and job.agent_version == "1"
         assert job.spool_updated_at.isoformat() == "2026-09-20T10:05:00+00:00"
 
+    def test_a_status_naming_no_target_keeps_the_one_the_request_took_from_the_snapshot(
+        self, spool_dir, superuser, write_status, no_push
+    ):
+        job = MaintenanceJob.objects.create(
+            operation="platform.rollback",
+            executor="host",
+            requested_by=superuser,
+            state="requested",
+            in_flight=True,
+            target_version="0.1.3",
+            args={"snapshot": "backup-20260921-122237", "restore_database": True},
+        )
+        write_status(
+            job.job_id, "succeeded", target_version="", running_version="0.1.3", snapshot="backup-20260921-122237"
+        )
+        assert spool.sync(force=True)["applied"] == 1
+        job.refresh_from_db()
+        assert job.state == "succeeded" and job.target_version == "0.1.3" and job.running_version == "0.1.3"
+
     def test_an_older_status_is_ignored(self, spool_dir, superuser, write_status, no_push):
         job = _host_job(superuser, state="running", spool_updated_at=timezone.now())
         write_status(job.job_id, "failed", updated_at="2020-01-01T00:00:00Z")
@@ -132,6 +151,38 @@ class TestRestore:
         assert recreated.verify_deadline.isoformat() == "2026-09-20T10:35:00+00:00"
         assert recreated.created_at.isoformat().replace("+00:00", "Z") == requested_at
         assert recreated.last_notified_state == "awaiting_verification"
+
+    def test_a_recreated_rollback_row_takes_its_target_from_the_heartbeat(
+        self, spool_dir, superuser, write_status, no_push
+    ):
+        spool.write_json_atomic(
+            spool.spool_path() / "agent.json",
+            {
+                "protocol": 1,
+                "version": "2",
+                "enabled": True,
+                "last_run": spool.now_iso(),
+                "snapshots": [{"name": "backup-20260921-122237", "version": "0.1.3", "code": True}],
+            },
+        )
+        job = MaintenanceJob.objects.create(
+            operation="platform.rollback",
+            executor="host",
+            requested_by=superuser,
+            state="requested",
+            in_flight=True,
+            target_version="0.1.3",
+            args={"snapshot": "backup-20260921-122237", "restore_database": True},
+        )
+        spool.write_request(job)
+        write_status(job.job_id, "succeeded", target_version="", running_version="0.1.3")
+        # The restore the rollback performed erased the row the request made.
+        MaintenanceJob.objects.all().delete()
+
+        assert spool.sync(force=True)["created"] == 1
+        recreated = MaintenanceJob.objects.get(job_id=job.job_id)
+        assert recreated.operation == "platform.rollback" and recreated.state == "succeeded"
+        assert recreated.target_version == "0.1.3"
 
     def test_a_request_for_a_deleted_user_still_comes_back(self, spool_dir, make_user, no_push):
         user = make_user()

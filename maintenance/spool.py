@@ -370,6 +370,10 @@ def _apply_status(job, status: dict) -> bool:
     job.in_flight = state in MaintenanceJob.IN_FLIGHT_STATES
     for name in _STATUS_TEXT_FIELDS:
         value = status.get(name)
+        if name == "target_version" and value in (None, ""):
+            # A rollback's status file names no target; the row's, taken from
+            # the snapshot when the request was made, stands.
+            continue
         setattr(job, name, str(value) if value is not None else "")
     for name in _STATUS_TIME_FIELDS:
         setattr(job, name, parse_timestamp(status.get(name)))
@@ -407,6 +411,14 @@ def _row_from_request(job_id, request: dict, status: dict | None):
     requested_at = parse_timestamp(request.get("requested_at"))
     if requested_at is not None:
         job.created_at = requested_at
+    # What the request endpoint had worked out at the time: a package's
+    # version, or the version the snapshot to restore was taken at. A status
+    # file that names a target overrides it below; a rollback's names none.
+    if package is not None:
+        job.target_version = package.version
+    elif isinstance(args.get("snapshot"), str):
+        known = {row["name"]: row for row in agent_summary()["snapshots"]}
+        job.target_version = (known.get(args["snapshot"]) or {}).get("version") or ""
     if status is not None:
         _apply_status(job, status)
     return job
