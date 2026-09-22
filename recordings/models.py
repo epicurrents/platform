@@ -69,8 +69,18 @@ class Recording(models.Model):
     file_extension = models.CharField(max_length=32, blank=True, default="")
     file_size = models.BigIntegerField()
     file_path = models.CharField(max_length=1024)
+    # SHA-256 of the bytes as uploaded, before any de-identification. Never served: it is a
+    # bit-exact link to the original held by whoever acquired the recording, and an endpoint that
+    # answers whether a given hash exists is a membership oracle for anyone holding a copy (see
+    # docs/anonymisation-compliance.md). Internal uses only: the preservation manifest, content_hash,
+    # and the dataset withdrawal path a project runs as a management command.
     file_hash = models.CharField(max_length=64, blank=True, default="")
     content_hash = models.CharField(max_length=64, blank=True, default="")
+    # SHA-256 of the file as stored, computed after the last ingest rewrite and again whenever the
+    # platform rewrites the file (``recordings.metadata.refresh_signal_metadata``). The one digest
+    # the API serves: a hash of already-de-identified bytes links to nothing outside the platform.
+    # Empty for a recording that never reached READY.
+    stored_hash = models.CharField(max_length=64, blank=True, default="")
 
     class Status(models.TextChoices):
         PENDING = "pending", "Pending"

@@ -12,6 +12,8 @@ with a row when adding a caller class, a column when adding a surface — the re
 walks an app adds its combinations here.
 """
 
+from datetime import datetime
+
 import pytest
 from django.contrib.contenttypes.models import ContentType
 from django.test import Client
@@ -225,6 +227,23 @@ class TestAccessMatrix:
             assert body.get("original_name") is None, f"original_name leaked to {caller}"
             assert body.get("processing_error") is None, f"processing_error leaked to {caller}"
         assert _get(matrix, "author", "detail").json().get("original_name") == "parity.edf"
+
+    def test_file_hash_is_served_to_nobody(self, matrix):
+        for caller in ("author", "grantee", "raw_grantee", "dataset_grantee", "token", "superuser"):
+            body = _get(matrix, caller, "detail").json()
+            assert "file_hash" not in body, f"file_hash served to {caller}"
+
+    def test_created_at_is_month_truncated_for_every_non_author_reader(self, matrix):
+        exact = matrix["recording"].created_at
+        # The JSON encoder writes millisecond precision.
+        exact = exact.replace(microsecond=(exact.microsecond // 1000) * 1000)
+        truncated = exact.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        for caller in ("grantee", "raw_grantee", "dataset_grantee", "token"):
+            served = datetime.fromisoformat(_get(matrix, caller, "detail").json()["created_at"])
+            assert served == truncated, f"{caller} received an upload time finer than the month"
+        for caller in ("author", "superuser"):
+            served = datetime.fromisoformat(_get(matrix, caller, "detail").json()["created_at"])
+            assert served == exact, f"{caller} should receive the exact upload time"
 
     def test_middleware_grants_receive_sanitised_bytes_raw_grants_do_not(self, matrix):
         raw = matrix["content"]

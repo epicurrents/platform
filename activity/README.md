@@ -555,6 +555,7 @@ To check the table against the tree, walk the AST for `log_activity` / `with_sys
 | `recordings.read` | `recording_detail` |
 | `recordings.read.slice` | `recording_detail_slice` |
 | `recordings.set_mains` | `bulk_set_mains` |
+| `recordings.stored_hash.backfill` | `handle` † |
 | `recordings.status` | `recording_status` |
 | `recordings.trash` | `delete_recording` |
 | `recordings.update` | `update_recording` |

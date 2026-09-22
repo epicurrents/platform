@@ -32,10 +32,12 @@ export interface Recording {
     processing_error: string | null
     file_extension: string
     file_size: number
-    file_hash: string
+    /** SHA-256 of the file as stored, after de-identification; empty until processing completes. */
+    stored_hash: string
     content_hash: string
     status: 'pending' | 'processing' | 'ready' | 'failed'
     modality: string
+    /** Exact for the author and superusers; truncated to the first of its month for every other reader. */
     created_at: string
     deleted_at: string | null
     meta: RecordingMeta | null
@@ -56,7 +58,6 @@ export interface RecordingUpload {
     stored_name: string
     file_extension: string
     file_size: number
-    file_hash: string
     status: string
 }
 

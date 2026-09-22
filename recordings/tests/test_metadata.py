@@ -12,26 +12,36 @@ from django.contrib.contenttypes.models import ContentType
 from activity.derived_state import verify_derived_state
 from activity.models import Activity, ObjectChangeLog
 from activity.system_activity import with_system_activity
-from recordings.metadata import MetadataRefreshError, refresh_signal_metadata
+from recordings.metadata import MetadataRefreshError, refresh_signal_metadata, stored_hash_of
 from recordings.models import Recording, RecordingMeta, SignalInfo
 from recordings.testing import make_edf_bytes
 
 
-def _make_recording(user, tmp_path, *, n_channels: int, stored_signal_count: int | None = None):
+def _make_recording(
+    user,
+    tmp_path,
+    *,
+    n_channels: int,
+    stored_signal_count: int | None = None,
+    stored_name: str | None = None,
+):
     """Write an EDF with *n_channels* and register metadata claiming *stored_signal_count*.
 
     When ``stored_signal_count`` differs from ``n_channels`` the recording is in exactly the state a
-    reprocessing stage leaves behind: a correct file, and rows describing an older one.
+    reprocessing stage leaves behind: a correct file, and rows describing an older one. The file is
+    named after the channel count unless *stored_name* is given; a test that reaches the recording
+    through the API passes a hash-shaped name, since the resolvers accept nothing else.
     """
     data = make_edf_bytes(n_channels=n_channels, n_records=2)
     path = tmp_path / f"rec{n_channels}.edf"
     path.write_bytes(data)
     recording = Recording.objects.create(
         author=user,
-        stored_name=path.name,
+        stored_name=stored_name or path.name,
         file_path=str(path),
         file_extension=".edf",
         file_size=len(data),
+        stored_hash=stored_hash_of(path),
         status=Recording.Status.READY,
     )
     # Rows are derived from the file rather than invented, so "in sync" in these tests means the
@@ -126,6 +136,52 @@ class TestRefreshSignalMetadata:
         assert refresh_signal_metadata(recording).changed is True
         assert refresh_signal_metadata(recording).changed is False
 
+    def test_stale_stored_hash_is_corrected_without_touching_metadata(self, user, tmp_path):
+        """A rewrite that changes samples leaves the header alone, so the descriptor comparison
+        cannot see it; the digest is what notices."""
+        recording, meta = _make_recording(user, tmp_path, n_channels=3)
+        path = tmp_path / "rec3.edf"
+        data = bytearray(path.read_bytes())
+        data[-1] ^= 0xFF
+        path.write_bytes(bytes(data))
+        signal_rows_before = list(SignalInfo.objects.filter(meta=meta).values_list("pk", flat=True))
+
+        result = refresh_signal_metadata(recording)
+
+        assert result.changed is True
+        assert result.stored_hash_changed is True
+        assert "stored hash" in result.summary
+        recording.refresh_from_db()
+        assert recording.stored_hash == stored_hash_of(path)
+        assert list(SignalInfo.objects.filter(meta=meta).values_list("pk", flat=True)) == signal_rows_before
+        assert refresh_signal_metadata(recording).changed is False
+
+    def test_empty_stored_hash_is_backfilled_by_a_refresh(self, user, tmp_path):
+        recording, _ = _make_recording(user, tmp_path, n_channels=3)
+        Recording.objects.filter(pk=recording.pk).update(stored_hash="")
+        recording.refresh_from_db()
+        assert refresh_signal_metadata(recording).stored_hash_changed is True
+        recording.refresh_from_db()
+        assert recording.stored_hash == stored_hash_of(tmp_path / "rec3.edf")
+
+    def test_dry_run_reports_a_stale_hash_without_writing(self, user, tmp_path):
+        recording, _ = _make_recording(user, tmp_path, n_channels=3)
+        Recording.objects.filter(pk=recording.pk).update(stored_hash="0" * 64)
+        recording.refresh_from_db()
+        result = refresh_signal_metadata(recording, dry_run=True)
+        assert result.stored_hash_changed is True
+        recording.refresh_from_db()
+        assert recording.stored_hash == "0" * 64
+
+    def test_metadata_drift_re_derives_the_hash_in_the_same_pass(self, user, tmp_path):
+        recording, _ = _make_recording(user, tmp_path, n_channels=6, stored_signal_count=3)
+        Recording.objects.filter(pk=recording.pk).update(stored_hash="")
+        recording.refresh_from_db()
+        result = refresh_signal_metadata(recording)
+        assert (result.changed, result.stored_hash_changed) == (True, True)
+        recording.refresh_from_db()
+        assert recording.stored_hash == stored_hash_of(tmp_path / "rec6.edf")
+
     def test_missing_file_raises_rather_than_clearing_metadata(self, user, tmp_path):
         recording, meta = _make_recording(user, tmp_path, n_channels=3)
         (tmp_path / "rec3.edf").unlink()
@@ -205,6 +261,21 @@ class TestRefreshAuditTrail:
         rows = ObjectChangeLog.objects.filter(activity=activity, content_type__model="recording")
         assert rows.count() == 1
         assert verify_derived_state(rows.first()).ok is True
+
+    def test_hash_only_correction_is_one_audited_row_without_a_digest(self, user, tmp_path):
+        """No SignalInfo row moved, so there is nothing to re-baseline; the row records the hash."""
+        recording, _ = _make_recording(user, tmp_path, n_channels=3)
+        Recording.objects.filter(pk=recording.pk).update(stored_hash="")
+        recording.refresh_from_db()
+        with with_system_activity("recordings.metadata.refresh", interface=Activity.Interface.COMMAND):
+            refresh_signal_metadata(recording)
+        activity = Activity.objects.filter(verb="recordings.metadata.refresh").latest("id")
+        rows = ObjectChangeLog.objects.filter(activity=activity, content_type__model="recording")
+        assert rows.count() == 1
+        row = rows.first()
+        assert "stored_hash" in (row.changes or {})
+        assert not row.extra_payload
+        assert verify_derived_state(row).ok is True
 
     def test_channel_replacement_writes_no_per_row_entries(self, user, tmp_path):
         """The digest covers the SignalInfo set; a row per deleted channel would say nothing it

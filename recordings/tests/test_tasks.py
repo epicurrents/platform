@@ -58,6 +58,8 @@ class TestProcessRecording:
         assert recording.status == Recording.Status.READY
         assert recording.content_hash != ""
         assert Path(recording.file_path).exists()
+        # The digest of the file as stored, taken at the end of processing.
+        assert recording.stored_hash == hashlib.sha256(Path(recording.file_path).read_bytes()).hexdigest()
 
     def test_unexpected_error_marks_failed_with_reason(self, user, tmp_path):
         """An unexpected (non-format) processing error preserves the row as
@@ -86,6 +88,8 @@ class TestProcessRecording:
         recording.refresh_from_db()
         assert recording.status == Recording.Status.FAILED
         assert recording.processing_error.startswith("Unexpected processing error:")
+        # A FAILED recording is never stamped: its file still holds the bytes as uploaded.
+        assert recording.stored_hash == ""
         # The author is still notified of the failure.
         mock_push.assert_called_once()
         assert mock_push.call_args[1]["title"] == "Recording failed"

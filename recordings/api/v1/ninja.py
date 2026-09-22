@@ -21,6 +21,21 @@ sanitization parity for middleware callers, raw-bytes parity for
 authors, and a source scan rejecting pipeline construction outside
 ``_build_serve_pipeline``).
 
+⚠️ LOAD-BEARING — the grantee-visible response shape.
+``_build_recording_out`` and the slice serialiser decide what a reader
+who is not the author learns about a recording. Two fields are the
+platform's own linkage keys and are handled here: ``file_hash`` is never
+serialised (a bit-exact link to the original held by whoever acquired
+it; ``stored_hash`` is the digest served instead), and ``created_at`` is
+truncated to the first of its month for every non-author reader
+(``_visible_created_at``), since the upload time is the acquisition date
+at hours' resolution. The hazard is a field added without a decision:
+the next ``Out`` field ships to every grantee, share-token holder and
+peer, and no byte-level test notices. The contract test in
+``recordings/tests/test_grantee_visible_shape.py`` pins the exact key
+set per caller class, so adding a field fails the suite until the
+given-data table in docs/anonymisation-compliance.md is re-read.
+
 Endpoints
 ---------
 POST   /upload              Upload an EDF/BDF file; returns 202 and enqueues processing.
@@ -49,7 +64,7 @@ import logging
 import math
 import re
 import secrets
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 
 from django.conf import settings
@@ -166,7 +181,9 @@ class RecordingUploadOut(Schema):
     """Response payload returned immediately after upload (status=pending).
 
     The upload endpoint is author-only by definition, so ``original_name`` is
-    returned unconditionally here — the uploader is always the author.
+    returned unconditionally here — the uploader is always the author. No hash
+    is returned: ``stored_hash`` does not exist until processing has run, and
+    ``file_hash`` is never served (see ``RecordingOut``).
     """
 
     original_name: str
@@ -174,7 +191,6 @@ class RecordingUploadOut(Schema):
     stored_name: str
     file_extension: str
     file_size: int
-    file_hash: str
     status: str
 
 
@@ -195,6 +211,12 @@ class RecordingOut(Schema):
     filename can carry PHI.  Use ``display_name`` for any grantee-visible
     label; it is always populated (defaulting to the ``stored_name`` hash
     prefix when the author has not set a custom name).
+
+    ``stored_hash`` is the SHA-256 of the file as stored, after
+    de-identification; it is empty until processing completes. The digest of
+    the bytes as uploaded (``Recording.file_hash``) is never serialised, to
+    anyone. ``created_at`` is exact for the author and superusers and
+    truncated to the first of its month for every other reader.
     """
 
     hash: str
@@ -204,7 +226,7 @@ class RecordingOut(Schema):
     processing_error: str | None = None
     file_extension: str
     file_size: int
-    file_hash: str
+    stored_hash: str = ""
     content_hash: str
     status: str
     modality: str = ""
@@ -273,7 +295,7 @@ class RecordingSliceOut(Schema):
     has_custom_name: bool = False
     file_extension: str
     file_size: int
-    file_hash: str
+    stored_hash: str = ""
     content_hash: str
     status: str
     modality: str = ""
@@ -382,6 +404,19 @@ def _can_see_original_name(user, recording, fed) -> bool:
     if getattr(user, "is_superuser", False):
         return True
     return getattr(recording, "author_id", None) == user.pk
+
+
+def _visible_created_at(recording, *, exact: bool) -> datetime:
+    """Return ``created_at`` as the caller may see it: exact for authors and superusers, else month-truncated.
+
+    The upload time on a clinical deployment falls within hours of acquisition, so it reinstates the
+    start date the header de-identification removed. The first of the month, in UTC, keeps listing
+    order stable for a grantee and links to nothing in an acquisition log.
+    """
+    created_at = recording.created_at
+    if exact or created_at is None:
+        return created_at
+    return created_at.astimezone(UTC).replace(day=1, hour=0, minute=0, second=0, microsecond=0)
 
 
 def _failed_hidden_for_caller(recording, user, fed) -> bool:
@@ -1082,11 +1117,11 @@ def _build_recording_out(
         "processing_error": ((recording.processing_error or None) if can_see_author_fields else None),
         "file_extension": recording.file_extension,
         "file_size": recording.file_size,
-        "file_hash": recording.file_hash,
+        "stored_hash": recording.stored_hash,
         "content_hash": recording.content_hash,
         "status": recording.status,
         "modality": recording.modality,
-        "created_at": recording.created_at,
+        "created_at": _visible_created_at(recording, exact=can_see_author_fields),
         "deleted_at": recording.deleted_at,
         "meta": {
             "format": meta_obj.format,
@@ -1382,7 +1417,6 @@ def upload_recording(
         "stored_name": recording.stored_name,
         "file_extension": recording.file_extension,
         "file_size": recording.file_size,
-        "file_hash": recording.file_hash,
         "status": recording.status,
     }
 
@@ -1851,18 +1885,19 @@ def recording_detail_slice(
         },
     )
 
+    can_see_author_fields = _can_see_original_name(user, recording, fed)
     return {
         "hash": recording.stored_name.split(".", 1)[0],
-        "original_name": (recording.original_name if _can_see_original_name(user, recording, fed) else None),
+        "original_name": (recording.original_name if can_see_author_fields else None),
         "display_name": _resolve_display_name(recording),
         "has_custom_name": _has_custom_display_name(recording),
         "file_extension": recording.file_extension,
         "file_size": recording.file_size,
-        "file_hash": recording.file_hash,
+        "stored_hash": recording.stored_hash,
         "content_hash": recording.content_hash,
         "status": recording.status,
         "modality": recording.modality,
-        "created_at": recording.created_at,
+        "created_at": _visible_created_at(recording, exact=can_see_author_fields),
         "deleted_at": recording.deleted_at,
         "meta": {
             "format": meta.format,

@@ -364,9 +364,9 @@ async function confirmDelete () {
                     <dt>{{ t('Added', SCOPE) }}</dt>
                     <dd>{{ formatDate(detailsRec.created_at) }}</dd>
                 </div>
-                <div class="wa-flank details-flank">
+                <div v-if="detailsRec.stored_hash" class="wa-flank details-flank">
                     <dt>{{ t('File hash', SCOPE) }}</dt>
-                    <dd class="details-hash">{{ detailsRec.file_hash }}</dd>
+                    <dd class="details-hash">{{ detailsRec.stored_hash }}</dd>
                 </div>
             </dl>
         </div>

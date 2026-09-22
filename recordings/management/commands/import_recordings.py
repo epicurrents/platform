@@ -427,6 +427,7 @@ class Command(BaseCommand):
         from epicurrents.system_user import get_system_user
         from library.models import CollectionItem
         from recordings.converters.sidecar import save_sidecar_events
+        from recordings.metadata import stored_hash_of
         from recordings.models import ImportJob, Recording, stored_original_name
         from recordings.processors.edf import process_edf_file
         from recordings.tasks import (
@@ -509,6 +510,8 @@ class Command(BaseCommand):
         except Exception:
             permanent_path.unlink(missing_ok=True)
             raise
+        # The digest of the file as served, taken after process_edf_file's in-place rewrites.
+        stored_hash = stored_hash_of(permanent_path)
 
         # ── Persist to DB (atomic) ────────────────────────────────────────────
         with transaction.atomic():
@@ -554,6 +557,7 @@ class Command(BaseCommand):
                 update_fields={
                     "status": Recording.Status.READY,
                     "content_hash": content_hash,
+                    "stored_hash": stored_hash,
                     "modality": modality,
                 },
             )

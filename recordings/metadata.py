@@ -15,6 +15,7 @@ bytes cut at the wrong offsets.
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -48,14 +49,34 @@ class MetadataRefresh:
     file_signal_count: int
     stored_record_count: int
     file_record_count: int
+    #: The stored digest disagreed with the bytes on disk. Set on its own when a rewrite changed
+    #: samples but not the header, which the descriptor comparison cannot see.
+    stored_hash_changed: bool = False
 
     @property
     def summary(self) -> str:
         """One line naming the drift, for command output and task logs."""
-        return (
+        line = (
             f"signals {self.stored_signal_count} → {self.file_signal_count}, "
             f"records {self.stored_record_count} → {self.file_record_count}"
         )
+        if self.stored_hash_changed:
+            line += ", stored hash re-derived"
+        return line
+
+
+def stored_hash_of(file_path) -> str:
+    """Return the SHA-256 hex digest of the file at *file_path*, the value ``Recording.stored_hash`` carries.
+
+    Streams the file in 64 KiB chunks so a multi-gigabyte recording is never held in memory. The
+    ingest paths call this after their last in-place rewrite, and :func:`refresh_signal_metadata`
+    calls it to notice a rewrite that happened since.
+    """
+    digest = hashlib.sha256()
+    with Path(file_path).open("rb") as fh:
+        for chunk in iter(lambda: fh.read(65536), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _header_length(header, file_size: int, file_path: Path) -> int:
@@ -147,12 +168,13 @@ def _parse_file(recording):
 
 
 def refresh_signal_metadata(recording, *, dry_run: bool = False) -> MetadataRefresh:
-    """Rewrite ``RecordingMeta`` and ``SignalInfo`` to match the stored file.
+    """Rewrite ``RecordingMeta``, ``SignalInfo`` and ``Recording.stored_hash`` to match the stored file.
 
     Re-parses the file's header, and when it disagrees with the database replaces the metadata rows
-    and re-baselines the ``SignalInfo`` audit digest on the recording. Returns without writing when
-    the two already agree, so a re-run is idempotent and a sweep over an unaffected deployment
-    writes nothing.
+    and re-baselines the ``SignalInfo`` audit digest on the recording. The file's digest is compared
+    to ``stored_hash`` as well, since a rewrite that changes samples leaves the header alone; a stale
+    digest is corrected on its own audit row. Returns without writing when everything already agrees,
+    so a re-run is idempotent and a sweep over an unaffected deployment writes nothing.
 
     Interruptions and the "Original annotations" row are deliberately untouched. They are derived
     from signal *content*, which a header refresh has no view of, and recreating them would
@@ -165,18 +187,15 @@ def refresh_signal_metadata(recording, *, dry_run: bool = False) -> MetadataRefr
     Under ``dry_run`` the drift is reported and nothing is written, so a sweep can be inspected
     before it is applied.
     """
-    from activity.audit import record_modify_change, serialize_instance
-    from recordings.audit_digests import (
-        SIGNAL_INFO_DIGEST_KEY,
-        compute_signal_info_digest,
-    )
-    from recordings.models import Recording, RecordingMeta, SignalInfo
+    from recordings.models import RecordingMeta, SignalInfo
 
     extension = (recording.file_extension or "").lower()
     if extension not in EDF_EXTENSIONS:
         raise MetadataRefreshError(f"Only EDF and BDF recordings carry parseable signal metadata, not {extension!r}.")
 
     header, signal_infos = _parse_file(recording)
+    digest = stored_hash_of(recording.file_path)
+    hash_in_sync = recording.stored_hash == digest
     recording_ct = ContentType.objects.get_for_model(recording, for_concrete_model=False)
     meta = RecordingMeta.objects.filter(content_type=recording_ct, object_id=str(recording.pk)).first()
     if meta is None:
@@ -193,16 +212,20 @@ def refresh_signal_metadata(recording, *, dry_run: bool = False) -> MetadataRefr
         and _stored_descriptors(meta) == _parsed_descriptors(signal_infos)
     )
     result = MetadataRefresh(
-        changed=not in_sync,
+        changed=not (in_sync and hash_in_sync),
         stored_signal_count=meta.signal_count,
         file_signal_count=header.signal_count,
         stored_record_count=meta.data_record_count,
         file_record_count=header.data_record_count,
+        stored_hash_changed=not hash_in_sync,
     )
-    if in_sync or dry_run:
+    if (in_sync and hash_in_sync) or dry_run:
         return result
 
     with transaction.atomic():
+        if in_sync:
+            _write_stored_hash(recording, digest, rebaseline_digest=False)
+            return result
         meta.format = header.data_format
         meta.duration = header.data_record_count * header.data_record_duration
         meta.data_record_count = header.data_record_count
@@ -243,18 +266,37 @@ def refresh_signal_metadata(recording, *, dry_run: bool = False) -> MetadataRefr
         finally:
             reset_change_logging_suppressed(suppression)
 
-        # The recording's own fields do not change here, so this row's diff is empty; it exists to
-        # carry the new digest. Without it the recording keeps a baseline describing the replaced
-        # rows, and every later integrity check reports tampering that never happened.
-        fresh = Recording.objects.get(pk=recording.pk)
-        record_modify_change(
-            actor=None,
-            obj=fresh,
-            before_state=serialize_instance(fresh),
-            extra_payload={SIGNAL_INFO_DIGEST_KEY: compute_signal_info_digest(fresh)},
-        )
+        # This row carries the new digest, and the corrected stored hash when the bytes changed too.
+        # Without it the recording keeps a baseline describing the replaced rows, and every later
+        # integrity check reports tampering that never happened.
+        _write_stored_hash(recording, digest, rebaseline_digest=True)
 
     return result
+
+
+def _write_stored_hash(recording, digest: str, *, rebaseline_digest: bool) -> None:
+    """Persist *digest* as ``stored_hash`` on one audit row, re-baselining the SignalInfo digest when asked.
+
+    The column is written with a queryset update, which fires no signal, so the audit row is
+    recorded explicitly with the database state from before the write. When the digest already
+    matches, the row is written for the re-baseline alone and its field diff is empty.
+    """
+    from activity.audit import record_modify_change, serialize_instance
+    from recordings.audit_digests import SIGNAL_INFO_DIGEST_KEY, compute_signal_info_digest
+    from recordings.models import Recording
+
+    fresh = Recording.objects.get(pk=recording.pk)
+    before_state = serialize_instance(fresh)
+    if fresh.stored_hash != digest:
+        Recording.objects.filter(pk=fresh.pk).update(stored_hash=digest)
+        fresh.stored_hash = digest
+        recording.stored_hash = digest
+    record_modify_change(
+        actor=None,
+        obj=fresh,
+        before_state=before_state,
+        extra_payload=({SIGNAL_INFO_DIGEST_KEY: compute_signal_info_digest(fresh)} if rebaseline_digest else None),
+    )
 
 
 def _carried_source_fields(source_fields, idx, new_label) -> tuple[str, str, str, int | None]:

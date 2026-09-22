@@ -267,7 +267,8 @@ def process_recording(recording_id: int, preserve_annotations: bool = False):
     before the rest of processing. Converter-produced sidecar events are saved
     as a "Source events" annotation. The stored file and all DB metadata
     (``stored_name``, ``file_extension``, ``file_hash``, ``file_size``) are
-    updated to reflect the converted EDF.
+    updated to reflect the converted EDF. ``stored_hash`` is taken from the
+    file after every rewrite and is the one digest the API serves.
 
     For recognised formats (EDF / BDF) the header is parsed, de-identified,
     and rewritten; signal metadata, gaps, and embedded annotations are stored.
@@ -521,6 +522,14 @@ def _process_recording_body(*, recording, recording_id, staging_path, preserve_a
         # post_convert hook, registered in RecordingsConfig.ready and
         # already fired by dispatch_post_convert above.
 
+        # ── Stored-bytes digest ──────────────────────────────────────────────
+        # Taken after the last in-place rewrite so it describes the file as served. Left empty on
+        # failure: the file then still holds the bytes as uploaded, and a digest of those is
+        # ``file_hash`` under another name.
+        from recordings.metadata import stored_hash_of
+
+        stored_hash = "" if format_error else stored_hash_of(permanent_path)
+
         # ── Compute content_hash ──────────────────────────────────────────────
         final_status = Recording.Status.FAILED if format_error else Recording.Status.READY
         recording.file_path = str(permanent_path)
@@ -563,6 +572,7 @@ def _process_recording_body(*, recording, recording_id, staging_path, preserve_a
                 "file_path": str(permanent_path),
                 "status": final_status,
                 "content_hash": content_hash,
+                "stored_hash": stored_hash,
                 "modality": modality,
                 "processing_error": (format_error or "")[:4096],
             },
