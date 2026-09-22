@@ -1,6 +1,6 @@
 # Anonymisation compliance — execution plan
 
-**Status: v1.2, 2026-09-22. Phases 0 and 1 shipped; phases 2–7 not started.** Three decisions taken on review are folded in: `file_hash` leaves every response, the author's included; a centre's withdrawal confirmation is the purge command's report and never a lookup; and the dataset releases on a monthly cadence, with the acquisition embargo's length left to the deployment. The reason this plan exists is the edu project's multi-centre teaching dataset, whose design in the project's own engineering note is a contextual-approach anonymisation case; [the section on it](#the-edu-teaching-dataset-under-the-guidelines) says what the guidelines require of that design and which phases are prerequisites for its first release. The assessment in [docs/anonymisation-compliance.md](../anonymisation-compliance.md) found that the platform's de-identified output is pseudonymised personal data under the EDPB Guidelines 02/2026 on Anonymisation, and recorded eight design gaps. This note is the plan for closing the ones the software can close, in an order where each phase leaves the platform in a consistent, shippable state. Paragraph references (¶ *n*) are to the guidelines' consultation version, as in the assessment.
+**Status: v1.3, 2026-09-22. Phases 0–2 shipped; phases 3–7 not started.** Three decisions taken on review are folded in: `file_hash` leaves every response, the author's included; a centre's withdrawal confirmation is the purge command's report and never a lookup; and the dataset releases on a monthly cadence, with the acquisition embargo's length left to the deployment. The reason this plan exists is the edu project's multi-centre teaching dataset, whose design in the project's own engineering note is a contextual-approach anonymisation case; [the section on it](#the-edu-teaching-dataset-under-the-guidelines) says what the guidelines require of that design and which phases are prerequisites for its first release. The assessment in [docs/anonymisation-compliance.md](../anonymisation-compliance.md) found that the platform's de-identified output is pseudonymised personal data under the EDPB Guidelines 02/2026 on Anonymisation, and recorded eight design gaps. This note is the plan for closing the ones the software can close, in an order where each phase leaves the platform in a consistent, shippable state. Paragraph references (¶ *n*) are to the guidelines' consultation version, as in the assessment.
 
 ## What "comply in the technical sense" means here
 
@@ -37,7 +37,9 @@ Shipped as written below, with two details decided in the doing. `refresh_signal
 
 **Docs.** [recordings/README.md](../../recordings/README.md) model table and de-identification list; the given-data table and gap table in the assessment; the [data-protection page](../epicurrents/src/docs/latest/platform/data-protection.md) in the docs submodule at the next release.
 
-## Phase 2 — Safe model default for `apply_middleware`
+## Phase 2 — Safe model default for `apply_middleware` (shipped 2026-09-22)
+
+Shipped as written. The call-site search found no site that relied on the old default: every core, example-project and plugin creation site either builds the author's own row, where the flag is ignored, or passes the flag explicitly; the DICOM study share endpoint omits it and the flag has no effect on DICOM bytes. The terms test sits in [epicurrents/tests/test_permissions.py](../../epicurrents/tests/test_permissions.py) and the access matrix gained a reader whose row carries no decision and receives sanitised bytes.
 
 **Why.** `AccessRight.apply_middleware` defaults to `False` on the model while the upload endpoint, the library grant schema and the federation service default it to `True`. A row created through the ORM by a project, a fixture or a data migration is a raw grant unless its author remembered the flag; the safe default lives one layer above the row.
 
@@ -135,7 +137,7 @@ The platform-side items from the edu note's "work required", restated as platfor
 |---|---|---|---|
 | 0 Vocabulary | — | S | Shipped |
 | 1 Linkage keys + shape test | — | M | Shipped 2026-09-22 |
-| 2 Model default | — | S | Yes |
+| 2 Model default | — | S | Shipped 2026-09-22 |
 | 3 Per-recording record | 1 (shape test) | M | Yes |
 | 4 Free-text hygiene | 1 (shape test, for `warnings`) | M | Yes, or split: tag scope and push bodies first, the heuristic second |
 | 5 Export labelling | 3 (version range in the envelope) | S | Yes |

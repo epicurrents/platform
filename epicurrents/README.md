@@ -34,7 +34,7 @@ Permission booleans:
 | `can_read` | `True` | List + view + download. |
 | `can_write` | `False` | Modify fields the author can modify, soft-delete. |
 | `can_share` | `False` | Create new `AccessRight` rows that re-share this object. |
-| `apply_middleware` | `False` | Pipe EDF/BDF content through the configured pipeline when serving downloads. No effect on the recording author, superusers, or non-EDF files. |
+| `apply_middleware` | `True` | Pipe EDF/BDF content through the configured pipeline when serving downloads. An explicit `False` grants the raw file. No effect on the recording author, superusers, or non-EDF files. |
 
 Other fields:
 
@@ -393,7 +393,7 @@ pytest epicurrents/tests/
 
 ## Gotchas
 
-- **Extension order matters when grants disagree.** Step 3 (direct `AccessRight`) wins over step 4 (extensions) even when an extension would have granted more. A user with a direct `can_read=True, apply_middleware=False` row will get raw downloads even if an extension would have granted `apply_middleware=True`. This is intentional — explicit grants are the source of truth. The same precedence applies inside step 3: a direct user row beats a sanitizing group row, so granting a group member an unrelated direct right with `apply_middleware` left at its default (`False`) switches that member's reads to raw. The exposure is bounded by the grant capping in [granting.py](granting.py) — a grantor whose own read access is sanitized cannot confer `apply_middleware=False`, so only a principal already authorized for the raw bytes (author, superuser, raw-holding sharer) can create that row — but a raw-holding grantor who intends to preserve the group's sanitizing policy must set `apply_middleware=True` on the direct row explicitly.
+- **Extension order matters when grants disagree.** Step 3 (direct `AccessRight`) wins over step 4 (extensions) even when an extension would have granted more. A user with a direct `can_read=True, apply_middleware=False` row will get raw downloads even if an extension would have granted `apply_middleware=True`. This is intentional — explicit grants are the source of truth. The same precedence applies inside step 3: a direct user row beats a sanitizing group row, so granting a group member an unrelated direct right with `apply_middleware=False` switches that member's reads to raw. The exposure is bounded by the grant capping in [granting.py](granting.py) — a grantor whose own read access is sanitized cannot confer `apply_middleware=False`, so only a principal already authorized for the raw bytes (author, superuser, raw-holding sharer) can create that row — and the raw row takes an explicit `False`, so a direct row created without a decision leaves the group's sanitizing policy in force.
 - **Share-token rows must stay restrictive.** Always create them with `can_write=False` and `can_share=False`. Destructive operations require an authenticated session for audit attribution; token holders can't be held accountable.
 - **Federated grants don't honour authorship.** A peer is never automatically granted access to objects its remote users authored on the local instance. Only explicit `AccessRight` rows with `federated_peer` set grant federated access.
 - **`EPICURRENTS_PROJECT` is read at process start.** Changing the variable while the Django/Celery containers are running has no effect — restart `web`, `celery`, and `celery-beat` after switching projects, which `scripts/switch_project.sh` does automatically.

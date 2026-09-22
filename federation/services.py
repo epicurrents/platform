@@ -245,10 +245,10 @@ def create_grant(
         "can_share": can_share,
         "expires_at": expires_at,
     }
-    # The AccessRight model default (False) is tuned for local grants, where
-    # access stays within this controller. A federated grant crosses to
-    # another controller, so de-identification is on unless explicitly
-    # declined.
+    # A federated grant crosses to another controller, so de-identification is
+    # on unless explicitly declined. The model default agrees; the explicit
+    # resolution stays so that a None from the API means "the safe choice"
+    # here rather than "whatever the model says".
     fields["apply_middleware"] = True if apply_middleware is None else apply_middleware
 
     if AccessRight.objects.filter(

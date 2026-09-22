@@ -141,12 +141,18 @@ class AccessRight(models.Model):
     can_read = models.BooleanField(default=True)
     can_write = models.BooleanField(default=False)
     can_share = models.BooleanField(default=False)
+    # Default True: a row created through the ORM without a decision serves
+    # de-identified bytes, and an explicit False is the deliberate act of
+    # granting the raw file. Every API and command path defaults the same way,
+    # so a project's fixture or data migration cannot create a raw grant by
+    # omission.
     apply_middleware = models.BooleanField(
-        default=False,
+        default=True,
         help_text=(
             "Pipe EDF/BDF file content through the configured middleware pipeline "
-            "when serving this access right. Has no effect on non-EDF files or when "
-            "the caller is the recording author or a superuser."
+            "when serving this access right. An explicit False grants the raw file. "
+            "Has no effect on non-EDF files or when the caller is the recording "
+            "author or a superuser."
         ),
     )
 
