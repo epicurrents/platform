@@ -115,7 +115,7 @@ version has no stored blob to link and is materialised once regardless.)
 
 The federation FUSE layer already does the hard part: a **read-only** presentation
 of recordings as files, with **on-read transforms** (Layer 1 server-side
-anonymisation; Layer 2 local channel-drop / downsample) and accurate `stat()`
+de-identification; Layer 2 local channel-drop / downsample) and accurate `stat()`
 sizes precomputed from per-channel info. A detector's BIDS input is a natural fit
 for the same machinery — present a recording as a BIDS tree and compute the
 *analysis version* (montage subset, downsample, reconstruction) on read, exactly

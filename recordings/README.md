@@ -58,10 +58,10 @@ The canonical file row. Fields:
 | `author` | FK to user; cascades on delete. |
 | `original_name` | Filename as uploaded. Visible only to the author and superusers — grantees, share-token holders, and federated peers see `null` in API responses. Can carry PHI (`MRN_12345_routine.edf` and similar) so all grantee-facing surfaces use `display_name` instead. **Not user-mutable** (PATCH does not accept it), but is rewritten by the ingest pipeline when a converter runs — for example a `.e` upload becomes `<stem>.edf` after the Nicolet converter so the filename matches the stored format. |
 | `display_name` | Nullable. Grantee-visible label. Defaults to the `stored_name` hash prefix (first 8 chars, uppercase) when unset. Editable via PATCH; set to `""` to clear. The collection bulk-rename endpoint writes this field. |
-| `stored_name` | Unique name under `RECORDINGS_UPLOAD_PATH`. Format: 32 hex chars + extension. Never derived from user input. **Immutable** across the recording's lifetime (the file is rewritten in place during anonymisation, but the name is not). |
+| `stored_name` | Unique name under `RECORDINGS_UPLOAD_PATH`. Format: 32 hex chars + extension. Never derived from user input. **Immutable** across the recording's lifetime (the file is rewritten in place during de-identification, but the name is not). |
 | `file_extension` | Lowercased with leading dot. Updated by the converter when format is changed. |
 | `file_size`, `file_hash` | SHA-256 of file bytes. Recomputed after conversion. |
-| `content_hash` | SHA-256 over `file_hash + serialised(Recording)`. A content fingerprint, not the URL identifier: the public `hash` in `/recordings/api/v1/{hash}` is the 32-hex-char prefix of `stored_name`, which is random, stable for the row's lifetime, and what the by-hash resolvers match on. `content_hash` can change when the platform rewrites the file (anonymisation). |
+| `content_hash` | SHA-256 over `file_hash + serialised(Recording)`. A content fingerprint, not the URL identifier: the public `hash` in `/recordings/api/v1/{hash}` is the 32-hex-char prefix of `stored_name`, which is random, stable for the row's lifetime, and what the by-hash resolvers match on. `content_hash` can change when the platform rewrites the file (de-identification). |
 | `status` | `pending` → `processing` → `ready` \| `failed`. FAILED recordings are visible only to the author and superusers — every grantee surface filters them out (see [FAILED-hidden rule](#failed-hidden-rule)). |
 | `processing_error` | Populated when ingest fails so the FAILED state carries enough information for the author to act. Capped at 4 KB. Same visibility rule as `original_name` — author + superuser only. |
 | `modality` | Inferred during processing — `eeg`, `emg`, etc. The upload API forces `eeg` regardless of header content (it's EEG-only); other paths use channel-label heuristics. |
@@ -107,7 +107,7 @@ class RecordingPipeline:
     signals: SignalPipelineOptions = field(default_factory=SignalPipelineOptions)
 ```
 
-`HeaderPipelineOptions.strip_annotation_text` defaults to `True`: text TALs are removed from the stored EDF file at ingest. The text is always saved to the database as an "Original annotations" `Annotation` first, so nothing is lost — only the on-disk copy is anonymised. `SignalPipelineOptions` is currently a placeholder for future signal-level transforms (channel filtering, downsampling, etc.).
+`HeaderPipelineOptions.strip_annotation_text` defaults to `True`: text TALs are removed from the stored EDF file at ingest. The text is always saved to the database as an "Original annotations" `Annotation` first, so nothing is lost — only the on-disk copy is de-identified. `SignalPipelineOptions` is currently a placeholder for future signal-level transforms (channel filtering, downsampling, etc.).
 
 ### Built-in pipelines
 
@@ -421,7 +421,7 @@ The endpoint wraps the `Recording` row, the `AccessRight` rows, and the `process
 The download endpoint resolves the caller's access via [epicurrents.permissions.get_read_access_result](../epicurrents/permissions.py) and inspects `ReadAccessTerms.apply_middleware`:
 
 - **Author or superuser** → raw bytes always. The flag is ignored.
-- **Other readers with `apply_middleware=True`** → bytes pass through `_build_serve_pipeline()` in [api/v1/ninja.py](api/v1/ninja.py), which always applies `[AnonymizeEDFHeader, StripAnnotationTextMiddleware]`.
+- **Other readers with `apply_middleware=True`** → bytes pass through `_build_serve_pipeline()` in [api/v1/ninja.py](api/v1/ninja.py), which always applies `[DeidentifyEDFHeader, StripAnnotationTextMiddleware]`.
 - **Other readers with `apply_middleware=False`** → raw bytes.
 
 The serve pipeline is scope `"api"`; the federation FUSE filesystem builds its own pipeline scoped `"fuse"`. Both share the same middleware classes — see [federation/README.md](../federation/README.md) for the pipeline class hierarchy.
@@ -495,7 +495,7 @@ The platform optionally copies the as-uploaded file to a **host-controlled origi
 |---|---|
 | `"none"` *(default)* | The platform never writes to the originals volume. Failed uploads stop at the FAILED row + the processed-files store; the originals volume can be unset. |
 | `"failed"` | On ingest failure, the worker copies the current permanent file to the originals volume after the failure handler runs. Successful uploads are not preserved beyond the processed-files store. |
-| `"all"` | Every upload is copied to the originals volume **before** any processing runs — the only correct time, since processing rewrites the file in place for header anonymisation. |
+| `"all"` | Every upload is copied to the originals volume **before** any processing runs — the only correct time, since processing rewrites the file in place for header de-identification. |
 
 ### The regulatory threshold
 
@@ -510,7 +510,7 @@ Layout, per recording::
             <sanitized-original-filename>
             manifest.json
 
-`stored_name_prefix` is the 32-hex-char prefix of `Recording.stored_name` — unique per upload and stable across the recording's lifetime (independent of `content_hash`, which the platform rewrites during anonymisation).
+`stored_name_prefix` is the 32-hex-char prefix of `Recording.stored_name` — unique per upload and stable across the recording's lifetime (independent of `content_hash`, which the platform rewrites during de-identification).
 
 `manifest.json` carries:
 
@@ -588,7 +588,7 @@ What happens at ingest, in order:
 1. **Filename randomisation** — `stored_name` is a 32-hex-char token used as both the on-disk filename and the public URL hash. `original_name` is preserved on the row as an author-private reference (visible only to the author and superusers) and never used as a filesystem path.
 2. **Display-name decoupling** — `display_name` is the grantee-visible label, distinct from `original_name`. Defaults to the `stored_name` hash prefix when the author does not supply a custom name. The `Content-Disposition` header on every download uses `display_name + file_extension`, so a filename that encodes subject identity never reaches anyone but the author.
 3. **File timestamp normalisation** — `os.utime(path, (0, 0))` after the file lands in `RECORDINGS_UPLOAD_PATH`. The filesystem no longer reveals when the upload happened. Applied again after conversion.
-4. **EDF header anonymisation** — `process_edf_file` writes the stored file with `_build_clean_header`: patient and recording identification become `X X X X`, the start date becomes `01.01.85` and the start time `00.00.00`. The header on disk therefore carries no identification. When an authorised reader (not the author / superuser) requests the file with `apply_middleware=True`, the serve pipeline additionally runs `AnonymizeEDFHeader` over the bytes on the wire — defence in depth for a file that reached storage by some other path.
+4. **EDF header de-identification** — `process_edf_file` writes the stored file with `_build_clean_header`: patient and recording identification become `X X X X`, the start date becomes `01.01.85` and the start time `00.00.00`. The header on disk therefore carries no identification. When an authorised reader (not the author / superuser) requests the file with `apply_middleware=True`, the serve pipeline additionally runs `DeidentifyEDFHeader` over the bytes on the wire — defence in depth for a file that reached storage by some other path.
 5. **Annotation text stripping** — by default (`strip_annotation_text=True`) the stored EDF has its annotation TALs replaced with the minimum timekeeping records. The original text is stored in the database as an "Original annotations" `Annotation` so the author can still see what was there.
 6. **FAILED-state hiding** — failed uploads (which may carry a PHI-bearing filename and an unrewritten header) are entirely invisible to grantees. See [FAILED-hidden rule](#failed-hidden-rule).
 7. **PK suppression in responses** — recording responses use the `stored_name` hash prefix as the public identifier, never `id` or `author_id`. See the de-identification rule in [epicurrents/README.md](../epicurrents/README.md#cross-app-rules-this-app-enforces).
@@ -616,7 +616,7 @@ What happens at ingest, in order:
 
 Four settings for a deployment whose position is that no patient personal data reaches the platform at all. All four default to the permissive value, because each discards or forbids something other deployments legitimately need — an author diagnosing a de-identification problem needs the `source_*` columns, and a research pipeline may need the annotations the file arrived with. A project whose deployment takes that position turns on all four in its `settings.py` and records why.
 
-They stop the platform *retaining* what an anonymising client was supposed to have removed. None of them anonymises anything: that happens before upload, and these are what make the claim hold when a recording arrives some other way.
+They stop the platform *retaining* what a de-identifying client was supposed to have removed. None of them de-identifies anything: that happens before upload, and these are what make the claim hold when a recording arrives some other way.
 
 **`RECORDINGS_DISCARD_ORIGINAL_NAME`** replaces the filename with `upload-<UTC timestamp><ext>`. Clinical exports are routinely named after the patient, which makes the filename a direct identifier arriving through a field nobody classifies as one. The value is resolved by `stored_original_name` in [recordings/models.py](models.py), and every route that creates a `Recording` must obtain it there — the upload endpoint and `import_recordings` alike. A source scan in the tests fails the build if a new route assigns the field any other way — a gate that covers one route of several is a default wearing a prohibition's name.
 
@@ -643,11 +643,11 @@ Coverage is in [recordings/tests/test_ingest_privacy_overrides.py](tests/test_in
 
 `build_header(header: EdfHeader, signal_infos: list[EdfSignalInfo]) -> bytes` assembles header bytes for a channel set that no longer matches the file on disk. Any transform that changes the channel set has to re-emit the header, and both the federation middleware and the FUSE filesystem do; a project doing the same needs the same function rather than a copy of it.
 
-It is a serializer and makes no claim about what it serializes: identification fields are copied verbatim from `header`. A caller that needs them removed combines it with an anonymisation step. The de-identifying counterpart, `_build_clean_header`, stays private on purpose — its blanking values are the platform's PHI contract rather than a parameter, and [recordings/processors/edf.py](processors/edf.py) is load-bearing for exactly that reason.
+It is a serializer and makes no claim about what it serializes: identification fields are copied verbatim from `header`. A caller that needs them removed combines it with a de-identification step. The de-identifying counterpart, `_build_clean_header`, stays private on purpose — its blanking values are the platform's PHI contract rather than a parameter, and [recordings/processors/edf.py](processors/edf.py) is load-bearing for exactly that reason.
 
 ### Test helpers
 
-[recordings/testing.py](testing.py) holds fixture builders that ship with the app rather than living in a test file, so a project plugin in its own repository can import them. `make_edf_bytes(n_channels=1, n_records=1)` returns a minimal valid plain-EDF file with zeroed samples — right for a test asserting on structure, wrong for one asserting on signal content. Its identification fields already carry the anonymised values, so a test exercising PHI removal must build its own header.
+[recordings/testing.py](testing.py) holds fixture builders that ship with the app rather than living in a test file, so a project plugin in its own repository can import them. `make_edf_bytes(n_channels=1, n_records=1)` returns a minimal valid plain-EDF file with zeroed samples — right for a test asserting on structure, wrong for one asserting on signal content. Its identification fields already carry the de-identified values, so a test exercising PHI removal must build its own header.
 
 Import from here, never from a `recordings.tests.*` module. Test modules carry no stability promise, are free to be reorganised at any time, and importing one executes it.
 

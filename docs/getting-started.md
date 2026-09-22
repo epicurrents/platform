@@ -373,7 +373,7 @@ For non-API content that doesn't fit under `/project/api/v1/` — an embedded vi
 
 ### 6. (Optional) EDF middleware in `middleware.py`
 
-If your project needs to transform EDF/BDF files on-the-fly (anonymise headers, drop channels, etc.), see [`projects/example/middleware.py`](../projects/example/middleware.py) for a worked example. The middleware system is documented in [federation/README.md](../federation/README.md#middleware-pipeline).
+If your project needs to transform EDF/BDF files on-the-fly (de-identify headers, drop channels, etc.), see [`projects/example/middleware.py`](../projects/example/middleware.py) for a worked example. The middleware system is documented in [federation/README.md](../federation/README.md#middleware-pipeline).
 
 Delete the file entirely if you don't need middleware.
 

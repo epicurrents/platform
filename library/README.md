@@ -203,7 +203,7 @@ Consulted only when no direct `AccessRight` row matches the caller and the targe
 
 ### `can_read_via_dataset`
 
-Grants read on `obj` when `obj` is a member of a non-deleted `Dataset` for which the caller (user, group, or supplied share token) holds an active `can_read` `AccessRight`. The returned `ReadAccessTerms.apply_middleware` reflects the matching Dataset right's `apply_middleware` flag, so EDF files served through dataset-inherited reads honour the sharer's anonymisation choice. Write is never inherited.
+Grants read on `obj` when `obj` is a member of a non-deleted `Dataset` for which the caller (user, group, or supplied share token) holds an active `can_read` `AccessRight`. The returned `ReadAccessTerms.apply_middleware` reflects the matching Dataset right's `apply_middleware` flag, so EDF files served through dataset-inherited reads honour the sharer's de-identification choice. Write is never inherited.
 
 ### `can_read_via_dataset_federated` and `federated_dataset_visible_terms`
 

@@ -167,7 +167,7 @@ the preservation tier exists to bound.
 only place a non-empty `MiddlewarePipeline` may be constructed in
 serving code. The
 hazard this rule exists for is divergence, not absence: a serving path
-that hand-rolls its own pipeline (e.g. header-only) anonymises the
+that hand-rolls its own pipeline (e.g. header-only) de-identifies the
 header while leaking clinical annotation text, and every test written
 locally for that path still passes. Two concrete checks:
 

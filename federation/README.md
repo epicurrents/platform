@@ -7,7 +7,7 @@ Two transport surfaces, one access model:
 - **HTTP** — federated peers call the normal `/recordings/api/v1/{hash}` endpoint with `Authorization: FederatedBearer <jwt>` instead of a session cookie. The platform's permission layer treats them as another grant target.
 - **FUSE** — local user runs `mount_federation_fs` to expose all remote recordings they have access to as files under a mountpoint. Each `read(path, size, offset)` is translated into an HTTP `Range:` request against the owning peer.
 
-EDF/BDF content can be transformed on the wire by a configurable middleware pipeline — channel dropping, downsampling, header / annotation anonymisation — without ever modifying the stored file. The same middleware classes serve both the HTTP API and the FUSE filesystem.
+EDF/BDF content can be transformed on the wire by a configurable middleware pipeline — channel dropping, downsampling, header / annotation de-identification — without ever modifying the stored file. The same middleware classes serve both the HTTP API and the FUSE filesystem.
 
 The wire contract itself — token claims, binding canonicalisation, the verification order, what the owning instance decides and records, and the protocol's security goals and open issues — is specified in [docs/federation-protocol.md](../docs/federation-protocol.md), written for a reviewer or a reimplementation. This README is the architecture and operator view of the same system.
 
@@ -281,7 +281,7 @@ The pipeline filters by scope when servicing a request — same middleware list,
 
 | Class | Type | Effect |
 |---|---|---|
-| `AnonymizeEDFHeader` | Header | Removes patient and recording identifiers from the fixed header, and applies the ingest channel-block de-identification (canonical / `MISC_<n>` labels, blanked transducers, reconstructed prefiltering) as defense in depth — a no-op for files this platform ingested, since the stored bytes already carry both transforms. |
+| `DeidentifyEDFHeader` | Header | Removes patient and recording identifiers from the fixed header, and applies the ingest channel-block de-identification (canonical / `MISC_<n>` labels, blanked transducers, reconstructed prefiltering) as defense in depth — a no-op for files this platform ingested, since the stored bytes already carry both transforms. |
 | `DropChannelsMiddleware` | Signal | Removes the named channels from every data record, rewrites the header. |
 | `DropAnnotationChannelsMiddleware` | Signal | Variant of `DropChannelsMiddleware` targeting EDF+/BDF+ annotation channels only. |
 | `DownsampleMiddleware` | Signal | Integer-factor decimation of the named channels. Updates `samples_per_record` in the header. |
@@ -313,7 +313,7 @@ The recordings download endpoint always applies `_build_serve_pipeline()` from [
 ```python
 MiddlewarePipeline(
     [
-        AnonymizeEDFHeader(),
+        DeidentifyEDFHeader(),
         StripAnnotationTextMiddleware(),
     ]
 ).for_scope("api")
@@ -430,7 +430,7 @@ The default platform CI run excludes `federation/tests/test_fuse_fs.py` because 
 - **Request binding and `jti` are both mandatory, so upgrading is a coordinated operation.** A peer running a release older than the one that introduced [request binding](#request-binding) is refused with a message naming the cause. Upgrade both sides; there is no compatibility flag, deliberately — opening a second grace window while closing the first one would have repeated the mistake. The break is one-directional: an upgraded instance still reaches an older peer, because the added claims are ignored by a release that does not check them, but it refuses inbound requests from one. So an instance that upgrades first keeps pulling and stops serving, which is the shape to expect while the other side catches up.
 - **`is_trusted=False` until promoted.** The `POST /peers/` endpoint creates rows with `is_trusted=False`. Inbound requests from a peer are rejected until a superuser flips the flag. This is the trust gate — registering a peer is not the same as trusting it.
 - **`apply_middleware` reaches annotation rows too, not only bytes.** A peer reading under a de-identifying grant receives each event's timing without its name or value, from the recordings time-slice endpoint as from anywhere else — the rows carry the same text the pipeline strips out of the signal file. [annotations/redaction.py](../annotations/redaction.py) decides; AGENTS.md → *Annotation text follows `apply_middleware`* is the rule.
-- **`apply_middleware` is the privacy switch, not the pipeline definition.** A federation grant with `apply_middleware=True` makes the server run its configured pipeline. The grant doesn't pick which middleware runs — that's the server's `_build_serve_pipeline()` config. Different recipients of the same recording get the same anonymisation, by design.
+- **`apply_middleware` is the privacy switch, not the pipeline definition.** A federation grant with `apply_middleware=True` makes the server run its configured pipeline. The grant doesn't pick which middleware runs — that's the server's `_build_serve_pipeline()` config. Different recipients of the same recording get the same de-identification, by design.
 - **FUSE serving strategy depends on pipeline shape.** Header-only pipelines stream signal bytes raw and substitute the new header per-read. Signal pipelines map output ranges back to input records and fetch only those. Full-file pipelines buffer the entire transformed file on first access. Choose the right middleware type for the transform you need; misclassifying as `EDFFullFileMiddleware` when an `EDFSignalMiddleware` would work explodes memory usage on large recordings.
 - **Layer 2 (FUSE-side pipeline) carries no privacy guarantee.** It runs on the mounting instance, which is the recipient of already-served bytes. Any privacy decision belongs in Layer 1 (server-side `apply_middleware`). Use Layer 2 for analysis convenience, not security.
 - **Key rotation is a two-step operation.** `rotate_federation_keys --apply` rewrites this instance's `.env`. Until each remote instance refreshes its cached copy of this peer's public key (via the remote's `POST /peers/{id}/refresh-key/`), tokens this instance issues will be rejected. Plan rotations during low-traffic windows or warn peers in advance.
