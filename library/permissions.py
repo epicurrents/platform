@@ -13,7 +13,7 @@ Three silent-failure classes are in scope:
 3. **`apply_middleware` propagation.** The extension reads
    ``apply_middleware`` from the matching ``AccessRight`` and returns it
    in ``ReadAccessTerms``; dropping that propagation silently switches
-   EDF serving from anonymised to raw (or vice versa).
+   EDF serving from de-identified to raw (or vice versa).
 
 See AGENTS.md → *Load-bearing files* before modifying. Contract tests
 in `library/tests/test_permissions.py` cover all three classes,
@@ -92,7 +92,7 @@ def can_read_via_dataset(user, obj, share_token: str | None = None):
     Write access is never granted through Datasets.
 
     ``apply_middleware`` in the returned ``ReadAccessTerms`` reflects the matching
-    Dataset ``AccessRight`` row, so EDF content is anonymised (or not) according
+    Dataset ``AccessRight`` row, so EDF content is de-identified (or not) according
     to the sharer's choice — consistent with direct-right behaviour.
     """
     from django.contrib.contenttypes.models import ContentType

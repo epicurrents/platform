@@ -10,7 +10,7 @@ Coverage:
 - _peer_slug — URL-to-slug conversion
 - _edf_header_size — header byte calculation
 - _TransformCache — lazy fetch, in-memory caching, pipeline application, error handling
-- AnonymizeEDFHeader — PHI stripping, parse-error fallback
+- DeidentifyEDFHeader — PHI stripping, parse-error fallback
 - load_catalogue — DB + HTTP interaction, error handling
 - FederationOperations.getattr / readdir — virtual path resolution
 - FederationOperations.read — EDF header substitution, data proxy, boundary spanning,
@@ -39,7 +39,7 @@ from federation.fuse_fs import (
     _TransformCache,
     load_catalogue,
 )
-from federation.middleware import AnonymizeEDFHeader, MiddlewarePipeline
+from federation.middleware import DeidentifyEDFHeader, MiddlewarePipeline
 
 pytestmark = pytest.mark.require_fuse
 
@@ -57,7 +57,7 @@ def _make_ops(dirs=None, files=None, pipeline=None, signal_contexts=None) -> Fed
     ops._files = files or {}
     ops._signal_contexts = signal_contexts or {}
     if pipeline is None:
-        pipeline = MiddlewarePipeline([AnonymizeEDFHeader()])
+        pipeline = MiddlewarePipeline([DeidentifyEDFHeader()])
     ops._pipeline = pipeline
     ops._transform_cache = _TransformCache(pipeline)
     # The consumer-side read audit state __init__ sets up; without it the first
@@ -100,7 +100,7 @@ def _sample_dirs_files():
     return dirs, files
 
 
-# Fake anonymized header — exact size for a 32-channel EDF (8448 bytes).
+# Fake de-identified header — exact size for a 32-channel EDF (8448 bytes).
 _HEADER_SIZE_32CH = _edf_header_size(32)
 _ANON_HEADER = b"ANON" * (_HEADER_SIZE_32CH // 4)
 
@@ -149,7 +149,7 @@ def test_edf_header_size(ns, expected):
 
 class TestTransformCache:
     def test_get_header_first_call_fetches_and_transforms(self):
-        pipeline = MiddlewarePipeline([AnonymizeEDFHeader()])
+        pipeline = MiddlewarePipeline([DeidentifyEDFHeader()])
         cache = _TransformCache(pipeline)
         raw = b"R" * 512
         transformed = b"T" * 512
@@ -165,7 +165,7 @@ class TestTransformCache:
         mock_apply.assert_called_once_with(raw)
 
     def test_get_header_second_call_returns_cached_without_refetch(self):
-        pipeline = MiddlewarePipeline([AnonymizeEDFHeader()])
+        pipeline = MiddlewarePipeline([DeidentifyEDFHeader()])
         cache = _TransformCache(pipeline)
         raw = b"R" * 512
         transformed = b"T" * 512
@@ -233,14 +233,14 @@ class TestTransformCache:
 
         assert result == raw_header + raw_signals[:256]
 
-    def test_anonymize_edf_header_returns_raw_on_parse_error(self):
+    def test_deidentify_edf_header_returns_raw_on_parse_error(self):
         """Garbage bytes must be returned unchanged rather than raising."""
-        anon = AnonymizeEDFHeader()
+        anon = DeidentifyEDFHeader()
         raw = b"\x00" * 256  # not a valid EDF header
         result = anon.transform_header(raw)
         assert result == raw
 
-    def test_anonymize_edf_header_strips_phi_from_valid_edf_header(self):
+    def test_deidentify_edf_header_strips_phi_from_valid_edf_header(self):
         """Patient name injected into the patient field must be erased."""
         from recordings.processors.edf import (
             EdfHeader,
@@ -281,7 +281,7 @@ class TestTransformCache:
         raw[8:88] = phi
         raw = bytes(raw)
 
-        anon = AnonymizeEDFHeader()
+        anon = DeidentifyEDFHeader()
         result = anon.transform_header(raw)
 
         patient_field = result[8:88].decode("latin-1").strip()

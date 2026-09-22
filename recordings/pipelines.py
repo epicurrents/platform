@@ -116,7 +116,7 @@ class HeaderPipelineOptions:
     # When True, text TALs are stripped from EDF+/BDF+ annotation channels and
     # only the mandatory timekeeping TALs are preserved in the stored file.
     # Annotation text is always extracted and stored in the database regardless
-    # of this setting.  Defaults to True so that stored files are anonymised by
+    # of this setting.  Defaults to True so that stored files are de-identified by
     # default; set to False only when the original annotations must be kept in
     # the file (e.g. research pipelines where the caller explicitly opts in).
     strip_annotation_text: bool = True

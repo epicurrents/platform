@@ -8,7 +8,7 @@ the deliberate PHI-removal contract:
 
 * ``patient_bytes  = _pad("X X X X", 80)``       — patient field
 * ``recording_bytes = _pad("Startdate X X X X", 80)`` — recording field
-* ``startdate_bytes = b"01.01.85"`` — EDF anonymisation convention
+* ``startdate_bytes = b"01.01.85"`` — EDF+ de-identification convention
 * ``starttime_bytes = b"00.00.00"``
 
 These look like they could be parameterised "for testability", or
@@ -19,7 +19,7 @@ change of those constants leaks PHI:
   task calls ``rewrite_edf_header`` at ingest, so the *stored* file
   carries the de-identified header).
 * On every federated download served with ``apply_middleware=True``
-  (because ``federation.middleware.AnonymizeEDFHeader`` delegates to
+  (because ``federation.middleware.DeidentifyEDFHeader`` delegates to
   this function — and that middleware *fails open* on parse error, so
   this function producing the right bytes is the last line of defense
   in that path).
@@ -27,7 +27,7 @@ change of those constants leaks PHI:
 See AGENTS.md → *Load-bearing files* before modifying.  The contract
 tests in ``recordings/tests/test_edf_processor.py::TestRewriteEdfHeader``
 assert each PHI-removal byte explicitly (``test_patient_field_blanked``,
-``test_recording_field_blanked``, ``test_start_date_anonymised``,
+``test_recording_field_blanked``, ``test_start_date_replaced``,
 ``test_start_time_zeroed``) plus EDF+C/EDF+D marker preservation, BDF
 binary version byte, ASCII cleaning, and data-records-untouched
 invariants.
@@ -47,7 +47,7 @@ Processing steps
 3. Rewrite the header in-place to strict EDF+/BDF+ compliance:
    - All text fields cleaned to 7-bit ASCII.
    - Full de-identification of patient and recording fields.
-   - Recording date/time replaced with the EDF anonymisation convention.
+   - Recording date/time replaced with the EDF+ de-identification convention.
 4. Return a structured result for the caller to persist to the database.
 
 Bug fixes vs. the reference TypeScript EdfDecoder
@@ -1268,7 +1268,7 @@ def build_header(header: EdfHeader, signal_infos: list[EdfSignalInfo]) -> bytes:
     verbatim from *header*. That is the whole distinction between the two, and
     the reason only this one is public: this function is a serializer and makes
     no claim about the content it serializes, so a caller reaching for it must
-    combine it with a separate anonymisation step. The de-identifying variant
+    combine it with a separate de-identification step. The de-identifying variant
     stays private because its hardcoded blanking values are the platform's PHI
     contract rather than a parameter — see the module docstring.
 
@@ -1538,7 +1538,7 @@ def _build_clean_header(header: EdfHeader, signal_infos: list[EdfSignalInfo]) ->
     De-identification rules (EDF+ spec §2.1.3.1 / BDF equivalent):
     - Patient field  → ``"X X X X"`` (code sex birthdate name all unknown).
     - Recording field → ``"Startdate X X X X"`` (all admin fields unknown).
-    - Start date     → ``"01.01.85"`` (EDF anonymisation convention date).
+    - Start date     → ``"01.01.85"`` (EDF+ de-identification convention date).
     - Start time     → ``"00.00.00"``.
 
     All other text fields are ASCII-cleaned (non-ASCII chars replaced or

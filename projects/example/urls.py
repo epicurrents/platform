@@ -125,7 +125,7 @@ def _resolve_recording_or_404(recording_hash: str) -> Recording:
 
     The public ``hash`` every recording response serves is the 32-character
     prefix of ``Recording.stored_name`` — not ``content_hash``, which is a
-    content fingerprint the platform rewrites during anonymisation. Match the
+    content fingerprint the platform rewrites during de-identification. Match the
     prefix the same way the core recordings API does.
     """
     normalized = (recording_hash or "").strip().upper()

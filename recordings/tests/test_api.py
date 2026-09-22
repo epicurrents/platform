@@ -689,7 +689,7 @@ class TestDownloadMiddleware:
         assert b"".join(resp.streaming_content) == content
 
     def test_grantee_with_flag_gets_transformed_header(self, client, user, make_user, tmp_path):
-        """apply_middleware=True → AnonymizeEDFHeader is applied to the EDF header."""
+        """apply_middleware=True → DeidentifyEDFHeader is applied to the EDF header."""
         from unittest.mock import patch
 
         reader = make_user()
@@ -703,7 +703,7 @@ class TestDownloadMiddleware:
         client.force_login(reader)
 
         with patch(
-            "federation.middleware.AnonymizeEDFHeader.transform_header",
+            "federation.middleware.DeidentifyEDFHeader.transform_header",
             return_value=sentinel,
         ):
             resp = client.get(DOWNLOAD_URL.format(hash=hash_part))
@@ -727,7 +727,7 @@ class TestDownloadMiddleware:
         client.force_login(reader)
 
         with patch(
-            "federation.middleware.AnonymizeEDFHeader.transform_header",
+            "federation.middleware.DeidentifyEDFHeader.transform_header",
             return_value=sentinel,
         ):
             resp = client.get(
@@ -755,7 +755,7 @@ class TestDownloadMiddleware:
         client.force_login(reader)
 
         with patch(
-            "federation.middleware.AnonymizeEDFHeader.transform_header",
+            "federation.middleware.DeidentifyEDFHeader.transform_header",
             return_value=sentinel,
         ):
             resp = client.get(
@@ -785,7 +785,7 @@ class TestDownloadMiddleware:
         client.force_login(reader)
 
         with patch(
-            "federation.middleware.AnonymizeEDFHeader.transform_header",
+            "federation.middleware.DeidentifyEDFHeader.transform_header",
             return_value=sentinel,
         ):
             resp = client.get(
@@ -1151,8 +1151,8 @@ class TestSliceRecording:
         hdr = parse_edf_header(body)
         assert hdr.data_record_count == 8
 
-    def test_slice_with_apply_middleware_anonymises_header(self, auth_client, tmp_path, make_user):
-        """apply_middleware=True anonymises patient info in the slice header."""
+    def test_slice_with_apply_middleware_deidentifies_header(self, auth_client, tmp_path, make_user):
+        """apply_middleware=True de-identifies patient info in the slice header."""
         from django.test import Client
 
         from recordings.processors.edf import parse_edf_header
@@ -1656,7 +1656,7 @@ class TestDownloadSizeField:
     def test_download_size_equals_file_size_for_size_preserving_pipeline(self, client, user, make_user):
         """Size-preserving pipeline does not change file size.
 
-        The default pipeline (AnonymizeEDFHeader + StripAnnotationTextMiddleware)
+        The default pipeline (DeidentifyEDFHeader + StripAnnotationTextMiddleware)
         is size-preserving: both middlewares leave the file size unchanged so
         download_size == file_size without requiring a disk read.
         """
@@ -1864,7 +1864,7 @@ class TestFailedRecordingHiding:
         body = resp.json()
         assert body == {
             "code": "recording_unprocessed",
-            "detail": ("This recording could not be processed and cannot be served in anonymised form."),
+            "detail": ("This recording could not be processed and cannot be served in de-identified form."),
         }
 
     # ── Author / superuser retain visibility on FAILED ───────────────────────

@@ -6,7 +6,7 @@ is served to a federated peer or to any caller whose ``AccessRight``
 carries ``apply_middleware=True``.  Three classes of silent failure
 are in scope here:
 
-1. **Sanitization regression.** ``AnonymizeEDFHeader`` rewrites patient
+1. **Sanitization regression.** ``DeidentifyEDFHeader`` rewrites patient
    and recording identifiers in the fixed EDF header; if its delegate
    ``recordings.processors.edf._build_clean_header`` drifts (or this
    class stops calling it), un-sanitized headers go out.
@@ -19,7 +19,7 @@ are in scope here:
    falls back to returning the raw bytes.  This is a deliberate design
    choice (filesystem remains accessible for non-standard or
    vendor-extended EDF variants), tested in
-   ``test_anonymize_returns_same_length_on_garbage_input``, but it
+   ``test_deidentify_returns_same_length_on_garbage_input``, but it
    means a malformed-but-parseable input could leak PHI.  Errors are
    logged via ``logger.exception`` so forensics has a trail; do not
    "improve" the fall-back to raise without coordinating the
@@ -126,7 +126,7 @@ Pipeline ordering
 
 Built-in middleware
 ~~~~~~~~~~~~~~~~~~~
-:class:`AnonymizeEDFHeader` — removes patient and recording identifiers from
+:class:`DeidentifyEDFHeader` — removes patient and recording identifiers from
 the fixed header.
 
 :class:`DropChannelsMiddleware` — removes the specified signal channels from
@@ -633,7 +633,7 @@ class MiddlewarePipeline:
 # ---------------------------------------------------------------------------
 
 
-class AnonymizeEDFHeader(EDFHeaderMiddleware):
+class DeidentifyEDFHeader(EDFHeaderMiddleware):
     """Remove patient, recording, and channel-block identifiers from EDF/BDF headers.
 
     Rewrites the *local patient identification* field to ``"X X X X"`` and the
@@ -672,9 +672,13 @@ class AnonymizeEDFHeader(EDFHeaderMiddleware):
             deidentify_signal_infos(signal_infos)
             return _build_clean_header(header, signal_infos)
         except Exception:
-            logger.exception("EDF header anonymization failed; serving raw header instead")
+            logger.exception("EDF header de-identification failed; serving raw header instead")
             return raw_header
 
+
+#: The name this class carried before the vocabulary rule in AGENTS.md (a de-identifying pass is not an
+#: anonymising one). Kept importable so a project pipeline written against it keeps working.
+AnonymizeEDFHeader = DeidentifyEDFHeader
 
 class DropChannelsMiddleware(EDFSignalMiddleware):
     """Remove the specified signal channels from every data record.
@@ -685,11 +689,11 @@ class DropChannelsMiddleware(EDFSignalMiddleware):
     annotations`` / ``bdf annotations``) are never dropped regardless of the
     *drop_labels* list.
 
-    Combine with :class:`AnonymizeEDFHeader` if de-identification is also
+    Combine with :class:`DeidentifyEDFHeader` if de-identification is also
     required::
 
         pipeline = MiddlewarePipeline([
-            AnonymizeEDFHeader(),
+            DeidentifyEDFHeader(),
             DropChannelsMiddleware(["EEG Fp1-Cz", "EMG"]),
         ])
 
@@ -828,11 +832,11 @@ class DownsampleMiddleware(EDFSignalMiddleware):
 
     The header is rebuilt with updated ``samples_per_record`` values.
 
-    Combine with :class:`AnonymizeEDFHeader` if de-identification is also
+    Combine with :class:`DeidentifyEDFHeader` if de-identification is also
     required::
 
         pipeline = MiddlewarePipeline([
-            AnonymizeEDFHeader(),
+            DeidentifyEDFHeader(),
             DownsampleMiddleware(factor=4),
         ])
 
@@ -941,10 +945,10 @@ class StripAnnotationTextMiddleware(EDFSignalMiddleware):
     Falls back to preserving raw annotation channel bytes on TAL parse
     errors, so the file remains accessible for non-standard EDF variants.
 
-    Combine with :class:`AnonymizeEDFHeader` for full de-identification::
+    Combine with :class:`DeidentifyEDFHeader` for full de-identification::
 
         pipeline = MiddlewarePipeline([
-            AnonymizeEDFHeader(),
+            DeidentifyEDFHeader(),
             StripAnnotationTextMiddleware(),
         ])
     """

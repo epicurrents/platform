@@ -488,7 +488,7 @@ class TestFederatedDownload:
             resp = client.get(DOWNLOAD_URL.format(hash=_hash(r)))
         assert resp.status_code == 401
 
-    def test_download_apply_middleware_anonymises_header(self, client, user, tmp_path):
+    def test_download_apply_middleware_deidentifies_header(self, client, user, tmp_path):
         """Grant with apply_middleware=True should scrub the EDF patient field."""
         peer = _make_peer(user)
         r, _ = self._make_edf_on_disk(user, tmp_path)
@@ -498,7 +498,7 @@ class TestFederatedDownload:
             resp = client.get(DOWNLOAD_URL.format(hash=_hash(r)))
         assert resp.status_code == 200
         body = b"".join(resp.streaming_content)
-        # AnonymizeEDFHeader rewrites patient id (bytes 8..87) to "X X X X"
+        # DeidentifyEDFHeader rewrites patient id (bytes 8..87) to "X X X X"
         assert b"X X X X" in body[:256]
 
     def test_download_without_middleware_returns_raw(self, client, user, tmp_path):
@@ -574,7 +574,7 @@ class TestFederatedSlice:
             resp = client.get(f"{SLICE_URL.format(hash=_hash(r))}?t_start=0&t_end=5")
         assert resp.status_code == 401
 
-    def test_slice_apply_middleware_anonymises_header(self, client, user, tmp_path):
+    def test_slice_apply_middleware_deidentifies_header(self, client, user, tmp_path):
         peer = _make_peer(user)
         r = self._make_edf_on_disk(user, tmp_path)
         _grant(peer, r, user, apply_middleware=True)

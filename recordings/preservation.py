@@ -15,7 +15,7 @@ The platform supports three preservation modes (``RECORDINGS_PRESERVE_MODE``):
 ``"all"``
     The platform copies the upload to the originals volume **before
     processing runs** — the only correct time, since processing rewrites the
-    file in place for header anonymisation.
+    file in place for header de-identification.
 
 The originals volume is **strictly write-only from the platform's
 perspective**.  No code path in this module or anywhere else reads from
@@ -33,7 +33,7 @@ On-disk layout::
 where ``stored_name_prefix`` is the 32-character random hex prefix of
 ``Recording.stored_name`` — unique per upload and stable across the
 recording's lifetime (independent of ``content_hash``, which the platform
-rewrites during anonymisation).
+rewrites during de-identification).
 """
 
 from __future__ import annotations

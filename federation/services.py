@@ -219,7 +219,7 @@ def create_grant(
     ``remote_user_id`` is the wildcard "any authenticated user from that peer".
     ``apply_middleware`` left as ``None`` applies the fail-safe default for
     cross-instance sharing: ``True``, so EDF/BDF bytes served under the grant
-    pass through the de-identification pipeline (anonymized header, stripped
+    pass through the de-identification pipeline (de-identified header, stripped
     annotation text). Pass ``False`` explicitly to serve raw bytes to the
     peer — a deliberate cross-controller PHI disclosure.
     """

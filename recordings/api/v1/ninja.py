@@ -5,7 +5,7 @@
 middleware pipeline applied to every byte-serving path (full download,
 range request, time-range slice, and the peer download-size
 computation). The hazard is divergence, not absence: a serving path
-that builds its own pipeline can anonymise the header while leaking
+that builds its own pipeline can de-identify the header while leaking
 clinical annotation text, and every locally-written test for that path
 still passes. Two rules keep the paths in sync:
 
@@ -348,7 +348,7 @@ def _resolve_display_name(recording) -> str:
     Falls back to the first 8 chars of ``stored_name`` (uppercase hex) when
     ``display_name`` is empty.  ``stored_name`` is generated at upload time
     and is stable across the recording's lifetime — unlike ``content_hash``,
-    which the platform rewrites whenever it anonymises the file in place.
+    which the platform rewrites whenever it de-identifies the file in place.
     """
     name = (recording.display_name or "").strip()
     if name:
@@ -456,7 +456,7 @@ def _compute_download_sizes_for_peer(recordings, peer, remote_user_id, meta_by_p
 
     Cost
     ----
-    Size-preserving pipelines (default ``[AnonymizeEDFHeader, StripAnnotationTextMiddleware]``):
+    Size-preserving pipelines (default ``[DeidentifyEDFHeader, StripAnnotationTextMiddleware]``):
         Free — file size is unchanged, returned directly.
 
     Signal pipelines (:class:`~federation.middleware.EDFSignalMiddleware`):
@@ -673,7 +673,7 @@ def _serve_recording_file(request, file_path: Path, filename: str):
 def _build_serve_pipeline():
     """Return the API-scope middleware pipeline used for download and size computation.
 
-    Always applies :class:`~federation.middleware.AnonymizeEDFHeader` followed
+    Always applies :class:`~federation.middleware.DeidentifyEDFHeader` followed
     by :class:`~federation.middleware.StripAnnotationTextMiddleware` so that
     clinical annotation text is never transmitted to ``apply_middleware``
     consumers (federated peers and other grantees).
@@ -684,12 +684,12 @@ def _build_serve_pipeline():
     pipeline stays in sync across every serving path.
     """
     from federation.middleware import (
-        AnonymizeEDFHeader,
+        DeidentifyEDFHeader,
         MiddlewarePipeline,
         StripAnnotationTextMiddleware,
     )
 
-    return MiddlewarePipeline([AnonymizeEDFHeader(), StripAnnotationTextMiddleware()]).for_scope("api")
+    return MiddlewarePipeline([DeidentifyEDFHeader(), StripAnnotationTextMiddleware()]).for_scope("api")
 
 
 def _serve_recording_with_middleware(request, file_path: Path, filename: str, recording) -> object:
@@ -715,7 +715,7 @@ def _serve_recording_with_middleware(request, file_path: Path, filename: str, re
 
     When ``RecordingMeta`` is missing the function refuses with **403** and the
     structured code ``recording_unprocessed`` rather than falling back to raw
-    bytes.  This is the only branch where the caller asked for anonymisation
+    bytes.  This is the only branch where the caller asked for de-identification
     and the server cannot satisfy the request — serving the original here
     would leak the unrewritten EDF/BDF header to a grantee whose grant
     specifically requires middleware to apply.  Fires for ``status=FAILED``
@@ -743,7 +743,7 @@ def _serve_recording_with_middleware(request, file_path: Path, filename: str, re
         return JsonResponse(
             {
                 "code": "recording_unprocessed",
-                "detail": ("This recording could not be processed and cannot be served in anonymised form."),
+                "detail": ("This recording could not be processed and cannot be served in de-identified form."),
             },
             status=403,
         )
@@ -961,7 +961,7 @@ def _patch_record_count(header_bytes: bytes, n_records: int) -> bytes:
 
     The field at offset 236 is overwritten in-place (as ASCII, space-padded to
     8 bytes).  All other header bytes are preserved unchanged, so the function
-    works on both raw and anonymised headers.
+    works on both raw and de-identified headers.
     """
     nrecs = str(n_records).ljust(_NRECS_WIDTH).encode("ascii")
     return header_bytes[:_NRECS_OFFSET] + nrecs + header_bytes[_NRECS_OFFSET + _NRECS_WIDTH :]
@@ -988,7 +988,7 @@ def _serve_recording_slice(
        :class:`~federation.middleware.EDFSignalMiddleware`; the transformed
        header from :class:`~federation.middleware.SignalPipelineContext` is
        used as the base.
-    2. **Isometric** — header anonymised, signal bytes streamed raw.
+    2. **Isometric** — header de-identified, signal bytes streamed raw.
     3. **Raw** — no transform; original header and records served verbatim.
     """
     from federation.middleware import MiddlewarePipeline
@@ -1585,7 +1585,7 @@ def list_recordings(
 
     # For federated requests, include per-recording download_size so the
     # mounting instance does not need to infer the server's pipeline output size.
-    # For the default isometric pipeline (AnonymizeEDFHeader) this equals
+    # For the default isometric pipeline (DeidentifyEDFHeader) this equals
     # file_size at zero extra cost.  Signal pipelines require one EDF header disk
     # read per affected recording — see _compute_download_sizes_for_peer.
     download_sizes: dict | None = None

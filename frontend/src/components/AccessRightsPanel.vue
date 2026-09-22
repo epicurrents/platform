@@ -435,7 +435,7 @@ function userDisplayName(user: UserSearchResult): string {
                     <wa-callout v-if="showOriginalDataInfo" variant="warning">
                         {{ t(
                             'Enabling this allows the share token holder to read the data exactly as it is stored, ' +
-                            'without any additional anonymization applied.',
+                            'without the de-identification pass applied.',
                             SCOPE
                         ) }}
                     </wa-callout>

@@ -24,10 +24,10 @@ that are deliberately kept separate:
 
 **Layer 1 — Server-side privacy control (authoritative)**
     The *serving* instance decides whether the bytes it sends over the wire are
-    anonymised.  This is configured by setting ``apply_middleware=True`` on the
+    de-identified.  This is configured by setting ``apply_middleware=True`` on the
     ``AccessRight`` federation grant for the peer.  When set, the server runs
-    its own middleware pipeline (default: :class:`~federation.middleware.AnonymizeEDFHeader`)
-    before transmitting and the mounting instance receives already-anonymised bytes.
+    its own middleware pipeline (default: :class:`~federation.middleware.DeidentifyEDFHeader`)
+    before transmitting and the mounting instance receives already-de-identified bytes.
     This is the correct place to enforce privacy: the data owner controls it and
     it cannot be bypassed by the mounting instance.
 
@@ -49,8 +49,8 @@ Each ``read(path, size, offset)`` call:
 1. Issues one or more HTTP ``Range: bytes=<offset>-<end>`` requests to the
    remote ``/recordings/api/v1/<hash>/file`` endpoint — a read spanning the
    header/signal boundary takes two. Bytes returned by the server are already
-   at Layer 1 anonymisation level (raw if the grant has
-   ``apply_middleware=False``, anonymised if it has ``apply_middleware=True``).
+   at Layer 1 de-identification level (raw if the grant has
+   ``apply_middleware=False``, de-identified if it has ``apply_middleware=True``).
 2. Signs a fresh short-lived ``FederatedBearer`` JWT for each of those
    requests, bound to its method, path and ``Range``. Tokens are single-use at
    the peer, so one per request is a requirement rather than a preference; the
@@ -402,7 +402,7 @@ def _reconstruct_edf_header_from_catalogue(meta: dict, signals: list[dict]) -> b
     (``RecordingMetaOut.signals``, populated via ``SignalInfoOut``) together
     with general recording metadata to assemble a syntactically valid EDF/BDF
     header.  Patient and recording-ID fields are intentionally left blank because
-    the server-side pipeline always applies ``AnonymizeEDFHeader`` for federated
+    the server-side pipeline always applies ``DeidentifyEDFHeader`` for federated
     reads.
 
     Parameters
@@ -875,8 +875,8 @@ class FederationOperations(Operations):
 
         .. note::
 
-            This pipeline is *not* the privacy/anonymisation control.  Whether
-            the serving peer sends anonymised or raw bytes is determined by the
+            This pipeline is *not* the privacy/de-identification control.  Whether
+            the serving peer sends de-identified or raw bytes is determined by the
             ``apply_middleware`` flag on the federation ``AccessRight`` grant
             (Layer 1, configured on the serving instance).  See module docstring.
     """
@@ -900,7 +900,7 @@ class FederationOperations(Operations):
 
         self.local_user_id = str(local_user_id)
         self._mount_time = int(time.time())
-        # Default to an empty (no-op) local pipeline.  Anonymisation of bytes
+        # Default to an empty (no-op) local pipeline.  De-identification of bytes
         # received from peers is Layer 1: controlled by apply_middleware on the
         # federation AccessRight grant on the *serving* instance.
         if pipeline is None:
@@ -1011,7 +1011,7 @@ class FederationOperations(Operations):
         **Layer 1 (server-side, authoritative):** bytes received from the
         serving peer are already at the privacy level set by the data owner —
         raw if the federation ``AccessRight`` grant has ``apply_middleware=False``,
-        anonymised if it has ``apply_middleware=True``.  This layer is invisible
+        de-identified if it has ``apply_middleware=True``.  This layer is invisible
         here; it happens transparently inside the HTTP range request.
 
         **Layer 2 (local, optional):** if a local post-processing pipeline was
@@ -1058,7 +1058,7 @@ class FederationOperations(Operations):
 
         try:
             # Layer 1 is implicit: the HTTP range request below returns bytes
-            # already at the serving peer's privacy level (raw or anonymised
+            # already at the serving peer's privacy level (raw or de-identified
             # depending on apply_middleware on the federation AccessRight grant).
             # Layer 2 (local post-processing) begins here.
             if entry.is_edf and entry.header_size:

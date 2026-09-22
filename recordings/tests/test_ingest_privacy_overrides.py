@@ -3,7 +3,7 @@ identifiers out of the database.
 
 Both settings default off, and both exist for a project whose data-protection
 position is that no patient personal data reaches the platform at all. The
-position is not that these settings anonymise anything — the client does that
+position is not that these settings de-identify anything — the client does that
 before upload — but that the platform stops *retaining* what the client was
 supposed to have removed, so a recording arriving some other way does not
 silently falsify the claim.

@@ -233,7 +233,7 @@ class TestAccessMatrix:
             assert response.status_code == 200
             body = b"".join(response.streaming_content)
             assert body != raw, f"{caller} with apply_middleware=True received the raw file"
-            assert b"X X X X" in body[:88], f"{caller}'s header is not anonymised"
+            assert b"X X X X" in body[:88], f"{caller}'s header is not de-identified"
         for caller in ("author", "raw_grantee"):
             response = _get(matrix, caller, "file")
             assert response.status_code == 200

@@ -845,7 +845,7 @@ class TestRewriteEdfHeader:
         recording_field = result[88:168].decode("ascii").strip()
         assert recording_field == "Startdate X X X X"
 
-    def test_start_date_anonymised(self):
+    def test_start_date_replaced(self):
         raw = _make_edf_header(startdate="15.06.24")
         result = self._roundtrip(raw)
         assert result[168:176] == b"01.01.85"

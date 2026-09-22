@@ -40,7 +40,7 @@ const rejectedCount = ref(0)
 const input = reactive({
     modality: 'eeg',
     // Grantee-visible label for a single-file upload; blank falls back to an
-    // anonymous hash-prefix ID, keeping a PHI-bearing filename off the server.
+    // random hash-prefix ID, keeping a PHI-bearing filename off the server.
     displayName: '',
     preserveAnnotations: false,
     // Opt-in: mirror the on-disk folder structure as nested Collections.
@@ -440,7 +440,7 @@ function phaseIconClass (phase: string | undefined) {
                 <wa-input
                     v-if="isSingleFile"
                     class="gap"
-                    :hint="t('Shown to anyone you share this recording with. Leave blank to use an anonymous ID (like ABCD1234) instead of the file name.', SCOPE)"
+                    :hint="t('Shown to anyone you share this recording with. Leave blank to use a random ID (like ABCD1234) instead of the file name.', SCOPE)"
                     :label="t('Display name', SCOPE)"
                     size="s"
                     type="text"

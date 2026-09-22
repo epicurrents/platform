@@ -283,7 +283,7 @@ TWO_FACTOR_REQUIRED_FOR_ALL = env_bool("TWO_FACTOR_REQUIRED_FOR_ALL", default=Fa
 # ── Ingest privacy overrides ─────────────────────────────────────────────────
 # Both default off, because they discard information the author may legitimately
 # want, and both exist for projects whose data-protection position is that no
-# patient personal data reaches the platform at all. Such a project anonymises
+# patient personal data reaches the platform at all. Such a project de-identifies
 # in the client before upload; these settings make the platform stop retaining
 # the two things that would otherwise preserve what the client was supposed to
 # have removed. A project turns them on in its own settings.py.
