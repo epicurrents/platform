@@ -67,7 +67,7 @@ a DPA or controller arrangement.
 
 | Destination | Role | Data | Safeguard |
 |---|---|---|---|
-| Federated peer instances | Separate controller | Recording bytes (de-identified by default — anonymized EDF header + stripped annotation text; raw only by explicit `--no-apply-middleware` / API opt-out), `display_name`, signal metadata; media bytes raw (ROADMAP); inbound: requesting user's pk as JWT `sub` | Per-peer trust gate, Ed25519 JWT auth, quotas, `FederationAuditLog`; grant default is de-identified |
+| Federated peer instances | Separate controller | Recording bytes (pseudonymised by default — header identification fields blanked, annotation text stripped; the signal itself is unchanged, so this is not anonymous data, see [anonymisation-compliance.md](anonymisation-compliance.md); raw only by explicit `--no-apply-middleware` / API opt-out), `display_name`, signal metadata; media bytes raw (ROADMAP); inbound: requesting user's pk as JWT `sub` | Per-peer trust gate, Ed25519 JWT auth, quotas, `FederationAuditLog`; grant default is de-identified |
 | SMTP relay (`EMAIL_HOST`) | Processor | Recipient address, password-reset links, account emails | TLS; failure logs carry hashed recipients only |
 | Web-push services (Google / Mozilla / Apple) | Processor | Device endpoint + timing; payload is end-to-end encrypted; bodies carry `display_name`, never `original_name` | RFC 8291 encryption; endpoint scrubbed from audit on erasure |
 | OIDC provider (Microsoft Entra) | IdP / separate controller for its logs | Login events; inbound `sub`, email, name, tenant id | Tenant + nonce + audience checks; email-domain allowlist |
@@ -96,7 +96,7 @@ The measures live in code and are documented where they are enforced:
 - Object-level permissions, share-token limits — [epicurrents/README.md](../epicurrents/README.md#permissions).
 - TOTP second factor on password login, with hashed single-use recovery codes and a replay-guarded verification step — [user/README.md](../user/README.md#two-factor-authentication-totp). Opt-in per account by default; `TWO_FACTOR_REQUIRED_FOR_STAFF` and `TWO_FACTOR_REQUIRED_FOR_ALL` make it mandatory, and an account with no factor enrols during login rather than being locked out. Whether it is in force on a given deployment therefore remains the operator's configuration, but the software no longer leaves them without the option.
 - Tamper-evident audit trail (HMAC + per-shard hash chain), credential masking, session exclusion — [activity/README.md](../activity/README.md#threat-model).
-- PHI de-identification on upload and on federated serving — [recordings/README.md](../recordings/README.md), [federation/README.md](../federation/README.md#middleware-pipeline).
+- PHI de-identification on upload and on federated serving — [recordings/README.md](../recordings/README.md), [federation/README.md](../federation/README.md#middleware-pipeline). This is pseudonymisation in the Art. 4(5) / Art. 32(1)(a) sense, not anonymisation; the assessment against the EDPB anonymisation guidelines, and the vocabulary rule that follows from it, are in [anonymisation-compliance.md](anonymisation-compliance.md).
 - `Cache-Control: no-store` on all PHI-bearing responses; HSTS, CSP, secure cookies (12-hour production sessions), throttling keyed on hashed identities.
 - Security event stream for SIEM with hashed identifiers — [docs/operations.md](operations.md).
 - Encrypted backups (Borg repokey); Redis password-gated; internal-network-only services.
@@ -143,6 +143,7 @@ window; preserved originals follow step 3.
 Tracked in [ROADMAP.md](../ROADMAP.md) with the `Privacy` / `Federation` /
 `Security` prefixes; the load-bearing ones as of the 2026-08-26 audit:
 
+- The served output is pseudonymised, not anonymous, and the metadata API hands every reader the SHA-256 of the pre-de-identification upload and the upload timestamp — a bit-exact link to the original and a proxy for the acquisition date. The full gap table is in [anonymisation-compliance.md → Design gaps](anonymisation-compliance.md#design-gaps).
 - Patient-side audit snapshots (annotation content, recording states) persist
   after a recording purge — purge-time tombstoning is the planned extension.
 - No *self-service* subject-access export — Art. 15 is served by the operator running `export_user`, which is a person's turnaround rather than a download link.
@@ -173,6 +174,7 @@ is due rather than inferring it from commit dates.
 | Date | Scope | Outcome |
 |---|---|---|
 | 2026-08-26 | Full four-lens sweep, ahead of first production deployment | Six findings, all fixed in the same commit. The serious one is on the main ingest path: `with_system_activity` stored `str(target)` in `Activity.target_identifier`, and `Recording.__str__` renders `original_name`, so every processed recording published its uploaded filename into a permanent column — past the mask that keeps it out of `ObjectChangeLog`, past the author-private gate on the API, and past every erasure path, none of which touch that column. It now stores a content-type-and-pk locator. The other five are the bulk-import path (a raw username and the operator's source directory in `Activity` metadata; the per-file source filename and error text unmasked in `ObjectChangeLog`) and the same directory-in-metadata shape in `index_dicom`. Inventory gained `ImportJob` / `ImportJobFile`; `PipelineRunAudit` recorded above as a gap that opens on first write. Retention windows, processor flows and the other project registrations verified unchanged, and the active project's recording-name column confirmed a documented pseudonym rather than a leak. Regression tests in [activity/tests/test_system_activity_identifier.py](../activity/tests/test_system_activity_identifier.py) and [recordings/tests/test_import_audit_hygiene.py](../recordings/tests/test_import_audit_hygiene.py). **Operator step:** rows written before this date still carry the names — see below. |
+| 2026-09-22 | Anonymisation lens only, against EDPB Guidelines 02/2026 (consultation version) | Served output classified as pseudonymised special-category personal data for every recipient; no anonymity claim is supportable without a per-recipient contextual assessment. Eight design gaps, led by `file_hash` and `created_at` exposure to non-authors; vocabulary in this document and the notice template corrected. Full assessment and gap table in [anonymisation-compliance.md](anonymisation-compliance.md), which the six-monthly sweep now includes. |
 
 Existing `Activity` rows are not rewritten by the fix. A deployment that
 processed recordings before 2026-08-26 has their filenames in
