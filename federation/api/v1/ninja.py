@@ -23,7 +23,7 @@ Inbound (called by remote instances; auth via FederatedBearer JWT)
 from __future__ import annotations
 
 import logging
-from datetime import datetime
+from datetime import date, datetime
 
 from django.conf import settings
 from django.contrib.contenttypes.models import ContentType
@@ -100,15 +100,29 @@ class FederatedGrantIn(Schema):
     # the grant are de-identified. Explicit False serves raw bytes.
     apply_middleware: bool | None = None
     expires_at: datetime | None = None
+    # The giver's contextual assessment for this grant, where one exists. Both
+    # or neither; see epicurrents.assessment.
+    assessment_reference: str = ""
+    assessment_date: date | None = None
 
 
 class FederatedGrantPatchIn(Schema):
-    """Partial update for a federation grant. Currently only the expiry."""
+    """Partial update for a federation grant: the expiry, the assessment, or both.
+
+    ``expires_at`` keeps its replace semantics — the value sent, or ``null`` for
+    non-expiring — and is applied whenever it is sent or when nothing else is.
+    The assessment pair is applied only when sent, so a client recording an
+    assessment does not touch the expiry by omission.
+    """
 
     expires_at: datetime | None = None
+    assessment_reference: str | None = None
+    assessment_date: date | None = None
 
 
 class FederatedGrantOut(Schema):
+    """A federation grant as served to its giver; the assessment pair is ``None`` when none is recorded."""
+
     id: int
     federated_peer_id: int
     remote_user_id: str
@@ -120,6 +134,12 @@ class FederatedGrantOut(Schema):
     apply_middleware: bool
     expires_at: datetime | None
     created_at: datetime
+    assessment_reference: str | None = None
+    assessment_date: date | None = None
+
+    @staticmethod
+    def resolve_assessment_reference(obj):
+        return obj.assessment_reference or None
 
 
 class InboundObjectOut(Schema):
@@ -319,19 +339,34 @@ def create_grant(request, payload: FederatedGrantIn):
         can_share=payload.can_share,
         apply_middleware=payload.apply_middleware,
         expires_at=payload.expires_at,
+        assessment_reference=payload.assessment_reference,
+        assessment_date=payload.assessment_date,
     )
 
 
 @api.patch("/grants/{grant_id}/", response=FederatedGrantOut)
 def patch_grant(request, grant_id: int, payload: FederatedGrantPatchIn):
-    """Set a federation grant's expiry (must be the original giver or superuser).
+    """Set a federation grant's expiry or record its assessment (the original giver or a superuser).
 
-    This is the only update path for a grant's ``expires_at``. The provided
-    value replaces the current expiry; ``null`` makes the grant non-expiring.
+    This is the only update path for a grant's ``expires_at``: the provided value
+    replaces the current expiry, and ``null`` makes the grant non-expiring. A
+    body carrying only the assessment pair leaves the expiry alone.
     """
     user = _require_auth(request)
     grant = _service_call(services.get_grant, grant_id)
-    return _service_call(services.renew_grant, grant=grant, actor=user, expires_at=payload.expires_at)
+    sent = payload.model_fields_set
+    assessing = bool(sent & {"assessment_reference", "assessment_date"})
+    if assessing:
+        grant = _service_call(
+            services.record_assessment,
+            grant=grant,
+            actor=user,
+            reference=payload.assessment_reference or "",
+            assessment_date=payload.assessment_date,
+        )
+    if "expires_at" in sent or not assessing:
+        grant = _service_call(services.renew_grant, grant=grant, actor=user, expires_at=payload.expires_at)
+    return grant
 
 
 @api.delete("/grants/{grant_id}/")

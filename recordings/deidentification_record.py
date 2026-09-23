@@ -19,8 +19,11 @@ recording written by an older pass than the current one.
 
 from __future__ import annotations
 
+from datetime import date
+
 from django.conf import settings
 from django.contrib.contenttypes.models import ContentType
+from django.utils import timezone
 
 from recordings.processors.channel_labels import CHANNEL_ORDER_VERSION
 from recordings.processors.edf import DEIDENTIFICATION_VERSION
@@ -97,6 +100,23 @@ def stored_deidentification_record(recording) -> dict | None:
     if row is None:
         return None
     return row.extra_payload[DEIDENTIFICATION_RECORD_KEY]
+
+
+def deidentification_record_dates() -> dict[str, date]:
+    """Return, per recording pk as a string, the local date its newest sealed record was written.
+
+    That is the date the pass now stamped on the recording wrote the stored file, which is what a
+    contextual assessment made earlier did not see. Recordings processed before the record existed
+    have no entry.
+    """
+    from recordings.models import Recording
+
+    ct = ContentType.objects.get_for_model(Recording, for_concrete_model=False)
+    dates: dict[str, date] = {}
+    rows = _record_rows(ct).order_by("created_at", "pk").values_list("object_id", "created_at")
+    for object_id, created_at in rows.iterator(chunk_size=500):
+        dates[object_id] = timezone.localdate(created_at)
+    return dates
 
 
 def stored_deidentification_records() -> dict[str, dict]:

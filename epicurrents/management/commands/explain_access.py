@@ -131,6 +131,15 @@ class Command(BaseCommand):
                         "extensions are not consulted"
                     )
                 )
+                # The sharer's contextual assessment, where one is recorded. The
+                # operator running this command is the one audience it is for
+                # besides the sharer; a grantee never reaches this output.
+                if right.assessment_reference:
+                    self.stdout.write(
+                        f"assessment: {right.assessment_reference} (dated {right.assessment_date.isoformat()})"
+                    )
+                else:
+                    self.stdout.write("assessment: none recorded; the grant serves pseudonymised personal data")
                 return
         self.stdout.write("step 4: no matching direct AccessRight row")
 

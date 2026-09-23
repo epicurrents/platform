@@ -47,7 +47,7 @@ Tags
 
 import hashlib
 import json
-from datetime import datetime
+from datetime import date, datetime
 
 from django.conf import settings
 from django.contrib.auth import get_user_model
@@ -59,7 +59,8 @@ from ninja import NinjaAPI, Query, Schema
 from ninja.errors import HttpError
 
 from activity.audit import log_activity
-from epicurrents.api.schemas import AccessRightOut, access_right_out
+from epicurrents.api.schemas import AccessRightOut, AssessmentIn, access_right_out, apply_assessment, assessment_values
+from epicurrents.assessment import assessment_visible, ensure_can_assess
 from epicurrents.auth import enforce_session_csrf
 from epicurrents.granting import ensure_can_confer, ensure_can_manage_access, ensure_can_revoke
 from epicurrents.models import AccessRight
@@ -223,7 +224,11 @@ class BulkRenameRecordingsOut(Schema):
 
 
 class GrantAccessIn(Schema):
-    """Payload for granting an access right on a collection or dataset."""
+    """Payload for granting an access right on a collection or dataset.
+
+    ``assessment_reference`` and ``assessment_date`` record the sharer's contextual
+    assessment for the grant where one already exists; both or neither.
+    """
 
     access_target_id: int | None = None
     access_target_group_id: int | None = None
@@ -233,6 +238,8 @@ class GrantAccessIn(Schema):
     can_share: bool = False
     apply_middleware: bool = True
     expires_at: datetime | None = None
+    assessment_reference: str = ""
+    assessment_date: date | None = None
 
 
 class TagIn(Schema):
@@ -2066,7 +2073,7 @@ def list_dataset_access_rights(request, dataset_id: str):
         target=dataset,
         metadata={"returned_count": len(rights)},
     )
-    return [access_right_out(r) for r in rights]
+    return [access_right_out(r, assessment_visible=assessment_visible(r, user, dataset)) for r in rights]
 
 
 @api.post("/datasets/{dataset_id}/access/", response={201: AccessRightOut})
@@ -2114,6 +2121,7 @@ def grant_dataset_access(request, dataset_id: str, payload: GrantAccessIn):
     )
 
     UserModel = get_user_model()
+    assessment_reference, assessment_date = assessment_values(payload.assessment_reference, payload.assessment_date)
     kwargs: dict = {
         "content_type": dataset_ct,
         "object_id": str(dataset.pk),
@@ -2123,6 +2131,8 @@ def grant_dataset_access(request, dataset_id: str, payload: GrantAccessIn):
         "can_share": payload.can_share,
         "apply_middleware": payload.apply_middleware,
         "expires_at": payload.expires_at,
+        "assessment_reference": assessment_reference,
+        "assessment_date": assessment_date,
     }
 
     if payload.access_target_id is not None:
@@ -2163,7 +2173,40 @@ def grant_dataset_access(request, dataset_id: str, payload: GrantAccessIn):
         # loser, which is the same conflict the pre-check reports.
         raise HttpError(409, "This target already has an access right on the dataset. Revoke it first.") from exc
     right = AccessRight.objects.select_related("access_target", "access_target_group").get(pk=right.pk)
-    return 201, access_right_out(right)
+    return 201, access_right_out(right, assessment_visible=True)
+
+
+@api.patch("/datasets/{dataset_id}/access/{right_id}/", response=AccessRightOut)
+def assess_dataset_access(request, dataset_id: str, right_id: int, payload: AssessmentIn):
+    """Record, update or clear the sharer's contextual assessment on a grant.
+
+    The one editable part of a local grant. Requires the same authority as
+    managing access, and then the row's giver, the dataset's author or a
+    superuser: the assessment is the sharer's record, and a delegated sharer
+    edits their own grants only. Both fields or neither; an empty pair clears.
+    """
+    user = _require_auth(request)
+    dataset = _get_active_dataset(dataset_id)
+    ensure_can_manage_access(user, dataset, object_label="dataset", action="manage access for")
+
+    right = (
+        AccessRight.objects.filter(pk=right_id, content_type=_dataset_ct(), object_id=str(dataset.pk))
+        .select_related("access_target", "access_target_group")
+        .first()
+    )
+    if right is None:
+        raise HttpError(404, "Access right not found")
+    ensure_can_assess(request, user, dataset, right, object_label="dataset")
+
+    apply_assessment(right, payload)
+    with transaction.atomic():
+        right.save(update_fields=["assessment_reference", "assessment_date", "modified_at"])
+        log_activity(
+            verb="library.dataset.access.assess",
+            target=right,
+            metadata={"assessed": bool(right.assessment_reference)},
+        )
+    return access_right_out(right, assessment_visible=True)
 
 
 @api.delete("/datasets/{dataset_id}/access/{right_id}/")

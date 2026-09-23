@@ -156,6 +156,26 @@ class AccessRight(models.Model):
         ),
     )
 
+    # The sharer's contextual assessment for this grant, where one exists: a
+    # reference to the document and the date it was made. The platform holds
+    # the finding beside the grant and reports when it is due for re-checking;
+    # it never makes the finding. Shown to the giver, the object's author and
+    # superusers only; see epicurrents.assessment.
+    assessment_reference = models.CharField(
+        max_length=512,
+        blank=True,
+        default="",
+        help_text=(
+            "Reference to the sharer's documented contextual assessment for this grant (an identifier or a "
+            "URL), where one exists. Set together with assessment_date."
+        ),
+    )
+    assessment_date = models.DateField(
+        null=True,
+        blank=True,
+        help_text="Date the assessment named by assessment_reference was made or last re-run.",
+    )
+
     created_at = models.DateTimeField(auto_now_add=True)
     modified_at = models.DateTimeField(auto_now=True)
 
@@ -195,6 +215,15 @@ class AccessRight(models.Model):
             models.CheckConstraint(
                 condition=Q(can_read=True) | Q(can_write=True) | Q(can_share=True),
                 name="access_right_requires_some_permission",
+            ),
+            # An assessment is a dated reference: a date without a document,
+            # or a document without a date, is half a record and stays out.
+            models.CheckConstraint(
+                condition=(
+                    Q(assessment_reference="", assessment_date__isnull=True)
+                    | (~Q(assessment_reference="") & Q(assessment_date__isnull=False))
+                ),
+                name="access_right_assessment_dated",
             ),
             models.CheckConstraint(
                 condition=(

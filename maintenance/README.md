@@ -57,6 +57,7 @@ Core registrations, made from `MaintenanceConfig.ready`:
 | `recordings.validate_originals` | celery | `validate_originals --json [--no-size-check]` | no |
 | `recordings.refresh_signal_metadata` | celery | `refresh_signal_metadata [--dry-run]` | yes |
 | `recordings.deidentification_report` | celery | `deidentification_report --format json` | no |
+| `epicurrents.grant_assessments` | celery | `grant_assessments --format json` | no |
 | `mail.send_test` | celery | `send_test_email` | no |
 | `platform.update` | host | the agent applies the named package | yes |
 | `platform.backup` | host | the agent snapshots code, database and `.env` without stopping anything | yes |

@@ -388,6 +388,7 @@ Mounted at `/recordings/api/v1/`. Full request/response detail in [api/v1/ninja.
 | `POST` | `/set-mains` | Batch-set (or clear, with `null`) `power_line_frequency` across a list of recording hashes. Skips invalid hashes and recordings the caller cannot write; returns `{updated, skipped}`. |
 | `DELETE` | `/{hash}` | Soft-delete (sets `deleted_at`). |
 | `GET` | `/{hash}/access/` | List the access rights granted on a recording. See [Access management](#access-management). |
+| `PATCH` | `/{hash}/access/{right_id}/` | Record, update or clear the sharer's contextual assessment on one access right. |
 | `DELETE` | `/{hash}/access/{right_id}` | Revoke one access right. |
 
 ### Access management
@@ -397,6 +398,8 @@ Grants on a recording are created at upload (`user_assignments` / `group_assignm
 Access to *manage* access follows the collection and dataset rule: `can_modify_object` — author or superuser — or the holder of a `can_share` grant, directly or through a group. Staff is deliberately **not** a route in. Who may see a recording is the author's decision; an account administrator with no grant of their own has no business reading the guest list. The listing includes share-token rows with their token values, since every caller who reaches this point could mint or read one anyway, and a share link the owner cannot see is one they cannot audit.
 
 A FAILED recording answers 404 here to everyone but its author and superusers, per the [FAILED-hidden rule](#failed-hidden-rule) — otherwise the access list would confirm that a failed upload exists.
+
+The one editable part of a grant is the sharer's contextual assessment, `assessment_reference` and `assessment_date`, set together or cleared together through the `PATCH` route. Managing access gets a caller to the route; recording an assessment on a row additionally needs the caller to be that row's giver, the recording's author or a superuser, and the listing serves the pair to the same three and `null` to every other manager, so a `can_share` holder sees their own grants' assessments and nobody else's. Recording it is audited as `recordings.access.assess` against the grant row, with whether a record now exists and never the reference. What the record is for, and its Art. 15 and Art. 17 handling, is in [epicurrents/README.md → AccessRight model](../epicurrents/README.md#permissions).
 
 **The author's own grant cannot be revoked**, by anyone, including a superuser. Reading resolves through `AccessRight` and `get_read_access_result` has no author fast-path (only superusers get one), so the self-grant written at upload is the author's sole read access. Deleting it would leave them able to rename and soft-delete the recording — `can_modify_object` *does* check author — while unable to read or download it, and no endpoint creates a grant, so there would be no way back. The refusal is a 409.
 

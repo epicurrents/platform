@@ -1,10 +1,11 @@
 <script setup lang="ts">
-import { ref, reactive, watch } from 'vue'
+import { computed, ref, reactive, watch } from 'vue'
 import { t } from '#i18n'
 import { showToast } from '#lib/toast'
 import { searchUsers, listGroups } from '#api/user'
 import type { UserSearchResult, Group } from '#api/user'
-import type { AccessRight, GrantAccessPayload } from '#api/library'
+import type { AccessRight, AssessmentPayload, GrantAccessPayload } from '#api/library'
+import { joinAssessmentReference, splitAssessmentReference, type AssessmentKind } from '#lib/assessment'
 
 const SCOPE = 'AccessRightsPanel'
 
@@ -12,6 +13,8 @@ const props = defineProps<{
     accessRights: AccessRight[]
     grantFn: (payload: GrantAccessPayload) => Promise<AccessRight>
     revokeFn: (right: AccessRight) => Promise<void>
+    /** When given, each grant the caller may assess gets an assessment control; see epicurrents.assessment. */
+    assessFn?: (right: AccessRight, payload: AssessmentPayload) => Promise<AccessRight>
     infoMessage?: string
     readPermLabel?: string
 }>()
@@ -173,6 +176,77 @@ async function submitGrant() {
     }
 }
 
+// ── Assessment ────────────────────────────────────────────────────────────────
+
+const showAssessment = ref(false)
+const assessmentTarget = ref<AccessRight | null>(null)
+const assessmentForm = reactive({ kind: '' as AssessmentKind, reference: '', date: '' })
+const assessmentLoading = ref(false)
+const assessmentError = ref<string | null>(null)
+const showAssessmentHelp = ref(false)
+
+const assessmentKindOptions = computed(() => [
+    { value: '', label: t('Other document or link', SCOPE) },
+    { value: 'assessment', label: t('Written contextual assessment', SCOPE) },
+    { value: 'dpia', label: t('Data protection impact assessment', SCOPE) },
+    { value: 'agreement', label: t('Data-sharing agreement with a re-identification prohibition', SCOPE) },
+    { value: 'published', label: t('Anonymity statement of a published dataset', SCOPE) },
+])
+
+function openAssessment(right: AccessRight) {
+    assessmentTarget.value = right
+    const stored = splitAssessmentReference(right.assessment_reference ?? '')
+    assessmentForm.kind = stored.kind
+    assessmentForm.reference = stored.identifier
+    assessmentForm.date = right.assessment_date ?? ''
+    assessmentError.value = null
+    showAssessmentHelp.value = false
+    showAssessment.value = true
+}
+
+function closeAssessment() {
+    showAssessment.value = false
+}
+
+async function saveAssessment(clear = false) {
+    const right = assessmentTarget.value
+    if (!right || !props.assessFn) {
+        return
+    }
+    const reference = clear ? '' : joinAssessmentReference(assessmentForm.kind, assessmentForm.reference)
+    const date = clear ? '' : assessmentForm.date
+    if ((reference === '') !== (date === '')) {
+        assessmentError.value = t('Give both a reference and a date, or clear the assessment.', SCOPE)
+        return
+    }
+    assessmentError.value = null
+    assessmentLoading.value = true
+    try {
+        const updated = await props.assessFn(right, { assessment_reference: reference, assessment_date: date || null })
+        emit('update:accessRights', props.accessRights.map(r => (r.id === updated.id ? updated : r)))
+        showAssessment.value = false
+        showToast(
+            reference ? t('Assessment recorded.', SCOPE) : t('Assessment cleared.', SCOPE),
+            'neutral',
+        )
+    } catch (e: unknown) {
+        const msg = (e as { response?: { data?: { detail?: string } } })?.response?.data?.detail
+        assessmentError.value = msg ?? t('Failed to save the assessment.', SCOPE)
+    } finally {
+        assessmentLoading.value = false
+    }
+}
+
+function assessmentLabel(right: AccessRight): string {
+    if (!right.assessment_reference) {
+        return ''
+    }
+    return t('Assessed {date}: {reference}', SCOPE, {
+        date: right.assessment_date ?? '',
+        reference: right.assessment_reference,
+    })
+}
+
 // ── Revoke ────────────────────────────────────────────────────────────────────
 
 async function revokeAccess(right: AccessRight) {
@@ -257,8 +331,19 @@ function userDisplayName(user: UserSearchResult): string {
                 {{ t('User', SCOPE) }}
             </wa-badge>
             <wa-badge v-else pill variant="success">{{ t('Group', SCOPE) }}</wa-badge>
-            <span class="access-target">{{ accessTargetLabel(right) }}</span>
+            <span class="access-target">
+                {{ accessTargetLabel(right) }}
+                <span v-if="right.assessment_reference" class="access-assessment">{{ assessmentLabel(right) }}</span>
+            </span>
             <span class="access-perms">{{ accessPermsLabel(right) }}</span>
+            <wa-button v-if="assessFn"
+                appearance="plain"
+                size="s"
+                :title="t('Contextual assessment', SCOPE)"
+                @click="openAssessment(right)"
+            >
+                <wa-icon name="circle-check"></wa-icon>
+            </wa-button>
             <wa-button
                 appearance="plain"
                 size="s"
@@ -270,6 +355,129 @@ function userDisplayName(user: UserSearchResult): string {
             </wa-button>
         </div>
     </div>
+
+    <!-- Assessment dialog -->
+    <wa-dialog
+        :label="t('Contextual assessment', SCOPE)"
+        :open="showAssessment"
+        @wa-hide.self="closeAssessment"
+    >
+        <div class="dialog-form">
+            <wa-callout v-if="assessmentError" variant="danger">{{ assessmentError }}</wa-callout>
+            <p class="search-hint">
+                {{ t(
+                    'Where you have documented that this recipient cannot identify anyone from what they receive, ' +
+                    'point at that document here and say when it was made. The platform keeps the pointer beside ' +
+                    'the grant and reports when it is due for re-checking; it does not make the finding, and the ' +
+                    'recipient never sees this.',
+                    SCOPE
+                ) }}
+            </p>
+            <wa-details
+                :open="showAssessmentHelp"
+                :summary="t('What to record here', SCOPE)"
+                @wa-show.self="showAssessmentHelp = true"
+                @wa-hide.self="showAssessmentHelp = false"
+            >
+                <p class="assessment-help">
+                    {{ t(
+                        'Sharing through this platform hands the recipient pseudonymised personal data: the ' +
+                        'identification in the file is removed, the signal itself is not. Under the EDPB ' +
+                        'anonymisation guidelines a sharer may still conclude that the data is anonymous for ' +
+                        'one particular recipient, by assessing what that recipient could reasonably do to ' +
+                        'identify someone. That conclusion is yours to reach and to write down; this form only ' +
+                        'records where you wrote it.',
+                        SCOPE
+                    ) }}
+                </p>
+                <p class="assessment-help">
+                    {{ t(
+                        'The document you point at should name the recipient and whoever stands behind them, ' +
+                        'say why they cannot reach the original recordings or a reference recording of the ' +
+                        'same person, state that they may not pass the data on, and carry a date. A written ' +
+                        'contextual assessment following the guidelines is the direct form; a data protection ' +
+                        'impact assessment or a signed data-sharing agreement with a re-identification ' +
+                        'prohibition can carry the same finding.',
+                        SCOPE
+                    ) }}
+                </p>
+                <p class="assessment-help">
+                    {{ t(
+                        'Where the recordings come from a published dataset, the publisher\'s own anonymity ' +
+                        'statement can be the document: a recipient who could fetch the same data from the ' +
+                        'publisher gains nothing from your copy. Point at the dataset\'s citation or DOI and ' +
+                        'where the statement lives. Relying on it makes the finding yours for this recipient, ' +
+                        'and it needs re-checking like any other, since datasets are withdrawn when someone ' +
+                        'is identified in them. The platform still labels what it serves as pseudonymised, ' +
+                        'because it does not know per recording where the data came from.',
+                        SCOPE
+                    ) }}
+                </p>
+                <p class="assessment-help">
+                    {{ t(
+                        'The kind names what the document is and is stored in front of the reference. The ' +
+                        'reference is whatever lets you find the document again: an identifier in your records ' +
+                        'or a link. The date is when the assessment was made, or last re-run; update it each ' +
+                        'time you re-check the finding, which the guidelines ask for after any security ' +
+                        'incident and as capabilities change.',
+                        SCOPE
+                    ) }}
+                </p>
+            </wa-details>
+            <wa-select
+                :disabled="assessmentLoading"
+                :label="t('Kind of document', SCOPE)"
+                size="s"
+                v-wa="[assessmentForm, 'kind']"
+            >
+                <wa-option v-for="option in assessmentKindOptions" :key="option.value" :value="option.value">
+                    {{ option.label }}
+                </wa-option>
+            </wa-select>
+            <wa-input
+                :disabled="assessmentLoading"
+                :label="t('Reference', SCOPE)"
+                :placeholder="t('e.g. an identifier in your records or a link', SCOPE)"
+                size="s"
+                type="text"
+                v-wa="[assessmentForm, 'reference']"
+            ></wa-input>
+            <wa-input
+                :disabled="assessmentLoading"
+                :label="t('Date made or last re-run', SCOPE)"
+                size="s"
+                type="date"
+                v-wa="[assessmentForm, 'date']"
+            ></wa-input>
+        </div>
+
+        <div slot="footer" class="form-actions">
+            <wa-button v-if="assessmentTarget?.assessment_reference"
+                appearance="plain"
+                :disabled="assessmentLoading"
+                variant="danger"
+                @click="saveAssessment(true)"
+            >
+                {{ t('Clear', SCOPE) }}
+            </wa-button>
+            <wa-button
+                appearance="filled-outlined"
+                :disabled="assessmentLoading"
+                variant="neutral"
+                @click="closeAssessment"
+            >
+                {{ t('Cancel', SCOPE) }}
+            </wa-button>
+            <wa-button
+                appearance="filled-outlined"
+                :loading="assessmentLoading"
+                variant="brand"
+                @click="saveAssessment()"
+            >
+                {{ t('Save', SCOPE) }}
+            </wa-button>
+        </div>
+    </wa-dialog>
 
     <!-- Grant access dialog -->
     <wa-dialog
@@ -510,6 +718,21 @@ function userDisplayName(user: UserSearchResult): string {
     color: var(--wa-color-text-quiet);
     flex-shrink: 0;
     font-size: var(--wa-font-size-s);
+}
+
+.assessment-help {
+    color: var(--wa-color-text-quiet);
+    font-size: var(--wa-font-size-s);
+    margin: 0 0 var(--wa-space-s);
+}
+
+.access-assessment {
+    color: var(--wa-color-text-quiet);
+    display: block;
+    font-size: var(--wa-font-size-xs);
+    font-weight: 400;
+    overflow: hidden;
+    text-overflow: ellipsis;
 }
 
 .empty-state {

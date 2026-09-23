@@ -148,6 +148,36 @@ journalctl -t epicurrents-updater -n 50
 A request made while the agent is not running waits as `requested`; cancel it
 from the job page or let the agent pick it up once it is back.
 
+## After a security incident
+
+If an incident touched the originals volume, a backup, the database, a
+federation peer's credentials or a share token in circulation, two things
+follow once the service itself is safe. Both are the data controller's, not
+the software's; the runbook's part is to make sure they happen.
+
+**Reassess any shared data.** Some sharers may have documented that a
+particular recipient cannot identify anyone from what they receive. An
+incident can hand someone exactly the information that finding assumed they
+lacked, so every such finding has to be re-run. List them:
+
+```bash
+scripts/manage.sh grant_assessments
+```
+
+Every grant with an assessment date is one to hand back to whoever made it,
+whatever its status column says; the `--due` filter is for the routine
+six-monthly sweep, not for this. The output names grantees by kind and id
+only, and the reference column is whatever the sharer wrote. The same listing
+is the "Grant assessments" operation on the Maintenance tab for a deployment
+without a shell.
+
+**Consider notification.** An incident of this kind may also engage the
+breach-notification duties in the deployment's data-protection documentation.
+That decision is not made from this runbook; hand the timeline to the person
+responsible for it, along with the grant list.
+
+Background for the developer who is asked why: [anonymisation-compliance.md → Reassessment](anonymisation-compliance.md#reassessment).
+
 ## Escalate to a developer
 
 Hand off when the problem is **not** "a service is down":

@@ -89,6 +89,7 @@ class TestCoreOperations:
             "recordings.validate_originals",
             "recordings.refresh_signal_metadata",
             "recordings.deidentification_report",
+            "epicurrents.grant_assessments",
             "platform.update",
             "platform.backup",
             "platform.rollback",

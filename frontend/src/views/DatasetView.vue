@@ -24,10 +24,12 @@ import {
     listDatasetAccess,
     grantDatasetAccess,
     revokeDatasetAccess,
+    assessDatasetAccess,
     getRecordingContentTypeId,
     type Collection,
     type CollectionItem,
     type AccessRight,
+    type AssessmentPayload,
     type DatasetFolder,
 } from '#api/library'
 import { getMediaContentTypeId } from '#api/media'
@@ -645,6 +647,9 @@ const grantFn = (payload: Parameters<typeof grantDatasetAccess>[1]) =>
 
 const revokeFn = (right: AccessRight) =>
     revokeDatasetAccess(datasetId.value, right.id)
+
+const assessFn = (right: AccessRight, payload: AssessmentPayload) =>
+    assessDatasetAccess(datasetId.value, right.id, payload)
 </script>
 
 <template>
@@ -865,6 +870,7 @@ const revokeFn = (right: AccessRight) =>
             <AccessRightsPanel
                 ref="accessPanel"
                 v-model:accessRights="accessRights"
+                :assessFn="assessFn"
                 :grantFn="grantFn"
                 :infoMessage="t('Anyone with read access to this dataset can read all recordings in it, including recordings added in the future.', SCOPE)"
                 :readPermLabel="t('Read (grants access to all recordings)', SCOPE)"

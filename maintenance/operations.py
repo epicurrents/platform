@@ -178,6 +178,10 @@ def _deidentification_report_args(args: NoArgs) -> list[str]:
     return ["--format", "json"]
 
 
+def _grant_assessments_args(args: NoArgs) -> list[str]:
+    return ["--format", "json"]
+
+
 class PlatformUpdateArgs(Schema):
     """Arguments of ``platform.update``: an already-uploaded package, by hash."""
 
@@ -262,6 +266,22 @@ def register_core_operations() -> None:
             args_schema=NoArgs,
             command="deidentification_report",
             command_args=_deidentification_report_args,
+            requires_step_up=False,
+        )
+    )
+    register_operation(
+        Operation(
+            key="epicurrents.grant_assessments",
+            executor=CELERY,
+            label="Grant assessments",
+            description=(
+                "List every active grant with the state of its sharer's contextual assessment: none, current, "
+                "older than half a year, or older than the pass that last wrote a recording it covers. The "
+                "six-monthly sweep and the after-incident step. Reads only."
+            ),
+            args_schema=NoArgs,
+            command="grant_assessments",
+            command_args=_grant_assessments_args,
             requires_step_up=False,
         )
     )

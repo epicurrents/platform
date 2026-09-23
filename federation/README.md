@@ -233,8 +233,8 @@ Symmetric to local grants — the caller must hold `can_share=True` on the targe
 | Method | Path | Notes |
 |---|---|---|
 | `GET` | `/grants/` | List federation grants the caller has issued. |
-| `POST` | `/grants/` | Create a grant. Payload: `federated_peer_id`, `content_type_id`, `object_id`, `remote_user_id` (empty for wildcard), permission flags, optional `expires_at`. Returns 409 when a grant for the same `(peer, remote_user_id)` already exists on the object — revoke it first. |
-| `PATCH` | `/grants/{id}/` | Update the grant's expiry (renew). Body: `expires_at` — the value replaces the current expiry; `null` makes the grant non-expiring. Only the original `access_giver` or a superuser. |
+| `POST` | `/grants/` | Create a grant. Payload: `federated_peer_id`, `content_type_id`, `object_id`, `remote_user_id` (empty for wildcard), permission flags, optional `expires_at`, and optionally the giver's contextual assessment as `assessment_reference` + `assessment_date` (both or neither). Returns 409 when a grant for the same `(peer, remote_user_id)` already exists on the object — revoke it first. |
+| `PATCH` | `/grants/{id}/` | Update the grant's expiry, its assessment, or both. `expires_at` keeps its replace semantics — the value sent, or `null` for non-expiring — and is applied whenever it is sent or when the body carries nothing else; `assessment_reference` + `assessment_date` are applied only when sent, so a body carrying just the pair leaves the expiry alone. Only the original `access_giver` or a superuser. Responses carry the pair, `null` when none is recorded. |
 | `DELETE` | `/grants/{id}/` | Revoke. Only the original `access_giver` or a superuser may revoke. |
 
 The peer and grant endpoints share their implementation with the [management commands](#management-commands) through [`services.py`](services.py) — one copy of the SSRF guard, the trust gate, the object-level share check, and the audited writes. The endpoints keep the request-layer concerns (session-CSRF, superuser gating); the services carry the domain logic.
@@ -379,6 +379,7 @@ The peer and grant operators below are CLI equivalents of the [API](#api), shari
 | `federation_list_peers` | List peers with trust state and key fingerprints. |
 | `federation_grant --peer <ref> --giver <user> (--recording <hash> \| --content-type <app.model> --object-id <id>) [--remote-user] [--no-read] [--write] [--share] [--apply-middleware] [--expires <iso>]` | Grant a peer (optionally a specific remote user) access to an object. `--giver` must hold share rights on it. `--recording` takes the 32-character hash a recording's URL carries, or its full `content_hash`. |
 | `federation_renew_grant --grant-id <id> (--expires <iso> \| --no-expiry) [--actor]` | Set or clear a grant's expiry — the CLI side of `PATCH /grants/{id}/`. |
+| `federation_assess_grant --grant-id <id> (--reference <ref> --date <YYYY-MM-DD> \| --clear) [--actor]` | Record, update or clear the giver's contextual assessment on a grant — the other half of `PATCH /grants/{id}/`. `federation_grant` takes the same pair as `--assessment-reference` / `--assessment-date` at creation. |
 | `federation_revoke_grant --grant-id <id> [--actor]` | Revoke a grant. |
 | `federation_list_grants [--giver <user>]` | List federation grants (peer, remote user, target, permissions, expiry). |
 | `federation_check_peer (--peer <ref> \| --url <url>) [--no-probe]` | Diagnose the peer handshake: reachability, TLS, and key (Level 1), then a signed round-trip to the peer's inbound endpoint that distinguishes "peer trusts us" (404) from "peer rejects us" (401) (Level 2). The single best command for debugging an opaque federation 401. |

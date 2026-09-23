@@ -81,7 +81,8 @@ from ninja import File, NinjaAPI, Query, Schema, UploadedFile
 from ninja.errors import HttpError
 
 from activity.audit import log_activity
-from epicurrents.api.schemas import AccessRightOut, access_right_out
+from epicurrents.api.schemas import AccessRightOut, AssessmentIn, access_right_out, apply_assessment
+from epicurrents.assessment import assessment_visible, ensure_can_assess
 from epicurrents.auth import enforce_session_csrf
 from epicurrents.models import AccessRight
 from epicurrents.offload import offload_file_response
@@ -2720,7 +2721,7 @@ def list_recording_access(request, hash: str):
     anyway, and a share link the owner cannot see is a share link they cannot
     audit.
     """
-    _user, recording = _require_access_manager(request, hash)
+    user, recording = _require_access_manager(request, hash)
     recording_ct = ContentType.objects.get_for_model(recording, for_concrete_model=False)
     rights = list(
         AccessRight.objects.filter(content_type=recording_ct, object_id=str(recording.pk))
@@ -2732,7 +2733,39 @@ def list_recording_access(request, hash: str):
         target=recording,
         metadata={"returned_count": len(rights)},
     )
-    return [access_right_out(right) for right in rights]
+    return [access_right_out(right, assessment_visible=assessment_visible(right, user, recording)) for right in rights]
+
+
+@api.patch("/{hash}/access/{right_id}/", response=AccessRightOut)
+def assess_recording_access(request, hash: str, right_id: int, payload: AssessmentIn):
+    """Record, update or clear the sharer's contextual assessment on a grant.
+
+    The one editable part of a recording grant. Requires the same authority as
+    managing access, and then the row's giver, the recording's author or a
+    superuser: the assessment is the sharer's record, and a delegated sharer
+    edits their own grants only. Both fields or neither; an empty pair clears.
+    """
+    user, recording = _require_access_manager(request, hash)
+    recording_ct = ContentType.objects.get_for_model(recording, for_concrete_model=False)
+
+    right = (
+        AccessRight.objects.filter(pk=right_id, content_type=recording_ct, object_id=str(recording.pk))
+        .select_related("access_target", "access_target_group")
+        .first()
+    )
+    if right is None:
+        raise HttpError(404, "Access right not found")
+    ensure_can_assess(request, user, recording, right, object_label="recording")
+
+    apply_assessment(right, payload)
+    with transaction.atomic():
+        right.save(update_fields=["assessment_reference", "assessment_date", "modified_at"])
+        log_activity(
+            verb="recordings.access.assess",
+            target=right,
+            metadata={"assessed": bool(right.assessment_reference)},
+        )
+    return access_right_out(right, assessment_visible=True)
 
 
 @api.delete("/{hash}/access/{right_id}/", response=dict)

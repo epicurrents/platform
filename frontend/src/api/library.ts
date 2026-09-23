@@ -82,6 +82,9 @@ export interface AccessRight {
     can_share: boolean
     apply_middleware: boolean
     expires_at: string | null
+    /** The sharer's contextual assessment; null when none is recorded or the caller may not see it. */
+    assessment_reference: string | null
+    assessment_date: string | null
 }
 
 export interface GrantAccessPayload {
@@ -93,6 +96,14 @@ export interface GrantAccessPayload {
     can_share?: boolean
     apply_middleware?: boolean
     expires_at?: string | null
+    assessment_reference?: string
+    assessment_date?: string | null
+}
+
+/** Record, update or clear a grant's contextual assessment: both fields, or an empty reference and a null date. */
+export interface AssessmentPayload {
+    assessment_reference: string
+    assessment_date: string | null
 }
 
 export interface ContentTypeInfo {
@@ -338,4 +349,13 @@ export async function grantDatasetAccess(datasetId: number | string, payload: Gr
 
 export async function revokeDatasetAccess(datasetId: number | string, rightId: number): Promise<void> {
     await http.delete(`/api/v1/library/datasets/${datasetId}/access/${rightId}/`)
+}
+
+export async function assessDatasetAccess(
+    datasetId: number | string,
+    rightId: number,
+    payload: AssessmentPayload,
+): Promise<AccessRight> {
+    const response = await http.patch<AccessRight>(`/api/v1/library/datasets/${datasetId}/access/${rightId}/`, payload)
+    return response.data
 }

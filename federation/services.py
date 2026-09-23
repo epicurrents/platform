@@ -19,6 +19,7 @@ from django.db import IntegrityError, transaction
 from django.utils import timezone
 
 from activity.audit import log_activity
+from epicurrents.assessment import normalise_assessment
 from epicurrents.models import AccessRight
 from federation.auth import fetch_peer_public_key
 from federation.models import FederatedPeer
@@ -211,6 +212,8 @@ def create_grant(
     can_share: bool = False,
     apply_middleware: bool | None = None,
     expires_at=None,
+    assessment_reference: str = "",
+    assessment_date=None,
 ) -> AccessRight:
     """Create a federation grant on an object for a peer (optionally a specific remote user).
 
@@ -221,9 +224,12 @@ def create_grant(
     cross-instance sharing: ``True``, so EDF/BDF bytes served under the grant
     pass through the de-identification pipeline (de-identified header, stripped
     annotation text). Pass ``False`` explicitly to serve raw bytes to the
-    peer — a deliberate cross-controller PHI disclosure.
+    peer — a deliberate cross-controller PHI disclosure. ``assessment_reference``
+    and ``assessment_date`` record the giver's contextual assessment where one
+    exists, both or neither; see :mod:`epicurrents.assessment`.
     """
     obj = _resolve_object(content_type, object_id)
+    assessment_reference, assessment_date = _assessment_values(assessment_reference, assessment_date)
 
     is_author = getattr(obj, "author_id", None) == giver.pk
     if not is_author and not getattr(giver, "is_superuser", False):
@@ -244,6 +250,8 @@ def create_grant(
         "can_write": can_write,
         "can_share": can_share,
         "expires_at": expires_at,
+        "assessment_reference": assessment_reference,
+        "assessment_date": assessment_date,
     }
     # A federated grant crosses to another controller, so de-identification is
     # on unless explicitly declined. The model default agrees; the explicit
@@ -272,6 +280,13 @@ def create_grant(
             409, "A grant for this peer and remote user already exists on the object. Revoke it first."
         ) from exc
     return grant
+
+
+def _assessment_values(reference, assessment_date):
+    try:
+        return normalise_assessment(reference, assessment_date)
+    except ValueError as exc:
+        raise FederationServiceError(400, str(exc)) from exc
 
 
 def get_grant(grant_id: int) -> AccessRight:
@@ -312,4 +327,20 @@ def renew_grant(*, grant: AccessRight, actor, expires_at) -> AccessRight:
         # No metadata: AccessRight is tracked, so this save records the
         # expires_at from/to in the linked ObjectChangeLog already.
         log_activity(verb="federation.grant.renew", target=grant)
+    return grant
+
+
+def record_assessment(*, grant: AccessRight, actor, reference: str, assessment_date) -> AccessRight:
+    """Record, update or clear the giver's contextual assessment on a grant.
+
+    Only the original giver or a superuser may. Both values or neither: an empty
+    reference with no date clears the record.
+    """
+    _require_grant_control(grant, actor)
+    grant.assessment_reference, grant.assessment_date = _assessment_values(reference, assessment_date)
+    with transaction.atomic():
+        grant.save(update_fields=["assessment_reference", "assessment_date", "modified_at"])
+        log_activity(
+            verb="federation.grant.assess", target=grant, metadata={"assessed": bool(grant.assessment_reference)}
+        )
     return grant

@@ -432,6 +432,7 @@ To check the table against the tree, walk the AST for `log_activity` / `with_sys
 | Verb | Emitted by |
 |---|---|
 | `epicurrents.access_rights.purge` | `purge_expired_access_rights` † |
+| `epicurrents.grant_assessments` | `handle` † |
 | `epicurrents.viewer_config.read` | `get_viewer_config` |
 | `epicurrents.viewer_config.update` | `update_viewer_config` |
 
@@ -439,6 +440,7 @@ To check the table against the tree, walk the AST for `log_activity` / `with_sys
 
 | Verb | Emitted by |
 |---|---|
+| `federation.grant.assess` | `handle` †, `record_assessment` † |
 | `federation.grant.create` | `create_grant` †, `handle` † |
 | `federation.grant.list` | `list_grants` |
 | `federation.grant.renew` | `handle` †, `renew_grant` † |
@@ -469,6 +471,7 @@ To check the table against the tree, walk the AST for `log_activity` / `with_sys
 | `library.collection.restore` | `restore_collection` |
 | `library.collection.trash` | `delete_collection` |
 | `library.collection.update` | `update_collection` |
+| `library.dataset.access.assess` | `assess_dataset_access` |
 | `library.dataset.access.grant` | `grant_dataset_access` |
 | `library.dataset.access.list` | `list_dataset_access_rights` |
 | `library.dataset.access.revoke` | `revoke_dataset_access` |
@@ -544,6 +547,7 @@ To check the table against the tree, walk the AST for `log_activity` / `with_sys
 
 | Verb | Emitted by |
 |---|---|
+| `recordings.access.assess` | `assess_recording_access` |
 | `recordings.access.list` | `list_recording_access` |
 | `recordings.access.revoke` | `revoke_recording_access` |
 | `recordings.annotations.list` | `list_recording_annotations` |
