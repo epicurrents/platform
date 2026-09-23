@@ -61,6 +61,12 @@ export interface AnnotationExportFilters {
     until?: string | null
     /** Restrict to annotations bound to one signal version. */
     versionId?: string | null
+    /**
+     * Withhold the text of every row the caller did not write, as a de-identifying grant would:
+     * name, value and code notes leave empty, timing, codes and annotator ids stay. For a file
+     * prepared for a recipient under a de-identifying arrangement. Narrows the export, never widens it.
+     */
+    withholdText?: boolean
 }
 
 /**
@@ -111,6 +117,9 @@ export async function downloadAnnotationExport(filters: AnnotationExportFilters)
     }
     if (filters.versionId) {
         params.version_id = filters.versionId
+    }
+    if (filters.withholdText) {
+        params.withhold_text = 'true'
     }
     const fallback = `annotations-${filters.types.join('-')}.${filters.format}`
     await downloadFile(EXPORT_URL, params, fallback)

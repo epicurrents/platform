@@ -1,6 +1,6 @@
 # Anonymisation compliance — execution plan
 
-**Status: v1.5, 2026-09-23. Phases 0–4 shipped; phases 5–7 not started.** Three decisions taken on review are folded in: `file_hash` leaves every response, the author's included; a centre's withdrawal confirmation is the purge command's report and never a lookup; and the dataset releases on a monthly cadence, with the acquisition embargo's length left to the deployment. The reason this plan exists is the edu project's multi-centre teaching dataset, whose design in the project's own engineering note is a contextual-approach anonymisation case; [the section on it](#the-edu-teaching-dataset-under-the-guidelines) says what the guidelines require of that design and which phases are prerequisites for its first release. The assessment in [docs/anonymisation-compliance.md](../anonymisation-compliance.md) found that the platform's de-identified output is pseudonymised personal data under the EDPB Guidelines 02/2026 on Anonymisation, and recorded eight design gaps. This note is the plan for closing the ones the software can close, in an order where each phase leaves the platform in a consistent, shippable state. Paragraph references (¶ *n*) are to the guidelines' consultation version, as in the assessment.
+**Status: v1.6, 2026-09-23. Phases 0–5 shipped; phases 6 and 7 not started.** Three decisions taken on review are folded in: `file_hash` leaves every response, the author's included; a centre's withdrawal confirmation is the purge command's report and never a lookup; and the dataset releases on a monthly cadence, with the acquisition embargo's length left to the deployment. The reason this plan exists is the edu project's multi-centre teaching dataset, whose design in the project's own engineering note is a contextual-approach anonymisation case; [the section on it](#the-edu-teaching-dataset-under-the-guidelines) says what the guidelines require of that design and which phases are prerequisites for its first release. The assessment in [docs/anonymisation-compliance.md](../anonymisation-compliance.md) found that the platform's de-identified output is pseudonymised personal data under the EDPB Guidelines 02/2026 on Anonymisation, and recorded eight design gaps. This note is the plan for closing the ones the software can close, in an order where each phase leaves the platform in a consistent, shippable state. Paragraph references (¶ *n*) are to the guidelines' consultation version, as in the assessment.
 
 ## What "comply in the technical sense" means here
 
@@ -76,7 +76,9 @@ A project that creates grants in a data migration and expected raw serving will 
 - **Notice.** [docs/privacy-notice-template.md](../privacy-notice-template.md) gains a sentence in the recording-subject notice that labels typed by the uploader are shown to recipients as typed.
 - Reviews: `phi-exposure` (response shapes gain `warnings`), `csrf-coverage` and `audit-trail-completeness` if any endpoint is added rather than modified, `documentation-style`. Tests: the heuristic's own table-driven test, the tag-scope test per caller class, a push-body test asserting no `display_name` in the payload.
 
-## Phase 5 — Label the annotation export and add a withholding mode
+## Phase 5 — Label the annotation export and add a withholding mode (shipped 2026-09-23)
+
+**Shipped with two departures from the text below.** The withholding decision is not reimplemented in the export: `withheld_row_ids` in [annotations/redaction.py](../../annotations/redaction.py) was split so its de-identifying half, `withheld_under_deidentification`, is callable without terms, and the export calls that, which keeps the grant path and the export on one decision and adds no second one to the load-bearing module. And registered row sources are omitted from a withholding export rather than passed through, because a registration declares columns and not which of them hold text; omission is the direction the export already takes for a filter a source cannot answer. Every core row also gained a `text_withheld` column, since a withheld row is otherwise indistinguishable from one whose text is empty, and the `format_version` bump to 3 covers that column as well as the header keys.
 
 **Why.** [annotations/export.py](../../annotations/export.py) serves annotation text verbatim, gated by role rather than by grant, and is documented as the one path that answers past the text rule. That is a deliberate position, but the exported document leaves the platform and nothing in it says what it is.
 
@@ -144,11 +146,11 @@ The platform-side items from the edu note's "work required", restated as platfor
 | 2 Model default | — | S | Shipped 2026-09-22 |
 | 3 Per-recording record | 1 (shape test) | M | Shipped 2026-09-23 |
 | 4 Free-text hygiene | 1 (shape test, for `warnings`) | M | Shipped 2026-09-23 |
-| 5 Export labelling | 3 (version range in the envelope) | S | Yes |
+| 5 Export labelling | 3 (version range in the envelope) | S | Shipped 2026-09-23 |
 | 6 Assessment support | 3 (version comparison) | M | Yes |
 | 7 Dataset support | 1, 2 (default), 3 (record) | L | In slices: gate, purge and release cadence first, validating ingest and pooling second, the reports last |
 
-Phases 1 and 2 are the minimum before any deployment states its position under the guidelines to a recipient; phases 3 and 6 are what let it document that position; phases 4 and 5 reduce the surface the position has to defend (4 shipped). Phase 7 is what the edu dataset needs on top, and its first slice (the visibility gate, the share-token refusal, the purge command and the monthly release cadence) is the release blocker. None of them changes the classification of the output, which stays pseudonymised personal data, and the assessment's given-data tables are updated in the commit that ships each phase.
+Phases 1 and 2 are the minimum before any deployment states its position under the guidelines to a recipient; phases 3 and 6 are what let it document that position; phases 4 and 5 reduce the surface the position has to defend (both shipped). Phase 7 is what the edu dataset needs on top, and its first slice (the visibility gate, the share-token refusal, the purge command and the monthly release cadence) is the release blocker. None of them changes the classification of the output, which stays pseudonymised personal data, and the assessment's given-data tables are updated in the commit that ships each phase.
 
 ## Versioning
 

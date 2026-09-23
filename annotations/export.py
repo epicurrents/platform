@@ -17,6 +17,14 @@ annotation-text rule withholds from a grantee reading under a de-identifying gra
 across annotators is the one path that answers past that rule, so it is gated on the tier the
 platform reserves for its other content-level bypasses rather than on admin visibility.
 
+Whatever the tier, the exported document is pseudonymised personal data of the recording subjects,
+and its header says so: ``data_classification`` names it, ``deidentification_versions`` records
+which pass wrote the exported recordings, and ``text_withheld`` says whether the withholding mode
+was on. That mode, ``?withhold_text=true``, prepares a narrower file for a recipient under a
+de-identifying arrangement by applying the annotation-text rule to every row the exporter did not
+write — the same decision a de-identifying grant makes, taken from
+:func:`annotations.redaction.withheld_under_deidentification` so the two cannot drift.
+
 Two rules from AGENTS.md are enforced on the way out, both concerning the *target* rather than the
 annotation:
 
@@ -58,12 +66,24 @@ from django.utils.dateparse import parse_date, parse_datetime
 from ninja.errors import HttpError
 
 from annotations.models import Event, Label
+from annotations.redaction import withheld_under_deidentification
 
 #: Bumped when the emitted field set changes in a way a downstream parser could trip over.
 #: Additive changes (a new column at the end, a new metadata key) do not bump it.
 #: Version 2 replaced ``author_username`` with ``author_id`` and stripped names and usernames from
 #: the metadata header — annotator identity resolves via the in-platform roster endpoint instead.
-FORMAT_VERSION = 2
+#: Version 3 labelled the header (``data_classification``, ``deidentification_versions``,
+#: ``text_withheld``) and gave every core row a ``text_withheld`` column, because a row whose text
+#: was withheld is otherwise indistinguishable from one whose text is empty; CSV cells spell a
+#: boolean ``true`` / ``false`` since then, as JSON does.
+FORMAT_VERSION = 3
+
+#: What every exported file is, in the header's own words. The de-identification pass blanks the
+#: header, strips annotation text from the file and canonicalises the channel block; the signal is
+#: untouched and the platform keeps the means to reverse the rest, so the output is pseudonymised
+#: personal data for every recipient (docs/anonymisation-compliance.md). The value is a fixed token
+#: so a recipient's tooling can refuse to treat the file as anonymous by checking one key.
+DATA_CLASSIFICATION = "pseudonymised_personal_data"
 
 #: The core annotation types, in the order they appear in a JSON payload. Registered row sources
 #: add to this set at runtime — :func:`exportable_types` is what a deployment can export.
@@ -87,7 +107,10 @@ _MODELS = {"events": Event, "labels": Label}
 #:
 #: ``author_id`` is the only annotator identifier — no username or name appears anywhere in the
 #: file. The roster endpoint (:func:`list_annotators`) maps ids to identities inside the
-#: platform, so an exported file carries attribution without carrying personal data.
+#: platform, so an exported file carries attribution without carrying annotator identity.
+#:
+#: ``text_withheld`` is last and always present: ``true`` on a row whose ``name``, ``value`` and
+#: code ``meta`` were withheld by the withholding mode, ``false`` otherwise.
 _COLUMNS = {
     "events": (
         "object_hash",
@@ -103,6 +126,7 @@ _COLUMNS = {
         "duration",
         "value",
         "codes",
+        "text_withheld",
     ),
     "labels": (
         "object_hash",
@@ -115,6 +139,7 @@ _COLUMNS = {
         "name",
         "value",
         "codes",
+        "text_withheld",
     ),
 }
 
@@ -341,6 +366,9 @@ class ExportFilters:
     since: datetime | None = None
     until: datetime | None = None
     version_id: str | None = None
+    #: Withhold the text of every row the exporter did not write, as a de-identifying grant would.
+    #: A mode rather than a filter, so it is reported beside ``filters`` in the header, not inside.
+    withhold_text: bool = False
 
     def as_metadata(self) -> dict:
         """Return the applied filters as they appear in the export's metadata header.
@@ -374,6 +402,9 @@ class ExportResult:
     #: (id plus per-type counts), for the audit trail and the annotator-count metadata.
     annotator_ids: list[int] = field(default_factory=list)
     restricted_to_self: bool = False
+    #: Distinct ``RecordingMeta.deidentification_version`` values across the exported recording
+    #: targets, sorted. ``0`` names a recording processed before the record existed.
+    deidentification_versions: list[int] = field(default_factory=list)
 
 
 def parse_filters(
@@ -386,12 +417,14 @@ def parse_filters(
     since: str | None,
     until: str | None,
     version_id: str | None,
+    withhold_text: bool = False,
 ) -> ExportFilters:
     """Validate raw query parameters into an :class:`ExportFilters`, raising 422 on bad input.
 
     ``since`` and ``until`` accept a plain date or a full datetime. A bare date is widened to cover
     the whole day — ``until=2026-08-11`` includes everything annotated on the 11th, which is what
     someone typing a date means, and the alternative silently truncates a day of rows.
+    ``withhold_text`` is passed through; see :func:`build_export` for what it does.
     """
     available = exportable_types()
     requested = tuple(part.strip() for part in (types or "").split(",") if part.strip()) or available
@@ -424,6 +457,7 @@ def parse_filters(
         since=_parse_boundary(since, "since", end_of_day=False),
         until=_parse_boundary(until, "until", end_of_day=True),
         version_id=(version_id or "").strip() or None,
+        withhold_text=bool(withhold_text),
     )
 
 
@@ -479,7 +513,19 @@ def can_export_all_annotators(caller) -> bool:
 
 
 def build_export(*, caller, filters: ExportFilters) -> ExportResult:
-    """Collect and serialise every row the caller may export under *filters*."""
+    """Collect and serialise every row the caller may export under *filters*.
+
+    With ``filters.withhold_text`` the core rows the caller did not write leave without their
+    ``name``, ``value`` and code ``meta`` and carry ``text_withheld: true`` — the annotation-text
+    rule applied by choice, own rows and machine-produced findings excepted exactly as under a
+    de-identifying grant. Timing, hashes, author ids and classification codes stay, so the file
+    still supports attribution and agreement analysis. Registered row sources are omitted in that
+    mode: the export cannot tell which of a source's declared columns hold text, and omission is the
+    safe direction. Export extension columns pass through unchanged, since they describe the target
+    rather than the annotation; a resolver whose columns carry free text gates it itself, which is
+    what it receives the caller for. The mode narrows an export and never widens one; the tier is
+    unchanged.
+    """
     exports_all_annotators = can_export_all_annotators(caller)
     restricted = not exports_all_annotators
     if restricted and any(annotator_id != caller.pk for annotator_id in filters.annotator_ids):
@@ -507,7 +553,11 @@ def build_export(*, caller, filters: ExportFilters) -> ExportResult:
 
     for type_name, rows in collected.items():
         visible = [row for row in rows if (row.target_content_type_id, row.target_object_id) in targets]
-        result.rows[type_name] = [_serialise_row(row, type_name, targets=targets, extras=extras) for row in visible]
+        withheld = withheld_under_deidentification(visible, caller=caller) if filters.withhold_text else set()
+        result.rows[type_name] = [
+            _serialise_row(row, type_name, targets=targets, extras=extras, withhold_text=row.pk in withheld)
+            for row in visible
+        ]
 
     for type_name in filters.types:
         source = _ROW_SOURCES.get(type_name)
@@ -517,7 +567,27 @@ def build_export(*, caller, filters: ExportFilters) -> ExportResult:
             )
 
     result.annotators, result.annotator_ids = _build_roster(result.rows)
+    result.deidentification_versions = _deidentification_versions(target_objects)
     return result
+
+
+def _deidentification_versions(objects) -> list[int]:
+    """Return the sorted distinct de-identification pass versions of the recording targets in *objects*.
+
+    Read off ``RecordingMeta`` in one query. A recording with no meta row contributes nothing; one
+    processed before the record existed contributes ``0``, which the header passes on as it is so a
+    recipient sees that the pass is unrecorded rather than a version.
+    """
+    from recordings.models import Recording, RecordingMeta
+
+    object_ids = [str(obj.pk) for obj in objects.values() if isinstance(obj, Recording)]
+    if not object_ids:
+        return []
+    recording_ct = ContentType.objects.get_for_model(Recording)
+    versions = RecordingMeta.objects.filter(content_type=recording_ct, object_id__in=object_ids).values_list(
+        "deidentification_version", flat=True
+    )
+    return sorted(set(versions))
 
 
 def _source_rows(
@@ -526,12 +596,15 @@ def _source_rows(
     """Return the serialised rows one registered row source contributes under *filters*.
 
     Empty when the export is narrowed by a filter the source cannot answer — see
-    :func:`register_export_row_source` on why omission is the safe direction. Every filter is
-    applied here rather than by the source, and each row is projected onto the declared columns with
-    the author id read off the row itself, so what leaves the platform is what the registration
-    declares.
+    :func:`register_export_row_source` on why omission is the safe direction — and in the
+    withholding mode, for the same reason: the registration declares columns, not which of them hold
+    text. Every filter is applied here rather than by the source, and each row is projected onto the
+    declared columns with the author id read off the row itself, so what leaves the platform is what
+    the registration declares.
     """
     if target_scope is not None:
+        return []
+    if filters.withhold_text:
         return []
     if filters.version_id is not None and source.version_field is None:
         return []
@@ -748,11 +821,14 @@ def _resolve_extension_values(*, caller, targets, objects) -> dict[tuple[int, st
     return extras
 
 
-def _serialise_row(row, type_name: str, *, targets, extras) -> dict:
+def _serialise_row(row, type_name: str, *, targets, extras, withhold_text: bool) -> dict:
     """Flatten one annotation row into the export's column set.
 
     ``created_at`` / ``modified_at`` are not emitted; see the note on :data:`_COLUMNS`.
     Extension columns for the row's target, if any, are appended after the base fields.
+    With ``withhold_text`` the row keeps its timing, hashes, author id and codes but leaves without
+    ``name``, ``value`` and code ``meta``, the same shape the per-target serialisers give a
+    de-identifying reader. The flag is keyword-only and undefaulted for the reason those are.
     """
     target = targets[(row.target_content_type_id, row.target_object_id)]
     common = {
@@ -763,9 +839,12 @@ def _serialise_row(row, type_name: str, *, targets, extras) -> dict:
         "target_ref": target.ref,
         "target_label": target.label,
         "version_id": row.version_id,
-        "name": row.name,
-        "value": row.value,
-        "codes": [{"standard": code.standard, "value": code.value, "meta": code.meta} for code in row.codes.all()],
+        "name": "" if withhold_text else row.name,
+        "value": None if withhold_text else row.value,
+        "codes": [
+            {"standard": code.standard, "value": code.value, "meta": None if withhold_text else code.meta}
+            for code in row.codes.all()
+        ],
     }
     if type_name == "events":
         common.update(
@@ -775,6 +854,7 @@ def _serialise_row(row, type_name: str, *, targets, extras) -> dict:
                 "duration": row.duration,
             }
         )
+    common["text_withheld"] = withhold_text
     common.update(extras.get((row.target_content_type_id, row.target_object_id), {}))
     return common
 
@@ -845,9 +925,22 @@ def build_metadata(result: ExportResult, *, exported_by, exported_at: datetime) 
     ``exported_by`` is an id for the same reason the roster is: the file outlives the platform's
     erasure reach, so no name or username enters it. The audit trail records the same actor with
     full attribution for as long as the account exists.
+
+    ``data_classification`` and ``deidentification_versions`` label what the file is and which pass
+    wrote the recordings it describes — the pass currently in force alongside the versions actually
+    found, since a deployment can hold recordings written by an older one. ``text_withheld`` says
+    whether the withholding mode produced the file.
     """
+    from recordings.processors.edf import DEIDENTIFICATION_VERSION
+
     return {
         "format_version": FORMAT_VERSION,
+        "data_classification": DATA_CLASSIFICATION,
+        "deidentification_versions": {
+            "current": DEIDENTIFICATION_VERSION,
+            "exported_recordings": list(result.deidentification_versions),
+        },
+        "text_withheld": result.filters.withhold_text,
         "exported_at": exported_at.isoformat(),
         "exported_by": {"id": exported_by.pk},
         "restricted_to_own_annotations": result.restricted_to_self,
@@ -898,8 +991,12 @@ def render_csv(result: ExportResult, metadata: dict) -> str:
 def _metadata_comment_lines(metadata: dict, type_name: str) -> list[str]:
     """Return the human-readable metadata header for a CSV export, one line per entry."""
     filters = metadata["filters"]
+    versions = metadata["deidentification_versions"]
+    found = ", ".join(str(version) for version in versions["exported_recordings"]) or "none"
     lines = [
         f"epicurrents annotation export (format_version {metadata['format_version']})",
+        f"data_classification: {metadata['data_classification']}",
+        f"deidentification_versions: current {versions['current']}, exported recordings {found}",
         f"type: {type_name}",
         f"exported_at: {metadata['exported_at']}",
         f"exported_by: user id {metadata['exported_by']['id']}",
@@ -910,6 +1007,8 @@ def _metadata_comment_lines(metadata: dict, type_name: str) -> list[str]:
     lines.append(f"filters: {', '.join(applied) if applied else 'none'}")
     if metadata["restricted_to_own_annotations"]:
         lines.append("scope: own annotations only (caller is not staff)")
+    if metadata["text_withheld"]:
+        lines.append("text: withheld on rows the exporter did not write (see the text_withheld column)")
     lines.append("")
     if metadata["annotators"]:
         lines.append(f"annotators: {len(metadata['annotators'])} (ids resolve via the platform's annotator roster)")
@@ -928,6 +1027,9 @@ def _csv_cell(value):
     """
     if value is None:
         return ""
+    if isinstance(value, bool):
+        # JSON spelling, so ``text_withheld`` reads the same in both formats.
+        return "true" if value else "false"
     if isinstance(value, (dict, list)):
         return json.dumps(value, ensure_ascii=False, separators=(",", ":"), default=str)
     return value

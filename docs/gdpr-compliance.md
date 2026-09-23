@@ -143,7 +143,7 @@ window; preserved originals follow step 3.
 Tracked in [ROADMAP.md](../ROADMAP.md) with the `Privacy` / `Federation` /
 `Security` prefixes; the load-bearing ones as of the 2026-08-26 audit:
 
-- The served output is pseudonymised, not anonymous. The two linkage keys the platform itself used to add, the SHA-256 of the pre-de-identification upload and the exact upload timestamp, left the metadata API on 2026-09-22; the remaining gaps (free text, the per-recording process record, export labelling, media and DICOM) are in [anonymisation-compliance.md → Design gaps](anonymisation-compliance.md#design-gaps).
+- The served output is pseudonymised, not anonymous. The two linkage keys the platform itself used to add, the SHA-256 of the pre-de-identification upload and the exact upload timestamp, left the metadata API on 2026-09-22; free-text warnings, the per-recording process record and the labelled annotation export followed on 2026-09-23, and the remaining gaps (media and DICOM, and the contextual-assessment support of the plan's phase 6) are in [anonymisation-compliance.md → Design gaps](anonymisation-compliance.md#design-gaps).
 - Patient-side audit snapshots (annotation content, recording states) persist
   after a recording purge — purge-time tombstoning is the planned extension.
 - No *self-service* subject-access export — Art. 15 is served by the operator running `export_user`, which is a person's turnaround rather than a download link.
