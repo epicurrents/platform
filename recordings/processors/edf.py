@@ -280,6 +280,16 @@ def wall_clock_to_data_position(onset: float, gaps: GapMap) -> float:
     return onset - shift
 
 
+# Version of the de-identification pass — ``_build_clean_header`` for the
+# subject fields and ``deidentify_signal_infos`` for the channel block — stamped
+# on ``RecordingMeta.deidentification_version`` at ingest so every stored file
+# names the pass that wrote it. Bump on any behaviour change to either function:
+# ``recordings/tests/test_deidentification_record.py`` pins a digest of their
+# source against this value, so the bump cannot be forgotten, and the report
+# command flags every recording written by an older pass.
+DEIDENTIFICATION_VERSION = 1
+
+
 @dataclass
 class EdfProcessingResult:
     """All information extracted by :func:`process_edf_file`."""
@@ -288,6 +298,10 @@ class EdfProcessingResult:
     signal_infos: list[EdfSignalInfo]
     annotations: list[AnnotationEntry]
     gaps: GapMap
+    # Whether the file on disk keeps its annotation text: the resolved strip
+    # decision, carried on the result so the persistence step stamps what the
+    # pass actually did rather than what its caller meant to ask for.
+    annotation_text_preserved: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -1846,4 +1860,5 @@ def process_edf_file(
         signal_infos=signal_infos,
         annotations=annotations,
         gaps=gaps,
+        annotation_text_preserved=not strip_annotation_text,
     )

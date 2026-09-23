@@ -24,6 +24,7 @@ from collections.abc import Callable
 from .models import ObjectChangeLog
 
 _DIGESTERS: dict[tuple[type, str], Callable[[object], str]] = {}
+_RECORDS: set[tuple[type, str]] = set()
 
 
 def register_derived_state_digester(
@@ -46,6 +47,18 @@ def register_derived_state_digester(
     _DIGESTERS[(target_model, key)] = digester
 
 
+def register_derived_state_record(*, target_model: type, key: str) -> None:
+    """Declare that audit rows for ``target_model`` may carry a documentary record under ``key``.
+
+    A record is a payload the writer wants sealed into the row's ``after_hash`` but that
+    describes a moment rather than live state — the settings in force when the row was
+    written, say — so nothing can recompute it. ``verify_derived_state`` reports such a key
+    as ``"record"`` and counts it as intact: the row's own hash is what protects it, and a
+    declared key nothing can re-derive is not the same as a key no app knows.
+    """
+    _RECORDS.add((target_model, key))
+
+
 class DerivedStateVerificationResult:
     """Outcome of recomputing an audit row's derived-state digests.
 
@@ -57,9 +70,11 @@ class DerivedStateVerificationResult:
       written; in that case ``digests`` is empty and ``ok`` is ``False``.
     - ``digests`` — mapping from each ``extra_payload`` key to a verdict:
       ``"ok"`` (recomputed value matches stored), ``"mismatch"`` (recomputed
-      differs — tamper signal), or ``"no_digester"`` (no callable registered
-      for this ``(target_model, key)`` pair; the row carries a digest the
-      app code doesn't know how to recompute).
+      differs — tamper signal), ``"record"`` (a documentary payload declared
+      with ``register_derived_state_record``; sealed by the row's hash, nothing
+      to recompute), or ``"no_digester"`` (no callable registered for this
+      ``(target_model, key)`` pair; the row carries a digest the app code
+      doesn't know how to recompute).
     """
 
     def __init__(
@@ -74,7 +89,7 @@ class DerivedStateVerificationResult:
 
     @property
     def ok(self) -> bool:
-        return self.target_loaded and all(verdict == "ok" for verdict in self.digests.values())
+        return self.target_loaded and all(verdict in ("ok", "record") for verdict in self.digests.values())
 
     def __repr__(self) -> str:
         return (
@@ -105,6 +120,9 @@ def verify_derived_state(change: ObjectChangeLog) -> DerivedStateVerificationRes
     target_model = type(target)
     digests: dict[str, str] = {}
     for key, stored in (change.extra_payload or {}).items():
+        if (target_model, key) in _RECORDS:
+            digests[key] = "record"
+            continue
         digester = _DIGESTERS.get((target_model, key))
         if digester is None:
             digests[key] = "no_digester"

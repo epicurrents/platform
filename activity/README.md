@@ -175,6 +175,8 @@ register_derived_state_digester(
 
 `verify_derived_state(change)` loops over each key in the row's `extra_payload`, looks up the registered digester, runs it against the live target, and compares the result to the stored hex. The result object reports per-key verdicts: `"ok"`, `"mismatch"`, or `"no_digester"` (the row carries a digest under a key no app has registered). The recompute path is on-demand; the future periodic-integrity Celery task will call it on a sliding window.
 
+**Documentary records.** A writer may seal a payload that describes a moment rather than live state — the settings in force when the row was written — and nothing can recompute such a value. Declare the key with `register_derived_state_record(target_model=..., key=...)` and the verifier reports it as `"record"`, which counts as intact: the row's `after_hash` covers it, so editing the column still breaks chain verification, and a declared key stays distinguishable from one no app knows, which is `"no_digester"` and what the integrity check logs. The recordings app's `deidentification_record` is the one registered today.
+
 **Two layers of detection.** The chain catches naive tampering with the stored digest column (recomputed `after_hash` no longer matches). The recompute catches tampering with the dependent rows themselves (live digest differs from stored). To hide a derived-row tamper an attacker would have to recompute the digest, update the audit row's column, recompute its `after_hash` — and *then* rewrite every subsequent row in the same chain shard so the link forward stays consistent.
 
 Canonical example: [recordings/audit_digests.py](../recordings/audit_digests.py) hashes all `SignalInfo` rows attached to a `Recording`; the digest rides on the final READY transition's audit row.
@@ -545,6 +547,7 @@ To check the table against the tree, walk the AST for `log_activity` / `with_sys
 | `recordings.access.list` | `list_recording_access` |
 | `recordings.access.revoke` | `revoke_recording_access` |
 | `recordings.annotations.list` | `list_recording_annotations` |
+| `recordings.deidentification_report` | `handle` † |
 | `recordings.download` | `download_recording` |
 | `recordings.download.slice` | `slice_recording` |
 | `recordings.import` | `_run_job` † |

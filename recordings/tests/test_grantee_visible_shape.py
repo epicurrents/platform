@@ -64,6 +64,8 @@ META_KEYS = {
     "channel_layout",
     "unresolved_channel_count",
     "channel_order_version",
+    "deidentification_version",
+    "annotation_text_preserved",
     "signals",
 }
 
@@ -118,6 +120,8 @@ SLICE_META_KEYS = {
     "channel_layout",
     "unresolved_channel_count",
     "channel_order_version",
+    "deidentification_version",
+    "annotation_text_preserved",
     "signals",
 }
 

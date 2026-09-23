@@ -223,6 +223,19 @@ class RecordingMeta(models.Model):
     # canonical ordering was applied. Stamped at ingest, never re-derived — a
     # refresh cannot know which spec wrote the bytes.
     channel_order_version = models.PositiveSmallIntegerField(default=0)
+    # Version of the header and channel-block de-identification pass that wrote
+    # the stored file (processors.edf.DEIDENTIFICATION_VERSION); 0 means the file
+    # was processed before the record existed. Stamped at ingest, never
+    # re-derived, for the same reason as channel_order_version. Together with
+    # the flag below and the READY audit row's payload, this is the per-recording
+    # process record EDPB Guidelines 02/2026 paragraph 41 asks for.
+    deidentification_version = models.PositiveSmallIntegerField(default=0)
+    # Whether the stored file keeps the annotation text it arrived with. Stamped
+    # from the resolved strip decision at ingest; meaningful only when
+    # deidentification_version is non-zero, since older rows were never stamped.
+    # Content-free and served to every reader: a de-identifying grant strips the
+    # text on the wire regardless, and a raw grant's reader is entitled to know.
+    annotation_text_preserved = models.BooleanField(default=False)
 
     created_at = models.DateTimeField(auto_now_add=True)
     modified_at = models.DateTimeField(auto_now=True)

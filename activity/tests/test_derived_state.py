@@ -18,6 +18,7 @@ from activity.audit import (
 from activity.derived_state import (
     DerivedStateVerificationResult,
     register_derived_state_digester,
+    register_derived_state_record,
     verify_derived_state,
 )
 from activity.models import ObjectChangeLog
@@ -136,6 +137,29 @@ class TestDigesterRegistry:
         result = verify_derived_state(row)
         assert result.ok is False
         assert result.digests == {"probe": "mismatch"}
+
+    def test_registered_record_counts_as_sealed(self, user):
+        from model_bakery import baker
+
+        recording = baker.make("recordings.Recording", author=user)
+        register_derived_state_record(target_model=type(recording), key="test_record")
+
+        before = serialize_instance(recording)
+        recording.original_name = "r.edf"
+        recording.save(update_fields=["original_name"])
+        row = record_modify_change(
+            actor=user,
+            obj=recording,
+            before_state=before,
+            extra_payload={"test_record": {"setting": True, "version": 3}},
+        )
+        result = verify_derived_state(row)
+        assert result.ok is True
+        assert result.digests == {"test_record": "record"}
+        # Sealed by the row's own hash: editing the record is still caught.
+        row.extra_payload["test_record"]["setting"] = False
+        row.save(update_fields=["extra_payload"])
+        assert verify_change_hash(row) is False
 
     def test_unregistered_key_returns_no_digester(self, user):
         from model_bakery import baker

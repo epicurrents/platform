@@ -66,18 +66,28 @@ def _write_final_recording_transition(*, recording, update_fields: dict) -> None
         SIGNAL_INFO_DIGEST_KEY,
         compute_signal_info_digest,
     )
+    from recordings.deidentification_record import (
+        DEIDENTIFICATION_RECORD_KEY,
+        build_deidentification_record,
+    )
     from recordings.models import Recording
 
     before_state = serialize_instance(Recording.objects.get(pk=recording.pk))
     Recording.objects.filter(pk=recording.pk).update(**update_fields)
     recording.refresh_from_db()
+    extra_payload = {SIGNAL_INFO_DIGEST_KEY: compute_signal_info_digest(recording)}
+    # The process record rides on the same row as the digest: the versions
+    # stamped on the meta row and the ingest overrides in force at this moment,
+    # which nothing else retains. A FAILED transition has no meta row and gets
+    # no record, because no pass wrote the file.
+    record = build_deidentification_record(recording)
+    if record is not None:
+        extra_payload[DEIDENTIFICATION_RECORD_KEY] = record
     record_modify_change(
         actor=None,
         obj=recording,
         before_state=before_state,
-        extra_payload={
-            SIGNAL_INFO_DIGEST_KEY: compute_signal_info_digest(recording),
-        },
+        extra_payload=extra_payload,
     )
 
 
@@ -127,6 +137,7 @@ def _save_edf_results(recording, result) -> None:
 
     # ── RecordingMeta ─────────────────────────────────────────────────────
     from recordings.processors.channel_labels import CHANNEL_ORDER_VERSION, assess_channel_layout
+    from recordings.processors.edf import DEIDENTIFICATION_VERSION
 
     channel_layout, unresolved_count = assess_channel_layout(signal_infos)
     duration = header.data_record_count * header.data_record_duration
@@ -143,6 +154,10 @@ def _save_edf_results(recording, result) -> None:
         channel_layout=channel_layout,
         unresolved_channel_count=unresolved_count,
         channel_order_version=CHANNEL_ORDER_VERSION,
+        # The process record: which pass wrote the file and whether the text
+        # survived, from the result rather than from any caller-side flag.
+        deidentification_version=DEIDENTIFICATION_VERSION,
+        annotation_text_preserved=result.annotation_text_preserved,
     )
 
     # ── SignalInfo rows ───────────────────────────────────────────────────
@@ -288,7 +303,9 @@ def process_recording(recording_id: int, preserve_annotations: bool = False):
     READY/FAILED transition carries a digest of the recording's
     ``SignalInfo`` rows in ``extra_payload`` — those bulk-created rows
     don't fire ``post_save``, so the digest is how their integrity rides
-    on the chain.
+    on the chain. The READY row also carries the de-identification record
+    (``recordings.deidentification_record``): the stamped pass versions,
+    the annotation-text flag and the ingest overrides in force.
     """
     from activity.models import Activity
     from activity.system_activity import with_system_activity

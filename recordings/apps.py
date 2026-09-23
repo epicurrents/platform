@@ -25,13 +25,14 @@ class RecordingsConfig(AppConfig):
         example for plugin authors writing format-specific post_convert
         handlers.
         """
-        from activity.derived_state import register_derived_state_digester
+        from activity.derived_state import register_derived_state_digester, register_derived_state_record
         from epicurrents.permissions import register_read_visibility_gate
         from recordings.audit_digests import (
             SIGNAL_INFO_DIGEST_KEY,
             compute_signal_info_digest,
         )
         from recordings.converters.sidecar import handle_post_convert
+        from recordings.deidentification_record import DEIDENTIFICATION_RECORD_KEY
         from recordings.models import Recording
         from recordings.pipelines import (
             register_convert_failed,
@@ -77,3 +78,7 @@ class RecordingsConfig(AppConfig):
             key=SIGNAL_INFO_DIGEST_KEY,
             digester=compute_signal_info_digest,
         )
+        # The de-identification record on the same row is documentary — it holds
+        # the settings in force at ingest, which nothing can recompute — so the
+        # verifier is told to count it as sealed rather than unknown.
+        register_derived_state_record(target_model=Recording, key=DEIDENTIFICATION_RECORD_KEY)

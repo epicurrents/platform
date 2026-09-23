@@ -174,6 +174,13 @@ class RecordingMetaOut(Schema):
     unresolved_channel_count: int = 0
     # Canonical channel-order spec version the stored file follows; 0 = unordered.
     channel_order_version: int = 0
+    # Which version of the header and channel-block de-identification pass wrote
+    # the stored file (DEIDENTIFICATION_VERSION in processors/edf.py); 0 = processed
+    # before the record existed. Whether the file keeps its annotation text: under
+    # a de-identifying grant the wire strips it regardless, and a raw grant's
+    # reader is entitled to know. Both content-free; served to every reader.
+    deidentification_version: int = 0
+    annotation_text_preserved: bool = False
     signals: list[SignalInfoOut] = []
 
 
@@ -1133,6 +1140,8 @@ def _build_recording_out(
             "channel_layout": meta_obj.channel_layout,
             "unresolved_channel_count": meta_obj.unresolved_channel_count,
             "channel_order_version": meta_obj.channel_order_version,
+            "deidentification_version": meta_obj.deidentification_version,
+            "annotation_text_preserved": meta_obj.annotation_text_preserved,
             "signals": [
                 {
                     "index": si.index,
@@ -1906,6 +1915,14 @@ def recording_detail_slice(
             "data_record_duration": meta.data_record_duration,
             "signal_count": meta.signal_count,
             "discontinuous": meta.discontinuous,
+            # The recording-level facts a slice inherits unchanged. Left out,
+            # the schema serves its defaults, which read as "unknown layout" and
+            # "written by no pass" for a recording that is neither.
+            "channel_layout": meta.channel_layout,
+            "unresolved_channel_count": meta.unresolved_channel_count,
+            "channel_order_version": meta.channel_order_version,
+            "deidentification_version": meta.deidentification_version,
+            "annotation_text_preserved": meta.annotation_text_preserved,
         },
         "t_start": actual_t_start,
         "t_end": actual_t_end,

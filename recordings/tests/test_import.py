@@ -595,7 +595,9 @@ class TestImportRecordingsAudit:
         )
         result = verify_derived_state(final)
         assert result.ok is True
-        assert result.digests == {"signal_info_digest": "ok"}
+        # An imported EDF has a meta row, so the READY row also seals the
+        # de-identification record; the .bin fixture in test_tasks has none.
+        assert result.digests == {"signal_info_digest": "ok", "deidentification_record": "record"}
 
 
 @pytest.mark.django_db

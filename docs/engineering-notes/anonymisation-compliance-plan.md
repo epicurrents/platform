@@ -1,6 +1,6 @@
 # Anonymisation compliance — execution plan
 
-**Status: v1.3, 2026-09-22. Phases 0–2 shipped; phases 3–7 not started.** Three decisions taken on review are folded in: `file_hash` leaves every response, the author's included; a centre's withdrawal confirmation is the purge command's report and never a lookup; and the dataset releases on a monthly cadence, with the acquisition embargo's length left to the deployment. The reason this plan exists is the edu project's multi-centre teaching dataset, whose design in the project's own engineering note is a contextual-approach anonymisation case; [the section on it](#the-edu-teaching-dataset-under-the-guidelines) says what the guidelines require of that design and which phases are prerequisites for its first release. The assessment in [docs/anonymisation-compliance.md](../anonymisation-compliance.md) found that the platform's de-identified output is pseudonymised personal data under the EDPB Guidelines 02/2026 on Anonymisation, and recorded eight design gaps. This note is the plan for closing the ones the software can close, in an order where each phase leaves the platform in a consistent, shippable state. Paragraph references (¶ *n*) are to the guidelines' consultation version, as in the assessment.
+**Status: v1.4, 2026-09-23. Phases 0–3 shipped; phases 4–7 not started.** Three decisions taken on review are folded in: `file_hash` leaves every response, the author's included; a centre's withdrawal confirmation is the purge command's report and never a lookup; and the dataset releases on a monthly cadence, with the acquisition embargo's length left to the deployment. The reason this plan exists is the edu project's multi-centre teaching dataset, whose design in the project's own engineering note is a contextual-approach anonymisation case; [the section on it](#the-edu-teaching-dataset-under-the-guidelines) says what the guidelines require of that design and which phases are prerequisites for its first release. The assessment in [docs/anonymisation-compliance.md](../anonymisation-compliance.md) found that the platform's de-identified output is pseudonymised personal data under the EDPB Guidelines 02/2026 on Anonymisation, and recorded eight design gaps. This note is the plan for closing the ones the software can close, in an order where each phase leaves the platform in a consistent, shippable state. Paragraph references (¶ *n*) are to the guidelines' consultation version, as in the assessment.
 
 ## What "comply in the technical sense" means here
 
@@ -51,7 +51,9 @@ Shipped as written. The call-site search found no site that relied on the old de
 
 A project that creates grants in a data migration and expected raw serving will notice at its next test run, which is the point. Note it in the CHANGELOG as a behaviour change for project code.
 
-## Phase 3 — Per-recording record of the de-identification applied
+## Phase 3 — Per-recording record of the de-identification applied (shipped 2026-09-23)
+
+**Shipped as written, with three details settled in the building.** The audit payload carries the record under one key, `deidentification_record`, holding the two stamped fields, the channel-order version and the four override values, rather than six loose keys; the verifier gained a `record` verdict for payloads declared with `register_derived_state_record`, since the overrides describe a moment and nothing can recompute them, and the existing `no_digester` verdict is what the integrity check alerts on. The annotation flag is stamped from the processing result, so the import command and any project calling the persistence helper stamp what the pass did without a second flag to fall out of step. And the report is registered as a maintenance operation so a deployment without a shell can produce it. The slice response was found serving the schema defaults for the recording-level meta fields and now serves the recording's values.
 
 **Why.** ¶ 41: the controller documents the anonymisation process, including its testing, and keeps that documentation. Today `channel_order_version` is the only fact stamped per recording; whether annotation text was stripped or preserved is a transient task argument, and the ingest privacy overrides in force at the time are not recorded anywhere.
 
@@ -138,7 +140,7 @@ The platform-side items from the edu note's "work required", restated as platfor
 | 0 Vocabulary | — | S | Shipped |
 | 1 Linkage keys + shape test | — | M | Shipped 2026-09-22 |
 | 2 Model default | — | S | Shipped 2026-09-22 |
-| 3 Per-recording record | 1 (shape test) | M | Yes |
+| 3 Per-recording record | 1 (shape test) | M | Shipped 2026-09-23 |
 | 4 Free-text hygiene | 1 (shape test, for `warnings`) | M | Yes, or split: tag scope and push bodies first, the heuristic second |
 | 5 Export labelling | 3 (version range in the envelope) | S | Yes |
 | 6 Assessment support | 3 (version comparison) | M | Yes |

@@ -88,6 +88,7 @@ class TestCoreOperations:
             "activity.verify_audit_integrity",
             "recordings.validate_originals",
             "recordings.refresh_signal_metadata",
+            "recordings.deidentification_report",
             "platform.update",
             "platform.backup",
             "platform.rollback",

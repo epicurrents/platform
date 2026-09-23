@@ -52,6 +52,8 @@ class _Result:
         self.signal_infos = []
         self.annotations = annotations or []
         self.gaps = gaps or {}
+        # The persistence step stamps the strip decision from the result.
+        self.annotation_text_preserved = False
 
 
 @pytest.fixture

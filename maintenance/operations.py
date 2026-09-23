@@ -174,6 +174,10 @@ def _refresh_signal_metadata_args(args: RefreshSignalMetadataArgs) -> list[str]:
     return ["--dry-run"] if args.dry_run else []
 
 
+def _deidentification_report_args(args: NoArgs) -> list[str]:
+    return ["--format", "json"]
+
+
 class PlatformUpdateArgs(Schema):
     """Arguments of ``platform.update``: an already-uploaded package, by hash."""
 
@@ -243,6 +247,22 @@ def register_core_operations() -> None:
             args_schema=RefreshSignalMetadataArgs,
             command="refresh_signal_metadata",
             command_args=_refresh_signal_metadata_args,
+        )
+    )
+    register_operation(
+        Operation(
+            key="recordings.deidentification_report",
+            executor=CELERY,
+            label="De-identification report",
+            description=(
+                "List, per recording, which de-identification pass wrote the stored file, whether its annotation "
+                "text was kept, and the ingest settings recorded at the time; flags recordings behind the current "
+                "pass. Reads only."
+            ),
+            args_schema=NoArgs,
+            command="deidentification_report",
+            command_args=_deidentification_report_args,
+            requires_step_up=False,
         )
     )
     register_operation(
