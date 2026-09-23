@@ -28,7 +28,7 @@ write — the same decision a de-identifying grant makes, taken from
 Two rules from AGENTS.md are enforced on the way out, both concerning the *target* rather than the
 annotation:
 
-- FAILED-hidden recordings are dropped, reusing ``_failed_hidden_for_caller`` from the recordings
+- FAILED-hidden recordings, and members of a release-gated dataset the caller may not see, are dropped, reusing ``_hidden_for_caller`` from the recordings
   API rather than restating the rule. Soft-deleted recordings are dropped for the same reason — a
   trashed recording should not come back through an export.
 - ``Recording.original_name`` never appears. Targets are identified by ``content_hash`` and
@@ -703,7 +703,7 @@ def _resolve_targets(rows, *, caller, all_annotators):
     caller, or — for a caller outside the cross-annotator tier — read access to it has since been
     revoked. Access is checked once per distinct target, not once per row.
     """
-    from recordings.api.v1.ninja import _failed_hidden_for_caller, _resolve_display_name
+    from recordings.api.v1.ninja import _hidden_for_caller, _resolve_display_name
     from recordings.models import Recording
 
     recording_ct_id = ContentType.objects.get_for_model(Recording).pk
@@ -725,7 +725,7 @@ def _resolve_targets(rows, *, caller, all_annotators):
             if ct_id == recording_ct_id:
                 if obj.deleted_at is not None:
                     continue
-                if _failed_hidden_for_caller(obj, caller, None):
+                if _hidden_for_caller(obj, caller, None):
                     continue
                 resolved[key] = TargetInfo(type_name, obj.content_hash or "", _resolve_display_name(obj))
                 fetched[key] = obj

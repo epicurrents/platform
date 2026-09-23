@@ -61,6 +61,8 @@ Also carries a `viewer_config` JSONField — a flat per-dataset viewer-settings 
 
 Like `Collection`, `Dataset` declares reverse `GenericRelation` fields for `AccessRight`, `CollectionItem`, `TaggedItem`, and the four annotation types — same rationale, same cross-reference.
 
+A `release_gated` flag turns on [release gating](#release-gating): members stay hidden from every reader but the dataset's managers until a release run publishes them, no member resolves for a request carrying a share token, and a released member is dated by its release month. Only the author or a superuser may change the flag through `PATCH /datasets/{id}/`, since turning it off publishes every unreleased member at once.
+
 ### `DatasetMeta`
 
 Governance metadata sidecar, one-to-one with `Dataset`, created on first write through the dataset PATCH endpoint. Holds the SPDX licence pair (`license_spdx`, `license_url`) — the only fields whose list is settled; contributors, funding, DOIs and subject-group description land here when designed. Absence means "nothing declared", and dataset responses serve `null` for both fields in that case.
@@ -75,7 +77,11 @@ Because only hashes are pinned, a snapshot survives member purge or subject eras
 
 ### `DatasetItem`
 
-Membership record. Same shape as `CollectionItem` minus the "globally unique" constraint — an object can belong to many datasets. Indexed on `(content_type, object_id)` for the reverse lookup ("which datasets contain this object?") used by the permission extension. Carries a nullable `folder` FK placing the item in the dataset's [folder tree](#models); null means the dataset root, and the FK is `SET_NULL` so deleting a folder drops its items back to the root with membership untouched.
+Membership record. Same shape as `CollectionItem` minus the "globally unique" constraint — an object can belong to many datasets. Indexed on `(content_type, object_id)` for the reverse lookup ("which datasets contain this object?") used by the permission extension. Carries a nullable `folder` FK placing the item in the dataset's [folder tree](#models); null means the dataset root, and the FK is `SET_NULL` so deleting a folder drops its items back to the root with membership untouched. A nullable `release` FK names the [release run](#release-gating) that published the item; null means unreleased, which in a release-gated dataset hides the member. `PROTECT` on the release, because deleting a run would silently unpublish its members.
+
+### `DatasetRelease`
+
+One release run of a release-gated dataset and the record it leaves: `dataset`, `author` (who ran it, nullable), `released_on`, `release_month` (the first instant of the run's month in UTC, derived at save and the one source of the month readers see), `profile_version`, `deidentification_versions` (the sorted distinct pass versions of the recordings released, filled by the run), `k`, `m`, `sign_off_user_ids` (primary keys, never names), `assessment_reference` and `member_count`. The row is the process record EDPB Guidelines 02/2026 ¶ 41 asks to be kept with a release; the per-grant assessment fields on `AccessRight` are the general-sharing counterpart and are not used for dataset members. Exported under the runs a subject performed; nothing in the row is personal data beyond that link.
 
 ### `DatasetFolder`
 
@@ -120,6 +126,7 @@ Same CRUD + items shape as Collections at `/datasets/`, plus the access surface 
 - `POST /datasets/{id}/items/` does **not** raise 409 on multi-membership; an item can belong to many datasets.
 - Access rights propagate downward to items via the permission extension (see [Permission extensions](#permission-extensions)).
 - `viewer_config` — returned in the dataset response and settable via `PATCH /datasets/{id}/` (write access required, validated as a flat object). The viewer layers it on top of the deployment's project-level config when the dataset is opened.
+- `release_gated` — returned in the dataset response and settable via `PATCH /datasets/{id}/` by the author or a superuser only (403 for a `can_write` grantee). In a gated dataset `GET /datasets/{id}/items/` lists unreleased members to managers only, orders by name (lower-cased display name, else stored name) instead of `added_at`, carries each row's `release_month`, and serves the release month as `added_at` to readers who are not managers. `GET /datasets/{id}/`, the item, folder and snapshot listings all answer 403 to a share-token request on a gated dataset, and a snapshot's manifest omits unreleased members. See [release gating](#release-gating).
 - `object_hash`, `license_spdx`, `license_url` — dataset responses carry the opaque identifier and the [DatasetMeta](#models) licence pair (`null` when undeclared); the licence fields are settable via the same PATCH.
 - Snapshots: `POST /datasets/{id}/snapshots/` (write access) seals the current membership; `GET /datasets/{id}/snapshots/` lists newest-first without manifests; `GET /datasets/snapshots/{hash}/` returns one with its manifest. No update or delete routes exist — see [DatasetSnapshot](#models).
 - All `/datasets/{id}/...` routes resolve the dataset `object_hash` or the integer PK — see [Identifiers](#identifiers).
@@ -224,6 +231,22 @@ Placement inside a dataset is not carried across federation yet — `DatasetItem
 
 No collection counterpart exists: collections grant nothing on their items, and `TestCollectionRowsGrantNothing` in [tests/test_permissions.py](tests/test_permissions.py) pins that a stale collection-targeted `AccessRight` row stays inert.
 
+The same `ready()` registers two read-visibility gates from [release.py](release.py), consulted before any grant is read: `member_hidden_from_reader` for `recordings.recording` and `dataset_hidden_from_reader` for `library.dataset`. See [release gating](#release-gating).
+
+## Release gating
+
+A release-gated dataset is a pool whose members must not surface one by one as they arrive: the multi-centre teaching dataset the [anonymisation plan](../docs/engineering-notes/anonymisation-compliance-plan.md) describes under Phase 7, where the arrival time and order of a member is the centre fingerprint the pooling exists to hide. Three rules apply to a dataset with `release_gated` set, all in [release.py](release.py):
+
+- **Unreleased members are hidden.** A member whose `DatasetItem.release` is null resolves for the dataset's managers only: the dataset author, a holder of a `can_write` grant on the dataset, the member's own author and superusers. Everyone else, a direct grantee included, is denied inside `get_read_access_result` before any grant is read, so every surface that resolves through the permission layer honours it. The recording endpoints shape the denial as 404 through `_hidden_for_caller` in [recordings/api/v1/ninja.py](../recordings/api/v1/ninja.py), the FAILED-hidden pattern; the recording listing's federated branch subtracts `unreleased_member_ids` the same way. A member that is unreleased in one gated dataset is hidden everywhere, whatever other datasets or direct grants reach it.
+- **No member resolves for a request carrying a share token**, released or not, whoever holds the token, and the gated dataset itself is invisible to share-token callers. A forwardable link is the onward transfer the gate exists to prevent, and the access-control argument needs an individual account.
+- **A released member is dated by its release month.** `DatasetRelease.release_month` replaces `created_at` on the recording detail, listing and slice responses for every reader who is not the recording's author or a superuser (the platform-wide month truncation is the floor; the dataset replaces the value), and the recording listing sorts a member as if uploaded at that instant, then by name among members released in the same month. The dataset item listing orders by name and serves the month as `added_at`. Nothing a reader sees says when a member arrived.
+
+**Release runs** happen on a monthly cadence through `manage.py release_dataset <hash>`: a member uploaded in month M is eligible from the run at the start of M+2 (`eligibility_cutoff`), so each waits between one and two months and a month's submissions from every contributor surface together, backlog and new submissions alike. Trashed and FAILED recordings are never eligible. The cadence is the platform's; which eligible members a run publishes is the project's, through `register_release_selector(fn)` from the project's `apps.py::ready()`. The selector is called as `fn(dataset, eligible, as_of=date)` and returns a `ReleaseDecision` naming the subset to publish and whatever it knows of the record fields (profile version, k and m, sign-offs, assessment reference); the command line fills the rest. Without a selector a run publishes everything eligible. A run always leaves a `DatasetRelease` row, even one that released nothing, audited as `library.dataset.release` against the dataset with each published item's change recorded under it; `--dry-run` reports the eligible and selected members and writes nothing.
+
+**Withdrawal** is `manage.py purge_dataset_recordings` in the recordings app, keyed on `Recording.file_hash` and scoped to members of release-gated datasets; its per-hash report is the platform's only answer to whether a submitted hash exists ([recordings/README.md → Soft delete and purge](../recordings/README.md#soft-delete-and-purge)). A deployment that sets `LIBRARY_RELEASE_GATED_DEPLOYMENT` refuses to boot with `RECORDINGS_ORIGINALS_PATH` configured ([checks.py](checks.py)), because a pool keeps no copy its contributors do not also hold and the purge never reaches that volume.
+
+Still to come from the plan's Phase 7: the validating ingest path with pooled batch ingest, and the access and anonymity reports.
+
 ## Identifiers
 
 Datasets are addressed by `Dataset.object_hash` — a 32-character random identifier that leaks nothing about creation order or count. Every `/datasets/{id}/...` route resolves either the hash or the integer PK (`_get_active_dataset` mirrors the dual resolution recordings use), the frontend builds its dataset URLs and viewer `?dataset=` links from the hash, and the PK form stays accepted for internal callers and old links. Snapshots are hash-addressed from birth.
@@ -237,6 +260,7 @@ Items inside collections / datasets / tags are still referenced by the contained
 | Variable | Default | Notes |
 |---|---|---|
 | `LIBRARY_TAG_CREATION_REQUIRES_STAFF` | `True` | Reserve tag creation for staff; a tag created by staff is curated and listed to everyone. Off, anyone creates uncurated tags, listed by [reach](#tag-reach). |
+| `LIBRARY_RELEASE_GATED_DEPLOYMENT` | `False` | Declares a deployment whose datasets are [release-gated](#release-gating); with it on, `manage.py check` refuses a configured `RECORDINGS_ORIGINALS_PATH`. Set by the project's settings. |
 | `TEXT_HYGIENE_PATTERNS` | `{}` | Core setting; the deployment's own identifier patterns for the [free-text warnings](#free-text-warnings). |
 
 The app also consumes the cross-app `AccessRight` model from `epicurrents`.
@@ -247,6 +271,7 @@ The app also consumes the cross-app `AccessRight` model from `epicurrents`.
 |---|---|
 | Make a project model a collection / dataset / tag target | Nothing required — the generic-FK membership rows accept any Django model. Add an instance via `POST /collections/{id}/items/` with the model's `content_type` and `object_id`. |
 | Register an additional read-permission rule | `register_read_permission_extension(callable)` from your project's `apps.py::ready()`. Your extension is consulted alongside the two library extensions. See [epicurrents/README.md](../epicurrents/README.md#permission-extensions). |
+| Decide what a release run publishes | `register_release_selector(fn)` from your project's `apps.py::ready()`; see [release gating](#release-gating). The platform applies the monthly cadence and hands the selector the eligible members. |
 | Add project-specific tag namespacing | The platform has no namespace mechanism for tags today — tag names are a flat global string. If a project needs namespaces, the cleanest path is a prefix convention (`epicurrents.<project>.<concept>`, mirroring the `Code.standard` pattern) enforced at the project's API layer. |
 
 ## Tests
@@ -255,7 +280,7 @@ The app also consumes the cross-app `AccessRight` model from `epicurrents`.
 pytest library/tests/
 ```
 
-The permission tests live in [tests/test_permissions.py](tests/test_permissions.py) and cover `can_read_via_dataset`, the author-only collection gate, and the inertness of stale collection-targeted rows. API tests are in [tests/test_api.py](tests/test_api.py).
+The permission tests live in [tests/test_permissions.py](tests/test_permissions.py) and cover `can_read_via_dataset`, the author-only collection gate, and the inertness of stale collection-targeted rows. API tests are in [tests/test_api.py](tests/test_api.py). Release gating, the cadence and the `release_dataset` command are in [tests/test_release.py](tests/test_release.py).
 
 ## Gotchas
 

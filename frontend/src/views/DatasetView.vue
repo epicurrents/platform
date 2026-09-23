@@ -412,7 +412,7 @@ async function submitMoveItem() {
 const showEdit = ref(false)
 const editLoading = ref(false)
 const editError = ref<string | null>(null)
-const input = reactive({ editName: '', editDescription: '' })
+const input = reactive({ editName: '', editDescription: '', editReleaseGated: false })
 
 function openEdit() {
     if (!dataset.value) {
@@ -420,6 +420,7 @@ function openEdit() {
     }
     input.editName = dataset.value.name
     input.editDescription = dataset.value.description
+    input.editReleaseGated = dataset.value.release_gated ?? false
     editError.value = null
     showEdit.value = true
 }
@@ -436,10 +437,14 @@ async function submitEdit() {
     editLoading.value = true
     editError.value = null
     try {
-        dataset.value = await updateDataset(datasetId.value, {
+        const payload: Parameters<typeof updateDataset>[1] = {
             name: input.editName.trim(),
             description: input.editDescription.trim(),
-        })
+        }
+        if (canEditConfig.value) {
+            payload.release_gated = input.editReleaseGated
+        }
+        dataset.value = await updateDataset(datasetId.value, payload)
         showEdit.value = false
         showToast(t('Dataset updated.', SCOPE), 'success')
         toastNameWarnings(dataset.value?.warnings)
@@ -783,6 +788,11 @@ const assessFn = (right: AccessRight, payload: AssessmentPayload) =>
                                 @row-click="onRowClick(item.object_hash, $event)"
                                 @row-dblclick="openRecordings([item.object_hash])"
                             >
+                                <template #meta>
+                                    <wa-tag v-if="dataset?.release_gated && !item.release_month" size="small" variant="warning">
+                                        {{ t('Unreleased', SCOPE) }}
+                                    </wa-tag>
+                                </template>
                                 <template #actions>
                                     <wa-dropdown-item value="edit">
                                         <wa-icon name="pencil" slot="icon"></wa-icon>
@@ -918,6 +928,16 @@ const assessFn = (right: AccessRight, payload: AssessmentPayload) =>
                 size="s"
                 v-wa="[input, 'editDescription']"
             ></wa-textarea>
+            <wa-switch v-if="canEditConfig"
+                :disabled="editLoading"
+                size="s"
+                v-wa="[input, 'editReleaseGated']"
+            >
+                {{ t('Release-gated', SCOPE) }}
+            </wa-switch>
+            <p v-if="canEditConfig" class="dataset-view__hint">
+                {{ t('Members of a release-gated dataset stay hidden from readers until a release run publishes them, never resolve through a share link, and are dated by their release month rather than their upload time. Turning the gate off publishes every unreleased member.', SCOPE) }}
+            </p>
         </div>
         <div slot="footer" class="form-actions">
             <wa-button
@@ -1157,6 +1177,12 @@ const assessFn = (right: AccessRight, payload: AssessmentPayload) =>
 </template>
 
 <style scoped>
+.dataset-view__hint {
+    color: var(--wa-color-text-quiet);
+    font-size: var(--wa-font-size-s);
+    margin: 0;
+}
+
 .dataset-view {
     /* Width of the centred content column, shared by the scroller's inner wrap and
      * the error callout. */

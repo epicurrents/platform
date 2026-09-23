@@ -764,6 +764,10 @@ TEXT_HYGIENE_PATTERNS: dict[str, str] = {}
 # deployment decision rather than whatever each user types; a deployment that
 # wants user-defined tags turns this off and gets the reach-scoped listing.
 LIBRARY_TAG_CREATION_REQUIRES_STAFF = env_bool("LIBRARY_TAG_CREATION_REQUIRES_STAFF", default=True)
+# A deployment whose datasets are release-gated (a multi-centre pool released to readers by
+# release runs) keeps no copy of a submission its contributor does not also hold, so the
+# originals volume is refused at boot while this is on (library/checks.py). Set by the project.
+LIBRARY_RELEASE_GATED_DEPLOYMENT = env_bool("LIBRARY_RELEASE_GATED_DEPLOYMENT", default=False)
 
 # ──────────────────────────────────────────────────────────────────────────────
 # External login — OpenID Connect (Microsoft Entra ID).

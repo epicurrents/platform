@@ -1,0 +1,353 @@
+"""Release gating for datasets: hidden until released, refused to share-token callers, dated by release month.
+
+A release-gated dataset (``Dataset.release_gated``) is a pool whose members must not surface one
+by one as they arrive. Three rules follow, all enforced here and registered from
+``library.apps.LibraryConfig.ready()``:
+
+- **Unreleased members are hidden.** A member with no ``DatasetItem.release`` resolves for the
+  dataset's managers only: the dataset author, a holder of a ``can_write`` grant on the dataset,
+  the member's own author and superusers (who never reach a gate). Everyone else, a direct
+  grantee included, is denied before any grant is read, through the read-visibility gate
+  :func:`member_hidden_from_reader` registered for ``recordings.recording``.
+- **No member resolves for a request carrying a share token**, released or not, whoever holds
+  the token. A forwardable link fails the onward-transfer test the gate exists for, and the
+  accountability argument needs an individual account. The dataset itself is hidden from
+  share-token callers by :func:`dataset_hidden_from_reader`, so a join link lists nothing.
+- **A released member is dated by its release month.** ``DatasetRelease.release_month`` replaces
+  the upload time on every surface that serves a time to a reader who is not a manager, and
+  listings of members order by name rather than by any time.
+
+Releases run on a monthly cadence: a member uploaded in month M is eligible from the run at the
+start of M+2, so every member waits between one and two months and a month's submissions from
+every contributor surface together. The cadence is the platform's; which eligible members a run
+publishes is the project's, through :func:`register_release_selector`. Without a selector a run
+publishes everything eligible.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Callable
+from dataclasses import dataclass, field
+from datetime import date, datetime
+from typing import Any
+
+from django.contrib.contenttypes.models import ContentType
+from django.db.models import BigIntegerField, CharField, F, Func, OuterRef, Q, Subquery, Value
+from django.db.models.functions import Cast, Coalesce, NullIf
+
+from library.models import Dataset, DatasetItem, DatasetRelease, month_start
+
+# ---------------------------------------------------------------------------
+# Who may see an unreleased member
+# ---------------------------------------------------------------------------
+
+
+def is_dataset_manager(user: Any, dataset: Dataset) -> bool:
+    """True for the dataset author, a superuser and a holder of a ``can_write`` grant on the dataset.
+
+    Managers are the readers a gated dataset's unreleased members exist for: they curate what
+    the next run publishes. Write access rather than share access, because managing the pool
+    is a write and sharing it is the author's decision.
+    """
+    if user is None or not getattr(user, "is_authenticated", False):
+        return False
+    if getattr(user, "is_superuser", False) or dataset.author_id == user.pk:
+        return True
+    from epicurrents.models import AccessRight
+
+    dataset_ct = ContentType.objects.get_for_model(Dataset, for_concrete_model=False)
+    target_filter = Q(access_target_id=user.pk)
+    group_ids = list(user.groups.values_list("id", flat=True))
+    if group_ids:
+        target_filter |= Q(access_target_group_id__in=group_ids)
+    return (
+        AccessRight.objects.active()
+        .filter(content_type=dataset_ct, object_id=str(dataset.pk), can_write=True)
+        .filter(target_filter)
+        .exists()
+    )
+
+
+def gated_memberships(obj: Any) -> list[DatasetItem]:
+    """The rows placing *obj* in a live release-gated dataset."""
+    object_pk = getattr(obj, "pk", None)
+    if object_pk is None:
+        return []
+    ct = ContentType.objects.get_for_model(obj, for_concrete_model=False)
+    return list(
+        DatasetItem.objects.filter(
+            content_type=ct,
+            object_id=str(object_pk),
+            dataset__release_gated=True,
+            dataset__deleted_at__isnull=True,
+        ).select_related("dataset", "release")
+    )
+
+
+def member_hidden_from_reader(user: Any, obj: Any, share_token: str | None = None) -> bool:
+    """Read-visibility gate: True when a gated-dataset member must not resolve for this caller.
+
+    Hidden when the request carries a share token, whatever else the caller holds; when the
+    caller is anonymous; and when the member is unreleased in any gated dataset the caller does
+    not manage. ``user=None`` is the federated shape and sees released members only. The
+    member's own author keeps seeing it, as with FAILED uploads: what a user uploaded is theirs
+    to see regardless of where it was filed.
+    """
+    memberships = gated_memberships(obj)
+    if not memberships:
+        return False
+    if (share_token or "").strip():
+        return True
+    if user is None or not getattr(user, "is_authenticated", False):
+        # Anonymous without a token holds nothing anyway; a peer reads released members.
+        return any(item.release_id is None for item in memberships)
+    if getattr(user, "is_superuser", False) or getattr(obj, "author_id", None) == user.pk:
+        return False
+    unreleased = [item for item in memberships if item.release_id is None]
+    return any(not is_dataset_manager(user, item.dataset) for item in unreleased)
+
+
+def dataset_hidden_from_reader(user: Any, obj: Any, share_token: str | None = None) -> bool:
+    """Read-visibility gate for datasets: a release-gated dataset resolves for no share-token request."""
+    return bool(getattr(obj, "release_gated", False)) and bool((share_token or "").strip())
+
+
+# ---------------------------------------------------------------------------
+# Batch helpers for listings
+# ---------------------------------------------------------------------------
+
+
+def unreleased_member_ids(content_type: ContentType) -> set[str]:
+    """``object_id`` values of *content_type* that are unreleased members of a live gated dataset."""
+    return set(
+        DatasetItem.objects.filter(
+            content_type=content_type,
+            dataset__release_gated=True,
+            dataset__deleted_at__isnull=True,
+            release__isnull=True,
+        ).values_list("object_id", flat=True)
+    )
+
+
+def release_months_by_id(content_type: ContentType, object_ids) -> dict[str, datetime]:
+    """Release month per released member among *object_ids*, the earliest where a member was released twice."""
+    months: dict[str, datetime] = {}
+    rows = (
+        DatasetItem.objects.filter(
+            content_type=content_type,
+            object_id__in=[str(pk) for pk in object_ids],
+            dataset__release_gated=True,
+            dataset__deleted_at__isnull=True,
+            release__isnull=False,
+        )
+        .values_list("object_id", "release__release_month")
+        .order_by("release__release_month")
+    )
+    for object_id, month in rows:
+        months.setdefault(str(object_id), month)
+    return months
+
+
+def release_month_for(obj: Any) -> datetime | None:
+    """The release month of *obj* as a member of a gated dataset, or None when it is not a released member."""
+    object_pk = getattr(obj, "pk", None)
+    if object_pk is None:
+        return None
+    ct = ContentType.objects.get_for_model(obj, for_concrete_model=False)
+    return release_months_by_id(ct, [object_pk]).get(str(object_pk))
+
+
+def release_month_subquery(model) -> Subquery:
+    """A subquery annotation giving each row of *model* its release month, null for non-members.
+
+    For ordering a listing so that a released member sorts by its release month in place of
+    its upload time; pair it with a name key so members released in the same month do not fall
+    back to arrival order.
+    """
+    ct = ContentType.objects.get_for_model(model, for_concrete_model=False)
+    return Subquery(
+        DatasetItem.objects.filter(
+            content_type=ct,
+            object_id=Cast(OuterRef("pk"), CharField()),
+            dataset__release_gated=True,
+            dataset__deleted_at__isnull=True,
+            release__isnull=False,
+        )
+        .order_by("release__release_month")
+        .values("release__release_month")[:1]
+    )
+
+
+def member_name_subquery() -> Subquery:
+    """A subquery annotation naming a dataset item's recording: its display name, else its stored name.
+
+    Only recordings are named; other member types annotate null and sort after them by object
+    id. For ordering the items of a gated dataset, where ``added_at`` would reveal the arrival
+    order the release month is there to hide.
+    """
+    from recordings.models import Recording
+
+    return Subquery(
+        Recording.objects.filter(pk=Cast(OuterRef("object_id"), BigIntegerField()))
+        .annotate(
+            sort_name=Coalesce(
+                NullIf(Func(F("display_name"), function="LOWER", output_field=CharField()), Value("")),
+                F("stored_name"),
+            )
+        )
+        .values("sort_name")[:1],
+        output_field=CharField(),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Release runs
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class ReleaseDecision:
+    """What a release selector returns: the eligible members to publish and the record fields for the run.
+
+    ``items`` is a subset of the eligible set the selector was handed. The remaining fields are
+    the ¶ 41 record: the preparation profile version, the equivalence-class conditions in
+    force, the primary keys of the users who signed the run off and a reference to the written
+    assessment. Any left blank is filled from the command line, or left blank.
+    """
+
+    items: list[DatasetItem]
+    profile_version: str = ""
+    k: int | None = None
+    m: int | None = None
+    sign_off_user_ids: list[int] = field(default_factory=list)
+    assessment_reference: str = ""
+
+
+ReleaseSelector = Callable[..., ReleaseDecision]
+
+_RELEASE_SELECTOR: ReleaseSelector | None = None
+
+
+def register_release_selector(selector: ReleaseSelector | None) -> None:
+    """Register the project's release selector, or clear it with ``None``.
+
+    The selector is called as ``selector(dataset, eligible, as_of=date)`` with the
+    cadence-eligible unreleased members and returns a :class:`ReleaseDecision`. This is where
+    a project applies its own conditions: equivalence-class size, contributor mix, embargo
+    attestation, curator veto. One selector per deployment; registering a second replaces the
+    first, since a dataset pool has one release policy.
+    """
+    global _RELEASE_SELECTOR
+    _RELEASE_SELECTOR = selector
+
+
+def eligibility_cutoff(as_of: date) -> datetime:
+    """The instant before which a member must have been uploaded to be eligible at a run on *as_of*.
+
+    Uploaded in month M means eligible from the run at the start of M+2, so the cutoff is the
+    first instant of the month before the run's month: everything uploaded before it has waited
+    at least one full month, and at most two.
+    """
+    year, month = as_of.year, as_of.month - 1
+    if month == 0:
+        year, month = year - 1, 12
+    return month_start(date(year, month, 1))
+
+
+def eligible_items(dataset: Dataset, *, as_of: date) -> list[DatasetItem]:
+    """Unreleased members of *dataset* whose upload time is before the cadence cutoff for *as_of*.
+
+    A recording member is dated by its own ``created_at``; any other member type by the time
+    it was added to the dataset. Trashed and FAILED recordings are never eligible: a release
+    must not publish what no reader could then read.
+    """
+    from recordings.models import Recording
+
+    cutoff = eligibility_cutoff(as_of)
+    recording_ct = ContentType.objects.get_for_model(Recording, for_concrete_model=False)
+    items = list(
+        DatasetItem.objects.filter(dataset=dataset, release__isnull=True).select_related("content_type").order_by("pk")
+    )
+    recording_pks = [item.object_id for item in items if item.content_type_id == recording_ct.pk]
+    uploaded_at = {
+        str(pk): created_at
+        for pk, created_at in Recording.objects.filter(
+            pk__in=recording_pks, deleted_at__isnull=True, status=Recording.Status.READY
+        ).values_list("pk", "created_at")
+    }
+    eligible: list[DatasetItem] = []
+    for item in items:
+        if item.content_type_id == recording_ct.pk:
+            uploaded = uploaded_at.get(item.object_id)
+            if uploaded is None:
+                continue
+        else:
+            uploaded = item.added_at
+        if uploaded < cutoff:
+            eligible.append(item)
+    return eligible
+
+
+def deidentification_versions_of(items: list[DatasetItem]) -> list[int]:
+    """Distinct de-identification pass versions of the recording members among *items*, sorted."""
+    from recordings.models import Recording, RecordingMeta
+
+    recording_ct = ContentType.objects.get_for_model(Recording, for_concrete_model=False)
+    pks = [item.object_id for item in items if item.content_type_id == recording_ct.pk]
+    if not pks:
+        return []
+    versions = RecordingMeta.objects.filter(content_type=recording_ct, object_id__in=pks).values_list(
+        "deidentification_version", flat=True
+    )
+    return sorted({int(v) for v in versions if v is not None})
+
+
+def decide_release(dataset: Dataset, *, as_of: date) -> tuple[list[DatasetItem], ReleaseDecision]:
+    """Compute the eligible set and hand it to the registered selector, or publish it whole."""
+    eligible = eligible_items(dataset, as_of=as_of)
+    if _RELEASE_SELECTOR is None:
+        return eligible, ReleaseDecision(items=list(eligible))
+    decision = _RELEASE_SELECTOR(dataset, list(eligible), as_of=as_of)
+    eligible_pks = {item.pk for item in eligible}
+    decision.items = [item for item in decision.items if item.pk in eligible_pks]
+    return eligible, decision
+
+
+def run_release(
+    dataset: Dataset,
+    *,
+    as_of: date,
+    actor: Any = None,
+    profile_version: str = "",
+    k: int | None = None,
+    m: int | None = None,
+    sign_off_user_ids: list[int] | None = None,
+    assessment_reference: str = "",
+) -> tuple[DatasetRelease, list[DatasetItem], list[DatasetItem]]:
+    """Perform a release run on *dataset* and return the run, the eligible set and the released members.
+
+    Must be called inside an audited scope and a transaction: the run row is created, each
+    released item is saved with its release pointer so the audit signal records the change,
+    and nothing else moves. Command-line values fill whichever record fields the selector left
+    blank. A run that releases nothing still leaves a row, since a run with an empty eligible
+    set or a selector that withheld everything is a fact worth dating.
+    """
+    if not dataset.release_gated:
+        raise ValueError("Dataset is not release-gated")
+    eligible, decision = decide_release(dataset, as_of=as_of)
+    release = DatasetRelease.objects.create(
+        dataset=dataset,
+        author=actor if getattr(actor, "pk", None) is not None else None,
+        released_on=as_of,
+        profile_version=decision.profile_version or profile_version,
+        deidentification_versions=deidentification_versions_of(decision.items),
+        k=decision.k if decision.k is not None else k,
+        m=decision.m if decision.m is not None else m,
+        sign_off_user_ids=list(decision.sign_off_user_ids or sign_off_user_ids or []),
+        assessment_reference=decision.assessment_reference or assessment_reference,
+        member_count=len(decision.items),
+    )
+    for item in decision.items:
+        item.release = release
+        item.save(update_fields=["release"])
+    return release, eligible, decision.items

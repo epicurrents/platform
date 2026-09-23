@@ -26,6 +26,7 @@
 """
 
 import secrets
+from datetime import UTC, datetime
 
 from django.conf import settings
 from django.contrib.contenttypes.fields import GenericForeignKey, GenericRelation
@@ -204,6 +205,18 @@ class Dataset(models.Model):
     # on top of the deployment's project-level config when this dataset is opened
     # in the viewer. Same shape as epicurrents.ViewerConfigOverride.overrides.
     viewer_config = models.JSONField(default=dict, blank=True)
+    # Release gating. A member of a gated dataset is hidden from every reader
+    # but the dataset's managers until a release run publishes it, no member
+    # resolves for a request carrying a share token, and a released member
+    # is served by its release month in place of its upload time. The gate
+    # itself is in ``library.release``; the flag only says the rule applies.
+    release_gated = models.BooleanField(
+        default=False,
+        help_text=(
+            "Hide members until a release run publishes them, refuse share-token callers "
+            "and serve the release month in place of the upload time."
+        ),
+    )
 
     # Reverse GenericRelations so hard-delete cascades cleanly through every
     # reference row that targets this dataset via a GenericForeignKey.
@@ -372,6 +385,59 @@ class DatasetFolder(models.Model):
         return f"DatasetFolder({self.name!r} in dataset={self.dataset_id})"
 
 
+class DatasetRelease(models.Model):
+    """One release run of a release-gated dataset, and the record the run leaves behind.
+
+    A run publishes the members it selected by pointing their ``DatasetItem.release`` at this
+    row. ``release_month`` is the first instant of the run's month in UTC and is what every
+    reader who is not a manager sees in place of a member's upload time, so the row is the
+    only source of that value. The remaining fields are the process record EDPB Guidelines
+    02/2026 ¶ 41 asks to be kept with a release: the preparation profile the members were
+    checked against, the de-identification pass versions of what was released, the
+    equivalence-class conditions in force, who signed the run off (user primary keys, never
+    names) and a reference to the written assessment. The platform fills the version range
+    and the count; the rest comes from the project's release selector or the command line.
+    """
+
+    dataset = models.ForeignKey(Dataset, on_delete=models.CASCADE, related_name="releases")
+    # Who ran the release; null for a scheduled run with no actor.
+    author = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="dataset_releases",
+    )
+    released_on = models.DateField()
+    release_month = models.DateTimeField(editable=False)
+    profile_version = models.CharField(max_length=64, blank=True, default="")
+    deidentification_versions = models.JSONField(default=list, blank=True)
+    k = models.PositiveIntegerField(null=True, blank=True)
+    m = models.PositiveIntegerField(null=True, blank=True)
+    sign_off_user_ids = models.JSONField(default=list, blank=True)
+    assessment_reference = models.CharField(max_length=512, blank=True, default="")
+    member_count = models.PositiveIntegerField(default=0)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        indexes = [
+            models.Index(fields=["dataset", "released_on"]),
+        ]
+
+    def __str__(self) -> str:
+        return f"DatasetRelease({self.dataset_id} on {self.released_on})"
+
+    def save(self, *args, **kwargs):
+        if self.released_on and not self.release_month:
+            self.release_month = month_start(self.released_on)
+        super().save(*args, **kwargs)
+
+
+def month_start(day) -> datetime:
+    """The first instant, in UTC, of the month *day* falls in."""
+    return datetime(day.year, day.month, 1, tzinfo=UTC)
+
+
 class DatasetItem(models.Model):
     """A generic object in a Dataset.
 
@@ -403,6 +469,16 @@ class DatasetItem(models.Model):
         null=True,
         blank=True,
         on_delete=models.SET_NULL,
+        related_name="items",
+    )
+    # The release run that published this member; null means unreleased, which in
+    # a release-gated dataset hides the member from everyone but its managers.
+    # PROTECT: deleting a release would silently unpublish its members.
+    release = models.ForeignKey(
+        DatasetRelease,
+        null=True,
+        blank=True,
+        on_delete=models.PROTECT,
         related_name="items",
     )
 

@@ -127,6 +127,9 @@ class CollectionPatchIn(Schema):
     # empty string clears a previously declared value.
     license_spdx: str | None = None
     license_url: str | None = None
+    # Datasets only — release gating (library/release.py). The author or a
+    # superuser may change it; turning it off publishes every unreleased member.
+    release_gated: bool | None = None
 
 
 class CollectionOut(Schema):
@@ -148,6 +151,8 @@ class CollectionOut(Schema):
     # for datasets with nothing declared.
     license_spdx: str | None = None
     license_url: str | None = None
+    # Datasets only — members are hidden until a release run publishes them.
+    release_gated: bool = False
 
 
 class CollectionWriteOut(CollectionOut):
@@ -198,6 +203,10 @@ class CollectionItemOut(Schema):
     added_at: datetime
     # Dataset items only — the containing folder, or null for the dataset root.
     folder_id: int | None = None
+    # Dataset items only — the month the item was published by a release run
+    # of a release-gated dataset; null in other datasets and for unreleased
+    # members, which only the dataset's managers are listed.
+    release_month: datetime | None = None
     object_name: str | None = None
     object_hash: str | None = None
     object_type: str | None = None
@@ -484,6 +493,7 @@ def _enrich_collection_items(items: list, user) -> list[dict]:
             "object_id": item.object_id,
             "added_at": item.added_at,
             "folder_id": getattr(item, "folder_id", None),
+            "release_month": None,
             "object_name": None,
             "object_hash": None,
             "object_type": None,
@@ -1396,6 +1406,7 @@ def _dataset_out(dataset: Dataset) -> dict:
         "object_hash": dataset.object_hash,
         "license_spdx": meta.license_spdx if meta else None,
         "license_url": meta.license_url if meta else None,
+        "release_gated": dataset.release_gated,
     }
 
 
@@ -1454,6 +1465,16 @@ def update_dataset(request, dataset_id: str, payload: CollectionPatchIn):
         # are always strings, so the flat-map shape is already guaranteed here.
         dataset.viewer_config = payload.viewer_config
         fields_updated.append("viewer_config")
+    if payload.release_gated is not None and payload.release_gated != dataset.release_gated:
+        # Turning the gate off publishes every unreleased member at once, and
+        # turning it on hides what readers could see: the author's decision, not
+        # a write grantee's.
+        from epicurrents.permissions import can_modify_object
+
+        if not can_modify_object(user=user, obj=dataset):
+            raise HttpError(403, "Only the dataset's author or a superuser may change release gating")
+        dataset.release_gated = payload.release_gated
+        fields_updated.append("release_gated")
 
     meta_updates: dict[str, str] = {}
     if payload.license_spdx is not None:
@@ -1534,7 +1555,19 @@ def list_dataset_items(
     ):
         raise HttpError(403, "You do not have permission to view this dataset")
 
-    qs = DatasetItem.objects.filter(dataset=dataset).order_by("added_at")
+    qs = DatasetItem.objects.filter(dataset=dataset)
+    manager = True
+    if dataset.release_gated:
+        # A gated dataset lists unreleased members to its managers only, and
+        # orders by name: added_at is the arrival order the release month hides.
+        from library.release import is_dataset_manager, member_name_subquery
+
+        manager = is_dataset_manager(user, dataset)
+        if not manager:
+            qs = qs.filter(release__isnull=False)
+        qs = qs.select_related("release").annotate(sort_name=member_name_subquery()).order_by("sort_name", "object_id")
+    else:
+        qs = qs.order_by("added_at")
     if content_type_id is not None:
         qs = qs.filter(content_type_id=content_type_id)
     items = list(qs[offset : offset + limit])
@@ -1549,7 +1582,16 @@ def list_dataset_items(
             "share_token_used": bool((share_token or "").strip()),
         },
     )
-    return _enrich_collection_items(items, user)
+    rows = _enrich_collection_items(items, user)
+    if dataset.release_gated:
+        month_by_item = {item.pk: (item.release.release_month if item.release_id else None) for item in items}
+        for row in rows:
+            row["release_month"] = month_by_item.get(row["id"])
+            if not manager:
+                # The time a member was added is its ingest time; a reader gets
+                # the release month here as everywhere else.
+                row["added_at"] = row["release_month"]
+    return rows
 
 
 @api.post("/datasets/{dataset_id}/items/", response={201: CollectionItemOut})
@@ -1914,6 +1956,10 @@ def _canonical_manifest(dataset: Dataset) -> list[dict]:
     # rewrite rides the ROADMAP's batched-permission-helper entry if it comes.
     items = DatasetItem.objects.filter(dataset=dataset).select_related("content_type")
     for item in items:
+        # An unreleased member of a gated dataset is on no serving surface yet,
+        # and a manifest naming it would tell a reader what is coming.
+        if dataset.release_gated and item.release_id is None:
+            continue
         obj = item.content_object
         if obj is None:
             continue

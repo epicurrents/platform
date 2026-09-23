@@ -486,6 +486,7 @@ To check the table against the tree, walk the AST for `log_activity` / `with_sys
 | `library.dataset.item.remove` | `remove_dataset_item` |
 | `library.dataset.list` | `list_datasets` |
 | `library.dataset.read` | `get_dataset` |
+| `library.dataset.release` | `handle` † |
 | `library.dataset.snapshot.create` | `create_dataset_snapshot` |
 | `library.dataset.snapshot.list` | `list_dataset_snapshots` |
 | `library.dataset.snapshot.read` | `get_dataset_snapshot` |
@@ -559,6 +560,7 @@ To check the table against the tree, walk the AST for `log_activity` / `with_sys
 | `recordings.metadata.refresh` | `handle` † |
 | `recordings.process` | `process_recording` † |
 | `recordings.purge` | `purge_deleted_recordings` † |
+| `recordings.purge_dataset` | `handle` † |
 | `recordings.read` | `recording_detail` |
 | `recordings.read.slice` | `recording_detail_slice` |
 | `recordings.set_mains` | `bulk_set_mains` |

@@ -72,7 +72,7 @@ from django.contrib.auth import get_user_model
 from django.contrib.auth.models import Group
 from django.contrib.contenttypes.models import ContentType
 from django.db import transaction
-from django.db.models import Q, prefetch_related_objects
+from django.db.models import F, Q, prefetch_related_objects
 from django.http import FileResponse, HttpResponse, JsonResponse, StreamingHttpResponse
 from django.utils import timezone
 from django.utils.dateparse import parse_datetime
@@ -427,17 +427,85 @@ def _can_see_original_name(user, recording, fed) -> bool:
     return getattr(recording, "author_id", None) == user.pk
 
 
-def _visible_created_at(recording, *, exact: bool) -> datetime:
+def _visible_created_at(recording, *, exact: bool, release_month: datetime | None = None) -> datetime:
     """Return ``created_at`` as the caller may see it: exact for authors and superusers, else month-truncated.
 
     The upload time on a clinical deployment falls within hours of acquisition, so it reinstates the
     start date the header de-identification removed. The first of the month, in UTC, keeps listing
-    order stable for a grantee and links to nothing in an acquisition log.
+    order stable for a grantee and links to nothing in an acquisition log. A released member of a
+    release-gated dataset serves its *release_month* instead (``library.release``): the month it
+    became visible, which says nothing about when it arrived.
     """
     created_at = recording.created_at
     if exact or created_at is None:
         return created_at
+    if release_month is not None:
+        return release_month
     return created_at.astimezone(UTC).replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+
+
+def _release_month_of(recording, *, can_see_author_fields: bool, release_month_by_pk: dict | None = None):
+    """The release month a reader sees for a gated-dataset member, or None for authors, superusers and non-members."""
+    if can_see_author_fields:
+        return None
+    if release_month_by_pk is not None:
+        return release_month_by_pk.get(str(recording.pk))
+    from library.release import release_month_for
+
+    return release_month_for(recording)
+
+
+def _hidden_for_caller(recording, user, fed, share_token: str | None = None) -> bool:
+    """Return True when *recording* must answer 404 to this caller: FAILED-hidden, or a gated member it may not see.
+
+    The second rule is the release gate in ``library.release``: an unreleased member of a
+    release-gated dataset is hidden from everyone but the dataset's managers and the recording's
+    author, and any member is hidden from a request carrying a share token. Both rules also run
+    inside the permission resolver; this helper gives the recording surfaces their 404 shape,
+    since the resolver's denial reads as 403 and a 403 confirms the recording exists.
+    """
+    if _failed_hidden_for_caller(recording, user, fed):
+        return True
+    if user is not None and getattr(user, "is_superuser", False):
+        return False
+    from library.release import member_hidden_from_reader
+
+    return member_hidden_from_reader(user, recording, share_token)
+
+
+def _with_listing_order(queryset):
+    """Order a recording listing newest first, with released gated-dataset members dated by their release month.
+
+    A member of a release-gated dataset sorts as if uploaded at the first instant of its release
+    month, then by name among members released in the same month, so the listing position of a
+    member says nothing about when it arrived. Every other recording keeps its upload-time order.
+    """
+    from django.db.models.functions import Coalesce, Lower
+
+    from library.release import release_month_subquery
+
+    return (
+        queryset.annotate(release_month=release_month_subquery(Recording))
+        .annotate(sort_at=Coalesce(F("release_month"), F("created_at")))
+        .order_by("-sort_at", Lower("display_name"), "stored_name")
+    )
+
+
+def _ensure_pinned_content(recording, expect_stored_hash: str | None) -> None:
+    """Answer 412 when the caller pinned a ``stored_hash`` the recording no longer has.
+
+    ``stored_hash`` moves whenever the platform rewrites the file and stays put across metadata
+    edits, so a release manifest, a dataset snapshot or a cached analysis can carry it and fail
+    loudly on a reprocessed recording instead of reading different bytes under the same URL.
+    Checked after access resolution, so the answer is given to a caller who may read the bytes.
+    """
+    if expect_stored_hash is None:
+        return
+    pinned = expect_stored_hash.strip().lower()
+    if len(pinned) != 64 or any(c not in "0123456789abcdef" for c in pinned):
+        raise HttpError(400, "expect_stored_hash must be a 64-character hexadecimal SHA-256 digest")
+    if (recording.stored_hash or "").lower() != pinned:
+        raise HttpError(412, "Recording content differs from the pinned stored_hash")
 
 
 def _failed_hidden_for_caller(recording, user, fed) -> bool:
@@ -1115,6 +1183,7 @@ def _build_recording_out(
     user=None,
     fed=None,
     trashed_collection_by_pk: dict | None = None,
+    release_month_by_pk: dict | None = None,
 ) -> dict:
     """Assemble a RecordingOut-compatible dict for a single Recording instance.
 
@@ -1130,6 +1199,9 @@ def _build_recording_out(
     """
     meta_obj = (meta_by_pk or {}).get(recording.pk)
     can_see_author_fields = _can_see_original_name(user, recording, fed)
+    release_month = _release_month_of(
+        recording, can_see_author_fields=can_see_author_fields, release_month_by_pk=release_month_by_pk
+    )
     out = {
         "hash": recording.stored_name.split(".", 1)[0],
         "original_name": (recording.original_name if can_see_author_fields else None),
@@ -1142,7 +1214,7 @@ def _build_recording_out(
         "content_hash": recording.content_hash,
         "status": recording.status,
         "modality": recording.modality,
-        "created_at": _visible_created_at(recording, exact=can_see_author_fields),
+        "created_at": _visible_created_at(recording, exact=can_see_author_fields, release_month=release_month),
         "deleted_at": recording.deleted_at,
         "meta": {
             "format": meta_obj.format,
@@ -1470,7 +1542,7 @@ def recording_status(request, hash: str):
 
     if fed is not None:
         fed_peer, remote_user_id = fed
-        if _failed_hidden_for_caller(recording, user, fed):
+        if _hidden_for_caller(recording, user, fed):
             log_federation_access(
                 peer=fed_peer,
                 remote_user_id=remote_user_id,
@@ -1496,7 +1568,7 @@ def recording_status(request, hash: str):
             target=recording,
             status_code=200,
         )
-    elif _failed_hidden_for_caller(recording, user, None):
+    elif _hidden_for_caller(recording, user, None):
         raise HttpError(404, "Recording not found")
     elif not (
         getattr(user, "is_superuser", False)
@@ -1505,7 +1577,7 @@ def recording_status(request, hash: str):
     ):
         raise HttpError(403, "You do not have permission to view this recording")
 
-    if _failed_hidden_for_caller(recording, user, fed):
+    if _hidden_for_caller(recording, user, fed):
         raise HttpError(404, "Recording not found")
 
     log_activity(
@@ -1550,7 +1622,7 @@ def list_recordings(
         )
         raise HttpError(403, "Federated peers cannot browse the recycle bin")
 
-    queryset = Recording.objects.filter(deleted_at__isnull=not trash).order_by("-created_at")
+    queryset = _with_listing_order(Recording.objects.filter(deleted_at__isnull=not trash))
 
     if status is not None:
         normalized_status = status.strip().lower()
@@ -1603,6 +1675,11 @@ def list_recordings(
         # succeeds: the listing and the object endpoint disagreeing about the same
         # grant is worse than either answer alone.
         granted_ids |= get_federated_visible_ids(fed_peer, remote_user_id, recording_ct)
+        # A peer reads released members only: the batch form of the release gate
+        # the per-object check applies with ``user=None``.
+        from library.release import unreleased_member_ids
+
+        granted_ids -= unreleased_member_ids(recording_ct)
         visible = list(
             queryset.filter(pk__in=granted_ids).exclude(status=Recording.Status.FAILED)[offset : offset + limit]
         )
@@ -1631,9 +1708,11 @@ def list_recordings(
     prefetch_related_objects(visible, "events", "interruptions", "labels")
 
     # Batch-fetch RecordingMeta (with per-channel SignalInfo) to avoid N+1 queries.
+    from library.release import release_months_by_id
     from recordings.models import RecordingMeta
 
     recording_ct = ContentType.objects.get_for_model(Recording, for_concrete_model=False)
+    release_month_by_pk = release_months_by_id(recording_ct, [r.pk for r in visible])
     meta_by_pk = {
         int(m.object_id): m
         for m in RecordingMeta.objects.filter(
@@ -1707,6 +1786,7 @@ def list_recordings(
             user=user,
             fed=fed,
             trashed_collection_by_pk=trashed_collection_by_pk,
+            release_month_by_pk=release_month_by_pk,
         )
         for r in visible
     ]
@@ -1758,7 +1838,7 @@ def recording_detail_slice(
 
     if fed is not None:
         fed_peer, remote_user_id = fed
-        if _failed_hidden_for_caller(recording, user, fed):
+        if _hidden_for_caller(recording, user, fed):
             log_federation_access(
                 peer=fed_peer,
                 remote_user_id=remote_user_id,
@@ -1784,7 +1864,7 @@ def recording_detail_slice(
             target=recording,
             status_code=200,
         )
-    elif _failed_hidden_for_caller(recording, user, None):
+    elif _hidden_for_caller(recording, user, None):
         raise HttpError(404, "Recording not found")
     elif not (
         getattr(user, "is_superuser", False)
@@ -1793,7 +1873,7 @@ def recording_detail_slice(
     ):
         raise HttpError(403, "You do not have permission to view this recording")
 
-    if _failed_hidden_for_caller(recording, user, fed):
+    if _hidden_for_caller(recording, user, fed):
         raise HttpError(404, "Recording not found")
 
     ext = (recording.file_extension or "").lower()
@@ -1911,6 +1991,7 @@ def recording_detail_slice(
     )
 
     can_see_author_fields = _can_see_original_name(user, recording, fed)
+    release_month = _release_month_of(recording, can_see_author_fields=can_see_author_fields)
     return {
         "hash": recording.stored_name.split(".", 1)[0],
         "original_name": (recording.original_name if can_see_author_fields else None),
@@ -1922,7 +2003,7 @@ def recording_detail_slice(
         "content_hash": recording.content_hash,
         "status": recording.status,
         "modality": recording.modality,
-        "created_at": _visible_created_at(recording, exact=can_see_author_fields),
+        "created_at": _visible_created_at(recording, exact=can_see_author_fields, release_month=release_month),
         "deleted_at": recording.deleted_at,
         "meta": {
             "format": meta.format,
@@ -1975,7 +2056,7 @@ def list_recording_annotations(
     if recording is None:
         raise HttpError(404, "Recording not found")
 
-    if _failed_hidden_for_caller(recording, user, None):
+    if _hidden_for_caller(recording, user, None):
         raise HttpError(404, "Recording not found")
 
     # Resolved as terms rather than a boolean, for the same reason the slice endpoint
@@ -2152,7 +2233,7 @@ def recording_detail(request, hash: str, share_token: str | None = None):
 
     if fed is not None:
         fed_peer, remote_user_id = fed
-        if _failed_hidden_for_caller(recording, user, fed):
+        if _hidden_for_caller(recording, user, fed):
             log_federation_access(
                 peer=fed_peer,
                 remote_user_id=remote_user_id,
@@ -2178,7 +2259,7 @@ def recording_detail(request, hash: str, share_token: str | None = None):
             target=recording,
             status_code=200,
         )
-    elif _failed_hidden_for_caller(recording, user, None):
+    elif _hidden_for_caller(recording, user, None, share_token=share_token):
         raise HttpError(404, "Recording not found")
     elif not (
         (user and getattr(user, "is_superuser", False))
@@ -2187,7 +2268,7 @@ def recording_detail(request, hash: str, share_token: str | None = None):
     ):
         raise HttpError(403, "You do not have permission to view this recording")
 
-    if _failed_hidden_for_caller(recording, user, fed):
+    if _hidden_for_caller(recording, user, fed, share_token=share_token):
         raise HttpError(404, "Recording not found")
 
     prefetch_related_objects([recording], "events", "interruptions", "labels")
@@ -2212,14 +2293,23 @@ def recording_detail(request, hash: str, share_token: str | None = None):
 
 
 @api.get("/{hash}/file")
-def download_recording(request, hash: str, share_token: str | None = None):
+def download_recording(
+    request,
+    hash: str,
+    share_token: str | None = None,
+    expect_stored_hash: str | None = Query(
+        None,
+        description="Content pin: answer 412 unless the recording's stored_hash equals this SHA-256 digest.",
+    ),
+):
     """Download file content by stored recording hash, with Range request support.
 
     Supports ``Range: bytes=start-end`` for partial content retrieval (HTTP 206).
     Clients that do not send a Range header receive the full file (HTTP 200).
     The ``Accept-Ranges: bytes`` header is always present so viewers can seek
     without an initial probe request.  Unauthenticated access is allowed when a
-    valid *share_token* is supplied.
+    valid *share_token* is supplied. ``expect_stored_hash`` pins the content:
+    a recording whose ``stored_hash`` differs answers **412** and serves nothing.
     """
 
     user = getattr(request, "user", None)
@@ -2255,7 +2345,7 @@ def download_recording(request, hash: str, share_token: str | None = None):
     apply_middleware = False
     if fed is not None:
         fed_peer, remote_user_id = fed
-        if _failed_hidden_for_caller(recording, user, fed):
+        if _hidden_for_caller(recording, user, fed, share_token=share_token):
             log_federation_access(
                 peer=fed_peer,
                 remote_user_id=remote_user_id,
@@ -2301,7 +2391,7 @@ def download_recording(request, hash: str, share_token: str | None = None):
             status_code=200,
         )
         apply_middleware = result.apply_middleware
-    elif _failed_hidden_for_caller(recording, user, None):
+    elif _hidden_for_caller(recording, user, None, share_token=share_token):
         raise HttpError(404, "Recording not found")
     elif (
         user
@@ -2315,7 +2405,7 @@ def download_recording(request, hash: str, share_token: str | None = None):
             raise HttpError(403, "You do not have permission to view this recording")
         apply_middleware = result.apply_middleware
 
-    if _failed_hidden_for_caller(recording, user, fed):
+    if _hidden_for_caller(recording, user, fed, share_token=share_token):
         raise HttpError(404, "Recording not found")
 
     if recording.status not in (Recording.Status.READY, Recording.Status.FAILED):
@@ -2323,6 +2413,8 @@ def download_recording(request, hash: str, share_token: str | None = None):
             409,
             f"Recording is not yet available for download (status: {recording.status})",
         )
+
+    _ensure_pinned_content(recording, expect_stored_hash)
 
     file_path = Path(recording.file_path)
     if not file_path.exists() or not file_path.is_file():
@@ -2373,6 +2465,10 @@ def slice_recording(
             "end of the file. Defaults to the end of the file."
         ),
     ),
+    expect_stored_hash: str | None = Query(
+        None,
+        description="Content pin: answer 412 unless the recording's stored_hash equals this SHA-256 digest.",
+    ),
 ):
     """Download a time-range slice of an EDF/BDF recording as a valid EDF/BDF file.
 
@@ -2412,7 +2508,7 @@ def slice_recording(
     apply_middleware = False
     if fed is not None:
         fed_peer, remote_user_id = fed
-        if _failed_hidden_for_caller(recording, user, fed):
+        if _hidden_for_caller(recording, user, fed):
             log_federation_access(
                 peer=fed_peer,
                 remote_user_id=remote_user_id,
@@ -2457,7 +2553,7 @@ def slice_recording(
             status_code=200,
         )
         apply_middleware = result.apply_middleware
-    elif _failed_hidden_for_caller(recording, user, None):
+    elif _hidden_for_caller(recording, user, None):
         raise HttpError(404, "Recording not found")
     elif getattr(user, "is_superuser", False) or recording.author_id == user.pk:
         pass  # author and superusers always receive raw data
@@ -2467,7 +2563,7 @@ def slice_recording(
             raise HttpError(403, "You do not have permission to view this recording")
         apply_middleware = result.apply_middleware
 
-    if _failed_hidden_for_caller(recording, user, fed):
+    if _hidden_for_caller(recording, user, fed):
         raise HttpError(404, "Recording not found")
 
     if recording.status not in (Recording.Status.READY, Recording.Status.FAILED):
@@ -2486,6 +2582,8 @@ def slice_recording(
     ).first()
     if meta is None or not meta.data_record_count or not meta.data_record_duration:
         raise HttpError(422, "Recording metadata not available for time-range slicing")
+
+    _ensure_pinned_content(recording, expect_stored_hash)
 
     file_path = Path(recording.file_path)
     if not file_path.exists() or not file_path.is_file():
@@ -2686,7 +2784,7 @@ def _require_access_manager(request, hash: str):
     """
     user = _require_auth(request)
     recording = _resolve_recording_by_hash(hash)
-    if _failed_hidden_for_caller(recording, user, None):
+    if _hidden_for_caller(recording, user, None):
         raise HttpError(404, "Recording not found")
 
     if can_modify_object(user=user, obj=recording):

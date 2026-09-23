@@ -1,4 +1,4 @@
-"""Django app configuration — registers the dataset read-permission extensions."""
+"""Django app configuration — registers the dataset read-permission extensions and the release gates."""
 
 from django.apps import AppConfig
 
@@ -13,12 +13,15 @@ class LibraryConfig(AppConfig):
         from epicurrents.permissions import (
             register_federated_read_extension,
             register_read_permission_extension,
+            register_read_visibility_gate,
         )
+        from library import checks  # noqa: F401  — registers the originals-volume check
         from library.permissions import (
             can_read_via_dataset,
             can_read_via_dataset_federated,
             federated_dataset_visible_terms,
         )
+        from library.release import dataset_hidden_from_reader, member_hidden_from_reader
 
         # Dataset membership: a can_read AccessRight on a Dataset grants read
         # access to every contained item. This is the platform's only
@@ -34,6 +37,14 @@ class LibraryConfig(AppConfig):
             visible_terms=federated_dataset_visible_terms,
         )
 
+        # Release gating. A member of a release-gated dataset is invisible until a
+        # release run publishes it and to any request carrying a share token; the
+        # gate runs before any grant is read, so every surface that resolves
+        # through the permission layer honours it. The dataset itself is hidden
+        # from share-token callers so a join link lists no members either.
+        register_read_visibility_gate("recordings.recording", member_hidden_from_reader)
+        register_read_visibility_gate("library.dataset", dataset_hidden_from_reader)
+
         # Art. 15 subject export: snapshots a user authored are their activity
         # record. The manifest itself is deliberately NOT exported — it holds
         # content hashes of other subjects' recordings, and the manifest_hash
@@ -45,4 +56,22 @@ class LibraryConfig(AppConfig):
             "library.datasetsnapshot",
             "author",
             fields=("label", "manifest_hash", "created_at"),
+        )
+        # A release run a user performed is their activity record. The sign-off
+        # list holds primary keys, opaque on both subject surfaces; the
+        # assessment reference is free text the runner typed, so it is theirs on
+        # both: exported under their runs, scrubbed from the permanent trail
+        # with their account, as AccessRight.assessment_reference is for the
+        # giver. The live row keeps the reference with a null author.
+        register_export_relation(
+            "library.datasetrelease",
+            "author",
+            fields=("released_on", "profile_version", "member_count", "assessment_reference", "created_at"),
+        )
+        from activity.erasure import register_subject_pii
+
+        register_subject_pii(
+            "library.datasetrelease",
+            owner_field="author_id",
+            pii_fields={"assessment_reference"},
         )

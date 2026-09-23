@@ -27,6 +27,8 @@ export interface Collection {
     license_spdx: string | null
     /** Datasets only — licence text URL from DatasetMeta; null for collections and undeclared datasets. */
     license_url: string | null
+    /** Datasets only — members stay hidden from readers until a release run publishes them. */
+    release_gated?: boolean
     /** Create and update responses only: free-text warnings for `name` and `description`. */
     warnings?: NameWarning[]
 }
@@ -38,6 +40,8 @@ export interface CollectionItem {
     added_at: string
     /** Dataset items only — the containing folder, or null for the dataset root. */
     folder_id: number | null
+    /** Dataset items only — the month a release run published the item; null in ungated datasets and for unreleased members. */
+    release_month?: string | null
     /** Resolved display name for known types (e.g. Recording.display_name). Null for unknown types. */
     object_name: string | null
     /** Stable public hash for known types (recording content hash, media content hash). Null for unknown types. */
@@ -231,7 +235,14 @@ export async function createDataset(payload: { name: string; description?: strin
 
 export async function updateDataset(
     id: number | string,
-    payload: { name?: string; description?: string; viewer_config?: ViewerSettingsOverrides; license_spdx?: string; license_url?: string },
+    payload: {
+        name?: string
+        description?: string
+        viewer_config?: ViewerSettingsOverrides
+        license_spdx?: string
+        license_url?: string
+        release_gated?: boolean
+    },
 ): Promise<Collection> {
     const response = await http.patch<Collection>(`/api/v1/library/datasets/${id}/`, payload)
     return response.data
