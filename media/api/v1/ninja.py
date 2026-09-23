@@ -67,6 +67,7 @@ from epicurrents.permissions import (
     ensure_can_write_object,
     get_federated_read_access_result,
 )
+from epicurrents.text_hygiene import NameWarningOut, name_warnings
 from federation.audit import log_federation_access
 from federation.auth import try_federation_auth
 from media.models import MediaFile
@@ -147,6 +148,14 @@ class MediaFileUploadOut(Schema):
     time_offset: float | None
     created_at: str
     modified_at: str
+    # Free-text warnings for ``display_name`` (see ``epicurrents.text_hygiene``).
+    warnings: list[NameWarningOut] = []
+
+
+class MediaFilePatchOut(MediaFileDetailOut):
+    """The PATCH response: the media file plus free-text warnings for ``display_name``."""
+
+    warnings: list[NameWarningOut] = []
 
 
 class MediaAttachmentIn(Schema):
@@ -585,6 +594,7 @@ def upload_media(
         "time_offset": media.time_offset,
         "created_at": media.created_at.isoformat(),
         "modified_at": media.modified_at.isoformat(),
+        "warnings": name_warnings(display_name=media.display_name),
     }
 
 
@@ -801,9 +811,13 @@ def download_media(request, content_hash: str, share_token: str | None = None):
     return response
 
 
-@api.patch("/{content_hash}", response=MediaFileDetailOut)
+@api.patch("/{content_hash}", response=MediaFilePatchOut)
 def patch_media(request, content_hash: str, payload: MediaFilePatch):
-    """Update editable metadata. Author / superuser only."""
+    """Update editable metadata. Author / superuser only.
+
+    ``warnings`` flags a new display name that looks like an identifier; the
+    rename happens either way.
+    """
     user = _require_auth(request)
     media = _get_media_or_404(content_hash)
     ensure_can_write_object(user=user, obj=media)
@@ -856,9 +870,14 @@ def patch_media(request, content_hash: str, payload: MediaFilePatch):
 
     if changes:
         media.save()
-        log_activity(verb="media.update", target=media, metadata=changes)
+        # Field names only: the new display name is user-typed text and stays
+        # out of the permanent metadata. The row's own change record carries it.
+        log_activity(verb="media.update", target=media, metadata={"fields_updated": sorted(changes)})
 
-    return _serialise(media, user, detail=True)
+    return {
+        **_serialise(media, user, detail=True),
+        "warnings": name_warnings(display_name=media.display_name) if "display_name" in changes else [],
+    }
 
 
 @api.delete("/{content_hash}")

@@ -1,4 +1,5 @@
 import { http } from '#lib/http'
+import type { NameWarning } from '#lib/nameWarnings'
 import type { ViewerSettingsOverrides } from '#lib/viewerConfig'
 
 // ---------------------------------------------------------------------------
@@ -26,6 +27,8 @@ export interface Collection {
     license_spdx: string | null
     /** Datasets only — licence text URL from DatasetMeta; null for collections and undeclared datasets. */
     license_url: string | null
+    /** Create and update responses only: free-text warnings for `name` and `description`. */
+    warnings?: NameWarning[]
 }
 
 export interface CollectionItem {
@@ -63,6 +66,8 @@ export interface DatasetFolder {
     position: number
     created_at: string
     modified_at: string
+    /** Create and update responses only: free-text warnings for `name`. */
+    warnings?: NameWarning[]
 }
 
 export interface AccessRight {
@@ -154,8 +159,8 @@ export async function deleteCollection(id: number): Promise<void> {
 export async function bulkRenameCollectionRecordings(
     collectionId: number,
     prefix: string,
-): Promise<{ renamed: number; skipped: number }> {
-    const response = await http.post<{ renamed: number; skipped: number }>(
+): Promise<{ renamed: number; skipped: number; warnings: NameWarning[] }> {
+    const response = await http.post<{ renamed: number; skipped: number; warnings: NameWarning[] }>(
         `/api/v1/library/collections/${collectionId}/recordings/bulk-rename`,
         { prefix },
     )

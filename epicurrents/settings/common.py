@@ -747,6 +747,24 @@ ANNOTATION_EXPORT_ALL_ANNOTATORS_REQUIRES_SUPERUSER = env_bool(
     default=True,
 )
 
+# ── Free-text hygiene ────────────────────────────────────────────────────────
+# Regular expressions, keyed by a short kind name, that a deployment adds to the
+# built-in identifier heuristic in epicurrents/text_hygiene.py: a local record
+# number format, a study code, anything a label typed by an uploader should not
+# carry. The write endpoints for display names, collection, dataset, folder and
+# tag names return a warning per match beside their result; nothing is refused.
+# A project settings module extends this mapping (the project loader merges
+# dict settings), and manage.py check refuses a pattern that does not compile.
+TEXT_HYGIENE_PATTERNS: dict[str, str] = {}
+
+# Whether creating a tag is reserved for staff. Tags are a shared vocabulary:
+# a tag a staff member creates is curated and listed to every authenticated
+# user, a tag anyone else creates is listed only to its author and to readers
+# of the objects it decorates. Reserving creation keeps the vocabulary a
+# deployment decision rather than whatever each user types; a deployment that
+# wants user-defined tags turns this off and gets the reach-scoped listing.
+LIBRARY_TAG_CREATION_REQUIRES_STAFF = env_bool("LIBRARY_TAG_CREATION_REQUIRES_STAFF", default=True)
+
 # ──────────────────────────────────────────────────────────────────────────────
 # External login — OpenID Connect (Microsoft Entra ID).
 # ──────────────────────────────────────────────────────────────────────────────

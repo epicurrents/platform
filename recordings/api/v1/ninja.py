@@ -94,6 +94,7 @@ from epicurrents.permissions import (
     get_federated_visible_ids,
     get_read_access_result,
 )
+from epicurrents.text_hygiene import NameWarningOut, name_warnings
 from federation.audit import log_federation_access
 from federation.auth import try_federation_auth
 from federation.limits import QuotaExceeded, check_peer_download_limits
@@ -199,6 +200,8 @@ class RecordingUploadOut(Schema):
     file_extension: str
     file_size: int
     status: str
+    # Free-text warnings for ``display_name`` (see ``epicurrents.text_hygiene``).
+    warnings: list[NameWarningOut] = []
 
 
 class TrashedCollectionRef(Schema):
@@ -319,6 +322,16 @@ class RecordingStatusOut(Schema):
     """Lightweight status response for polling after upload."""
 
     status: str
+
+
+class RecordingPatchOut(RecordingOut):
+    """The PATCH response: the recording plus free-text warnings for ``display_name``.
+
+    The rename has happened regardless; the client surfaces the warning
+    against the field.
+    """
+
+    warnings: list[NameWarningOut] = []
 
 
 class RecordingPatchIn(Schema):
@@ -1222,7 +1235,8 @@ def upload_recording(
     for the recording.  When omitted, the field is left null and responses
     fall back to a hash-prefix default; the original filename is never used
     as the display name unless the author explicitly opts in by passing it
-    here (or via a later PATCH).
+    here (or via a later PATCH). ``warnings`` flags a label that looks like
+    an identifier; the upload is accepted either way.
     """
 
     user = _require_auth(request)
@@ -1427,6 +1441,7 @@ def upload_recording(
         "file_extension": recording.file_extension,
         "file_size": recording.file_size,
         "status": recording.status,
+        "warnings": name_warnings(display_name=normalized_display_name),
     }
 
 
@@ -2566,7 +2581,7 @@ def delete_recording(request, hash: str):
     return {"status": "ok"}
 
 
-@api.patch("/{hash}", response=RecordingOut)
+@api.patch("/{hash}", response=RecordingPatchOut)
 def update_recording(request, hash: str, payload: RecordingPatchIn):
     """Update a recording's editable metadata (display name and modality).
 
@@ -2575,7 +2590,8 @@ def update_recording(request, hash: str, payload: RecordingPatchIn):
     — only ``display_name`` and ``modality`` may be changed via this endpoint.
 
     Send ``display_name=""`` to clear the field; responses will fall back to
-    the ``stored_name`` hash prefix.
+    the ``stored_name`` hash prefix. ``warnings`` flags a new label that looks
+    like an identifier; the rename happens either way.
 
     Requires write access (author, superuser, or an ``AccessRight`` row with
     ``can_write=True``).
@@ -2620,7 +2636,10 @@ def update_recording(request, hash: str, payload: RecordingPatchIn):
             metadata={"fields_updated": fields_updated},
         )
 
-    return _build_recording_out(recording, user=user)
+    # Warnings are for the label being written, so a modality-only patch
+    # reports nothing about a label it did not touch.
+    label_warnings = name_warnings(display_name=recording.display_name) if payload.display_name is not None else []
+    return {**_build_recording_out(recording, user=user), "warnings": label_warnings}
 
 
 def _resolve_recording_by_hash(hash: str):

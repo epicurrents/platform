@@ -664,7 +664,6 @@ class TestItemMembership:
     def test_list_items_surfaces_media_with_support_flag(self, auth_client):
         """A media item in a collection lists with object_type=mediafile and
         media-specific fields (media_type, file_extension, is_supported)."""
-        from django.test import override_settings
 
         c, user = auth_client
         col = baker.make(Collection, author=user)
@@ -674,6 +673,8 @@ class TestItemMembership:
             content_type=self._media_ct(),
             object_id=str(media.pk),
         )
+        from django.test import override_settings
+
         with override_settings(MEDIA_ALLOWED_UPLOAD_EXTENSIONS=[".pdf"]):
             resp = c.get(_url(col.pk, "items/"))
         assert resp.status_code == 200
@@ -688,7 +689,6 @@ class TestItemMembership:
         """The user explicitly asked for unsupported rows to stay listed
         (greyed by the frontend) — only the live allowlist toggles
         ``is_supported``, never the membership row's presence."""
-        from django.test import override_settings
 
         c, user = auth_client
         col = baker.make(Collection, author=user)
@@ -698,6 +698,8 @@ class TestItemMembership:
             content_type=self._media_ct(),
             object_id=str(media.pk),
         )
+        from django.test import override_settings
+
         with override_settings(MEDIA_ALLOWED_UPLOAD_EXTENSIONS=[".md"]):
             resp = c.get(_url(col.pk, "items/"))
         assert resp.status_code == 200
@@ -883,7 +885,7 @@ class TestBulkRenameRecordings:
 
         resp = post_json(c, self._url_bulk_rename(col.pk), {"prefix": "Subject"})
         assert resp.status_code == 200
-        assert resp.json() == {"renamed": 3, "skipped": 0}
+        assert resp.json() == {"renamed": 3, "skipped": 0, "warnings": []}
 
         for rec, expected_n in zip(recs, [1, 2, 3]):
             rec.refresh_from_db()
@@ -925,7 +927,7 @@ class TestBulkRenameRecordings:
 
         resp = post_json(c, self._url_bulk_rename(col.pk), {"prefix": "S"})
         assert resp.status_code == 200
-        assert resp.json() == {"renamed": 2, "skipped": 1}
+        assert resp.json() == {"renamed": 2, "skipped": 1, "warnings": []}
 
         own.refresh_from_db()
         shared.refresh_from_db()
@@ -965,7 +967,7 @@ class TestBulkRenameRecordings:
 
         resp = post_json(c, self._url_bulk_rename(col.pk), {})
         assert resp.status_code == 200
-        assert resp.json() == {"renamed": 1, "skipped": 0}
+        assert resp.json() == {"renamed": 1, "skipped": 0, "warnings": []}
 
     def test_ignores_non_recording_items(self, auth_client):
         """Other content-type items in the collection are not touched."""
@@ -977,14 +979,14 @@ class TestBulkRenameRecordings:
 
         resp = post_json(c, self._url_bulk_rename(col.pk), {})
         assert resp.status_code == 200
-        assert resp.json() == {"renamed": 0, "skipped": 0}
+        assert resp.json() == {"renamed": 0, "skipped": 0, "warnings": []}
 
     def test_empty_collection_returns_zero(self, auth_client):
         c, user = auth_client
         col = baker.make(Collection, author=user)
         resp = post_json(c, self._url_bulk_rename(col.pk), {})
         assert resp.status_code == 200
-        assert resp.json() == {"renamed": 0, "skipped": 0}
+        assert resp.json() == {"renamed": 0, "skipped": 0, "warnings": []}
 
     def test_requires_read_on_collection(self, auth_client, make_user):
         """A user without read access to the collection is rejected with 403."""
@@ -1046,7 +1048,8 @@ class TestBulkRenameRecordings:
         assert row is not None
         assert row.metadata["renamed_count"] == 1
         assert row.metadata["skipped_count"] == 0
-        assert row.metadata["prefix"] == "Subject"
+        # The prefix is user-typed text and stays out of the permanent metadata.
+        assert "prefix" not in row.metadata
         assert row.metadata["renamed_recording_pks"] == [rec.pk]
 
 
@@ -1801,6 +1804,10 @@ class TestListTags:
 
 @pytest.mark.django_db
 class TestCreateTag:
+    @pytest.fixture(autouse=True)
+    def _user_created_tags(self, settings):
+        settings.LIBRARY_TAG_CREATION_REQUIRES_STAFF = False
+
     def test_unauthenticated_returns_401(self, client):
         assert post_json(client, TAGS_BASE, {"name": "X"}).status_code == 401
 
@@ -2403,7 +2410,7 @@ class TestLibraryAuditTrail:
         activity = Activity.objects.filter(verb="library.collection.recordings.bulk_rename").latest("created_at")
         assert activity.target_object_id == str(col.pk)
         assert activity.metadata["renamed_count"] == 1
-        assert activity.metadata["prefix"] == "Subject"
+        assert "prefix" not in activity.metadata
 
     # ── Datasets ────────────────────────────────────────────────────────────
 
@@ -2585,8 +2592,10 @@ class TestLibraryAuditTrail:
         activity = Activity.objects.filter(verb="library.tag.list").latest("created_at")
         assert "returned_count" in activity.metadata
 
-    def test_tag_create_records_verb(self, auth_client):
+    def test_tag_create_records_verb(self, auth_client, settings):
         from activity.models import Activity
+
+        settings.LIBRARY_TAG_CREATION_REQUIRES_STAFF = False
 
         c, user = auth_client
         resp = post_json(c, TAGS_BASE, {"name": "AuditTag"})

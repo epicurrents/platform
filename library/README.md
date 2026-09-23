@@ -83,7 +83,7 @@ Presentation-only folder tree inside a dataset: `dataset` FK, self-referential `
 
 ### `Tag`
 
-Hierarchical label. `author`, `name`, `description`, `parent` FK to self (adjacency list, `SET_NULL` on parent delete). The tag taxonomy is global: any authenticated user can browse the tag list and apply tags. Only the tag author or a superuser can edit or delete the tag definition.
+Hierarchical label. `author`, `name`, `description`, `parent` FK to self (adjacency list, `SET_NULL` on parent delete), `curated`. Creating a tag is reserved for staff while `LIBRARY_TAG_CREATION_REQUIRES_STAFF` is on, which is the default, and a tag created by staff is stamped `curated`: it is the deployment's vocabulary and every authenticated user can list and apply it. An uncurated tag is reached only by its author and by readers of the objects it decorates ([tag reach](#tag-reach)). The stamp is taken at creation rather than derived from the author's current flag, so a later promotion or demotion does not change who sees what was typed. Only the tag author or a superuser can edit or delete the tag definition.
 
 Tags are not soft-deleted. Removing a tag removes every `TaggedItem` row that references it.
 
@@ -134,20 +134,28 @@ Same CRUD + items shape as Collections at `/datasets/`, plus the access surface 
 
 | Method | Path | Notes |
 |---|---|---|
-| `GET` | `/tags/` | List tags. Filter by `parent_id` / `root` / `author`. |
-| `POST` | `/tags/` | Create. Optional `parent_id`. |
-| `GET` | `/tags/{id}/` | Detail. |
-| `PATCH` | `/tags/{id}/` | Update. Requires tag authorship. |
+| `GET` | `/tags/` | List the tags within the caller's reach. Filter by `parent_id`; a parent outside the caller's reach is 404. |
+| `POST` | `/tags/` | Create. Staff only by default (403 otherwise); optional `parent_id`, which must be within reach. Returns `warnings` for a name or description that looks like an identifier. |
+| `GET` | `/tags/{id}/` | Detail. 404 outside the caller's reach, the same answer as for a missing tag. |
+| `PATCH` | `/tags/{id}/` | Update. Requires tag authorship; a new parent must be within reach. Returns `warnings`. |
 | `DELETE` | `/tags/{id}/` | Hard-delete. Requires tag authorship. |
-| `GET` | `/tags/{id}/items/?include_children=true` | List items tagged with this tag, by default including items tagged with any descendant. Set `include_children=false` to exclude descendants. |
-| `POST` | `/tags/{id}/items/` | Tag an object. Requires write access to the object. |
+| `GET` | `/tags/{id}/items/?include_children=true` | List items tagged with this tag, by default including items tagged with any descendant. Set `include_children=false` to exclude descendants. 404 outside the caller's reach. |
+| `POST` | `/tags/{id}/items/` | Tag an object. Requires write access to the object and a tag within the caller's reach. |
 | `DELETE` | `/tags/{id}/items/{item_id}/` | Untag. Requires write access on the object **or** authorship of the tag. |
 
 `include_children` uses `_get_tag_subtree_ids` — a single DB query + in-memory BFS to expand the tag's descendant set, so a deeply-nested taxonomy doesn't fan out into many queries.
 
+### Tag reach
+
+A tag name is free text typed by whoever created it, and the listing used to hand every name to every authenticated user. [tag_scope.py](tag_scope.py) decides what a caller can list, read and apply: a superuser reaches everything; everyone else reaches the curated tags, the tags they authored, the tags on objects they can read, and the ancestors of all of those, so the tree stays browsable from its root. Reach through an object uses the same per-item check as the item listings, over the distinct objects carrying a tag not already in reach, so the cost is bounded by what people have tagged rather than by what the platform holds. Every tag endpoint answers a tag outside the caller's reach with the 404 it gives a missing tag, so the id space cannot be walked for names. Untagging is unchanged: it already requires write access on the object or authorship of the tag.
+
+### Free-text warnings
+
+Every endpoint that writes a grantee-visible label returns a `warnings` list beside its result: collection and dataset create and update (`name`, `description`), folder create and update (`name`), tag create and update (`name`, `description`) and the bulk-rename (`prefix`). Each row is `{field, kind, message}`, produced by `name_warnings` in [epicurrents/text_hygiene.py](../epicurrents/text_hygiene.py) when the text reads as a personal name, contains a run of six or more digits, contains a date, or matches one of the deployment's own `TEXT_HYGIENE_PATTERNS`. The write has happened regardless; the frontend surfaces each row as a warning toast against the field. Read responses carry no `warnings` key.
+
 ### Bulk-rename
 
-`POST /collections/{id}/recordings/bulk-rename` assigns sequential `display_name` values to the recordings in a collection, ordered by `added_at`. Payload: `{"prefix": "<prefix>"}` (defaults to `"Recording"`). Each writable recording gets `display_name = "{prefix} {n}"` with `n` starting at 1. Non-writable, FAILED, or soft-deleted recordings are skipped *without* advancing the counter, so the resulting numbers always form a contiguous 1..N sequence across the rows actually renamed. Returns `{"renamed": N, "skipped": M}`.
+`POST /collections/{id}/recordings/bulk-rename` assigns sequential `display_name` values to the recordings in a collection, ordered by `added_at`. Payload: `{"prefix": "<prefix>"}` (defaults to `"Recording"`). Each writable recording gets `display_name = "{prefix} {n}"` with `n` starting at 1. Non-writable, FAILED, or soft-deleted recordings are skipped *without* advancing the counter, so the resulting numbers always form a contiguous 1..N sequence across the rows actually renamed. Returns `{"renamed": N, "skipped": M, "warnings": [...]}`, the warnings covering the prefix. The prefix is user-typed text and stays out of the activity row's metadata; the renamed rows' own change records carry the resulting names.
 
 Requires read access on the collection and write access on each affected recording. Wrapped in `transaction.atomic()` so a partial run never leaves a half-renumbered collection.
 
@@ -225,7 +233,12 @@ Items inside collections / datasets / tags are still referenced by the contained
 
 ## Settings consumed
 
-None directly — the library app reads no `LIBRARY_*` env vars. It does consume the cross-app `AccessRight` model from `epicurrents`.
+| Variable | Default | Notes |
+|---|---|---|
+| `LIBRARY_TAG_CREATION_REQUIRES_STAFF` | `True` | Reserve tag creation for staff; a tag created by staff is curated and listed to everyone. Off, anyone creates uncurated tags, listed by [reach](#tag-reach). |
+| `TEXT_HYGIENE_PATTERNS` | `{}` | Core setting; the deployment's own identifier patterns for the [free-text warnings](#free-text-warnings). |
+
+The app also consumes the cross-app `AccessRight` model from `epicurrents`.
 
 ## Project plugin extension points
 
@@ -245,7 +258,7 @@ The permission tests live in [tests/test_permissions.py](tests/test_permissions.
 
 ## Gotchas
 
-- **Per-item access filtering is N+1.** [api/v1/ninja.py](api/v1/ninja.py) `_filter_readable` / `_user_can_read_item` check read access for each item individually when listing collection or tag contents. This is fine when the collection or tag scope is bounded and most items are readable. It becomes expensive if a large tag contains many items the caller cannot access — the iterator has to scan past every unreadable item to fill one page. **If a global tag browser is ever added** (listing all items with a tag across all users, or any view where the caller is expected to have access to only a small fraction), switch to the batched check: one `AccessRight.objects.filter(content_type__in=..., object_id__in=..., can_read=True)` over the full page plus a separate `DatasetItem` + `AccessRight` batch query. That drops per-page query count from O(items) to O(distinct content types).
+- **Per-item access filtering is N+1.** [api/v1/ninja.py](api/v1/ninja.py) `_filter_readable` and `user_can_read_item` in [item_access.py](item_access.py) check read access for each item individually when listing collection or tag contents, and the tag reach in [tag_scope.py](tag_scope.py) does the same over the distinct tagged objects. This is fine when the collection or tag scope is bounded and most items are readable. It becomes expensive if a large tag contains many items the caller cannot access — the iterator has to scan past every unreadable item to fill one page. **If a global tag browser is ever added** (listing all items with a tag across all users, or any view where the caller is expected to have access to only a small fraction), switch to the batched check: one `AccessRight.objects.filter(content_type__in=..., object_id__in=..., can_read=True)` over the full page plus a separate `DatasetItem` + `AccessRight` batch query. That drops per-page query count from O(items) to O(distinct content types).
 - **Extensions may return a plain `bool`.** The extension protocol normalises `True` to `ReadAccessTerms(granted=True, apply_middleware=False)`, so bool-returning project extensions work. Return `ReadAccessTerms` when you need to propagate middleware behaviour, as `can_read_via_dataset` does.
 - **Don't extend `register_read_permission_extension` lightly.** Each new extension is consulted on every read check that doesn't hit a direct `AccessRight`. The existing extension is scoped to single reverse-lookup queries; an extension that triggers heavy work per call will degrade every authorisation path that reaches it. Profile before registering.
 - **The two `CollectionItem` uniqueness constraints test independently.** When adding tests for the constraints, exercise each one separately — there are two different failure paths (409 from "already in this collection" vs 409 from "already in another collection") and the API caller may want to distinguish them.

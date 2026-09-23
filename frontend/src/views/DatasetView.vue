@@ -36,6 +36,7 @@ import MediaPickerDialog from '#components/MediaPickerDialog.vue'
 import { useRecordingsStore } from '#stores/recordings'
 import { useLibraryStore } from '#stores/library'
 import { useAuthStore } from '#stores/auth'
+import { toastNameWarnings } from '#lib/nameWarnings'
 import { showToast } from '#lib/toast'
 import ViewerConfigEditor from '#components/ViewerConfigEditor.vue'
 import type { ViewerSettingsOverrides } from '#lib/viewerConfig'
@@ -315,8 +316,11 @@ async function submitFolder() {
                 parent_id: parentId,
             })
             folders.value = folders.value.map(f => (f.id === updated.id ? updated : f))
+            toastNameWarnings(updated.warnings)
         } else {
-            folders.value.push(await createDatasetFolder(datasetId.value, { name, parent_id: parentId }))
+            const created = await createDatasetFolder(datasetId.value, { name, parent_id: parentId })
+            folders.value.push(created)
+            toastNameWarnings(created.warnings)
         }
         showFolderDialog.value = false
     } catch {
@@ -436,6 +440,7 @@ async function submitEdit() {
         })
         showEdit.value = false
         showToast(t('Dataset updated.', SCOPE), 'success')
+        toastNameWarnings(dataset.value?.warnings)
     } catch {
         editError.value = t('Failed to update dataset.', SCOPE)
     } finally {

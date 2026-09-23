@@ -8,6 +8,7 @@ import {
     type Recording,
     type RecordingUpload,
 } from '#api/recordings'
+import { toastNameWarnings } from '#lib/nameWarnings'
 import {
     createCollection,
     addCollectionItem,
@@ -388,6 +389,7 @@ export const useRecordingsStore = defineStore('recordings', () => {
 
         fileState.progress = 100
         fileState.phase = 'processing'
+        toastNameWarnings(result.warnings)
         // The upload response uses stored_name (e.g. "ABC123.edf") as the opaque
         // identifier; the recordings API never exposes the integer PK directly.
         // _resolve_recording_object_id on the backend accepts the 32-char hex prefix.

@@ -32,6 +32,7 @@ import {
     type CollectionItem,
 } from '#api/library'
 import { useLibraryStore } from '#stores/library'
+import { toastNameWarnings } from '#lib/nameWarnings'
 import { showToast } from '#lib/toast'
 
 const SCOPE = 'CreateDatasetDialog'
@@ -460,6 +461,7 @@ async function submit () {
 
         // Reflect in the store so DatasetsView shows the new entry without reload.
         libraryStore.datasets.push(dataset)
+        toastNameWarnings(dataset.warnings)
 
         // 4. Navigate to the new dataset page.
         emit('close')

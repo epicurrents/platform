@@ -64,6 +64,9 @@ from epicurrents.auth import enforce_session_csrf
 from epicurrents.granting import ensure_can_confer, ensure_can_manage_access, ensure_can_revoke
 from epicurrents.models import AccessRight
 from epicurrents.permissions import can_modify_object
+from epicurrents.security_log import log_security_event
+from epicurrents.text_hygiene import NameWarningOut, name_warnings
+from library.item_access import user_can_read_item
 from library.models import (
     Collection,
     CollectionItem,
@@ -79,6 +82,7 @@ from library.permissions import (
     ensure_can_read_collection,
     ensure_can_write_collection,
 )
+from library.tag_scope import can_create_tag, tag_reachable, visible_tag_ids
 
 api = NinjaAPI(
     title="Library API",
@@ -145,6 +149,17 @@ class CollectionOut(Schema):
     license_url: str | None = None
 
 
+class CollectionWriteOut(CollectionOut):
+    """A create or update response: the collection or dataset plus free-text warnings.
+
+    ``warnings`` names each of ``name`` and ``description`` that looks like an
+    identifier (see ``epicurrents.text_hygiene``). The write has happened
+    regardless; the client surfaces the warning against the field.
+    """
+
+    warnings: list[NameWarningOut] = []
+
+
 class CollectionItemIn(Schema):
     """Payload for adding an object to a collection."""
 
@@ -197,10 +212,14 @@ class BulkRenameRecordingsIn(Schema):
 
 
 class BulkRenameRecordingsOut(Schema):
-    """Result of the per-collection recording bulk-rename action."""
+    """Result of the per-collection recording bulk-rename action.
+
+    ``warnings`` covers the prefix, since every renamed recording carries it.
+    """
 
     renamed: int
     skipped: int
+    warnings: list[NameWarningOut] = []
 
 
 class GrantAccessIn(Schema):
@@ -233,15 +252,26 @@ class TagPatchIn(Schema):
 
 
 class TagOut(Schema):
-    """Tag response."""
+    """Tag response.
+
+    ``curated`` is stamped at creation from the author's staff flag and decides
+    whether the tag is listed to everyone or only to those who can reach it.
+    """
 
     id: int
     name: str
     description: str
     parent_id: int | None
     author_id: int
+    curated: bool = False
     created_at: datetime
     modified_at: datetime
+
+
+class TagWriteOut(TagOut):
+    """A tag create or update response plus free-text warnings for ``name`` and ``description``."""
+
+    warnings: list[NameWarningOut] = []
 
 
 class TaggedItemOut(Schema):
@@ -477,13 +507,14 @@ def _enrich_collection_items(items: list, user) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 
-@api.post("/collections/", response={201: CollectionOut})
+@api.post("/collections/", response={201: CollectionWriteOut})
 def create_collection(request, payload: CollectionIn):
     """Create a new collection.
 
     Collections are author-private; the author's access is implicit and no
     AccessRight row is created. Set ``parent_id`` to nest the collection
-    inside an existing one.
+    inside an existing one. ``warnings`` flags a name or description that
+    looks like an identifier; the collection is created either way.
     """
     user = _require_auth(request)
     parent = _resolve_parent(payload.parent_id, user)
@@ -496,7 +527,7 @@ def create_collection(request, payload: CollectionIn):
             parent=parent,
         )
         log_activity(verb="library.collection.create", target=collection)
-        return 201, collection
+    return 201, _collection_write_out(collection, name_warnings(name=payload.name, description=payload.description))
 
 
 @api.get("/collections/", response=list[CollectionOut])
@@ -565,12 +596,13 @@ def get_collection(request, collection_id: int):
     return collection
 
 
-@api.patch("/collections/{collection_id}/", response=CollectionOut)
+@api.patch("/collections/{collection_id}/", response=CollectionWriteOut)
 def update_collection(request, collection_id: int, payload: CollectionPatchIn):
     """Update collection name, description, or parent.
 
     Requires write access (author, superuser, or can_write AccessRight).
     Moving a collection to a new parent requires read access to the new parent.
+    ``warnings`` flags a new name or description that looks like an identifier.
     """
     user = _require_auth(request)
     collection = _get_active_collection(collection_id)
@@ -597,7 +629,7 @@ def update_collection(request, collection_id: int, payload: CollectionPatchIn):
             target=collection,
             metadata={"fields_updated": fields_updated},
         )
-    return collection
+    return _collection_write_out(collection, name_warnings(name=payload.name, description=payload.description))
 
 
 def _check_no_cycle(collection: Collection, new_parent_id: int):
@@ -897,7 +929,9 @@ def bulk_rename_recordings(request, collection_id: int, payload: BulkRenameRecor
     its contents) and write access to each affected recording.  Other
     content-type items in the collection are ignored.
 
-    Returns the count of renamed and skipped recording items.
+    Returns the count of renamed and skipped recording items, and a warning
+    when the prefix itself looks like an identifier, since every renamed
+    recording now carries it.
     """
     from epicurrents.permissions import can_write_object
     from recordings.models import Recording
@@ -922,8 +956,9 @@ def bulk_rename_recordings(request, collection_id: int, payload: BulkRenameRecor
 
     recording_ct = ContentType.objects.get_for_model(Recording, for_concrete_model=False)
     items = list(CollectionItem.objects.filter(collection=collection, content_type=recording_ct).order_by("added_at"))
+    prefix_warnings = name_warnings(prefix=prefix)
     if not items:
-        return {"renamed": 0, "skipped": 0}
+        return {"renamed": 0, "skipped": 0, "warnings": prefix_warnings}
 
     object_ids = [item.object_id for item in items]
     recordings = {
@@ -955,6 +990,8 @@ def bulk_rename_recordings(request, collection_id: int, payload: BulkRenameRecor
             renamed += 1
             renamed_pks.append(rec.pk)
 
+    # The prefix is user-typed text and stays out of the permanent metadata;
+    # the renamed rows' own change records carry the resulting names.
     log_activity(
         verb="library.collection.recordings.bulk_rename",
         target=collection,
@@ -962,11 +999,10 @@ def bulk_rename_recordings(request, collection_id: int, payload: BulkRenameRecor
             "renamed_count": renamed,
             "skipped_count": skipped,
             "renamed_recording_pks": renamed_pks,
-            "prefix": prefix,
         },
     )
 
-    return {"renamed": renamed, "skipped": skipped}
+    return {"renamed": renamed, "skipped": skipped, "warnings": prefix_warnings}
 
 
 class CollectionExportIn(Schema):
@@ -1107,39 +1143,6 @@ def export_collection_to_dataset(request, collection_id: int, payload: Collectio
     }
 
 
-def _user_can_read_item(user, ct: ContentType, object_id: str) -> bool:
-    """Return True if *user* may read the object referenced by *ct* + *object_id*.
-
-    Fast paths (no AccessRight query):
-    - superuser → always True
-    - object author → True
-
-    Falls back to ``can_read_object`` (which checks AccessRights and all
-    registered extensions including Dataset membership).  Soft-deleted or
-    missing objects are treated as unreadable and return False.
-    """
-    from epicurrents.permissions import can_read_object
-
-    if getattr(user, "is_superuser", False):
-        return True
-
-    model_class = ct.model_class()
-    if model_class is None:
-        return False
-
-    qs = model_class.objects.filter(pk=object_id)
-    if hasattr(model_class, "deleted_at"):
-        qs = qs.filter(deleted_at__isnull=True)
-    obj = qs.first()
-    if obj is None:
-        return False
-
-    if getattr(obj, "author_id", None) == user.pk:
-        return True
-
-    return can_read_object(user=user, obj=obj)
-
-
 def _filter_readable(user, qs, order_by: str, offset: int, limit: int) -> list:
     """Iterate *qs* and return up to *limit* items the user can read.
 
@@ -1151,7 +1154,7 @@ def _filter_readable(user, qs, order_by: str, offset: int, limit: int) -> list:
     visible = []
     skipped = 0
     for item in qs.select_related("content_type").order_by(order_by).iterator():
-        if _user_can_read_item(user, item.content_type, item.object_id):
+        if user_can_read_item(user, item.content_type, item.object_id):
             if skipped < offset:
                 skipped += 1
                 continue
@@ -1253,13 +1256,14 @@ def _get_active_dataset(dataset_id: int | str) -> Dataset:
     return dataset
 
 
-@api.post("/datasets/", response={201: CollectionOut})
+@api.post("/datasets/", response={201: CollectionWriteOut})
 def create_dataset(request, payload: DatasetIn):
     """Create a new Dataset.
 
     The creator automatically receives full read/write/share access.
     If ``recording_hashes`` is provided, all recordings are added atomically —
     the dataset is not persisted at all if any hash is invalid or unreadable.
+    ``warnings`` flags a name or description that looks like an identifier.
     """
     from recordings.models import Recording
 
@@ -1300,16 +1304,10 @@ def create_dataset(request, payload: DatasetIn):
             target=dataset,
             metadata={"initial_item_count": len(payload.recording_hashes)},
         )
-        return 201, {
-            "id": dataset.pk,
-            "name": dataset.name,
-            "description": dataset.description,
-            "parent_id": None,
-            "author_id": dataset.author_id,
-            "created_at": dataset.created_at,
-            "modified_at": dataset.modified_at,
-            "deleted_at": dataset.deleted_at,
-        }
+    return 201, {
+        **_dataset_out(dataset),
+        "warnings": name_warnings(name=payload.name, description=payload.description),
+    }
 
 
 @api.get("/datasets/", response=list[CollectionOut])
@@ -1356,6 +1354,21 @@ def list_datasets(
         },
     )
     return visible
+
+
+def _collection_write_out(collection: Collection, warnings: list[dict]) -> dict:
+    """Serialise a collection for a create or update response, with the free-text warnings beside it."""
+    return {
+        "id": collection.pk,
+        "name": collection.name,
+        "description": collection.description,
+        "parent_id": collection.parent_id,
+        "author_id": collection.author_id,
+        "created_at": collection.created_at,
+        "modified_at": collection.modified_at,
+        "deleted_at": collection.deleted_at,
+        "warnings": warnings,
+    }
 
 
 def _dataset_out(dataset: Dataset) -> dict:
@@ -1407,12 +1420,13 @@ def get_dataset(request, dataset_id: str, share_token: str | None = None):
     return _dataset_out(dataset)
 
 
-@api.patch("/datasets/{dataset_id}/", response=CollectionOut)
+@api.patch("/datasets/{dataset_id}/", response=CollectionWriteOut)
 def update_dataset(request, dataset_id: str, payload: CollectionPatchIn):
     """Update dataset name or description.
 
     Requires write access (author, superuser, or can_write AccessRight).
-    ``parent_id`` in the payload is ignored.
+    ``parent_id`` in the payload is ignored. ``warnings`` flags a new name or
+    description that looks like an identifier.
     """
     from epicurrents.permissions import can_write_object
 
@@ -1451,7 +1465,10 @@ def update_dataset(request, dataset_id: str, payload: CollectionPatchIn):
             target=dataset,
             metadata={"fields_updated": fields_updated},
         )
-    return _dataset_out(dataset)
+    return {
+        **_dataset_out(dataset),
+        "warnings": name_warnings(name=payload.name, description=payload.description),
+    }
 
 
 @api.delete("/datasets/{dataset_id}/")
@@ -1629,6 +1646,12 @@ class DatasetFolderOut(Schema):
     modified_at: datetime
 
 
+class DatasetFolderWriteOut(DatasetFolderOut):
+    """A folder create or update response plus free-text warnings for ``name``."""
+
+    warnings: list[NameWarningOut] = []
+
+
 class MoveDatasetItemIn(Schema):
     """Payload for placing a dataset item in a folder; null means the dataset root."""
 
@@ -1641,6 +1664,20 @@ def _get_dataset_folder(dataset: Dataset, folder_id: int) -> DatasetFolder:
     if folder is None:
         raise HttpError(404, "Folder not found in this dataset")
     return folder
+
+
+def _folder_write_out(folder: DatasetFolder, warnings: list[dict]) -> dict:
+    """Serialise a folder for a create or update response, with the free-text warnings beside it."""
+    return {
+        "id": folder.pk,
+        "dataset_id": folder.dataset_id,
+        "parent_id": folder.parent_id,
+        "name": folder.name,
+        "position": folder.position,
+        "created_at": folder.created_at,
+        "modified_at": folder.modified_at,
+        "warnings": warnings,
+    }
 
 
 def _subtree_folder_ids(root_id: int) -> set[int]:
@@ -1688,9 +1725,12 @@ def list_dataset_folders(request, dataset_id: str, share_token: str | None = Non
     return folders
 
 
-@api.post("/datasets/{dataset_id}/folders/", response={201: DatasetFolderOut})
+@api.post("/datasets/{dataset_id}/folders/", response={201: DatasetFolderWriteOut})
 def create_dataset_folder(request, dataset_id: str, payload: DatasetFolderIn):
-    """Create a folder in the dataset's tree. Requires write access to the dataset."""
+    """Create a folder in the dataset's tree. Requires write access to the dataset.
+
+    ``warnings`` flags a name that looks like an identifier.
+    """
     from epicurrents.permissions import can_write_object
 
     user = _require_auth(request)
@@ -1711,12 +1751,15 @@ def create_dataset_folder(request, dataset_id: str, payload: DatasetFolderIn):
             position=payload.position,
         )
         log_activity(verb="library.dataset.folder.create", target=folder)
-    return 201, folder
+    return 201, _folder_write_out(folder, name_warnings(name=name))
 
 
-@api.patch("/datasets/{dataset_id}/folders/{folder_id}/", response=DatasetFolderOut)
+@api.patch("/datasets/{dataset_id}/folders/{folder_id}/", response=DatasetFolderWriteOut)
 def update_dataset_folder(request, dataset_id: str, folder_id: int, payload: DatasetFolderPatchIn):
-    """Rename, move, or reposition a folder. Requires write access to the dataset."""
+    """Rename, move, or reposition a folder. Requires write access to the dataset.
+
+    ``warnings`` flags a new name that looks like an identifier.
+    """
     from epicurrents.permissions import can_write_object
 
     user = _require_auth(request)
@@ -1726,11 +1769,13 @@ def update_dataset_folder(request, dataset_id: str, folder_id: int, payload: Dat
     folder = _get_dataset_folder(dataset, folder_id)
 
     patch = payload.model_dump(exclude_unset=True)
+    warnings: list[dict] = []
     if "name" in patch:
         name = (patch["name"] or "").strip()
         if not name:
             raise HttpError(422, "Folder name cannot be empty")
         folder.name = name
+        warnings = name_warnings(name=name)
     if "parent_id" in patch:
         if patch["parent_id"] is None:
             folder.parent = None
@@ -1753,7 +1798,7 @@ def update_dataset_folder(request, dataset_id: str, folder_id: int, payload: Dat
             target=folder,
             metadata={"fields_updated": sorted(patch.keys())},
         )
-    return folder
+    return _folder_write_out(folder, warnings)
 
 
 @api.delete("/datasets/{dataset_id}/folders/{folder_id}/")
@@ -2155,12 +2200,31 @@ def revoke_dataset_access(request, dataset_id: str, right_id: int):
 # ---------------------------------------------------------------------------
 
 
-def _get_tag(tag_id: int) -> Tag:
-    """Return tag or raise 404."""
+def _get_tag(tag_id: int, user=None) -> Tag:
+    """Return the tag or raise 404; with *user*, a tag outside the caller's reach is 404 as well.
+
+    The same answer for "no such tag" and "not yours to see", so the id space
+    cannot be walked to read tag names.
+    """
     tag = Tag.objects.filter(pk=tag_id).first()
-    if tag is None:
+    if tag is None or (user is not None and not tag_reachable(user, tag.pk)):
         raise HttpError(404, "Tag not found")
     return tag
+
+
+def _tag_write_out(tag: Tag, warnings: list[dict]) -> dict:
+    """Serialise a tag for a create or update response, with the free-text warnings beside it."""
+    return {
+        "id": tag.pk,
+        "name": tag.name,
+        "description": tag.description,
+        "parent_id": tag.parent_id,
+        "author_id": tag.author_id,
+        "curated": tag.curated,
+        "created_at": tag.created_at,
+        "modified_at": tag.modified_at,
+        "warnings": warnings,
+    }
 
 
 def _get_tag_subtree_ids(root_id: int) -> list[int]:
@@ -2206,18 +2270,24 @@ def list_tags(
     limit: int = Query(50, ge=1, le=200),
     offset: int = Query(0, ge=0),
 ):
-    """List tags.
+    """List the tags within the caller's reach.
 
     - Omit ``parent_id`` to list root-level tags (no parent).
     - Pass ``parent_id`` to list direct children of a tag.
+
+    Reach is ``library.tag_scope``: curated tags, the caller's own, the tags on
+    objects the caller can read, and their ancestors. Superusers see every tag.
     """
-    _require_auth(request)
+    user = _require_auth(request)
+    reachable = visible_tag_ids(user)
     if parent_id is not None:
-        if not Tag.objects.filter(pk=parent_id).exists():
+        if not Tag.objects.filter(pk=parent_id).exists() or (reachable is not None and parent_id not in reachable):
             raise HttpError(404, "Tag not found")
         qs = Tag.objects.filter(parent_id=parent_id).order_by("name")
     else:
         qs = Tag.objects.filter(parent__isnull=True).order_by("name")
+    if reachable is not None:
+        qs = qs.filter(pk__in=reachable)
     tags = list(qs[offset : offset + limit])
     log_activity(
         verb="library.tag.list",
@@ -2231,45 +2301,52 @@ def list_tags(
     return tags
 
 
-@api.post("/tags/", response={201: TagOut})
+@api.post("/tags/", response={201: TagWriteOut})
 def create_tag(request, payload: TagIn):
     """Create a new tag.
 
-    Any authenticated user may create tags. Optionally nest under an existing
-    tag by providing ``parent_id``.
+    Reserved for staff while ``LIBRARY_TAG_CREATION_REQUIRES_STAFF`` is on
+    (the default). A tag created by staff is curated and listed to everyone;
+    any other tag is listed by reach. Optionally nest under an existing tag
+    within the caller's reach by providing ``parent_id``. ``warnings`` flags
+    a name or description that looks like an identifier.
     """
     user = _require_auth(request)
+    if not can_create_tag(user):
+        log_security_event("permission.denied", permission="library.tag.create", actor_id=user.pk)
+        raise HttpError(403, "Creating tags is reserved for staff on this deployment.")
     parent = None
     if payload.parent_id is not None:
-        parent = Tag.objects.filter(pk=payload.parent_id).first()
-        if parent is None:
-            raise HttpError(404, f"Parent tag {payload.parent_id} not found")
+        parent = _get_tag(payload.parent_id, user=user)
     tag = Tag.objects.create(
         author=user,
         name=payload.name,
         description=payload.description,
         parent=parent,
+        curated=bool(user.is_staff or user.is_superuser),
     )
     log_activity(verb="library.tag.create", target=tag)
-    return 201, tag
+    return 201, _tag_write_out(tag, name_warnings(name=payload.name, description=payload.description))
 
 
 @api.get("/tags/{tag_id}/", response=TagOut)
 def get_tag_detail(request, tag_id: int):
-    """Retrieve a single tag by ID."""
-    _require_auth(request)
-    tag = _get_tag(tag_id)
+    """Retrieve a single tag by ID; a tag outside the caller's reach is 404."""
+    user = _require_auth(request)
+    tag = _get_tag(tag_id, user=user)
     log_activity(verb="library.tag.read", target=tag)
     return tag
 
 
-@api.patch("/tags/{tag_id}/", response=TagOut)
+@api.patch("/tags/{tag_id}/", response=TagWriteOut)
 def update_tag(request, tag_id: int, payload: TagPatchIn):
     """Update a tag's name, description, or parent.
 
-    Requires the caller to be the tag author or a superuser.
-    Moving a tag to a new parent triggers cycle detection to prevent loops.
-    Pass ``parent_id: null`` explicitly to promote a tag to root level.
+    Requires the caller to be the tag author or a superuser. Moving a tag to
+    a new parent triggers cycle detection to prevent loops, and the new parent
+    must be within the caller's reach. Pass ``parent_id: null`` explicitly to
+    promote a tag to root level. ``warnings`` flags a new name or description
+    that looks like an identifier.
     """
     user = _require_auth(request)
     tag = _get_tag(tag_id)
@@ -2285,9 +2362,7 @@ def update_tag(request, tag_id: int, payload: TagPatchIn):
         fields_updated.append("description")
     if "parent_id" in payload.model_fields_set:
         if payload.parent_id is not None:
-            parent = Tag.objects.filter(pk=payload.parent_id).first()
-            if parent is None:
-                raise HttpError(404, f"Parent tag {payload.parent_id} not found")
+            parent = _get_tag(payload.parent_id, user=user)
             _check_no_tag_cycle(tag, payload.parent_id)
             tag.parent = parent
         else:
@@ -2301,7 +2376,7 @@ def update_tag(request, tag_id: int, payload: TagPatchIn):
             target=tag,
             metadata={"fields_updated": fields_updated},
         )
-    return tag
+    return _tag_write_out(tag, name_warnings(name=payload.name, description=payload.description))
 
 
 @api.delete("/tags/{tag_id}/")
@@ -2336,9 +2411,10 @@ def list_tagged_items(
     By default (``include_children=true``) results include items tagged with
     any descendant tag, enabling hierarchical browsing of the taxonomy.
     Set ``include_children=false`` to retrieve items with this exact tag only.
+    A tag outside the caller's reach is 404.
     """
     user = _require_auth(request)
-    tag = _get_tag(tag_id)
+    tag = _get_tag(tag_id, user=user)
 
     if include_children:
         tag_ids = _get_tag_subtree_ids(tag_id)
@@ -2395,12 +2471,13 @@ def list_tagged_items(
 def tag_item(request, tag_id: int, payload: CollectionItemIn):
     """Apply a tag to an object.
 
-    The caller must have write access to the referenced object.
+    The caller must have write access to the referenced object, and the tag
+    must be within the caller's reach (404 otherwise, as everywhere else).
     ``content_type_id`` is a Django ``ContentType`` PK; ``object_id`` is the
     target object's PK as a string.
     """
     user = _require_auth(request)
-    tag = _get_tag(tag_id)
+    tag = _get_tag(tag_id, user=user)
 
     ct = ContentType.objects.filter(pk=payload.content_type_id).first()
     if ct is None:

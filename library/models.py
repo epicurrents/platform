@@ -426,10 +426,12 @@ class DatasetItem(models.Model):
 class Tag(models.Model):
     """A hierarchical label that can be applied to any object.
 
-    Tags form a tree via the ``parent`` FK (adjacency list).  The tag
-    taxonomy is global — all authenticated users can browse and apply tags.
-    Only the tag author (or a superuser) may edit or delete the tag
-    definition itself.
+    Tags form a tree via the ``parent`` FK (adjacency list).  Creating one is
+    reserved for staff unless ``LIBRARY_TAG_CREATION_REQUIRES_STAFF`` is off,
+    and what a caller can list, read and apply is what ``library.tag_scope``
+    says they can reach: curated tags, their own, and the tags on objects they
+    can read.  Only the tag author (or a superuser) may edit or delete the
+    tag definition itself.
 
     Items are associated through ``TaggedItem``.  Querying items by tag
     optionally includes descendants (see ``_get_tag_subtree_ids`` in the
@@ -454,6 +456,13 @@ class Tag(models.Model):
         on_delete=models.SET_NULL,
         related_name="children",
     )
+    # Stamped at creation from the author's staff flag. A curated tag is the
+    # deployment's vocabulary and is listed to every authenticated user; an
+    # uncurated one is listed only to its author and to readers of the objects
+    # it decorates (library.tag_scope). Stamped rather than derived from the
+    # author's current flag so a later promotion or demotion does not silently
+    # change who sees what was typed.
+    curated = models.BooleanField(default=False)
 
     created_at = models.DateTimeField(auto_now_add=True)
     modified_at = models.DateTimeField(auto_now=True)

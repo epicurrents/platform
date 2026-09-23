@@ -1,6 +1,6 @@
 # Anonymisation compliance — execution plan
 
-**Status: v1.4, 2026-09-23. Phases 0–3 shipped; phases 4–7 not started.** Three decisions taken on review are folded in: `file_hash` leaves every response, the author's included; a centre's withdrawal confirmation is the purge command's report and never a lookup; and the dataset releases on a monthly cadence, with the acquisition embargo's length left to the deployment. The reason this plan exists is the edu project's multi-centre teaching dataset, whose design in the project's own engineering note is a contextual-approach anonymisation case; [the section on it](#the-edu-teaching-dataset-under-the-guidelines) says what the guidelines require of that design and which phases are prerequisites for its first release. The assessment in [docs/anonymisation-compliance.md](../anonymisation-compliance.md) found that the platform's de-identified output is pseudonymised personal data under the EDPB Guidelines 02/2026 on Anonymisation, and recorded eight design gaps. This note is the plan for closing the ones the software can close, in an order where each phase leaves the platform in a consistent, shippable state. Paragraph references (¶ *n*) are to the guidelines' consultation version, as in the assessment.
+**Status: v1.5, 2026-09-23. Phases 0–4 shipped; phases 5–7 not started.** Three decisions taken on review are folded in: `file_hash` leaves every response, the author's included; a centre's withdrawal confirmation is the purge command's report and never a lookup; and the dataset releases on a monthly cadence, with the acquisition embargo's length left to the deployment. The reason this plan exists is the edu project's multi-centre teaching dataset, whose design in the project's own engineering note is a contextual-approach anonymisation case; [the section on it](#the-edu-teaching-dataset-under-the-guidelines) says what the guidelines require of that design and which phases are prerequisites for its first release. The assessment in [docs/anonymisation-compliance.md](../anonymisation-compliance.md) found that the platform's de-identified output is pseudonymised personal data under the EDPB Guidelines 02/2026 on Anonymisation, and recorded eight design gaps. This note is the plan for closing the ones the software can close, in an order where each phase leaves the platform in a consistent, shippable state. Paragraph references (¶ *n*) are to the guidelines' consultation version, as in the assessment.
 
 ## What "comply in the technical sense" means here
 
@@ -64,7 +64,9 @@ A project that creates grants in a data migration and expected raw serving will 
 - Reprocessing: `refresh_signal_metadata` leaves both new fields alone, as it does `channel_order_version`, for the same reason: a refresh reads the header and cannot know which pass wrote it. A recording behind the current version is reprocessed only by a deliberate re-ingest, which stamps it.
 - Reviews: `gdpr-compliance` (new columns, no personal data), `audit-trail-completeness` (payload change and the command's activity scope), `phi-exposure` (two new `Out` fields, and the Phase 1 shape test must be updated in the same commit, which is what it is for).
 
-## Phase 4 — Free-text hygiene
+## Phase 4 — Free-text hygiene (shipped 2026-09-23)
+
+**Shipped with four departures from the text below.** Tag creation is reserved for staff by default (`LIBRARY_TAG_CREATION_REQUIRES_STAFF`), and a tag created by staff is stamped `Tag.curated` and reaches every authenticated user, so the scoped listing does not hide the deployment's vocabulary; an uncurated tag is reached by its author, by readers of the objects it decorates, and through those tags' ancestors so the tree stays browsable. Every tag endpoint answers a tag outside reach with the 404 of a missing tag. The frontend surfaces the warnings as a warning toast per flagged field after the save rather than as a confirm step before it, because the heuristic runs server-side and mirroring it client-side would drift; the label stays one edit away. Media display names got the same warnings, being the same channel. And two activity rows were found carrying user-typed text in their metadata, the bulk-rename prefix and the new media display name; both now carry field names only, and the rule in AGENTS.md says so.
 
 **Why.** `display_name`, dataset names and descriptions, folder names and tag names are unvalidated and grantee-visible; tags are listed to every authenticated user regardless of access. Free text is the classic identifier channel (¶ 23, 50), and the notice has to say these fields are the uploader's responsibility until the platform at least warns.
 
@@ -141,12 +143,12 @@ The platform-side items from the edu note's "work required", restated as platfor
 | 1 Linkage keys + shape test | — | M | Shipped 2026-09-22 |
 | 2 Model default | — | S | Shipped 2026-09-22 |
 | 3 Per-recording record | 1 (shape test) | M | Shipped 2026-09-23 |
-| 4 Free-text hygiene | 1 (shape test, for `warnings`) | M | Yes, or split: tag scope and push bodies first, the heuristic second |
+| 4 Free-text hygiene | 1 (shape test, for `warnings`) | M | Shipped 2026-09-23 |
 | 5 Export labelling | 3 (version range in the envelope) | S | Yes |
 | 6 Assessment support | 3 (version comparison) | M | Yes |
 | 7 Dataset support | 1, 2 (default), 3 (record) | L | In slices: gate, purge and release cadence first, validating ingest and pooling second, the reports last |
 
-Phases 1 and 2 are the minimum before any deployment states its position under the guidelines to a recipient; phases 3 and 6 are what let it document that position; phases 4 and 5 reduce the surface the position has to defend. Phase 7 is what the edu dataset needs on top, and its first slice (the visibility gate, the share-token refusal, the purge command and the monthly release cadence) is the release blocker. None of them changes the classification of the output, which stays pseudonymised personal data, and the assessment's given-data tables are updated in the commit that ships each phase.
+Phases 1 and 2 are the minimum before any deployment states its position under the guidelines to a recipient; phases 3 and 6 are what let it document that position; phases 4 and 5 reduce the surface the position has to defend (4 shipped). Phase 7 is what the edu dataset needs on top, and its first slice (the visibility gate, the share-token refusal, the purge command and the monthly release cadence) is the release blocker. None of them changes the classification of the output, which stays pseudonymised personal data, and the assessment's given-data tables are updated in the commit that ships each phase.
 
 ## Versioning
 

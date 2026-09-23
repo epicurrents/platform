@@ -258,15 +258,14 @@ def _save_edf_results(recording, result) -> None:
 
 
 def _push_display_name(recording) -> str:
-    """Grantee-safe label for push-notification bodies.
+    """The hash-prefix handle a push-notification body names the recording by.
 
     Push bodies surface on lock screens and transit the Celery broker in
-    plaintext, so they must not carry ``original_name`` (routinely a patient
-    identifier). Mirrors the API fallback: ``display_name`` when set,
-    otherwise the stored-hash prefix.
+    plaintext, so they carry neither ``original_name`` (routinely a patient
+    identifier) nor ``display_name`` (free text the uploader typed, which the
+    platform only warns about). The author knows which recording they
+    uploaded, and the label is one tap away in the app.
     """
-    if recording.display_name:
-        return recording.display_name
     return recording.stored_name[:8].upper()
 
 

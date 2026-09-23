@@ -1,4 +1,5 @@
 import { http } from '#lib/http'
+import type { NameWarning } from '#lib/nameWarnings'
 
 export interface RecordingMeta {
     format: string
@@ -50,6 +51,8 @@ export interface Recording {
      * collection is restored. Null for genuinely uncollected recordings.
      */
     trashed_collection: { id: number; name: string } | null
+    /** PATCH responses only: free-text warnings for `display_name`. */
+    warnings?: NameWarning[]
 }
 
 export interface RecordingUpload {
@@ -59,6 +62,8 @@ export interface RecordingUpload {
     file_extension: string
     file_size: number
     status: string
+    /** Free-text warnings for the `display_name` sent with the upload. */
+    warnings?: NameWarning[]
 }
 
 export interface RecordingStatus {

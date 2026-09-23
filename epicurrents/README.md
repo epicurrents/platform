@@ -212,9 +212,11 @@ Three modules under [settings/](settings/):
 | `API_THROTTLE_RATE_DEFAULT` / `API_THROTTLE_RATE_UPLOAD` / `API_THROTTLE_IP_RATE` | `300` / `30` / `1000` (per minute) | Throttle ceilings. `API_THROTTLE_RATES` and `API_THROTTLE_SCOPE_MAP` carry the full scope structure; see [docs/operations.md → API rate limiting](../docs/operations.md#api-rate-limiting). |
 | `DISABLE_NO_STORE_HEADERS` | `False` | PHI hygiene: `SecurityHeadersMiddleware` sets `Cache-Control: no-store` on every response (via `setdefault`) unless this is set; non-PHI static assets opt back into caching themselves. See AGENTS.md → *PHI no-store caching*. |
 | `ENABLE_PUBLIC_VIEWER` | `False` | Serves the standalone, auth-free viewer at `/viewer/<mode>`. See [Public viewer](#public-viewer). |
+| `TEXT_HYGIENE_PATTERNS` | `{}` | Deployment-specific identifier patterns, kind → regular expression, added to the built-in heuristic in [text_hygiene.py](text_hygiene.py) that returns `warnings` beside every write of a grantee-visible label. A project settings module extends it (dict-merge); `manage.py check` refuses a pattern that does not compile. |
+| `LIBRARY_TAG_CREATION_REQUIRES_STAFF` | `True` | Reserve tag creation for staff; see [library/README.md](../library/README.md#tag-reach). |
 | `PUBLIC_VIEWER_MODES` | one `public` mode | Per-mode viewer lib + SETUP for the public viewer; project-overridable. See [Public viewer](#public-viewer). |
 
-Project plugins extend the settings via `projects/<name>/settings.py`. The merge rules — list-append for `INSTALLED_APPS` / `MIDDLEWARE` / a few other named lists, dict-merge for `CELERY_BEAT_SCHEDULE`, replace for everything else — are defined in [project_loader.py](project_loader.py).
+Project plugins extend the settings via `projects/<name>/settings.py`. The merge rules — list-append for `INSTALLED_APPS` / `MIDDLEWARE` / a few other named lists, dict-merge for `CELERY_BEAT_SCHEDULE` and `TEXT_HYGIENE_PATTERNS`, replace for everything else — are defined in [project_loader.py](project_loader.py).
 
 ## Project loader
 

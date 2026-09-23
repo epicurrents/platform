@@ -1,4 +1,4 @@
-"""Django system check for a project's or plugin's declared platform version.
+"""Django system checks: a project's or plugin's declared platform version, and the text-hygiene patterns.
 
 A project lives in its own repository now, and nothing keeps it in step with the
 platform it is checked out beside. The failure that follows is rarely a clean
@@ -33,7 +33,10 @@ refusing to boot over an absent declaration would be a worse failure than the
 drift it is guarding against.
 """
 
+import re
+
 from django.apps import apps as django_apps
+from django.conf import settings
 from django.core.checks import Error, Tags, Warning, register
 
 from epicurrents.version import InvalidVersion, __version__, compatible_range, satisfies
@@ -94,6 +97,43 @@ def check_platform_version_requirements(app_configs, **kwargs):
                     ),
                     obj=config.name,
                     id="epicurrents.E001",
+                )
+            )
+    return issues
+
+
+@register(Tags.security)
+def check_text_hygiene_patterns(app_configs, **kwargs):
+    """Verify ``TEXT_HYGIENE_PATTERNS`` is a mapping of kind to a regular expression that compiles.
+
+    The patterns run on every rename and upload that carries a label, so one
+    that does not compile would fail those requests rather than the boot.
+    """
+    configured = getattr(settings, "TEXT_HYGIENE_PATTERNS", {})
+    if not isinstance(configured, dict):
+        return [
+            Error(
+                "TEXT_HYGIENE_PATTERNS must be a dict of kind -> regular expression.",
+                id="epicurrents.E010",
+            )
+        ]
+    issues = []
+    for kind, pattern in configured.items():
+        if not isinstance(kind, str) or not kind or not isinstance(pattern, str):
+            issues.append(
+                Error(
+                    f"TEXT_HYGIENE_PATTERNS entry {kind!r} must map a non-empty string kind to a string pattern.",
+                    id="epicurrents.E011",
+                )
+            )
+            continue
+        try:
+            re.compile(pattern)
+        except re.error as exc:
+            issues.append(
+                Error(
+                    f"TEXT_HYGIENE_PATTERNS[{kind!r}] does not compile: {exc}",
+                    id="epicurrents.E012",
                 )
             )
     return issues

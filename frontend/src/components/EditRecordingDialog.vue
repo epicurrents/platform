@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { reactive, ref, watch } from 'vue'
 import { t } from '#i18n'
+import { toastNameWarnings } from '#lib/nameWarnings'
 import { showToast } from '#lib/toast'
 import { updateRecording, type Recording } from '#api/recordings'
 
@@ -54,6 +55,7 @@ async function submit () {
         })
         emit('updated', updated)
         showToast(t('Recording updated.', SCOPE), 'success')
+        toastNameWarnings(updated.warnings)
         emit('close')
     } catch {
         error.value = t('Failed to update recording. Please try again.', SCOPE)
