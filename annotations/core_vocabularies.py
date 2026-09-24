@@ -53,8 +53,8 @@ VOCABULARY_PINS: dict[str, VocabularyPin] = {
     "epicurrents.biosignal": VocabularyPin(
         file="biosignal-events.json",
         label="Epicurrents biosignal acquisition events",
-        version="1.0",
-        sha256="0c87f692e59f130725ce25dbe0fa81640e72868ed567e7bf5b2d484e05aad7c3",
+        version="1.1",
+        sha256="145dd6b63ad810dd81955bb9d95f1b01d650bb3fd73a79fbf9b425c91bfc1720",
     ),
     "epicurrents.eeg": VocabularyPin(
         file="eeg-events.json",

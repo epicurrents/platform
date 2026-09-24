@@ -28,7 +28,8 @@ from conftest import post_json
 CODES_URL = "/annotations/api/v1/codes/"
 REPO_ROOT = Path(__file__).resolve().parents[2]
 VIEWER_FILES = {
-    "epicurrents.biosignal": REPO_ROOT / "frontend/viewer/epicurrents/core/src/assets/annotation/vocabulary/biosignal-events.json",
+    "epicurrents.biosignal": REPO_ROOT
+    / "frontend/viewer/epicurrents/core/src/assets/annotation/vocabulary/biosignal-events.json",
     "epicurrents.eeg": REPO_ROOT / "frontend/viewer/epicurrents/eeg-module/src/components/vocabulary/eeg-events.json",
 }
 
@@ -60,13 +61,23 @@ class TestPinnedCopies:
 
 
 class TestSets:
-    def test_biosignal_accepts_its_four_categories(self):
+    def test_biosignal_accepts_its_five_categories(self):
         vocabulary = load_vocabulary("epicurrents.biosignal")
-        assert set(vocabulary["categories"]) == {"TECHNICAL", "INTERVENTION", "OBSERVATION", "ENVIRONMENT"}
+        assert set(vocabulary["categories"]) == {
+            "TECHNICAL",
+            "INTERVENTION",
+            "OBSERVATION",
+            "ENVIRONMENT",
+            "PHYSIOLOGY",
+        }
         assert accepted_codes("epicurrents.biosignal") == acquisition_codes("epicurrents.biosignal")
-        assert {"BIO_TECH_CALIBRATION", "BIO_INT_MEDICATION", "BIO_OBS_LOC_ALERT", "BIO_ENV_NOISE"} <= accepted_codes(
-            "epicurrents.biosignal"
-        )
+        assert {
+            "BIO_TECH_CALIBRATION",
+            "BIO_INT_MEDICATION",
+            "BIO_OBS_LOC_ALERT",
+            "BIO_ENV_NOISE",
+            "BIO_PHYS_APNEA",
+        } <= accepted_codes("epicurrents.biosignal")
 
     def test_eeg_accepts_activation_and_the_shared_set_but_no_finding(self):
         eeg = acquisition_codes("epicurrents.eeg")

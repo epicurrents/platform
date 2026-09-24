@@ -1,6 +1,6 @@
 # Annotation event vocabulary — the acquisition set
 
-**Status:** v1.2, 2026-09-24. Design settled and built through the vendor mappings; what remains is the viewer's EDF export carrying the codes, and the documentation at release. Last privacy item on the [ROADMAP](../../ROADMAP.md) ("annotation event vocabulary still fingerprints the acquisition software") and Phase 4 of the [channel de-identification plan](channel-deidentification-plan.md).
+**Status:** v1.3, 2026-09-24. Design settled and built through the vendor mappings; what remains is the viewer's EDF export carrying the codes, and the documentation at release. Last privacy item on the [ROADMAP](../../ROADMAP.md) ("annotation event vocabulary still fingerprints the acquisition software") and Phase 4 of the [channel de-identification plan](channel-deidentification-plan.md).
 
 **This is the initial vocabulary.** It carries what a reader needs to explain a change in the signal by something that happened in the room, and no more. Terms will be added along the way, and the crosswalk columns filled, as SNOMED CT concepts are adopted for them; adding a term is an entry in a JSON file and a log row below, not a redesign.
 
@@ -22,7 +22,7 @@ The vocabulary lives in the viewer, which is where events are made and read, as 
 
 `GenericAnnotation` keeps the statics, made class-aware: each walks `this.CODED_EVENTS`, so a subclass that overrides the getter is searched through its own view, and `extendEvents` writes into the table that owns the category it names. They were arrow-function properties bound to the base class, which is why `EegEvent` had to copy them; as methods they inherit.
 
-`GenericBiosignalEvent` declares the shared set, four categories loaded from the file biosignal-events.json in a vocabulary folder beside the annotation classes in the core package. `EegEvent` declares its own, eeg-events.json beside its class in the EEG module, and its `CODED_EVENTS` getter returns the parent's categories followed by its own. Category names are unique across the chain: a subclass cannot shadow a parent category, and extending a shared category through `EegEvent` extends it for every biosignal event class, which is the intended way to add a shared term from outside.
+`GenericBiosignalEvent` declares the shared set, five categories loaded from the file biosignal-events.json in a vocabulary folder beside the annotation classes in the core package. `EegEvent` declares its own, eeg-events.json beside its class in the EEG module, and its `CODED_EVENTS` getter returns the parent's categories followed by its own. Category names are unique across the chain: a subclass cannot shadow a parent category, and extending a shared category through `EegEvent` extends it for every biosignal event class, which is the intended way to add a shared term from outside.
 
 Each JSON file names its standard and version at the top and carries categories, each with a scope, keyed terms and a description. A term is a `CodedEventProperties` object: `code`, `name`, optional `description`, `class` (the event class it is created with), `meta` (the keys a `Code.meta` for this term is expected to carry, each with a one-line meaning) and `standardCodes` (the crosswalk). The two new optional fields on the type are the only type change.
 
@@ -99,6 +99,29 @@ Procedures are enumerated only where knowing which one changes the reading; ever
 
 External influences are what reaches the signal or the patient without anyone intending it: the distinction from INTERVENTION and from the activation set is intent, and from OBSERVATION it is that the patient is not the source.
 
+**PHYSIOLOGY** (`class: event`)
+
+| Code | Name | Notes |
+|---|---|---|
+| `BIO_PHYS_BRADYCARDIA` | Bradycardia | State-like; `meta.rate`. SCT 48867003. |
+| `BIO_PHYS_TACHYCARDIA` | Tachycardia | State-like; `meta.rate`. SCT 3424008; MDC_EVT_ECG_TACHY. |
+| `BIO_PHYS_ARRHYTHMIA` | Arrhythmia | Span for a run, instant for a beat; `meta.rhythm`. SCT 698247007; MDC_EVT_ECG_ARRHY. |
+| `BIO_PHYS_ASYSTOLE` | Asystole | Span; a pause longer than the rhythm allows, up to standstill. SCT 397829000; MDC_EVT_ECG_ASYSTOLE. |
+| `BIO_PHYS_APNEA` | Apnoea | Span; `meta.type` (central, obstructive, mixed). SCT 1023001; MDC_EVT_APNEA. |
+| `BIO_PHYS_HYPOPNEA` | Hypopnoea | Span. No SNOMED finding for it; the sleep-scoring term has only an index. |
+| `BIO_PHYS_HYPERVENTILATION` | Spontaneous hyperventilation | Span; the procedure is `EEG_ACT_HV`, which keeps the SNOMED crosswalk: a crosswalk is looked up across the merged table, so one concept names one term. |
+| `BIO_PHYS_PERIODIC_BREATHING` | Periodic breathing | Span. No general SNOMED finding; the altitude and the sleep-apnoea variants are too specific. |
+| `BIO_PHYS_DESATURATION` | Oxygen desaturation | Span; `meta.nadir`. SCT 449171008. |
+| `BIO_PHYS_SWEATING` | Sweating | State-like. SCT 415690000. |
+| `BIO_PHYS_FLUSHING` | Flushing | State-like. SCT 238810007. |
+| `BIO_PHYS_PALLOR` | Pallor | State-like. The SNOMED pallor concept is inactive; no crosswalk. |
+| `BIO_PHYS_CYANOSIS` | Cyanosis | State-like. SCT 3415004. |
+| `BIO_PHYS_HICCUP` | Hiccup | Span for a bout, instant for one. SCT 65958008. |
+| `BIO_PHYS_VOMITING` | Vomiting | Instant. SCT 422400008. |
+| `BIO_PHYS_YAWNING` | Yawning | Instant. SCT 248626009. |
+
+The cardiorespiratory and autonomic state of the patient, whether seen at the bedside or read from a polygraphic channel. The category exists because these terms are neither observations nor findings in the sense the other categories use: a technician noting tachycardia and an ECG detector raising it name the same fact about the patient, and the annotator says who marked it. What makes a term a finding is that it interprets the signal of interest, which none of these do, so the category is acquisition-scoped and a platform translates a vendor's cardiac and respiratory markers into it. The boundary with OBSERVATION is bedside behaviour and consciousness there, the body's state here. The SNOMED crosswalks were checked against the SNOMED CT release of August 2026 through a public FHIR terminology server, the IEEE 11073 event identifiers against the IHE Devices Technical Framework's event table; bradycardia has only a sustained-bradycardia event identifier there, which is not recorded as a crosswalk for the plain term.
+
 Body position is an observation because it originates with the patient as often as with the examiner (a turn during polysomnography, a head-down tilt after a faint), and its values are positions rather than a change event. Level of consciousness is the behavioural state on the AVPU scale with three qualified forms of "responds to voice" as values of their own, because a value crosses the redaction boundary and a qualifier in `meta` does not; a GCS or RASS score goes in `meta.gcs` or `meta.rass`.
 
 **The instant-or-span convention**, stated once for every state-like term: an event with duration 0 marks entry into the state, which holds until the next event of the same family; an event with a duration bounds the state to that span. A recording that was supine throughout carries one instant at 0 seconds. The families are position, level of consciousness, eyes, video, montage, light and electrical device.
@@ -158,5 +181,6 @@ Steps A and B change published surface in two viewer packages: `CodedEventProper
 | Date | Change |
 |---|---|
 | 2026-09-24 | v1.0. Design from the 2026-09-24 discussion written up; DICOM crosswalk checked against CID 3035; SNOMED column left empty pending checked lookups. Steps A, B and C1 built the same day; electrode fault and electrode fixed added to the shared set on review, the electrode carried by its canonical label because ingest reorders channels; ENVIRONMENT category added for external influences. |
+| 2026-09-24 | v1.3. PHYSIOLOGY category added to the shared set (biosignal vocabulary 1.1): the cardiorespiratory and autonomic terms the Nicolet polygraphic event types and bedside notes need, which were neither observations nor findings as the categories were drawn; acquisition-scoped, so ingest translates them. SNOMED and IEEE 11073 crosswalks recorded where a checked lookup exists. |
 | 2026-09-24 | v1.2. Step C3 built: the viewer's Nicolet reader names every built-in event type by GUID and codes the acquisition ones with vocabulary terms; the server-side converter's table written against its sidecar and validated against the real files' events. Two findings: a converted upload reached both ingest seams and doubled its events, fixed by letting the sidecar own the rows; 14 and 16 Hz photic trains have no per-frequency term and take the unqualified one. |
 | 2026-09-24 | v1.1. Step C2 built: mappers and JSON tables, `Event` rows with a `Code` under the owning standard, text-free placeholders, the raw record kept under the annotation-text rule. Two corrections to section 6 as first written: the standard is resolved from the term rather than the modality, and the raw record is not author-private but follows the annotation-text rule, which is left as it was. The sidecar schema now accepts a null `type` or `label`, which the Nicolet converter writes and the pinned schema had refused. |
