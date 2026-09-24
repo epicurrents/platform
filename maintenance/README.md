@@ -59,6 +59,8 @@ Core registrations, made from `MaintenanceConfig.ready`:
 | `recordings.deidentification_report` | celery | `deidentification_report --format json` | no |
 | `epicurrents.grant_assessments` | celery | `grant_assessments --format json` | no |
 | `library.release_dataset` | celery | `release_dataset <hash> --format json [--as-of D] [--dry-run] [--profile-version V] [--k N] [--m N] [--assessment-reference R]` | yes |
+| `library.dataset_access_report` | celery | `dataset_access_report <hash> --format json --days N` | no |
+| `library.dataset_anonymity_report` | celery | `dataset_anonymity_report <hash> --format json [--release ID]` | no |
 | `mail.send_test` | celery | `send_test_email` | no |
 | `platform.update` | host | the agent applies the named package | yes |
 | `platform.backup` | host | the agent snapshots code, database and `.env` without stopping anything | yes |

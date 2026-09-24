@@ -38,34 +38,15 @@ from django.utils import timezone
 from activity.models import Activity
 from activity.system_activity import with_system_activity
 from library.models import Dataset
-from library.release import decide_release, run_release
+from library.release import decide_release, member_handle, resolve_dataset, run_release
 
 
 def _resolve_dataset(identifier: str) -> Dataset:
     """Resolve a live dataset by its 32-character hash or integer primary key, or raise."""
-    identifier = identifier.strip()
-    qs = Dataset.objects.filter(deleted_at__isnull=True)
-    if len(identifier) == 32 and identifier.isalnum():
-        dataset = qs.filter(object_hash=identifier.upper()).first()
-    elif identifier.isdigit():
-        dataset = qs.filter(pk=int(identifier)).first()
-    else:
-        dataset = None
+    dataset = resolve_dataset(identifier)
     if dataset is None:
         raise CommandError(f"No active dataset matches {identifier!r}")
     return dataset
-
-
-def _handle_of(item) -> str:
-    """Name a member by its content type and public handle, never by a label."""
-    obj = item.content_object
-    if obj is None:
-        return f"{item.content_type.model}:{item.object_id}"
-    stored_name = getattr(obj, "stored_name", None)
-    if stored_name:
-        return f"{item.content_type.model}:{stored_name.split('.', 1)[0]}"
-    object_hash = getattr(obj, "object_hash", None) or getattr(obj, "content_hash", None)
-    return f"{item.content_type.model}:{object_hash or item.object_id}"
 
 
 class Command(BaseCommand):
@@ -154,8 +135,8 @@ class Command(BaseCommand):
             "released_count": len(released),
             "withheld_count": len([item for item in eligible if item.pk not in released_pks]),
             "deidentification_versions": release.deidentification_versions if release is not None else [],
-            "released": [_handle_of(item) for item in released],
-            "withheld": [_handle_of(item) for item in eligible if item.pk not in released_pks],
+            "released": [member_handle(item) for item in released],
+            "withheld": [member_handle(item) for item in eligible if item.pk not in released_pks],
         }
 
     def _emit(self, report: dict, fmt: str, *, dry_run: bool) -> None:

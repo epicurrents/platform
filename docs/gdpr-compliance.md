@@ -219,7 +219,10 @@ This document is enforced, not aspirational:
 - **Periodic:** re-run the full GDPR audit (the four-lens sweep: inventory /
   retention, security of processing, third-party flows, project plugins)
   before each production release or every six months, whichever comes first,
-  and refresh [Known gaps](#known-gaps) from the results.
+  and refresh [Known gaps](#known-gaps) from the results. A deployment with a
+  release-gated dataset adds its two reports to the sweep, the access report
+  for the half year and the anonymity report for every release
+  ([library/README.md → Release gating](../library/README.md#release-gating)).
 - **At release:** the operator-facing fact sheet (docs.epicurrents.io →
   Platform → Data protection, source in the docs/epicurrents submodule)
   summarises this document for deployment operators. Changes to the

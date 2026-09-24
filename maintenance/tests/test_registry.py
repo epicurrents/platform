@@ -90,6 +90,9 @@ class TestCoreOperations:
             "recordings.refresh_signal_metadata",
             "recordings.deidentification_report",
             "epicurrents.grant_assessments",
+            "library.release_dataset",
+            "library.dataset_access_report",
+            "library.dataset_anonymity_report",
             "platform.update",
             "platform.backup",
             "platform.rollback",
@@ -114,6 +117,21 @@ class TestCoreOperations:
         assert op.command_args(op.args_schema(check_sizes=False)) == ["--json", "--no-size-check"]
         op = get_operation("recordings.refresh_signal_metadata")
         assert op.command_args(op.args_schema(dry_run=True)) == ["--dry-run"]
+        op = get_operation("library.dataset_access_report")
+        assert op.command_args(op.args_schema(dataset="A" * 32)) == ["A" * 32, "--format", "json", "--days", "183"]
+        with pytest.raises(ValidationError):
+            op.args_schema(dataset="A" * 32, days=0)
+        op = get_operation("library.dataset_anonymity_report")
+        assert op.command_args(op.args_schema(dataset="A" * 32)) == ["A" * 32, "--format", "json"]
+        assert op.command_args(op.args_schema(dataset="A" * 32, release=7)) == [
+            "A" * 32,
+            "--format",
+            "json",
+            "--release",
+            "7",
+        ]
+        with pytest.raises(ValidationError):
+            op.args_schema(dataset="not-a-hash")
 
     def test_the_update_operation_takes_a_hash_and_a_bounded_window(self):
         op = get_operation("platform.update")
@@ -127,6 +145,8 @@ class TestCoreOperations:
     def test_the_read_only_operations_skip_step_up_and_the_writing_one_does_not(self):
         assert not get_operation("activity.verify_audit_integrity").requires_step_up
         assert not get_operation("recordings.validate_originals").requires_step_up
+        assert not get_operation("library.dataset_access_report").requires_step_up
+        assert not get_operation("library.dataset_anonymity_report").requires_step_up
         assert get_operation("recordings.refresh_signal_metadata").requires_step_up
 
 

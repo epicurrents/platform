@@ -21,12 +21,14 @@ Releases run on a monthly cadence: a member uploaded in month M is eligible from
 start of M+2, so every member waits between one and two months and a month's submissions from
 every contributor surface together. The cadence is the platform's; which eligible members a run
 publishes is the project's, through :func:`register_release_selector`. Without a selector a run
-publishes everything eligible.
+publishes everything eligible. The equivalence classes the anonymity report counts are the
+project's too, through :func:`register_equivalence_class`; the reports themselves are in
+:mod:`library.reports`.
 """
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Hashable
 from dataclasses import dataclass, field
 from datetime import date, datetime
 from typing import Any
@@ -36,6 +38,34 @@ from django.db.models import BigIntegerField, CharField, F, Func, OuterRef, Q, S
 from django.db.models.functions import Cast, Coalesce, NullIf
 
 from library.models import Dataset, DatasetItem, DatasetRelease, month_start
+
+# ---------------------------------------------------------------------------
+# Naming datasets and members on the command line
+# ---------------------------------------------------------------------------
+
+
+def resolve_dataset(identifier: str) -> Dataset | None:
+    """Return the live dataset named by a 32-character hash or an integer primary key, or ``None``."""
+    identifier = identifier.strip()
+    qs = Dataset.objects.filter(deleted_at__isnull=True)
+    if len(identifier) == 32 and identifier.isalnum():
+        return qs.filter(object_hash=identifier.upper()).first()
+    if identifier.isdigit():
+        return qs.filter(pk=int(identifier)).first()
+    return None
+
+
+def member_handle(item: DatasetItem) -> str:
+    """Name a member by its content type and public handle, never by a label."""
+    obj = item.content_object
+    if obj is None:
+        return f"{item.content_type.model}:{item.object_id}"
+    stored_name = getattr(obj, "stored_name", None)
+    if stored_name:
+        return f"{item.content_type.model}:{stored_name.split('.', 1)[0]}"
+    object_hash = getattr(obj, "object_hash", None) or getattr(obj, "content_hash", None)
+    return f"{item.content_type.model}:{object_hash or item.object_id}"
+
 
 # ---------------------------------------------------------------------------
 # Who may see an unreleased member
@@ -239,6 +269,31 @@ def register_release_selector(selector: ReleaseSelector | None) -> None:
     """
     global _RELEASE_SELECTOR
     _RELEASE_SELECTOR = selector
+
+
+EquivalenceClass = Callable[[Any], Hashable | None]
+
+_EQUIVALENCE_CLASS: EquivalenceClass | None = None
+
+
+def register_equivalence_class(fn: EquivalenceClass | None) -> None:
+    """Register the project's equivalence-class function, or clear it with ``None``.
+
+    The function takes a recording and returns the key of the class it belongs to, or ``None``
+    for a recording the project leaves unclassified. What a class is (an age band, a montage
+    template, a condition marker, a combination) is the pool's design, so the platform never
+    defines one; it only counts. The anonymity report recomputes the classes live over the
+    released pool, which is what makes it re-runnable after a profile change, and a project's
+    release selector is expected to apply the same function so the k it records and the k the
+    report finds agree. One function per deployment, like the selector.
+    """
+    global _EQUIVALENCE_CLASS
+    _EQUIVALENCE_CLASS = fn
+
+
+def equivalence_class_function() -> EquivalenceClass | None:
+    """The registered equivalence-class function, or ``None``."""
+    return _EQUIVALENCE_CLASS
 
 
 def eligibility_cutoff(as_of: date) -> datetime:

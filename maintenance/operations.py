@@ -221,6 +221,31 @@ def _release_dataset_args(args: ReleaseDatasetArgs) -> list[str]:
     return argv
 
 
+class DatasetAccessReportArgs(Schema):
+    """Arguments of ``library.dataset_access_report``: which dataset and how long a window."""
+
+    dataset: str = Field(..., pattern=r"^[0-9A-Fa-f]{32}$", description="The dataset's public hash.")
+    days: int = Field(183, ge=1, le=3660, description="Window length in days, ending now; half a year by default.")
+
+
+def _dataset_access_report_args(args: DatasetAccessReportArgs) -> list[str]:
+    return [args.dataset, "--format", "json", "--days", str(args.days)]
+
+
+class DatasetAnonymityReportArgs(Schema):
+    """Arguments of ``library.dataset_anonymity_report``: which dataset, and optionally which release."""
+
+    dataset: str = Field(..., pattern=r"^[0-9A-Fa-f]{32}$", description="The dataset's public hash.")
+    release: int | None = Field(None, ge=1, description="One release, by its id; every release when omitted.")
+
+
+def _dataset_anonymity_report_args(args: DatasetAnonymityReportArgs) -> list[str]:
+    argv = [args.dataset, "--format", "json"]
+    if args.release is not None:
+        argv += ["--release", str(args.release)]
+    return argv
+
+
 class PlatformUpdateArgs(Schema):
     """Arguments of ``platform.update``: an already-uploaded package, by hash."""
 
@@ -338,6 +363,39 @@ def register_core_operations() -> None:
             args_schema=ReleaseDatasetArgs,
             command="release_dataset",
             command_args=_release_dataset_args,
+        )
+    )
+    register_operation(
+        Operation(
+            key="library.dataset_access_report",
+            executor=CELERY,
+            label="Dataset access report",
+            description=(
+                "Count requests and distinct readers per member of a release-gated dataset over a window, from the "
+                "activity trail, archived rows included: the evidence for the access-control argument and the input "
+                "to the six-monthly sweep. Counts only; no reader is named."
+            ),
+            args_schema=DatasetAccessReportArgs,
+            command="dataset_access_report",
+            command_args=_dataset_access_report_args,
+            requires_step_up=False,
+        )
+    )
+    register_operation(
+        Operation(
+            key="library.dataset_anonymity_report",
+            executor=CELERY,
+            label="Dataset anonymity report",
+            description=(
+                "Per release of a release-gated dataset, the record the run stored, the members still present and "
+                "any re-written since, and the equivalence-class sizes over the pool as released up to that run "
+                "(minimum k, fraction below the recorded k, prosecutor risk, entropy) from the project's registered "
+                "class function. Re-run after every release and every profile change."
+            ),
+            args_schema=DatasetAnonymityReportArgs,
+            command="dataset_anonymity_report",
+            command_args=_dataset_anonymity_report_args,
+            requires_step_up=False,
         )
     )
     register_operation(

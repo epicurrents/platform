@@ -171,6 +171,21 @@ only, and the reference column is whatever the sharer wrote. The same listing
 is the "Grant assessments" operation on the Maintenance tab for a deployment
 without a shell.
 
+**Re-run the dataset reports.** A deployment with a release-gated dataset
+re-runs its anonymity report for every release, and its access report for
+the window the incident may have covered:
+
+```bash
+scripts/manage.sh dataset_anonymity_report <dataset-hash>
+scripts/manage.sh dataset_access_report <dataset-hash> --days 183
+```
+
+Both are on the Maintenance tab as well. A manifest compromise at a
+contributing centre is an incident for that centre's contributions even
+when nothing on this deployment was touched; the participation agreement
+carries the duty to report it, and the reports are what the reassessment
+starts from.
+
 **Consider notification.** An incident of this kind may also engage the
 breach-notification duties in the deployment's data-protection documentation.
 That decision is not made from this runbook; hand the timeline to the person

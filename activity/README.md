@@ -475,6 +475,8 @@ To check the table against the tree, walk the AST for `log_activity` / `with_sys
 | `library.dataset.access.grant` | `grant_dataset_access` |
 | `library.dataset.access.list` | `list_dataset_access_rights` |
 | `library.dataset.access.revoke` | `revoke_dataset_access` |
+| `library.dataset.access_report` | `handle` † |
+| `library.dataset.anonymity_report` | `handle` † |
 | `library.dataset.create` | `create_dataset` |
 | `library.dataset.folder.create` | `create_dataset_folder` |
 | `library.dataset.folder.delete` | `delete_dataset_folder` |
