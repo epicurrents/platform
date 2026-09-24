@@ -34,8 +34,8 @@ from datetime import date, datetime
 from typing import Any
 
 from django.contrib.contenttypes.models import ContentType
-from django.db.models import BigIntegerField, CharField, F, Func, OuterRef, Q, Subquery, Value
-from django.db.models.functions import Cast, Coalesce, NullIf
+from django.db.models import BigIntegerField, Case, CharField, OuterRef, Q, Subquery, Value, When
+from django.db.models.functions import Cast, Coalesce, Lower, NullIf
 
 from library.models import Dataset, DatasetItem, DatasetRelease, month_start
 
@@ -208,26 +208,53 @@ def release_month_subquery(model) -> Subquery:
     )
 
 
-def member_name_subquery() -> Subquery:
-    """A subquery annotation naming a dataset item's recording: its display name, else its stored name.
-
-    Only recordings are named; other member types annotate null and sort after them by object
-    id. For ordering the items of a gated dataset, where ``added_at`` would reveal the arrival
-    order the release month is there to hide.
-    """
-    from recordings.models import Recording
-
+def _named_subquery(model, name_expression) -> Subquery:
+    """A subquery yielding *name_expression* for the row of *model* whose pk is the outer item's ``object_id``."""
     return Subquery(
-        Recording.objects.filter(pk=Cast(OuterRef("object_id"), BigIntegerField()))
-        .annotate(
-            sort_name=Coalesce(
-                NullIf(Func(F("display_name"), function="LOWER", output_field=CharField()), Value("")),
-                F("stored_name"),
-            )
-        )
+        model.objects.filter(pk=Cast(OuterRef("object_id"), BigIntegerField()))
+        .annotate(sort_name=name_expression)
         .values("sort_name")[:1],
         output_field=CharField(),
     )
+
+
+def _lower_or_null(field_name: str):
+    return NullIf(Lower(field_name), Value(""))
+
+
+def member_name_subquery() -> Case:
+    """An annotation naming a dataset item by its member's name, whatever the member's type.
+
+    A recording is named by its display name, else its stored name; a media file the same way;
+    a nested dataset by its name; all case-folded, so an unnamed member's hex handle sorts among
+    the names rather than before them. Each branch is keyed on the item's content type, since primary
+    keys collide across models. A member of any other type annotates null and sorts last by
+    object id. For ordering the items of a gated dataset, where ``added_at`` would reveal the
+    arrival order the release month is there to hide.
+    """
+    from django.apps import apps
+
+    from recordings.models import Recording
+
+    branches = [
+        When(
+            content_type=ContentType.objects.get_for_model(Recording, for_concrete_model=False),
+            then=_named_subquery(Recording, Coalesce(_lower_or_null("display_name"), Lower("stored_name"))),
+        ),
+        When(
+            content_type=ContentType.objects.get_for_model(Dataset, for_concrete_model=False),
+            then=_named_subquery(Dataset, Lower("name")),
+        ),
+    ]
+    if apps.is_installed("media"):
+        MediaFile = apps.get_model("media", "MediaFile")
+        branches.append(
+            When(
+                content_type=ContentType.objects.get_for_model(MediaFile, for_concrete_model=False),
+                then=_named_subquery(MediaFile, Coalesce(_lower_or_null("display_name"), Lower("stored_name"))),
+            )
+        )
+    return Case(*branches, default=Value(None), output_field=CharField())
 
 
 # ---------------------------------------------------------------------------

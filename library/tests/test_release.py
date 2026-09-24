@@ -352,6 +352,20 @@ class TestDatasetSurfaces:
         assert all(row["added_at"].startswith("2026-09-01T00:00:00") for row in rows)
         assert all(row["release_month"].startswith("2026-09-01") for row in rows)
 
+    def test_media_and_nested_datasets_sort_by_name_beside_recordings(self, client, make_user):
+        from media.models import MediaFile
+
+        author = make_user()
+        recording = _recording(author, index=0, display_name="middle")
+        clip = baker.make(MediaFile, author=author, display_name="Alpha clip", stored_name="C" * 32, file_size=1)
+        unnamed = baker.make(MediaFile, author=author, display_name=None, stored_name="D" * 32, file_size=1)
+        nested = Dataset.objects.create(author=author, name="zulu")
+        dataset, items = _gated_dataset(author, recording, clip, unnamed, nested)
+        _release(dataset, *items, on=date(2026, 9, 3))
+        client.force_login(author)
+        rows = self._items(client, dataset).json()
+        assert [row["object_id"] for row in rows] == [str(clip.pk), str(unnamed.pk), str(recording.pk), str(nested.pk)]
+
     def test_manager_sees_unreleased_members_with_a_null_release_month(self, client, make_user):
         author = make_user()
         zeta = _recording(author, index=0, display_name="Zeta")
