@@ -7,6 +7,8 @@ Usage
     python manage.py import_recordings <source_path> --username <owner>
         [--pipeline import]
         [--structure recursive|recursive-flat|flat]
+        [--preserve-annotations]
+        [--public-source DOI_OR_URL]
         [--reprocess]
         [--resume | --discard]
 
@@ -31,6 +33,11 @@ Usage
         Scan recursively but do not create any ``Collection`` objects.
     ``flat``
         Only process files in the top-level directory.
+
+``--public-source``
+    Record every imported recording as taken from this published dataset, as
+    a DOI or an http(s) URL (``Recording.public_source``). Refused when the
+    value is neither.
 
 ``--reprocess``
     Re-process files already marked ``DONE`` in the current (resumed) job.
@@ -63,6 +70,8 @@ from django.conf import settings
 from django.core.management.base import BaseCommand, CommandError
 from django.db import transaction
 from django.utils import timezone
+
+from recordings.public_source import normalise_public_source
 
 logger = logging.getLogger(__name__)
 
@@ -126,6 +135,15 @@ class Command(BaseCommand):
                 "(they are always saved to the database regardless)."
             ),
         )
+        parser.add_argument(
+            "--public-source",
+            default="",
+            metavar="DOI_OR_URL",
+            help=(
+                "Record every imported recording as taken from this published dataset, "
+                "given as a DOI or an http(s) URL. Refused when it is neither."
+            ),
+        )
 
     # ------------------------------------------------------------------
     # Entry point
@@ -161,6 +179,10 @@ class Command(BaseCommand):
                     "(RECORDINGS_ALLOW_PRESERVE_ANNOTATIONS is off)."
                 )
             pipeline.header.strip_annotation_text = False
+        try:
+            public_source = normalise_public_source(options["public_source"])
+        except ValueError as exc:
+            raise CommandError(str(exc))
 
         structure_map = {
             "recursive": ImportJob.Structure.RECURSIVE,
@@ -200,13 +222,13 @@ class Command(BaseCommand):
             )
             self.stdout.write(f"Created import job {job.pk}.")
 
-        self._run_job(job, source_path, pipeline, owner, options["reprocess"])
+        self._run_job(job, source_path, pipeline, owner, options["reprocess"], public_source=public_source)
 
     # ------------------------------------------------------------------
     # Job execution
     # ------------------------------------------------------------------
 
-    def _run_job(self, job, source_path, pipeline, owner, reprocess: bool) -> None:
+    def _run_job(self, job, source_path, pipeline, owner, reprocess: bool, *, public_source: str = "") -> None:
         from activity.models import Activity
         from activity.system_activity import with_system_activity
 
@@ -227,9 +249,9 @@ class Command(BaseCommand):
                 "reprocess": bool(reprocess),
             },
         ):
-            self._run_job_body(job, source_path, pipeline, owner, reprocess)
+            self._run_job_body(job, source_path, pipeline, owner, reprocess, public_source=public_source)
 
-    def _run_job_body(self, job, source_path, pipeline, owner, reprocess: bool) -> None:
+    def _run_job_body(self, job, source_path, pipeline, owner, reprocess: bool, *, public_source: str = "") -> None:
         from recordings.models import ImportJob, ImportJobFile
 
         edf_files = self._collect_files(source_path, job.structure)
@@ -274,7 +296,9 @@ class Command(BaseCommand):
                 continue
 
             try:
-                recording = self._process_file(abs_path, job, source_path, owner, pipeline, collection_map)
+                recording = self._process_file(
+                    abs_path, job, source_path, owner, pipeline, collection_map, public_source=public_source
+                )
                 job_file.status = ImportJobFile.Status.DONE
                 job_file.recording = recording
                 job_file.error = ""
@@ -417,6 +441,8 @@ class Command(BaseCommand):
         owner,
         pipeline,
         collection_map: dict,
+        *,
+        public_source: str = "",
     ):
         from django.conf import settings
         from django.contrib.contenttypes.models import ContentType
@@ -518,6 +544,7 @@ class Command(BaseCommand):
             recording = Recording.objects.create(
                 author=owner,
                 original_name=stored_original_name(original_name_for_db, suffix),
+                public_source=public_source,
                 stored_name=stored_name,
                 file_extension=suffix,
                 file_size=permanent_path.stat().st_size,

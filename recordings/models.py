@@ -113,6 +113,12 @@ class Recording(models.Model):
     # notch and BIDS ``PowerLineFrequency`` via
     # ``compute.mains.resolve_recording_notch_hz``.
     power_line_frequency = models.FloatField(null=True, blank=True, default=None)
+    # The published dataset this recording's data was taken from, as a DOI or URL, or empty
+    # for data acquired here. The author's assertion, validated for shape only by
+    # ``recordings.public_source``; served to every reader, since it names a public dataset
+    # rather than a person. Lives here for the same reason as ``power_line_frequency``:
+    # a reprocess rebuilds ``RecordingMeta`` and would drop it.
+    public_source = models.CharField(max_length=512, blank=True, default="")
 
     # Reverse GenericRelations so hard-delete (purge) cascades cleanly through
     # every reference row that targets this recording via a GenericForeignKey.

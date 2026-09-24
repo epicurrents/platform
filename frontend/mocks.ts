@@ -105,6 +105,8 @@ interface MockRecording {
     deleted_at: string | null
     /** Author-set grantee-visible label; empty means the hash-prefix fallback is used. */
     custom_name?: string
+    /** DOI or URL of the published dataset the data was taken from. */
+    public_source?: string
     /** Author-only failure detail, set when status is 'failed'. */
     processing_error?: string
     meta: {
@@ -1238,6 +1240,7 @@ function recordingOut(r: MockRecording) {
         content_hash: r.content_hash,
         status: r.status,
         modality: r.modality,
+        public_source: r.public_source ?? '',
         created_at: r.created_at,
         deleted_at: r.deleted_at,
         meta: r.meta,
@@ -2157,6 +2160,7 @@ export async function handleMock(
                     }
                 }
                 if (typeof body.modality === 'string') rec.modality = body.modality.trim().toLowerCase()
+                if (typeof body.public_source === 'string') rec.public_source = body.public_source.trim()
                 return send(res, 200, recordingOut(rec))
             }
             if (method === 'DELETE') {

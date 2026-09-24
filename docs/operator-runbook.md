@@ -167,9 +167,11 @@ scripts/manage.sh grant_assessments
 Every grant with an assessment date is one to hand back to whoever made it,
 whatever its status column says; the `--due` filter is for the routine
 six-monthly sweep, not for this. The output names grantees by kind and id
-only, and the reference column is whatever the sharer wrote. The same listing
-is the "Grant assessments" operation on the Maintenance tab for a deployment
-without a shell.
+only, and the reference column is whatever the sharer wrote. The PUBLIC
+column counts how many of the recordings a grant covers are recorded as
+taken from a published dataset, the case where the finding can rest on the
+publisher's own statement. The same listing is the "Grant assessments"
+operation on the Maintenance tab for a deployment without a shell.
 
 **Re-run the dataset reports.** A deployment with a release-gated dataset
 re-runs its anonymity report for every release, and its access report for

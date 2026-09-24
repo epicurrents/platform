@@ -16,6 +16,10 @@ without processing — a format with no parser — has no meta row and no pass t
 recording whose audit record disagrees with its meta row has been edited after ingest; the report
 prints both and leaves the conclusion to the reader.
 
+Each row also repeats ``Recording.public_source``, the DOI or URL of the published dataset the
+author says the data was taken from, so the reader can tell a recording acquired here from one
+whose original is already public (paragraph 26); the platform asserts nothing about the locator.
+
 Reads only. The run is recorded as an ``Activity`` row so the trail shows when a report was
 produced, which is part of what paragraph 41 asks to be kept.
 
@@ -61,6 +65,7 @@ def report_row(
     """Assemble one recording's entry of the report."""
     row: dict = {
         "hash": _hash_of(recording),
+        "public_source": recording.public_source or None,
         "deidentification_version": None,
         "channel_order_version": None,
         "annotation_text_preserved": None,
@@ -137,6 +142,7 @@ class Command(BaseCommand):
             "current": {**current, "ingest_overrides": overrides_now},
             "recordings": rows,
             "behind_count": sum(1 for r in rows if r["behind"]),
+            "public_source_count": sum(1 for r in rows if r["public_source"]),
         }
         if options["format"] == "json":
             self.stdout.write(json.dumps(report, indent=2))
@@ -152,27 +158,31 @@ class Command(BaseCommand):
         )
         self.stdout.write(f"Ingest overrides now: {_overrides_abbrev(current['ingest_overrides'])}")
         self.stdout.write("")
-        self.stdout.write(f"{'HASH':32}  {'PASS':>4}  {'ORDER':>5}  {'ANNOTATION TEXT':15}  RECORDED OVERRIDES")
+        self.stdout.write(
+            f"{'HASH':32}  {'PASS':>4}  {'ORDER':>5}  {'ANNOTATION TEXT':15}  {'RECORDED OVERRIDES':60}  PUBLIC SOURCE"
+        )
         unstamped = 0
         unprocessed = 0
         for row in report["recordings"]:
+            source = row["public_source"] or "-"
             if row["deidentification_version"] is None:
                 unprocessed += 1
-                self.stdout.write(f"{row['hash']:32}  {'-':>4}  {'-':>5}  {'no pass applies':15}  -")
+                self.stdout.write(f"{row['hash']:32}  {'-':>4}  {'-':>5}  {'no pass applies':15}  {'-':60}  {source}")
                 continue
             if row["deidentification_version"] == 0:
                 unstamped += 1
             record = row["audit_record"] or {}
             flag = "behind " if row["behind"] else ""
+            overrides = f"{flag}{_overrides_abbrev(record.get('ingest_overrides'))}"
             self.stdout.write(
                 f"{row['hash']:32}  {row['deidentification_version']:>4}  {row['channel_order_version']:>5}  "
-                f"{_TEXT_STATES[row['annotation_text_preserved']]:15}  "
-                f"{flag}{_overrides_abbrev(record.get('ingest_overrides'))}"
+                f"{_TEXT_STATES[row['annotation_text_preserved']]:15}  {overrides:60}  {source}"
             )
         self.stdout.write("")
         summary = (
             f"{len(report['recordings'])} recording(s); {report['behind_count']} behind the current pass; "
-            f"{unstamped} processed before the record existed; {unprocessed} stored without a pass."
+            f"{unstamped} processed before the record existed; {unprocessed} stored without a pass; "
+            f"{report['public_source_count']} from a published source."
         )
         if report["behind_count"]:
             self.stdout.write(self.style.WARNING(summary))

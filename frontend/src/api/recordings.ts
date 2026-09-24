@@ -38,6 +38,8 @@ export interface Recording {
     content_hash: string
     status: 'pending' | 'processing' | 'ready' | 'failed'
     modality: string
+    /** DOI or URL of the published dataset the data was taken from; empty for data acquired here. */
+    public_source: string
     /** Exact for the author and superusers; truncated to the first of its month for every other reader. */
     created_at: string
     deleted_at: string | null
@@ -131,6 +133,8 @@ export interface RecordingPatch {
     /** Grantee-visible label. Send an empty string to clear it and fall back to the hash prefix. */
     display_name?: string
     modality?: string
+    /** DOI or http(s) URL of the published dataset the data was taken from; empty string clears it. */
+    public_source?: string
 }
 
 /**

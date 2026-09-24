@@ -368,6 +368,10 @@ async function confirmDelete () {
                     <dt>{{ t('File hash', SCOPE) }}</dt>
                     <dd class="details-hash">{{ detailsRec.stored_hash }}</dd>
                 </div>
+                <div v-if="detailsRec.public_source" class="wa-flank details-flank">
+                    <dt>{{ t('Published source', SCOPE) }}</dt>
+                    <dd class="details-hash">{{ detailsRec.public_source }}</dd>
+                </div>
             </dl>
         </div>
     </wa-drawer>

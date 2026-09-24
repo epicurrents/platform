@@ -21,6 +21,11 @@ any, and one of four states:
 named by kind and primary key, never by username; the reference is the sharer's own text and is
 printed, since the operator running this is the one audience for it besides the sharer.
 
+Each grant also reports how many of the recordings it covers carry ``Recording.public_source``,
+the DOI or URL of the published dataset the author says the data was taken from. A grant whose
+every covered recording is recorded as public is one where the finding can rest on the publisher's
+own statement (paragraph 26); the count is the author's assertion repeated, not a check of it.
+
 Reads only. The run is recorded as an ``Activity`` row with counts, so the trail shows when the
 sweep was made, which is part of what paragraph 41 asks to be kept.
 
@@ -142,10 +147,15 @@ def sweep(*, older_than_days: int) -> list[dict]:
     )
     objects = _objects_by_row(rights)
     written_on = deidentification_record_dates()
+    covered_by_right = {
+        right.pk: (_covered_recording_pks(objects[right.pk]) if objects.get(right.pk) is not None else [])
+        for right in rights
+    }
+    public = _public_source_pks({pk for covered in covered_by_right.values() for pk in covered})
     rows = []
     for right in rights:
+        covered = covered_by_right[right.pk]
         obj = objects.get(right.pk)
-        covered = _covered_recording_pks(obj) if obj is not None else []
         status, reprocessed = assessment_status(right, cutoff=cutoff, written_on=written_on, covered=covered)
         rows.append(
             {
@@ -161,9 +171,24 @@ def sweep(*, older_than_days: int) -> list[dict]:
                 "assessment_date": right.assessment_date.isoformat() if right.assessment_date else None,
                 "status": status,
                 "reprocessed_count": reprocessed,
+                "covered_count": len(covered),
+                "public_source_count": sum(1 for pk in covered if pk in public),
             }
         )
     return rows
+
+
+def _public_source_pks(pks: set[str]) -> set[str]:
+    """The subset of recording *pks* that record a published source, in one query."""
+    from recordings.models import Recording
+
+    numeric = [int(pk) for pk in pks if pk.isdigit()]
+    if not numeric:
+        return set()
+    return {
+        str(pk)
+        for pk in Recording.objects.filter(pk__in=numeric).exclude(public_source="").values_list("pk", flat=True)
+    }
 
 
 class Command(BaseCommand):
@@ -201,6 +226,9 @@ class Command(BaseCommand):
             "generated_at": timezone.now().isoformat(),
             "older_than_days": older_than,
             "counts": counts,
+            "public_source_only": sum(
+                1 for r in rows if r["covered_count"] and r["covered_count"] == r["public_source_count"]
+            ),
             "grants": rows,
         }
         if options["format"] == "json":
@@ -212,16 +240,18 @@ class Command(BaseCommand):
         self.stdout.write(f"Grant assessments, {report['generated_at']}; stale after {report['older_than_days']} days")
         self.stdout.write("")
         self.stdout.write(
-            f"{'GRANT':>6}  {'OBJECT':44}  {'TARGET':14}  {'DEID':4}  {'ASSESSED':10}  {'STATUS':11}  REFERENCE"
+            f"{'GRANT':>6}  {'OBJECT':44}  {'TARGET':14}  {'DEID':4}  {'PUBLIC':7}  {'ASSESSED':10}  {'STATUS':11}  "
+            "REFERENCE"
         )
         for row in report["grants"]:
             obj = f"{row['object']['model']} {row['object']['handle'] or '?'}"
             status = row["status"]
             if status == STATUS_REPROCESSED:
                 status = f"{status} ({row['reprocessed_count']})"
+            public = f"{row['public_source_count']}/{row['covered_count']}"
             self.stdout.write(
                 f"{row['grant_id']:>6}  {obj:44}  {row['target']:14}  {'T' if row['apply_middleware'] else 'F':4}  "
-                f"{row['assessment_date'] or '-':10}  {status:11}  {row['assessment_reference'] or ''}"
+                f"{public:7}  {row['assessment_date'] or '-':10}  {status:11}  {row['assessment_reference'] or ''}"
             )
         self.stdout.write("")
         counts = report["counts"]
@@ -229,7 +259,8 @@ class Command(BaseCommand):
         summary = (
             f"{sum(counts.values())} grant(s): {counts[STATUS_NONE]} without an assessment, "
             f"{counts[STATUS_CURRENT]} current, {counts[STATUS_STALE]} stale, "
-            f"{counts[STATUS_REPROCESSED]} reprocessed since assessed."
+            f"{counts[STATUS_REPROCESSED]} reprocessed since assessed; "
+            f"{report['public_source_only']} covering only recordings from a published source."
         )
         if due_only:
             summary += f" Listed {len(report['grants'])} due."

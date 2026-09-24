@@ -102,6 +102,7 @@ from federation.auth import try_federation_auth
 from federation.limits import QuotaExceeded, check_peer_download_limits
 from recordings.models import Recording, stored_original_name
 from recordings.pipelines import get_converter
+from recordings.public_source import normalise_public_source
 
 logger = logging.getLogger(__name__)
 
@@ -242,6 +243,9 @@ class RecordingOut(Schema):
     content_hash: str
     status: str
     modality: str = ""
+    # The DOI or URL of the published dataset the data was taken from, empty for
+    # data acquired here. The author's assertion; served to every reader.
+    public_source: str = ""
     created_at: datetime
     deleted_at: datetime | None = None
     meta: RecordingMetaOut | None = None
@@ -311,6 +315,7 @@ class RecordingSliceOut(Schema):
     content_hash: str
     status: str
     modality: str = ""
+    public_source: str = ""
     created_at: datetime
     deleted_at: datetime | None = None
     meta: RecordingMetaOut | None = None
@@ -345,11 +350,14 @@ class RecordingPatchIn(Schema):
     endpoint.
 
     Set ``display_name`` to an empty string to clear it and revert to the
-    default (``stored_name`` hash prefix).
+    default (``stored_name`` hash prefix). ``public_source`` takes a DOI or an
+    http(s) URL of the published dataset the data was taken from, or an empty
+    string to clear it; anything else is refused with 400.
     """
 
     display_name: str | None = None
     modality: str | None = None
+    public_source: str | None = None
 
 
 def _require_auth(request):
@@ -1215,6 +1223,7 @@ def _build_recording_out(
         "content_hash": recording.content_hash,
         "status": recording.status,
         "modality": recording.modality,
+        "public_source": recording.public_source,
         "created_at": _visible_created_at(recording, exact=can_see_author_fields, release_month=release_month),
         "deleted_at": recording.deleted_at,
         "meta": {
@@ -1299,6 +1308,7 @@ def upload_recording(
     share_token_apply_middleware: bool = True,
     preserve_annotations: bool = False,
     display_name: str | None = None,
+    public_source: str | None = None,
 ):
     """Save uploaded file to staging and enqueue background processing.
 
@@ -1310,12 +1320,18 @@ def upload_recording(
     fall back to a hash-prefix default; the original filename is never used
     as the display name unless the author explicitly opts in by passing it
     here (or via a later PATCH). ``warnings`` flags a label that looks like
-    an identifier; the upload is accepted either way.
+    an identifier; the upload is accepted either way. ``public_source`` is the
+    DOI or URL of the published dataset the data was taken from, refused with
+    400 when it is neither.
     """
 
     user = _require_auth(request)
     user_assignments = _parse_target_access_list(user_access, "user_access")
     group_assignments = _parse_target_access_list(group_access, "group_access")
+    try:
+        normalized_public_source = normalise_public_source(public_source)
+    except ValueError as exc:
+        raise HttpError(400, str(exc))
     if any(target_id == user.pk for target_id, _ in user_assignments):
         # The uploader's own full-rights row is created unconditionally below;
         # a second row for the same target would violate the per-target
@@ -1426,6 +1442,7 @@ def upload_recording(
             author=user,
             original_name=name_for_db,
             display_name=normalized_display_name,
+            public_source=normalized_public_source,
             stored_name=stored_name,
             file_extension=extension,
             file_size=total_size,
@@ -2004,6 +2021,7 @@ def recording_detail_slice(
         "content_hash": recording.content_hash,
         "status": recording.status,
         "modality": recording.modality,
+        "public_source": recording.public_source,
         "created_at": _visible_created_at(recording, exact=can_see_author_fields, release_month=release_month),
         "deleted_at": recording.deleted_at,
         "meta": {
@@ -2683,11 +2701,12 @@ def delete_recording(request, hash: str):
 
 @api.patch("/{hash}", response=RecordingPatchOut)
 def update_recording(request, hash: str, payload: RecordingPatchIn):
-    """Update a recording's editable metadata (display name and modality).
+    """Update a recording's editable metadata: display name, modality and public source.
 
     Only fields included in the request body are updated.  The underlying
     file, the original filename, and all parsed EDF/BDF data are immutable
-    — only ``display_name`` and ``modality`` may be changed via this endpoint.
+    — only ``display_name``, ``modality`` and ``public_source`` may be changed
+    via this endpoint.
 
     Send ``display_name=""`` to clear the field; responses will fall back to
     the ``stored_name`` hash prefix. ``warnings`` flags a new label that looks
@@ -2727,6 +2746,12 @@ def update_recording(request, hash: str, payload: RecordingPatchIn):
     if payload.modality is not None:
         recording.modality = payload.modality.strip().lower()
         fields_updated.append("modality")
+    if payload.public_source is not None:
+        try:
+            recording.public_source = normalise_public_source(payload.public_source)
+        except ValueError as exc:
+            raise HttpError(400, str(exc))
+        fields_updated.append("public_source")
 
     with transaction.atomic():
         recording.save(update_fields=fields_updated + ["modified_at"])
