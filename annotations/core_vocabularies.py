@@ -90,6 +90,40 @@ def accepted_codes(standard: str) -> frozenset[str]:
     return codes | accepted_codes(pin.fallback) if pin.fallback else codes
 
 
+@dataclass(frozen=True)
+class AcquisitionTerm:
+    """One acquisition-scoped term and the standard that owns it: what an ingest translation resolves a code to."""
+
+    standard: str
+    code: str
+    name: str
+    #: The viewer's event class for the term (``technical``, ``activation``, ``trigger``, ``event``), or ``""``.
+    event_class: str
+
+
+@cache
+def _acquisition_terms() -> dict[str, AcquisitionTerm]:
+    """Every acquisition-scoped term of every pinned vocabulary, by code. The prefixes keep the codes disjoint."""
+    terms: dict[str, AcquisitionTerm] = {}
+    for standard in VOCABULARY_PINS:
+        for category in load_vocabulary(standard)["categories"].values():
+            if category.get("scope") != ACQUISITION_SCOPE:
+                continue
+            for term in category["events"].values():
+                terms[term["code"]] = AcquisitionTerm(
+                    standard=standard, code=term["code"], name=term["name"], event_class=term.get("class", "")
+                )
+    return terms
+
+
+def find_acquisition_term(code: str) -> AcquisitionTerm | None:
+    """The term *code* names in the pinned vocabularies, under the standard that owns it, or ``None``.
+
+    A finding-scoped term answers ``None`` like an unknown code: ingest writes acquisition events only.
+    """
+    return _acquisition_terms().get(code)
+
+
 def _validator(standard: str):
     """A membership validator over *standard*'s accepted codes, naming the term it rejects."""
 

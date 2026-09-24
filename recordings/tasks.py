@@ -25,20 +25,16 @@ from django.utils import timezone
 
 logger = logging.getLogger(__name__)
 
+from recordings.event_translation import SourceEvent, annotation_hash, write_source_events
+
 # File extensions handled by the EDF/BDF processor.
 _EDF_EXTENSIONS = {".edf", ".bdf"}
 
 
-def _annotation_hash(recording_pk: int, suffix: str) -> str:
-    """Return a 32-char uppercase hex string suitable for use as ``object_hash``.
-
-    Uses the recording PK (not the file hash) so that uploading the same file
-    a second time yields a different set of annotation hashes.  The *suffix*
-    distinguishes sibling annotations on the same recording (e.g. each
-    interruption has a unique timestamp string as its suffix).
-    """
-    key = f"{recording_pk}:{suffix}"
-    return hashlib.sha256(key.encode()).hexdigest()[:32].upper()
+#: The ``object_hash`` of a server-generated annotation row. Defined with the event
+#: translation, which the sidecar seam shares; kept under this name because
+#: ``import_recordings`` imports it from here.
+_annotation_hash = annotation_hash
 
 
 def _write_final_recording_transition(*, recording, update_fields: dict) -> None:
@@ -122,8 +118,12 @@ def _save_edf_results(recording, result) -> None:
     - One :class:`RecordingMeta` row with format-level metadata.
     - One :class:`SignalInfo` row per channel.
     - One :class:`~annotations.models.Interruption` row per detected gap.
+    - One :class:`~annotations.models.Event` row per embedded text event,
+      translated to the platform's vocabulary where anything translates it and
+      a text-free placeholder otherwise (``recordings.event_translation``).
     - One :class:`~annotations.models.Annotation` row (name "Original
-      annotations") when embedded text events or gaps are present.
+      annotations") when embedded text events or gaps are present: the raw
+      record, holding what the file said.
     """
     from annotations.models import Annotation, Interruption
     from epicurrents.system_user import get_system_user
@@ -211,11 +211,31 @@ def _save_edf_results(recording, result) -> None:
             duration=gap_duration,
         )
 
+    # ── Event rows, one per embedded text event ───────────────────────────
+    # ``onset`` is a **data position**, matching the Interruption rows above and
+    # every signal window the compute layer reads. The TAL field itself is wall
+    # clock, so on a discontinuous recording the two disagree by the accumulated
+    # gap time from the first splice onward: storing the raw onset here beside a
+    # data-position interruption put the same file's annotations and its gaps on
+    # two different timelines, and every event after the first gap landed on
+    # signal it did not describe.
+    positioned = [(anno, wall_clock_to_data_position(anno.onset, result.gaps)) for anno in result.annotations]
+    # A TAL is text without a vendor type, so every one is a source annotation to
+    # the translation; a vendor's exported EDF still names its events in the text.
+    write_source_events(
+        recording,
+        [SourceEvent(onset=onset, duration=anno.duration, label=anno.label) for anno, onset in positioned],
+        hash_prefix="original-annotation",
+    )
+
     # ── "Original annotations" Annotation (only when there is content) ────
-    # A deployment may declare that nothing annotating a recording came out of
-    # the uploaded file. The Interruption rows above are unaffected on purpose:
-    # a gap is geometry rather than annotation, it carries no text, and the
-    # viewer and compute layer read data positions derived from it.
+    # The raw record of what the file said, which the Event rows above do not
+    # carry. A deployment may declare that nothing annotating a recording came
+    # out of the uploaded file; translated events are written regardless, since
+    # a term of the platform's own vocabulary and a timestamp is nothing from the
+    # file. The Interruption rows above are unaffected on purpose: a gap is
+    # geometry rather than annotation, it carries no text, and the viewer and
+    # compute layer read data positions derived from it.
     if getattr(settings, "RECORDINGS_DISCARD_EMBEDDED_ANNOTATIONS", False):
         return
 
@@ -224,14 +244,6 @@ def _save_edf_results(recording, result) -> None:
     if has_events or has_gaps:
         content: dict = {}
         if has_events:
-            # ``onset`` is a **data position**, matching the Interruption rows above and
-            # every signal window the compute layer reads. The TAL field itself is wall
-            # clock, so on a discontinuous recording the two disagree by the accumulated
-            # gap time from the first splice onward: storing the raw onset here beside a
-            # data-position interruption put the same file's annotations and its gaps on
-            # two different timelines, and every event after the first gap landed on
-            # signal it did not describe.
-            #
             # The untranslated value is kept under ``wall_clock_onset`` when it differs,
             # because it is what the file says and what a re-export has to write back.
             content["events"] = [
@@ -241,7 +253,7 @@ def _save_edf_results(recording, result) -> None:
                     "label": anno.label,
                     **({} if onset == anno.onset else {"wall_clock_onset": anno.onset}),
                 }
-                for anno, onset in ((a, wall_clock_to_data_position(a.onset, result.gaps)) for a in result.annotations)
+                for anno, onset in positioned
             ]
         if has_gaps:
             content["interruptions"] = [

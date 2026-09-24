@@ -15,10 +15,13 @@ shapes (a converter emitting different key names must fail loudly, not produce r
 * ``annotations`` — clinical text events: ``onset_seconds`` (required, numeric), ``duration_seconds``
   (optional, numeric or null), ``text`` (optional, string).
 * ``events`` — system events (e.g. "Recording Paused"): ``onset_seconds`` (required, numeric),
-  ``duration_seconds`` (optional, numeric or null), ``type`` and ``label`` (optional, strings).
+  ``duration_seconds`` (optional, numeric or null), ``type`` and ``label`` (optional, string or null: a converter
+  writes ``null`` for an event it has no label for, and a null must not cost the whole sidecar).
 
-Both lists are merged into a single ``{"events": [...]}`` annotation whose per-item format mirrors
-``recordings.tasks._save_edf_results`` (``onset``, ``duration``, ``label``). The annotation is saved as
+Each item becomes an ``Event`` row through ``recordings.event_translation``: a term of the platform's own
+vocabulary where a mapper or table translates the vendor's type and label, and a text-free placeholder otherwise.
+Both lists are also merged into a single ``{"events": [...]}`` annotation, the raw record, whose per-item format
+mirrors ``recordings.tasks._save_edf_results`` (``onset``, ``duration``, ``label``). That annotation is saved as
 ``"Source events"`` with the hash suffix ``"source-events"`` so it is distinct from the ``"Original
 annotations"`` record written by the EDF processor.
 
@@ -39,9 +42,10 @@ Two callers:
 
 from __future__ import annotations
 
-import hashlib
 import logging
 from pathlib import Path
+
+from recordings.event_translation import SourceEvent, annotation_hash, write_source_events
 
 logger = logging.getLogger(__name__)
 
@@ -55,17 +59,9 @@ _ANNOTATION_ITEM_SCHEMA: dict[str, tuple[bool, tuple[type, ...]]] = {
 _EVENT_ITEM_SCHEMA: dict[str, tuple[bool, tuple[type, ...]]] = {
     "onset_seconds": (True, (int, float)),
     "duration_seconds": (False, (int, float, type(None))),
-    "type": (False, (str,)),
-    "label": (False, (str,)),
+    "type": (False, (str, type(None))),
+    "label": (False, (str, type(None))),
 }
-
-
-def _annotation_hash(recording_pk: int, suffix: str) -> str:
-    """Mirror of ``recordings.tasks._annotation_hash`` (kept local to avoid
-    importing from tasks, which would create an import cycle when this
-    module is loaded from ``RecordingsConfig.ready``)."""
-    key = f"{recording_pk}:{suffix}"
-    return hashlib.sha256(key.encode()).hexdigest()[:32].upper()
 
 
 def _validate_items(items: list, list_name: str, schema: dict[str, tuple[bool, tuple[type, ...]]]) -> None:
@@ -123,7 +119,7 @@ def _looks_like_nicolet_sidecar(sidecar_data: dict) -> bool:
 
 
 def save_sidecar_events(recording, sidecar_data: dict) -> None:
-    """Persist sidecar events as a ``"Source events"`` annotation row.
+    """Persist sidecar events as ``Event`` rows and a ``"Source events"`` annotation row.
 
     Validates ``sidecar_data`` against the pinned schema first and raises ``ValueError`` on a mismatch —
     both callers catch and log it, so a converter emitting the wrong shape fails loudly per recording
@@ -137,6 +133,32 @@ def save_sidecar_events(recording, sidecar_data: dict) -> None:
     from annotations.models import Annotation
     from epicurrents.system_user import get_system_user
 
+    validate_sidecar_events(sidecar_data)
+
+    sources: list[SourceEvent] = []
+    for ann in sidecar_data.get("annotations") or []:
+        sources.append(
+            SourceEvent(onset=ann["onset_seconds"], duration=ann.get("duration_seconds"), label=ann.get("text", ""))
+        )
+    for evt in sidecar_data.get("events") or []:
+        sources.append(
+            SourceEvent(
+                onset=evt["onset_seconds"],
+                duration=evt.get("duration_seconds"),
+                label=evt.get("label") or "",
+                type=evt.get("type") or "",
+            )
+        )
+    if not sources:
+        return
+    sources.sort(key=lambda source: source.onset or 0)
+
+    # One row per source event, translated where anything translates it. The
+    # discard gate below does not cover these: a translated event carries a term
+    # of the platform's own vocabulary and a timestamp, and the writer skips the
+    # placeholders under the setting itself.
+    write_source_events(recording, sources, hash_prefix="source-event")
+
     # Gated here rather than at the call sites so that every path honours it —
     # the Celery post_convert hook and import_recordings both reach this
     # function, and a deployment that discards file-borne annotations must not
@@ -145,33 +167,14 @@ def save_sidecar_events(recording, sidecar_data: dict) -> None:
     if getattr(settings, "RECORDINGS_DISCARD_EMBEDDED_ANNOTATIONS", False):
         return
 
-    validate_sidecar_events(sidecar_data)
-
-    events: list[dict] = []
-
-    for ann in sidecar_data.get("annotations") or []:
-        events.append(
-            {
-                "onset": ann["onset_seconds"],
-                "duration": ann.get("duration_seconds"),
-                "label": ann.get("text", ""),
-            }
-        )
-
-    for evt in sidecar_data.get("events") or []:
-        label_parts = [p for p in [evt.get("type"), evt.get("label")] if p]
-        events.append(
-            {
-                "onset": evt["onset_seconds"],
-                "duration": evt.get("duration_seconds"),
-                "label": ": ".join(label_parts),
-            }
-        )
-
-    if not events:
-        return
-
-    events.sort(key=lambda e: e.get("onset") or 0)
+    events = [
+        {
+            "onset": source.onset,
+            "duration": source.duration,
+            "label": ": ".join(part for part in (source.type, source.label) if part),
+        }
+        for source in sources
+    ]
 
     recording_ct = ContentType.objects.get_for_model(recording, for_concrete_model=False)
     Annotation.objects.create(
@@ -179,7 +182,7 @@ def save_sidecar_events(recording, sidecar_data: dict) -> None:
         name="Source events",
         target_content_type=recording_ct,
         target_object_id=str(recording.pk),
-        object_hash=_annotation_hash(recording.pk, "source-events"),
+        object_hash=annotation_hash(recording.pk, "source-events"),
         content={"events": events},
     )
 

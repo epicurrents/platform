@@ -337,6 +337,16 @@ RECORDINGS_ALLOW_PRESERVE_ANNOTATIONS = env_bool("RECORDINGS_ALLOW_PRESERVE_ANNO
 # being true and being merely likely.
 RECORDINGS_DISCARD_SOURCE_CHANNEL_METADATA = env_bool("RECORDINGS_DISCARD_SOURCE_CHANNEL_METADATA", default=False)
 
+# Translation tables for the events a file arrives with: JSON files, each a list
+# of rules from a vendor's event type or label to a term of the platform's own
+# vocabularies (annotations/vocabulary/), read at manage.py check. Paths are
+# absolute or relative to BASE_DIR. An event no table or registered mapper
+# translates is written as a placeholder that carries no text; the vendor
+# string stays only in the raw record. The format is documented on
+# recordings.event_translation.load_table, the mechanism in
+# recordings/README.md → Event translation.
+RECORDING_EVENT_TRANSLATIONS: list[str] = []
+
 #   RECORDING_PIPELINES = {
 #       "web":    {"header": {"strip_annotation_text": False}},
 #       "import": {"header": {"strip_annotation_text": True}},

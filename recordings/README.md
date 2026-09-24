@@ -26,7 +26,9 @@ process_recording Celery task
     │    (source_index records the original position)
     │  write RecordingMeta + SignalInfo rows, stamped with the pass
     │    version and the annotation-text flag
-    │  write Interruption + "Original annotations" rows
+    │  write Interruption rows, one Event per embedded text event
+    │    (translated to the platform vocabulary, else a text-free
+    │    placeholder) and the "Original annotations" raw record
     │  on processing failure: populate Recording.processing_error
     │    and (if mode in {"failed", "all"}) preserve the original
     │  audit: final transition row carries a SignalInfo digest and the
@@ -166,7 +168,7 @@ A *converter* turns a non-EDF input file into an EDF before the rest of processi
 def convert(input_path: Path, output_dir: Path) -> Path | tuple[Path, dict | None]: ...
 ```
 
-Return either the EDF path alone, or a two-tuple `(edf_path, sidecar_data)`. When a sidecar dict is returned, the [post_convert hook](#conversion-hooks) dispatcher fires registered handlers — the built-in [sidecar module](converters/sidecar.py) parses Nicolet-shaped sidecars and writes a "Source events" `Annotation` on the recording, distinct from the "Original annotations" record written from the EDF+ TAL parse. Plugin-supplied converters that emit a different sidecar shape register their own post_convert handler.
+Return either the EDF path alone, or a two-tuple `(edf_path, sidecar_data)`. When a sidecar dict is returned, the [post_convert hook](#conversion-hooks) dispatcher fires registered handlers — the built-in [sidecar module](converters/sidecar.py) parses Nicolet-shaped sidecars and writes one `Event` per item through the [event translation](#event-translation) plus a "Source events" `Annotation`, the raw record, distinct from the "Original annotations" record written from the EDF+ TAL parse. Plugin-supplied converters that emit a different sidecar shape register their own post_convert handler.
 
 After conversion, `Recording.stored_name`, `file_extension`, `file_hash`, `file_size`, and `original_name` are updated to reflect the EDF.
 
@@ -176,7 +178,7 @@ After conversion, `Recording.stored_name`, `file_extension`, `file_hash`, `file_
 |---|---|---|
 | `.csv` | Tabular signal data to EDF via a registry of per-format subconverters | [converters/csv2edf.py](converters/csv2edf.py) |
 
-Converters for vendor formats are separate programs the deployment describes in `RECORDING_CONVERTERS`; the platform carries no vendor-specific conversion code at all, and names no vendor package. See External converters below. A converter that emits a JSON sidecar has it saved as an `Annotation` named `"Source events"` (the generic name used for sidecar-derived events from any converter). A converter that would emit more than one EDF for one input should raise `ConversionError` and fail the task rather than pick a segment.
+Converters for vendor formats are separate programs the deployment describes in `RECORDING_CONVERTERS`; the platform carries no vendor-specific conversion code at all, and names no vendor package. See External converters below. A converter that emits a JSON sidecar has each item saved as an `Event` through the [event translation](#event-translation) and the whole saved as an `Annotation` named `"Source events"` (the generic name used for sidecar-derived events from any converter). A converter that would emit more than one EDF for one input should raise `ConversionError` and fail the task rather than pick a segment.
 
 ### Registering or disabling converters
 
@@ -367,13 +369,28 @@ def handle_post_convert(recording, source_path, converted_path, sidecar_data) ->
     save_sidecar_events(recording, sidecar_data)
 ```
 
-The per-item event schema (`onset_seconds` required and numeric; `duration_seconds`, `text`, `type`, `label` optional and typed) is pinned in [converters/sidecar.py](converters/sidecar.py) and validated by `save_sidecar_events` — a converter emitting different key names fails loudly per recording instead of writing rows of null onsets. Both callers catch and log the `ValueError`, so ingest continues.
+The per-item event schema (`onset_seconds` required and numeric; `duration_seconds` and `text` optional and typed; `type` and `label` optional and either strings or null, since a converter writes null for an event it has no label for) is pinned in [converters/sidecar.py](converters/sidecar.py) and validated by `save_sidecar_events` — a converter emitting different key names fails loudly per recording instead of writing rows of null onsets. Both callers catch and log the `ValueError`, so ingest continues.
 
 The shape filter is load-bearing — the post_convert dispatcher fires every registered handler for every successful conversion regardless of source format, so each handler must self-filter to its own sidecar shape. A plugin author writing a handler for, say, `.ncs` (Neuralynx) emits its own dict shape and filters on those keys; the Nicolet handler ignores it and the Neuralynx handler ignores Nicolet sidecars.
 
 ### Why hooks instead of a single hardcoded path
 
 The historical preservation gap motivated the protocol: when `RECORDINGS_PRESERVE_MODE="failed"` and a converter ran, the bytes preserved to the originals volume were the converted EDF, not the user-uploaded source. Special-casing each converter in `process_recording` doesn't scale (converters know their input format, not the platform's preservation policy). The `pre_convert` + `convert_failed` hooks let the preservation module ([preservation.py](preservation.py)) stash source bytes before conversion and write them on failure, without `process_recording` needing to know about the stash. The same extension surface enables plugin-supplied archival, pre-validation, and provenance handlers.
+
+## Event translation
+
+The events a file arrives with, the text TALs of an EDF+ and the `annotations` and `events` of a converter sidecar, each become an `Event` row on the recording through [event_translation.py](event_translation.py). A source event that a mapper or a table translates to a term of the platform's own vocabularies ([annotations/vocabulary/](../annotations/vocabulary/)) is written with the term's name and class and a `Code` under the standard that owns the term, `epicurrents.biosignal` or `epicurrents.eeg`; one nothing translates is written as a placeholder, named `Source annotation` or `Source event` by its kind, timed and carrying no text. The rule is fail-closed on purpose: a mapper answering a code no vocabulary has, a finding-scoped term or an exception is logged and the event stays untranslated, because a silently wrong term is worse than an untranslated event. The vendor's string reaches no `Event` or `Code` row. It stays in the raw record the two seams keep, the "Original annotations" and "Source events" bundles, which follow the [annotation-text rule](../AGENTS.md#annotation-text-follows-apply_middleware) like every row: served under a raw grant, withheld under a de-identifying one. So a translated event explains the signal to every reader, and the vendor's own vocabulary only to those who could have read the file.
+
+Two kinds of mapper, asked in this order until one answers. A project or plugin registers a callable with `register_event_translation(mapper, name=...)` from its `AppConfig.ready()`; it receives a `SourceEvent` (`onset`, `duration`, `label`, and `type` where the source distinguishes a vendor type) and returns a code, a `Translation(code, meta)` or `None`. A deployment names translation tables in `RECORDING_EVENT_TRANSLATIONS`, JSON files read at `manage.py check`, which is the shape a mapping for an [external converter](#external-converters) takes: the table ships beside the converter as data, so the platform learns the vendor's strings without importing the program. A table is an object with a `rules` list tried in order, each rule a `code` plus at least one matcher: `type` and `label` compare casefolded with whitespace collapsed, `pattern` is a regular expression the whole label must match, and with a pattern `{1}`, `{2}` in `code` and in string `meta` values are filled from its groups, the assembled code checked against the vocabularies at match time.
+
+```json
+{"name": "Vendor X events",
+ "rules": [{"type": "Eyes closed", "code": "EEG_ACT_EC"},
+           {"type": "Photic", "pattern": "(\\d+) ?hz", "code": "EEG_ACT_PHOTIC_{1}HZ"},
+           {"label": "Recording Paused", "code": "BIO_TECH_PAUSE"}]}
+```
+
+`manage.py check` refuses a table that does not parse (`recordings.E001`) or names a literal code outside the pinned vocabularies (`recordings.E002`), because both otherwise fail quietly as events that never translate. `RECORDINGS_DISCARD_EMBEDDED_ANNOTATIONS` skips the raw record and the placeholders and keeps the translated events: a term of the platform's own vocabulary and a timestamp carries nothing from the file. Tests in [tests/test_event_translation.py](tests/test_event_translation.py); design and term tables in [docs/engineering-notes/annotation-event-vocabulary.md](../docs/engineering-notes/annotation-event-vocabulary.md).
 
 ## API
 
@@ -509,7 +526,7 @@ Arguments:
 | `--reprocess` | off | When resuming, re-process files already marked `done` (default: skipped). |
 | `--resume` / `--discard` | — | Required when an `in_progress` job already exists. Mutually exclusive. |
 
-The command shares its EDF processing path with the upload Celery task — `_save_edf_results`, `_save_sidecar_events`, `_annotation_hash`, `_determine_modality` in [tasks.py](tasks.py) are private helpers but are imported by this command. Renaming or removing any of them requires updating the command in the same commit.
+The command shares its EDF processing path with the upload Celery task — `_save_edf_results`, `_annotation_hash` and `_determine_modality` in [tasks.py](tasks.py) are private helpers imported by this command, as is `save_sidecar_events` in [converters/sidecar.py](converters/sidecar.py). Renaming or removing any of them requires updating the command in the same commit.
 
 A converter that reads a multi-file study is registered on the one extension that identifies it — a Natus study on its `.stc` segment table, for instance — so a tree of unpacked studies imports one recording per study rather than one per segment file. The remaining files are read by the converter as siblings and are never enumerated as recordings in their own right.
 
@@ -639,10 +656,11 @@ What happens at ingest, in order:
 | `RECORDINGS_MAX_UPLOAD_SIZE` | `2 * 1024 * 1024 * 1024` (2 GiB) | Hard cap, enforced by the upload endpoint as it streams chunks to disk. Nothing in Django enforces it: Ninja streams a file part straight to disk, and `DATA_UPLOAD_MAX_MEMORY_SIZE` bounds form fields rather than files. |
 | `RECORDING_PIPELINES` | `{}` | Override / extend named ingest pipelines. |
 | `RECORDING_CONVERTERS` | `{}` | Override / extend the converter registry. `None` value disables a built-in. |
+| `RECORDING_EVENT_TRANSLATIONS` | `[]` | Translation tables for the events a file arrives with, JSON files read at `manage.py check`. See [Event translation](#event-translation). |
 | `RECORDINGS_PRESERVE_MODE` | `"none"` | `"none"` \| `"failed"` \| `"all"`. See [Preservation tiers](#preservation-tiers). |
 | `RECORDINGS_ORIGINALS_PATH` | unset | Mount point for the host-controlled originals volume. Required when mode is `"failed"` or `"all"`; the startup check fails loudly otherwise. Strict write-only from the platform. |
 | `RECORDINGS_DISCARD_ORIGINAL_NAME` | `False` | Replace the uploaded filename with an upload timestamp before the row is written. See [Ingest privacy overrides](#ingest-privacy-overrides). |
-| `RECORDINGS_DISCARD_EMBEDDED_ANNOTATIONS` | `False` | Write no annotation row for events that arrived inside the file. Gap records are unaffected. |
+| `RECORDINGS_DISCARD_EMBEDDED_ANNOTATIONS` | `False` | Write no raw record and no placeholder for events that arrived inside the file. Translated events and gap records are unaffected. |
 | `RECORDINGS_DISCARD_SOURCE_CHANNEL_METADATA` | `False` | Store no `SignalInfo.source_*` values — the pre-cleaning channel originals. The cleaned values are unaffected. |
 | `RECORDINGS_ALLOW_PRESERVE_ANNOTATIONS` | `True` | When false, a caller may not ask for annotation text to be kept in the stored file. |
 | `RECORDINGS_SUBMISSION_MAX_SIZE` | `64 * 1024 * 1024` (64 MiB) | Cap on a submitted file or sidecar, read into memory for the gate. Prepared excerpts, not whole recordings. See [Submissions](#submissions). |
@@ -658,7 +676,7 @@ They stop the platform *retaining* what a de-identifying client was supposed to 
 
 **`RECORDINGS_DISCARD_ORIGINAL_NAME`** replaces the filename with `upload-<UTC timestamp><ext>`. Clinical exports are routinely named after the patient, which makes the filename a direct identifier arriving through a field nobody classifies as one. The value is resolved by `stored_original_name` in [recordings/models.py](models.py), and every route that creates a `Recording` must obtain it there — the upload endpoint and `import_recordings` alike. A source scan in the tests fails the build if a new route assigns the field any other way — a gate that covers one route of several is a default wearing a prohibition's name.
 
-**`RECORDINGS_DISCARD_EMBEDDED_ANNOTATIONS`** suppresses both the `"Original annotations"` row written from EDF TALs and the `"Source events"` row written from a converted Nicolet `.e` file's sidecar. Vendor event vocabularies identify the acquisition software and through it the laboratory; free-text events carry whatever the file carried. `Interruption` rows are deliberately kept — a gap is geometry rather than annotation, it carries no text, and both the viewer and the compute layer place events against it.
+**`RECORDINGS_DISCARD_EMBEDDED_ANNOTATIONS`** suppresses the raw records, the `"Original annotations"` row written from EDF TALs and the `"Source events"` row written from a converter's sidecar, and the placeholder `Event` rows for events nothing translated. Vendor event vocabularies identify the acquisition software and through it the laboratory; free-text events carry whatever the file carried. Translated events are kept: each carries a term of the platform's own vocabulary and a timestamp, and nothing from the file besides ([Event translation](#event-translation)). `Interruption` rows are deliberately kept — a gap is geometry rather than annotation, it carries no text, and both the viewer and the compute layer place events against it.
 
 **`RECORDINGS_DISCARD_SOURCE_CHANNEL_METADATA`** drops the `source_label` / `source_transducer_type` / `source_prefiltering` / `source_index` capture. Applied at ingest and again on metadata refresh, which rebuilds those rows from the previous ones and would otherwise reacquire what had been dropped.
 
@@ -672,6 +690,7 @@ Coverage is in [recordings/tests/test_ingest_privacy_overrides.py](tests/test_in
 |---|---|
 | Custom ingest pipeline | Add a label to `RECORDING_PIPELINES` in your project's `settings.py`. Pass the label to `import_recordings --pipeline <label>`, or set `RECORDING_PIPELINES["web"]` to override the upload Celery task's pipeline. |
 | Custom converter | Add an entry to `RECORDING_CONVERTERS`. Implement the `(input_path, output_dir) -> Path | (Path, dict | None)` contract. |
+| Translate a vendor's events | Name a JSON table in `RECORDING_EVENT_TRANSLATIONS`, or register a callable with `register_event_translation` from [event_translation.py](event_translation.py) in `AppConfig.ready()`. See [Event translation](#event-translation). |
 | EDF middleware in the serve pipeline | Subclass `EDFHeaderMiddleware` or `EDFSignalMiddleware` from [federation/middleware.py](../federation/middleware.py). The serve pipeline is currently hardcoded in `_build_serve_pipeline`; project-level injection of additional middleware is on the roadmap. |
 | Reverse relation from project model to `Recording` | Standard FK / `OneToOneField` from your project model. See [projects/example/models.py](../projects/example/models.py) for the worked pattern. |
 | Re-emit an EDF/BDF header after a structural transform | `build_header(header, signal_infos)` from [recordings/processors/edf.py](processors/edf.py) — see [Building headers](#building-headers). |

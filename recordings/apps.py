@@ -27,6 +27,10 @@ class RecordingsConfig(AppConfig):
         """
         from activity.derived_state import register_derived_state_digester, register_derived_state_record
         from epicurrents.permissions import register_read_visibility_gate
+
+        # Imported for the @register side effect, as activity.checks is: the
+        # event-translation tables are read at `manage.py check`.
+        from recordings import checks  # noqa: F401
         from recordings.audit_digests import (
             SIGNAL_INFO_DIGEST_KEY,
             compute_signal_info_digest,
