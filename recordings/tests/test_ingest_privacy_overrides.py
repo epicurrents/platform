@@ -171,7 +171,7 @@ class TestDiscardEmbeddedAnnotations:
         assert interruptions.first().duration == 2.0
 
     # ── The converted-file route ──────────────────────────────────────────
-    # A Nicolet .e file carries its events in a sidecar rather than in the EDF
+    # A converted vendor file carries its events in a sidecar rather than in the EDF
     # the converter produces, so they reach the database through
     # save_sidecar_events and never through _save_edf_results. The setting is
     # documented as covering both; only the EDF one was tested, and deleting the

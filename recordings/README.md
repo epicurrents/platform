@@ -59,7 +59,7 @@ The canonical file row. Fields:
 | Field | Notes |
 |---|---|
 | `author` | FK to user; cascades on delete. |
-| `original_name` | Filename as uploaded. Visible only to the author and superusers — grantees, share-token holders, and federated peers see `null` in API responses. Can carry PHI (`MRN_12345_routine.edf` and similar) so all grantee-facing surfaces use `display_name` instead. **Not user-mutable** (PATCH does not accept it), but is rewritten by the ingest pipeline when a converter runs — for example a `.e` upload becomes `<stem>.edf` after the Nicolet converter so the filename matches the stored format. |
+| `original_name` | Filename as uploaded. Visible only to the author and superusers — grantees, share-token holders, and federated peers see `null` in API responses. Can carry PHI (`MRN_12345_routine.edf` and similar) so all grantee-facing surfaces use `display_name` instead. **Not user-mutable** (PATCH does not accept it), but is rewritten by the ingest pipeline when a converter runs — for example a vendor-format upload becomes `<stem>.edf` after its converter so the filename matches the stored format. |
 | `display_name` | Nullable. Grantee-visible label. Defaults to the `stored_name` hash prefix (first 8 chars, uppercase) when unset. Editable via PATCH; set to `""` to clear. The collection bulk-rename endpoint writes this field. |
 | `stored_name` | Unique name under `RECORDINGS_UPLOAD_PATH`. Format: 32 hex chars + extension. Never derived from user input. **Immutable** across the recording's lifetime (the file is rewritten in place during de-identification, but the name is not). |
 | `file_extension` | Lowercased with leading dot. Updated by the converter when format is changed. |
@@ -168,7 +168,7 @@ A *converter* turns a non-EDF input file into an EDF before the rest of processi
 def convert(input_path: Path, output_dir: Path) -> Path | tuple[Path, dict | None]: ...
 ```
 
-Return either the EDF path alone, or a two-tuple `(edf_path, sidecar_data)`. When a sidecar dict is returned, the [post_convert hook](#conversion-hooks) dispatcher fires registered handlers — the built-in [sidecar module](converters/sidecar.py) parses Nicolet-shaped sidecars and writes one `Event` per item through the [event translation](#event-translation) plus a "Source events" `Annotation`, the raw record, distinct from the "Original annotations" record written from the EDF+ TAL parse. Plugin-supplied converters that emit a different sidecar shape register their own post_convert handler.
+Return either the EDF path alone, or a two-tuple `(edf_path, sidecar_data)`. When a sidecar dict is returned, the [post_convert hook](#conversion-hooks) dispatcher fires registered handlers — the built-in [sidecar module](converters/sidecar.py) parses sidecars of the shape it pins and writes one `Event` per item through the [event translation](#event-translation) plus a "Source events" `Annotation`, the raw record, distinct from the "Original annotations" record written from the EDF+ TAL parse. Plugin-supplied converters that emit a different sidecar shape register their own post_convert handler.
 
 After conversion, `Recording.stored_name`, `file_extension`, `file_hash`, `file_size`, and `original_name` are updated to reflect the EDF.
 
@@ -193,18 +193,18 @@ RECORDING_CONVERTERS = {
     # A direct callable.
     ".smr": my_smr_converter,
     # An external program — see External converters below.
-    ".e": {
+    ".vnd": {
         "command": [
             "{python}",
             "-m",
-            "nicolet_e2edf.nicolet.cli",
+            "vendor2edf",
             "--in",
             "{input}",
             "--out",
             "{output}",
             "--json-sidecar",
         ],
-        "requires": "nicolet_e2edf",
+        "requires": "vendor2edf",
     },
 }
 ```
@@ -350,13 +350,13 @@ Pick `"hard"` only when the handler's purpose is *gating*. Anything that's obser
 
 The outer task error path catches *any* unexpected exception (a `"hard"` handler, a missing file, a database error), marks the recording `FAILED`, and writes `Unexpected processing error: …` to `processing_error` rather than deleting the row — so a failure always leaves a record the author and operator can inspect. See [docs/debugging.md → Recording processing failures](../docs/debugging.md#recording-processing-failures).
 
-### Worked example — Nicolet sidecar parser
+### Worked example — the built-in sidecar parser
 
-The Nicolet `.e` converter emits a sidecar dict; the matching post_convert handler lives at [converters/sidecar.py](converters/sidecar.py) and is registered in [apps.py](apps.py):
+A command converter emits a sidecar dict in the shape [converters/sidecar.py](converters/sidecar.py) pins; the matching post_convert handler lives there and is registered in [apps.py](apps.py):
 
 ```python
 # recordings/converters/sidecar.py
-def _looks_like_nicolet_sidecar(sidecar_data: dict) -> bool:
+def _looks_like_event_sidecar(sidecar_data: dict) -> bool:
     """Filter on shape so other converters' sidecars are not parsed by this handler."""
     if not isinstance(sidecar_data, dict):
         return False
@@ -364,14 +364,14 @@ def _looks_like_nicolet_sidecar(sidecar_data: dict) -> bool:
 
 
 def handle_post_convert(recording, source_path, converted_path, sidecar_data) -> None:
-    if sidecar_data is None or not _looks_like_nicolet_sidecar(sidecar_data):
+    if sidecar_data is None or not _looks_like_event_sidecar(sidecar_data):
         return
     save_sidecar_events(recording, sidecar_data)
 ```
 
 The per-item event schema (`onset_seconds` required and numeric; `duration_seconds` and `text` optional and typed; `type` and `label` optional and either strings or null, since a converter writes null for an event it has no label for) is pinned in [converters/sidecar.py](converters/sidecar.py) and validated by `save_sidecar_events` — a converter emitting different key names fails loudly per recording instead of writing rows of null onsets. Both callers catch and log the `ValueError`, so ingest continues.
 
-The shape filter is load-bearing — the post_convert dispatcher fires every registered handler for every successful conversion regardless of source format, so each handler must self-filter to its own sidecar shape. A plugin author writing a handler for, say, `.ncs` (Neuralynx) emits its own dict shape and filters on those keys; the Nicolet handler ignores it and the Neuralynx handler ignores Nicolet sidecars.
+The shape filter is load-bearing — the post_convert dispatcher fires every registered handler for every successful conversion regardless of source format, so each handler must self-filter to its own sidecar shape. A plugin author writing a handler for, say, `.ncs` (Neuralynx) emits its own dict shape and filters on those keys; the built-in handler ignores it and the Neuralynx handler ignores the built-in shape.
 
 ### Why hooks instead of a single hardcoded path
 
@@ -724,7 +724,7 @@ The pipeline / converter test surface lives in `recordings/tests/test_pipelines.
 - **`file_hash` vs `stored_hash` vs `content_hash` vs the public `hash`.** `file_hash` is the SHA-256 of the raw file bytes, stable across uploads of the same file (no dedup query uses it yet, so it carries no index) and never served. `stored_hash` is the SHA-256 of the de-identified file on disk and is what a reader sees. `content_hash` mixes `file_hash` with a serialisation of the row, so two uploads of the same file by different users differ. None of the three is the public identifier: the URL `hash` is the 32-hex-char `stored_name` prefix, served by a pattern-ops index on PostgreSQL.
 - **Re-uploads produce distinct annotation hashes.** `_annotation_hash(recording.pk, suffix)` is keyed on the recording PK rather than the file hash, so uploading the same file twice produces two separate sets of `Interruption` and "Original annotations" rows.
 - **FAILED-state visibility is asymmetric.** Author and superusers see FAILED recordings everywhere — listings, detail, status, downloads (they receive raw bytes since author / superuser bypass the middleware) — so they can act on the failure. Every grantee surface (other readers, share-token holders, federated peers, library item listings) filters FAILED out at the queryset / response level and returns 404 on direct hash lookups. The `apply_middleware=True` bypass that previously leaked unrewritten EDF headers when `RecordingMeta` was missing now returns 403 with `{"code": "recording_unprocessed", ...}` as a defense-in-depth check. See [FAILED-hidden rule](#failed-hidden-rule).
-- **Display name vs. original filename.** `original_name` is the filename as uploaded and is **not user-mutable** — PATCH does not accept it. The ingest pipeline rewrites it as a side effect of format conversion (the Nicolet `.e` converter, for example, replaces `.e` with `.edf` so the stored filename matches the format). `display_name` is the grantee-visible label, editable via PATCH. Grantee-facing responses always return `display_name` and `null` for `original_name`. The `Content-Disposition` filename on every download uses `display_name + file_extension`. Authors who want to use the original filename as the display name must opt in explicitly (upload-time `display_name` parameter or later PATCH) with a PHI acknowledgement on the UI side.
+- **Display name vs. original filename.** `original_name` is the filename as uploaded and is **not user-mutable** — PATCH does not accept it. The ingest pipeline rewrites it as a side effect of format conversion (a converter replaces the source extension with `.edf` so the stored filename matches the format). `display_name` is the grantee-visible label, editable via PATCH. Grantee-facing responses always return `display_name` and `null` for `original_name`. The `Content-Disposition` filename on every download uses `display_name + file_extension`. Authors who want to use the original filename as the display name must opt in explicitly (upload-time `display_name` parameter or later PATCH) with a PHI acknowledgement on the UI side.
 - **Pipeline mutation is local to one task.** `process_recording(..., preserve_annotations=True)` sets `pipeline.header.strip_annotation_text = False` on the *resolved* pipeline object for that task. The same is true in `import_recordings`. Don't cache a `RecordingPipeline` and reuse it across tasks if the per-task flag matters — call `get_pipeline()` afresh each time.
 - **Conversion rewrites `original_name`.** After a `.e` → EDF conversion, the user-facing filename is updated from `recording.e` to `recording.edf`. This is intentional — the viewer chooses its reader by extension and would otherwise look for a `.e` reader.
 - **Shared private helpers.** `_save_edf_results`, `_save_sidecar_events`, `_annotation_hash`, and `_determine_modality` live in [tasks.py](tasks.py) but are imported by [management/commands/import_recordings.py](management/commands/import_recordings.py). Treat them as a shared utility surface — renames or signature changes must update both call sites.

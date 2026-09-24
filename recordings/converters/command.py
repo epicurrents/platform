@@ -25,8 +25,8 @@ Anything else is refused rather than guessed at — two EDFs means a multi-segme
 that has to be split deliberately, not reduced to whichever file sorted first.
 
 A subprocess rather than an import, and the licence is the sharpest reason. A converter for
-a proprietary format may be licensed on terms the platform must not take on — the Nicolet
-one is GPLv3 — and importing it would combine the two, where running it as a separate
+a proprietary format may be licensed on terms the platform must not take on — one of the
+known ones is GPLv3 — and importing it would combine the two, where running it as a separate
 program at arm's length does not. Nothing here imports a converter: ``requires`` is checked
 with :func:`importlib.util.find_spec`, which locates a module without executing it. The
 practical benefits come free with it, since the converter's dependencies cannot collide

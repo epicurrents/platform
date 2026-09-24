@@ -16,12 +16,12 @@ Usage
     Directory containing EDF/BDF files (and optional ``.json`` sidecars).
 
 ``--username``
-    Username of the user who will own all imported recordings.  The user must
+    Username of the user who will own all imported recordings. The user must
     already exist.
 
 ``--pipeline``
     Named pipeline label defined in ``RECORDING_PIPELINES`` or one of the
-    built-ins (``"web"``, ``"import"``).  Defaults to ``"import"``.
+    built-ins (``"web"``, ``"import"``). Defaults to ``"import"``.
 
 ``--structure``
     How subdirectories are handled:
@@ -44,7 +44,7 @@ Usage
     Skipped by default.
 
 ``--resume`` / ``--discard``
-    Required when an ``IN_PROGRESS`` job already exists.  ``--resume``
+    Required when an ``IN_PROGRESS`` job already exists. ``--resume``
     continues from where the last run stopped; ``--discard`` marks the old
     job ``ABORTED`` and starts a fresh one (the already-copied files are
     *not* deleted).
@@ -52,7 +52,7 @@ Usage
 Progress
 --------
 Each file's outcome is persisted in :class:`ImportJobFile` so that interrupted
-imports can be resumed.  Only one job may be ``IN_PROGRESS`` at a time.
+imports can be resumed. Only one job may be ``IN_PROGRESS`` at a time.
 """
 
 from __future__ import annotations
@@ -83,7 +83,7 @@ _EDF_EXTENSIONS = {".edf", ".bdf"}
 
 
 class Command(BaseCommand):
-    help = "Import EDF/BDF (and convertible, e.g. Nicolet .e) files from a directory into Epicurrents."
+    help = "Import EDF/BDF files, and any format a registered converter handles, from a directory into Epicurrents."
 
     def add_arguments(self, parser):
         parser.add_argument(
@@ -561,7 +561,7 @@ class Command(BaseCommand):
                 except Exception as exc:
                     # Source path logged deliberately; see the failure log in handle().
                     logger.warning(
-                        "import_recordings: failed to save Nicolet sidecar events for %s: %s",
+                        "import_recordings: failed to save sidecar events for %s: %s",
                         abs_path,
                         exc,
                     )
@@ -604,8 +604,8 @@ class Command(BaseCommand):
             # ── Preserve original (mode "all") ────────────────────────────
             # Imports never reach the FAILED-status path — EDF parse errors
             # re-raise above and the row is never persisted — so only mode
-            # ``"all"`` needs to write here.  Source is the as-uploaded
-            # file at ``abs_path``.  When a converter has run, the
+            # ``"all"`` needs to write here. Source is the as-uploaded
+            # file at ``abs_path``. When a converter has run, the
             # recording's ``original_name`` was rewritten to the converted
             # extension; pass the actual source filename via
             # ``original_name_override`` so the preserved file is stored

@@ -36,7 +36,7 @@ from recordings.event_translation import (
 from recordings.tests.test_ingest_privacy_overrides import _Anno, _Result
 
 VENDOR_TYPE = "Øyne lukkes"
-VENDOR_LABEL = "Nervus review marker 7"
+VENDOR_LABEL = "Vendor review marker 7"
 MAPPER = "test-mapper"
 
 

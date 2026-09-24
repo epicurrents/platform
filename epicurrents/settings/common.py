@@ -304,7 +304,7 @@ TWO_FACTOR_REQUIRED_FOR_ALL = env_bool("TWO_FACTOR_REQUIRED_FOR_ALL", default=Fa
 RECORDINGS_DISCARD_ORIGINAL_NAME = env_bool("RECORDINGS_DISCARD_ORIGINAL_NAME", default=False)
 
 # Drop annotation content that came out of the uploaded file — the embedded
-# text events of an EDF and the sidecar events of a converted Nicolet .e — so
+# text events of an EDF and the sidecar events of a converted vendor file — so
 # that everything annotating a recording was written on the platform. Vendor
 # event vocabularies identify the acquisition software and through it the
 # acquiring laboratory, and free-text events carry whatever the file carried.

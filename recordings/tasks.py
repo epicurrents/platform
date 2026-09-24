@@ -2,7 +2,7 @@
 
 ``process_recording``
     Moves an uploaded file from staging to permanent storage, runs format
-    conversion (e.g. Nicolet .e → EDF) and EDF/BDF header processing, then
+    conversion (a vendor format to EDF) and EDF/BDF header processing, then
     notifies the author via push notification.
 
 ``purge_deleted_recordings``

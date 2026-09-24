@@ -43,10 +43,10 @@ through :mod:`recordings.converters.command`. Override or extend via
         # An in-process converter for another format:
         ".ncs": "mysite.converters.ncs.convert",
         # An external program, described rather than imported:
-        ".e": {
-            "command": ["{python}", "-m", "nicolet_e2edf.nicolet.cli",
+        ".vnd": {
+            "command": ["{python}", "-m", "vendor2edf",
                         "--in", "{input}", "--out", "{output}", "--json-sidecar"],
-            "requires": "nicolet_e2edf",
+            "requires": "vendor2edf",
         },
     }
 

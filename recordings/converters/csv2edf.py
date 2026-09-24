@@ -17,8 +17,8 @@ Projects inject their own subconverters with :func:`register_csv_subconverter`
 from their ``AppConfig.ready()``; registered subconverters are tried before the
 built-ins, so a project may override a built-in format. The converter is wired
 to ``.csv`` in ``recordings.pipelines._BUILTIN_CONVERTERS`` and obeys the same
-``convert(input_path, output_dir) -> (edf_path, sidecar)`` contract as the
-Nicolet ``.e`` converter.
+``convert(input_path, output_dir) -> (edf_path, sidecar)`` contract as an
+external command converter.
 """
 
 from __future__ import annotations

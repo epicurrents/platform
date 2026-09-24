@@ -20,7 +20,7 @@ class RecordingsConfig(AppConfig):
 
         The conversion-hook handlers close the Phase 3 ``"failed"``
         preservation gap for converter-bound formats — see
-        ``recordings/preservation.py`` for the stash mechanism. The Nicolet
+        ``recordings/preservation.py`` for the stash mechanism. The built-in
         sidecar handler is registered the same way and is the worked
         example for plugin authors writing format-specific post_convert
         handlers.

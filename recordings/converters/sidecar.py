@@ -25,8 +25,8 @@ mirrors ``recordings.tasks._save_edf_results`` (``onset``, ``duration``, ``label
 ``"Source events"`` with the hash suffix ``"source-events"`` so it is distinct from the ``"Original
 annotations"`` record written by the EDF processor.
 
-``handle_post_convert`` is the built-in handler for the Nicolet ``.e`` converter's sidecar and doubles as
-the worked example of the ``post_convert`` hook contract — a plugin author registering a converter for a
+``handle_post_convert`` is the built-in handler for a sidecar of this shape, whichever converter wrote it, and
+doubles as the worked example of the ``post_convert`` hook contract — a plugin author registering a converter for a
 different format (e.g. ``.ncs`` Neuralynx) would put a similar shape-filtered handler under their plugin's
 directory and register it the same way.
 
@@ -105,8 +105,8 @@ def validate_sidecar_events(sidecar_data: dict) -> None:
         _validate_items(events, "events", _EVENT_ITEM_SCHEMA)
 
 
-def _looks_like_nicolet_sidecar(sidecar_data: dict) -> bool:
-    """Return True when the dict matches the Nicolet sidecar shape.
+def _looks_like_event_sidecar(sidecar_data: dict) -> bool:
+    """Return True when the dict matches the sidecar shape pinned in this module.
 
     Filters out other converters' sidecars that might be registered in
     the future — the post_convert dispatcher fires this handler for every
@@ -188,13 +188,13 @@ def save_sidecar_events(recording, sidecar_data: dict) -> None:
 
 
 def handle_post_convert(recording, source_path: Path, converted_path: Path, sidecar_data) -> None:
-    """post_convert handler — parse a Nicolet-shaped sidecar when present.
+    """post_convert handler — parse a sidecar of the pinned shape when present.
 
     Skipped when ``sidecar_data`` is ``None`` (the converter produced no
-    sidecar) or when the shape doesn't match the Nicolet format (a different
-    converter ran).
+    sidecar) or when the shape doesn't match the pinned one (a converter
+    with its own sidecar shape and handler ran).
     """
-    if sidecar_data is None or not _looks_like_nicolet_sidecar(sidecar_data):
+    if sidecar_data is None or not _looks_like_event_sidecar(sidecar_data):
         return
     try:
         save_sidecar_events(recording, sidecar_data)
