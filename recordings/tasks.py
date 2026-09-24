@@ -111,7 +111,7 @@ def _determine_modality(signal_infos) -> str:
     return counts.most_common(1)[0][0]
 
 
-def _save_edf_results(recording, result) -> None:
+def _save_edf_results(recording, result, *, events_from_sidecar: bool = False) -> None:
     """Persist EDF/BDF processing results to the database.
 
     Creates:
@@ -121,6 +121,9 @@ def _save_edf_results(recording, result) -> None:
     - One :class:`~annotations.models.Event` row per embedded text event,
       translated to the platform's vocabulary where anything translates it and
       a text-free placeholder otherwise (``recordings.event_translation``).
+      Skipped when *events_from_sidecar* is set: a converter that emitted a
+      sidecar wrote the same events into its EDF, and the sidecar seam, which
+      keeps the vendor's event type, has written the rows for them.
     - One :class:`~annotations.models.Annotation` row (name "Original
       annotations") when embedded text events or gaps are present: the raw
       record, holding what the file said.
@@ -222,11 +225,15 @@ def _save_edf_results(recording, result) -> None:
     positioned = [(anno, wall_clock_to_data_position(anno.onset, result.gaps)) for anno in result.annotations]
     # A TAL is text without a vendor type, so every one is a source annotation to
     # the translation; a vendor's exported EDF still names its events in the text.
-    write_source_events(
-        recording,
-        [SourceEvent(onset=onset, duration=anno.duration, label=anno.label) for anno, onset in positioned],
-        hash_prefix="original-annotation",
-    )
+    # A converter's sidecar carries the same events with their types, and then
+    # the sidecar seam has written the rows: a second set here would put every
+    # event on the recording twice.
+    if not events_from_sidecar:
+        write_source_events(
+            recording,
+            [SourceEvent(onset=onset, duration=anno.duration, label=anno.label) for anno, onset in positioned],
+            hash_prefix="original-annotation",
+        )
 
     # ── "Original annotations" Annotation (only when there is content) ────
     # The raw record of what the file said, which the Event rows above do not
@@ -400,6 +407,7 @@ def _process_recording_body(*, recording, recording_id, staging_path, preserve_a
         ext = recording.file_extension.lower()
         sidecar_data: dict | None = None
 
+        from recordings.converters.sidecar import sidecar_carries_events
         from recordings.pipelines import (
             dispatch_convert_failed,
             dispatch_post_convert,
@@ -519,7 +527,7 @@ def _process_recording_body(*, recording, recording_id, staging_path, preserve_a
                     # the copy does not cover. Nothing downstream reads the object.
                     strip_annotation_text = False
                 result = process_edf_file(permanent_path, strip_annotation_text=strip_annotation_text)
-                _save_edf_results(recording, result)
+                _save_edf_results(recording, result, events_from_sidecar=sidecar_carries_events(sidecar_data))
 
                 logger.info(
                     "process_recording: EDF/BDF processing succeeded for recording %d "

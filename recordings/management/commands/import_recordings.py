@@ -452,7 +452,7 @@ class Command(BaseCommand):
         from epicurrents.models import AccessRight
         from epicurrents.system_user import get_system_user
         from library.models import CollectionItem
-        from recordings.converters.sidecar import save_sidecar_events
+        from recordings.converters.sidecar import save_sidecar_events, sidecar_carries_events
         from recordings.metadata import stored_hash_of
         from recordings.models import ImportJob, Recording, stored_original_name
         from recordings.processors.edf import process_edf_file
@@ -553,7 +553,9 @@ class Command(BaseCommand):
                 status=Recording.Status.PROCESSING,
             )
 
-            _save_edf_results(recording, result)
+            _save_edf_results(
+                recording, result, events_from_sidecar=sidecar_carries_events(sidecar_data_from_converter)
+            )
 
             if sidecar_data_from_converter is not None:
                 try:

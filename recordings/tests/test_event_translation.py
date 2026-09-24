@@ -364,6 +364,17 @@ class TestTalSeam:
         assert (aura.name, aura.timestamp) == (PLACEHOLDER_ANNOTATION_NAME, 5.0)
         assert "Pt. aura" not in _row_text(recording)
 
+    def test_when_a_sidecar_carried_the_events_the_tal_seam_writes_no_event_rows(self, recording, table):
+        from recordings.tasks import _save_edf_results
+
+        with table([{"label": "Eyes closed", "code": "EEG_ACT_EC"}]):
+            _save_edf_results(
+                recording, _Result(annotations=[_Anno(1.0, 0.5, "Eyes closed")]), events_from_sidecar=True
+            )
+        assert _events(recording) == []
+        # The raw record is the file's own account and is kept either way.
+        assert Annotation.objects.filter(target_object_id=str(recording.pk), name="Original annotations").exists()
+
     def test_the_raw_record_still_holds_what_the_file_said(self, recording, table):
         from recordings.tasks import _save_edf_results
 
@@ -504,3 +515,83 @@ class TestServing:
         closed, placeholder = self._listing(client, scene)
         assert (closed["name"], closed["text_withheld"]) == ("Eyes closed", False)
         assert placeholder["name"] == PLACEHOLDER_ANNOTATION_NAME
+
+
+class TestSeamOwnership:
+    """A converter writes its events into the EDF and into the sidecar; the sidecar owns the ``Event`` rows."""
+
+    def test_a_sidecar_with_an_item_in_either_list_carries_events(self):
+        from recordings.converters.sidecar import sidecar_carries_events
+
+        assert sidecar_carries_events({"events": [{"onset_seconds": 1.0, "type": "Photic"}]})
+        assert sidecar_carries_events({"annotations": [{"onset_seconds": 1.0, "text": "x"}], "events": []})
+
+    @pytest.mark.parametrize(
+        "sidecar",
+        [
+            None,
+            {},
+            {"annotations": [], "events": []},
+            {"channels": [{"index": 0}]},
+            {"events": "not a list"},
+            {"annotations": [], "events": "not a list"},
+            {"events": [{"type": "Photic"}]},
+            "text",
+        ],
+    )
+    def test_nothing_else_does(self, sidecar):
+        """Including a sidecar the schema refuses: its events are lost, so the TALs must not be too."""
+        from recordings.converters.sidecar import sidecar_carries_events
+
+        assert not sidecar_carries_events(sidecar)
+
+    def test_a_converted_upload_writes_each_event_once_from_the_sidecar(self, user, tmp_path):
+        from unittest.mock import patch
+
+        from recordings.converters.sidecar import handle_post_convert
+        from recordings.pipelines import register_post_convert
+        from recordings.tasks import process_recording
+        from recordings.tests.test_convert_hooks import _make_pending_recording
+
+        staging = tmp_path / "staging"
+        uploads = tmp_path / "uploads"
+        staging.mkdir()
+        uploads.mkdir()
+        recording = _make_pending_recording(user, staging, b"<vendor bytes>", ext=".xyz")
+        # Registered at boot; registration is idempotent, so this only guards against a test that reset it.
+        register_post_convert(handle_post_convert)
+        with (
+            override_settings(
+                RECORDINGS_STAGING_PATH=str(staging),
+                RECORDINGS_UPLOAD_PATH=str(uploads),
+                RECORDING_CONVERTERS={".xyz": "recordings.tests.test_event_translation._tals_and_sidecar_convert"},
+            ),
+            patch("notifications.tasks.send_push_to_user.delay"),
+        ):
+            process_recording(recording.pk)
+
+        recording.refresh_from_db()
+        assert recording.status == recording.Status.READY, recording.processing_error
+        # Two events in the file, two rows: the sidecar's typed ones, not the TALs' untyped ones as well.
+        assert [event.name for event in _events(recording)] == [PLACEHOLDER_EVENT_NAME, PLACEHOLDER_EVENT_NAME]
+        names = set(Annotation.objects.filter(target_object_id=str(recording.pk)).values_list("name", flat=True))
+        assert names == {"Original annotations", "Source events"}
+
+
+def _tals_and_sidecar_convert(source_path, output_dir):
+    """A converter that writes its two events into the EDF as TALs and into the sidecar with their types."""
+    from recordings.tests.test_edf_processor import _make_edfplus_file, _make_tal
+
+    converted = output_dir / "out.edf"
+    converted.write_bytes(
+        _make_edfplus_file(
+            n_records=1, tals_per_record=[[_make_tal(0.2, "10 Hz", duration=0.3), _make_tal(0.6, "Eyes closed")]]
+        )
+    )
+    sidecar = {
+        "events": [
+            {"onset_seconds": 0.2, "duration_seconds": 0.3, "type": "Photic", "label": "10 Hz"},
+            {"onset_seconds": 0.6, "duration_seconds": None, "type": "Eyes closed", "label": None},
+        ]
+    }
+    return converted, sidecar

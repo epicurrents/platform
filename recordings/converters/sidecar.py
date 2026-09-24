@@ -20,6 +20,9 @@ shapes (a converter emitting different key names must fail loudly, not produce r
 
 Each item becomes an ``Event`` row through ``recordings.event_translation``: a term of the platform's own
 vocabulary where a mapper or table translates the vendor's type and label, and a text-free placeholder otherwise.
+A converter that emits a sidecar also writes its events into the EDF as annotation records, so the two callers
+ask ``sidecar_carries_events`` first and the TAL seam in ``recordings.tasks._save_edf_results`` then writes no
+``Event`` rows of its own: the sidecar keeps the vendor's event type, which the text of a TAL has lost.
 Both lists are also merged into a single ``{"events": [...]}`` annotation, the raw record, whose per-item format
 mirrors ``recordings.tasks._save_edf_results`` (``onset``, ``duration``, ``label``). That annotation is saved as
 ``"Source events"`` with the hash suffix ``"source-events"`` so it is distinct from the ``"Original
@@ -116,6 +119,23 @@ def _looks_like_event_sidecar(sidecar_data: dict) -> bool:
     if not isinstance(sidecar_data, dict):
         return False
     return isinstance(sidecar_data.get("annotations"), list) or isinstance(sidecar_data.get("events"), list)
+
+
+def sidecar_carries_events(sidecar_data) -> bool:
+    """True when *sidecar_data* is a valid sidecar of the pinned shape with at least one item in either list.
+
+    The two ingest paths ask this before the EDF+ TAL seam runs: a converter that emits a sidecar writes the same
+    events into the EDF it produces as annotation records, and the sidecar, which keeps the vendor's event type,
+    is the one the ``Event`` rows come from. A sidecar that fails the schema owns nothing, so that the TAL seam
+    still writes the rows a refused sidecar would have lost. The raw records of both seams are still written.
+    """
+    if not _looks_like_event_sidecar(sidecar_data):
+        return False
+    try:
+        validate_sidecar_events(sidecar_data)
+    except ValueError:
+        return False
+    return bool(sidecar_data.get("annotations") or sidecar_data.get("events"))
 
 
 def save_sidecar_events(recording, sidecar_data: dict) -> None:
