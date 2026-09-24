@@ -130,6 +130,9 @@ class CollectionPatchIn(Schema):
     # Datasets only — release gating (library/release.py). The author or a
     # superuser may change it; turning it off publishes every unreleased member.
     release_gated: bool | None = None
+    # Datasets only — the submission group; null closes the path. Same rule as
+    # release_gated: the author or a superuser, never a write grantee.
+    submission_group_id: int | None = None
 
 
 class CollectionOut(Schema):
@@ -153,6 +156,9 @@ class CollectionOut(Schema):
     license_url: str | None = None
     # Datasets only — members are hidden until a release run publishes them.
     release_gated: bool = False
+    # Datasets only — the group whose members may submit prepared recordings
+    # through the validating submission path; null when the path is closed.
+    submission_group_id: int | None = None
 
 
 class CollectionWriteOut(CollectionOut):
@@ -1407,6 +1413,7 @@ def _dataset_out(dataset: Dataset) -> dict:
         "license_spdx": meta.license_spdx if meta else None,
         "license_url": meta.license_url if meta else None,
         "release_gated": dataset.release_gated,
+        "submission_group_id": dataset.submission_group_id,
     }
 
 
@@ -1475,6 +1482,23 @@ def update_dataset(request, dataset_id: str, payload: CollectionPatchIn):
             raise HttpError(403, "Only the dataset's author or a superuser may change release gating")
         dataset.release_gated = payload.release_gated
         fields_updated.append("release_gated")
+    if "submission_group_id" in payload.model_fields_set and payload.submission_group_id != dataset.submission_group_id:
+        # Who may feed the pool is the author's decision for the same reason
+        # as the gate: a contributor's submissions surface to every reader
+        # once released.
+        from django.contrib.auth.models import Group
+
+        from epicurrents.permissions import can_modify_object
+
+        if not can_modify_object(user=user, obj=dataset):
+            raise HttpError(403, "Only the dataset's author or a superuser may change the submission group")
+        if (
+            payload.submission_group_id is not None
+            and not Group.objects.filter(pk=payload.submission_group_id).exists()
+        ):
+            raise HttpError(400, "Unknown group")
+        dataset.submission_group_id = payload.submission_group_id
+        fields_updated.append("submission_group")
 
     meta_updates: dict[str, str] = {}
     if payload.license_spdx is not None:

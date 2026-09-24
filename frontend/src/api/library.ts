@@ -29,6 +29,8 @@ export interface Collection {
     license_url: string | null
     /** Datasets only — members stay hidden from readers until a release run publishes them. */
     release_gated?: boolean
+    /** Datasets only — the group whose members may submit prepared recordings; null when the path is closed. */
+    submission_group_id?: number | null
     /** Create and update responses only: free-text warnings for `name` and `description`. */
     warnings?: NameWarning[]
 }
@@ -242,6 +244,7 @@ export async function updateDataset(
         license_spdx?: string
         license_url?: string
         release_gated?: boolean
+        submission_group_id?: number | null
     },
 ): Promise<Collection> {
     const response = await http.patch<Collection>(`/api/v1/library/datasets/${id}/`, payload)

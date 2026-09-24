@@ -809,3 +809,162 @@ def _purge_deleted_recordings_body(*, cutoff, retention_days):
         retention_days,
     )
     return {"purged": purged, "orphaned": orphaned_purged, "errors": errors}
+
+
+@shared_task
+def ingest_pooled_submissions() -> dict:
+    """Ingest every accepted submission older than the pooling delay, in random order across batches.
+
+    The pooled counterpart of the upload's immediate ``process_recording``. A submission
+    accepted by the gate (``recordings.submissions``) waits in the spool until it is older
+    than ``RECORDINGS_SUBMISSION_POOLING_DELAY_HOURS``; this run then takes every such file
+    from every batch, shuffles them, and creates each recording under the system user with a
+    membership in the batch's dataset. The recording carries nothing that names the batch,
+    and the file row is deleted once the recording exists, so the batch is left with counts.
+    What the operator's own database still holds is the correlation between a batch's
+    timestamps and the recordings that appeared one delay later, which the compliance
+    document records as an operator-level residual.
+
+    One audited scope covers the run (``recordings.submission.ingest``, no target, the counts
+    in the metadata); each recording's creation is recorded under it. Processing is queued
+    per recording after the commit, as the upload does, so the de-identification pass runs
+    on the submitted bytes as defence in depth. A file that fails to ingest keeps its row as
+    ``failed`` with the error for the operator and is not retried.
+
+    Each run also retires failed rows older than ``RECORDINGS_SUBMISSION_FAILED_RETENTION_DAYS``,
+    unlinking the spooled bytes and deleting the row under ``recordings.submission.purge``, so a
+    contributor's file the platform could not ingest does not stay on disk indefinitely: the
+    operator has that long to read the error, and the contributor holds the file anyway.
+
+    Returns immediately when nothing is waiting, which is the case on every deployment
+    without a registered ingest profile.
+    """
+    from activity.models import Activity
+    from activity.system_activity import with_system_activity
+    from recordings.models import SubmissionFile
+
+    _purge_failed_submissions()
+
+    delay_hours = getattr(settings, "RECORDINGS_SUBMISSION_POOLING_DELAY_HOURS", 24)
+    cutoff = timezone.now() - timedelta(hours=delay_hours)
+    pending = list(
+        SubmissionFile.objects.filter(status=SubmissionFile.Status.PENDING, received_at__lt=cutoff).select_related(
+            "batch", "batch__dataset"
+        )
+    )
+    if not pending:
+        return {"ingested": 0, "failed": 0}
+
+    # A system source, not the default generator: the order is the one thing a reader of the
+    # audit trail could use to regroup a run into its batches.
+    import secrets
+
+    secrets.SystemRandom().shuffle(pending)
+    batch_count = len({item.batch_id for item in pending})
+    ingested = failed = 0
+    with with_system_activity(
+        "recordings.submission.ingest",
+        interface=Activity.Interface.CELERY,
+        metadata={"file_count": len(pending), "batch_count": batch_count},
+    ):
+        for item in pending:
+            if _ingest_submission_file(item):
+                ingested += 1
+            else:
+                failed += 1
+    return {"ingested": ingested, "failed": failed}
+
+
+def _purge_failed_submissions() -> int:
+    """Unlink and delete failed submission rows past the retention window; returns how many."""
+    from activity.models import Activity
+    from activity.system_activity import with_system_activity
+    from recordings.models import SubmissionFile
+
+    retention_days = getattr(settings, "RECORDINGS_SUBMISSION_FAILED_RETENTION_DAYS", 30)
+    cutoff = timezone.now() - timedelta(days=retention_days)
+    stale = list(SubmissionFile.objects.filter(status=SubmissionFile.Status.FAILED, received_at__lt=cutoff))
+    if not stale:
+        return 0
+    with with_system_activity(
+        "recordings.submission.purge",
+        interface=Activity.Interface.CELERY,
+        metadata={"count": len(stale), "retention_days": retention_days},
+    ):
+        for item in stale:
+            # File first: a row that outlives its bytes is a dead pointer, bytes that
+            # outlive their row are the thing the window exists to bound.
+            try:
+                Path(item.file_path).unlink(missing_ok=True)
+            except OSError:
+                logger.warning("ingest_pooled_submissions: could not unlink failed submission %s", item.stored_name)
+                continue
+            item.delete()
+    return len(stale)
+
+
+def _ingest_submission_file(item) -> bool:
+    """Create the recording for one spooled submission inside the open scope; False when it failed."""
+    from django.db import transaction
+
+    from epicurrents.models import AccessRight
+    from epicurrents.system_user import get_system_user
+    from library.models import DatasetItem
+    from recordings.models import Recording, SubmissionFile, stored_original_name
+    from recordings.submissions import get_ingest_profile
+
+    batch = item.batch
+    profile = get_ingest_profile(batch.profile_key)
+    try:
+        if profile is None:
+            raise RuntimeError(f"Ingest profile {batch.profile_key!r} is no longer registered")
+        if not Path(item.file_path).exists():
+            raise FileNotFoundError("The spooled file is missing")
+        if batch.dataset.deleted_at is not None or not batch.dataset.release_gated:
+            # The pool closed after the batch was opened: nothing may enter a
+            # trashed dataset, and an ungated one would publish on arrival.
+            raise RuntimeError("The batch's dataset is no longer an open release-gated pool")
+        system_user = get_system_user()
+        with transaction.atomic():
+            recording = Recording.objects.create(
+                author=system_user,
+                # The spool name, never a client filename: nothing personal reaches the
+                # author-private field either, and the discard override still applies.
+                original_name=stored_original_name(item.stored_name, item.file_extension),
+                stored_name=item.stored_name,
+                file_extension=item.file_extension,
+                file_size=item.file_size,
+                file_path=item.file_path,
+                file_hash=item.file_hash,
+                content_hash="",
+                status=Recording.Status.PENDING,
+            )
+            recording_ct = ContentType.objects.get_for_model(recording, for_concrete_model=False)
+            AccessRight.objects.create(
+                content_type=recording_ct,
+                object_id=str(recording.pk),
+                access_giver=system_user,
+                access_target=system_user,
+                can_read=True,
+                can_write=True,
+                can_share=True,
+            )
+            DatasetItem.objects.create(dataset=batch.dataset, content_type=recording_ct, object_id=str(recording.pk))
+            if profile.ingest is not None:
+                profile.ingest(recording, item.sidecar)
+            # Several files of one batch share the run; re-read the count rather
+            # than trusting the instance loaded with the file row.
+            batch.refresh_from_db(fields=["ingested_count"])
+            batch.ingested_count += 1
+            batch.save(update_fields=["ingested_count"])
+            item.delete()
+            recording_id = recording.pk
+            transaction.on_commit(lambda: process_recording.delay(recording_id))
+    except Exception as exc:
+        logger.exception("ingest_pooled_submissions: submission %s failed", item.stored_name)
+        # The atomic block rolled the row back to pending; mark it for the operator.
+        item.status = SubmissionFile.Status.FAILED
+        item.error = f"{type(exc).__name__}: {exc}"[:2000]
+        item.save(update_fields=["status", "error"])
+        return False
+    return True

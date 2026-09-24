@@ -217,6 +217,19 @@ class Dataset(models.Model):
             "and serve the release month in place of the upload time."
         ),
     )
+    # Members of this group may submit prepared recordings to the dataset through
+    # the validating submission path (``recordings.submissions``). Contributors
+    # are not managers: they see their own batches and nothing of the pool.
+    # SET_NULL so deleting the group closes the path without touching the
+    # dataset.
+    submission_group = models.ForeignKey(
+        "auth.Group",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="submission_datasets",
+        help_text="Group whose members may submit prepared recordings to this release-gated dataset.",
+    )
 
     # Reverse GenericRelations so hard-delete cascades cleanly through every
     # reference row that targets this dataset via a GenericForeignKey.

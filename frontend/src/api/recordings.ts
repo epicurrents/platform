@@ -153,3 +153,77 @@ export async function updateRecording(hash: string, payload: RecordingPatch): Pr
     const response = await http.patch<Recording>(`/recordings/api/v1/${hash}`, payload)
     return response.data
 }
+
+// ── Validating submissions to a release-gated dataset ────────────────────────
+
+/** A contributor's batch of prepared recordings: identifiers and counts, never a file. */
+export interface SubmissionBatch {
+    hash: string
+    dataset_hash: string
+    profile: string
+    pending_count: number
+    failed_count: number
+    ingested_count: number
+    created_at: string
+}
+
+/** One reason the gate refused a submitted file. */
+export interface SubmissionViolation {
+    code: string
+    message: string
+}
+
+export type SubmissionResult =
+    | { accepted: true; pending_count: number }
+    | { accepted: false; violations: SubmissionViolation[] }
+
+/** Open a batch against a dataset the caller may submit to, checked under a registered ingest profile. */
+export async function createSubmissionBatch(payload: { dataset: string; profile: string }): Promise<SubmissionBatch> {
+    const response = await http.post<SubmissionBatch>('/recordings/api/v1/submissions/batches', payload)
+    return response.data
+}
+
+export async function listSubmissionBatches(datasetHash?: string): Promise<SubmissionBatch[]> {
+    const response = await http.get<SubmissionBatch[]>('/recordings/api/v1/submissions/batches', {
+        params: datasetHash ? { dataset: datasetHash } : undefined,
+    })
+    return response.data
+}
+
+export async function getSubmissionBatch(batchHash: string): Promise<SubmissionBatch> {
+    const response = await http.get<SubmissionBatch>(`/recordings/api/v1/submissions/batches/${batchHash}`)
+    return response.data
+}
+
+/**
+ * Submit one prepared recording with its sidecar. A refused file resolves (not rejects) with
+ * `accepted: false` and the violations, since a 422 is the gate's ordinary answer; nothing was written.
+ * @param batchHash - The batch to add the file to.
+ * @param file - The prepared EDF or BDF excerpt.
+ * @param sidecar - The JSON sidecar as a Blob or File.
+ * @param onProgress - Upload progress callback in whole percent.
+ */
+export async function submitFile(
+    batchHash: string,
+    file: File,
+    sidecar: Blob,
+    onProgress?: (percent: number) => void,
+): Promise<SubmissionResult> {
+    const formData = new FormData()
+    formData.append('file', file)
+    formData.append('sidecar', sidecar, 'sidecar.json')
+    const response = await http.post<SubmissionResult>(
+        `/recordings/api/v1/submissions/batches/${batchHash}/files`,
+        formData,
+        {
+            headers: { 'Content-Type': 'multipart/form-data' },
+            validateStatus: (status) => status === 202 || status === 422,
+            onUploadProgress(event) {
+                if (onProgress && event.total) {
+                    onProgress(Math.round((event.loaded / event.total) * 100))
+                }
+            },
+        },
+    )
+    return response.data
+}

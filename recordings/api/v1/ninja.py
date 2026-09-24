@@ -60,6 +60,7 @@ supplied) require session authentication or a ``FederatedBearer`` JWT.
 """
 
 import hashlib
+import json
 import logging
 import math
 import re
@@ -72,7 +73,7 @@ from django.contrib.auth import get_user_model
 from django.contrib.auth.models import Group
 from django.contrib.contenttypes.models import ContentType
 from django.db import transaction
-from django.db.models import F, Q, prefetch_related_objects
+from django.db.models import Count, F, Q, prefetch_related_objects
 from django.http import FileResponse, HttpResponse, JsonResponse, StreamingHttpResponse
 from django.utils import timezone
 from django.utils.dateparse import parse_datetime
@@ -2913,3 +2914,243 @@ def revoke_recording_access(request, hash: str, right_id: int):
         )
         right.delete()
     return {"status": "ok"}
+
+
+# ── Validating submissions to a release-gated dataset ────────────────────────
+#
+# The pooled counterpart of /upload. A contributor opens a batch against a
+# dataset whose submission group they belong to, then adds files one request at
+# a time; each is checked against the registered ingest profile in memory and
+# is written nowhere unless the gate passes (recordings/submissions.py). Every
+# request audits against the batch, never a recording: the recordings are
+# created later by the pooled ingest task under the system user, in random
+# order across batches, and carry no reference back.
+
+
+class SubmissionBatchIn(Schema):
+    """Open a batch against a dataset, checked under a registered ingest profile."""
+
+    dataset: str
+    profile: str
+
+
+class SubmissionBatchOut(Schema):
+    """A contributor's view of one batch: identifiers and counts, never a file."""
+
+    hash: str
+    dataset_hash: str
+    profile: str
+    pending_count: int
+    failed_count: int
+    ingested_count: int
+    created_at: datetime
+
+
+class SubmissionViolationOut(Schema):
+    """One reason a submission was refused."""
+
+    code: str
+    message: str
+
+
+class SubmissionRejectedOut(Schema):
+    """The gate's answer to a refused file. Nothing was written."""
+
+    accepted: bool = False
+    violations: list[SubmissionViolationOut]
+
+
+class SubmissionAcceptedOut(Schema):
+    """The gate's answer to an accepted file: it now waits in the spool for the pooled run."""
+
+    accepted: bool = True
+    pending_count: int
+
+
+def _get_submission_dataset(identifier: str):
+    """Resolve an active dataset by its 32-character hash, or 404."""
+    from library.models import Dataset
+
+    value = (identifier or "").strip()
+    dataset = None
+    if len(value) == 32 and value.isalnum():
+        dataset = Dataset.objects.filter(deleted_at__isnull=True, object_hash=value.upper()).first()
+    if dataset is None:
+        raise HttpError(404, "Dataset not found")
+    return dataset
+
+
+def _get_own_batch(user, batch_hash: str):
+    """Resolve one of the caller's batches by hash, or 404 (a batch that is not theirs reads as absent)."""
+    from recordings.models import SubmissionBatch
+
+    value = (batch_hash or "").strip()
+    batch = None
+    if len(value) == 32 and value.isalnum():
+        batch = (
+            SubmissionBatch.objects.filter(object_hash=value.upper(), contributor=user)
+            .select_related("dataset")
+            .first()
+        )
+    if batch is None:
+        raise HttpError(404, "Batch not found")
+    return batch
+
+
+def _batch_out(batch) -> dict:
+    from recordings.models import SubmissionFile
+
+    counts = {
+        row["status"]: row["n"] for row in batch.files.values("status").annotate(n=Count("id")).values("status", "n")
+    }
+    return {
+        "hash": batch.object_hash,
+        "dataset_hash": batch.dataset.object_hash,
+        "profile": batch.profile_key,
+        "pending_count": counts.get(SubmissionFile.Status.PENDING, 0),
+        "failed_count": counts.get(SubmissionFile.Status.FAILED, 0),
+        "ingested_count": batch.ingested_count,
+        "created_at": batch.created_at,
+    }
+
+
+@api.post("/submissions/batches", response={201: SubmissionBatchOut})
+def create_submission_batch(request, payload: SubmissionBatchIn):
+    """Open a batch for submitting prepared recordings to a release-gated dataset.
+
+    The caller must belong to the dataset's submission group, and ``profile`` must name a
+    registered ingest profile. A dataset the caller may not submit to answers 403 whether or
+    not it exists for them otherwise; the batch is the audit target of every later request.
+    """
+    from recordings.models import SubmissionBatch
+    from recordings.submissions import can_submit_to_dataset, get_ingest_profile
+
+    user = _require_auth(request)
+    dataset = _get_submission_dataset(payload.dataset)
+    if not can_submit_to_dataset(user, dataset):
+        raise HttpError(403, "You may not submit to this dataset")
+    profile = get_ingest_profile((payload.profile or "").strip())
+    if profile is None:
+        raise HttpError(400, "Unknown ingest profile")
+
+    with transaction.atomic():
+        batch = SubmissionBatch.objects.create(dataset=dataset, contributor=user, profile_key=profile.key)
+        log_activity(verb="recordings.submission.batch.create", target=batch)
+    return 201, _batch_out(batch)
+
+
+@api.get("/submissions/batches", response=list[SubmissionBatchOut])
+def list_submission_batches(request, dataset: str | None = Query(None, description="Filter by dataset hash")):
+    """List the caller's own batches, newest first."""
+    from recordings.models import SubmissionBatch
+
+    user = _require_auth(request)
+    qs = SubmissionBatch.objects.filter(contributor=user).select_related("dataset").order_by("-created_at", "-pk")
+    if dataset:
+        qs = qs.filter(dataset=_get_submission_dataset(dataset))
+    batches = list(qs)
+    log_activity(verb="recordings.submission.batch.list", metadata={"count": len(batches)})
+    return [_batch_out(batch) for batch in batches]
+
+
+@api.get("/submissions/batches/{batch_hash}", response=SubmissionBatchOut)
+def get_submission_batch(request, batch_hash: str):
+    """One of the caller's batches with its counts."""
+    user = _require_auth(request)
+    batch = _get_own_batch(user, batch_hash)
+    log_activity(verb="recordings.submission.batch.read", target=batch)
+    return _batch_out(batch)
+
+
+@api.post(
+    "/submissions/batches/{batch_hash}/files",
+    response={202: SubmissionAcceptedOut, 422: SubmissionRejectedOut},
+)
+def submit_file(
+    request,
+    batch_hash: str,
+    file: UploadedFile = File(...),
+    sidecar: UploadedFile = File(...),
+):
+    """Submit one prepared recording with its sidecar to a batch.
+
+    Both parts are read into memory under ``RECORDINGS_SUBMISSION_MAX_SIZE`` and checked
+    against the batch's ingest profile. A file that fails answers 422 with every violation
+    and writes nothing: no row, no file, and an audit row carrying the violation codes and
+    their count, never a message. An accepted file is written to the spool with a random
+    name (the client filename is not kept) and waits for the pooled ingest run.
+
+    The batch's dataset must still be one the caller may submit to: a group membership
+    withdrawn after the batch was opened closes the batch too.
+    """
+    from recordings.models import SubmissionFile
+    from recordings.submissions import (
+        Violation,
+        can_submit_to_dataset,
+        get_ingest_profile,
+        submission_spool_root,
+        validate_file,
+        validate_submission,
+    )
+
+    user = _require_auth(request)
+    batch = _get_own_batch(user, batch_hash)
+    if not can_submit_to_dataset(user, batch.dataset):
+        raise HttpError(403, "You may not submit to this dataset")
+    profile = get_ingest_profile(batch.profile_key)
+    if profile is None:
+        raise HttpError(409, "The batch's ingest profile is no longer registered")
+
+    max_size = getattr(settings, "RECORDINGS_SUBMISSION_MAX_SIZE", 64 * 1024 * 1024)
+    if file.size > max_size or sidecar.size > max_size:
+        raise HttpError(413, f"A submission exceeds the maximum size ({max_size // (1024 * 1024)} MB).")
+    extension = Path(file.name or "").suffix.lower()
+    if extension not in _EDF_EXTENSIONS:
+        supported = ", ".join(sorted(_EDF_EXTENSIONS))
+        raise HttpError(400, f"A submission must be one of {supported}; converters do not apply on this path.")
+
+    data = file.read()
+    try:
+        sidecar_document = json.loads(sidecar.read().decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        violations = validate_file(profile, data)
+        violations.append(Violation("sidecar_shape", "The sidecar is not valid JSON."))
+    else:
+        violations = validate_submission(profile, data, sidecar_document)
+    if violations:
+        rows = [{"code": v.code, "message": v.message} for v in violations]
+        log_activity(
+            verb="recordings.submission.file.reject",
+            target=batch,
+            metadata={
+                "violation_count": len(rows),
+                "violation_codes": sorted({row["code"] for row in rows}),
+            },
+        )
+        return 422, {"accepted": False, "violations": rows}
+
+    spool = submission_spool_root()
+    spool.mkdir(parents=True, exist_ok=True)
+    stored_name = f"{secrets.token_hex(16).upper()}{extension}"
+    while (spool / stored_name).exists():
+        stored_name = f"{secrets.token_hex(16).upper()}{extension}"
+    spool_path = spool / stored_name
+    spool_path.write_bytes(data)
+    try:
+        with transaction.atomic():
+            SubmissionFile.objects.create(
+                batch=batch,
+                stored_name=stored_name,
+                file_extension=extension,
+                file_path=str(spool_path),
+                file_size=len(data),
+                file_hash=hashlib.sha256(data).hexdigest(),
+                sidecar_hash=hashlib.sha256(json.dumps(sidecar_document, sort_keys=True).encode()).hexdigest(),
+                sidecar=sidecar_document,
+            )
+            log_activity(verb="recordings.submission.file.accept", target=batch)
+    except Exception:
+        spool_path.unlink(missing_ok=True)
+        raise
+    pending = batch.files.filter(status=SubmissionFile.Status.PENDING).count()
+    return 202, {"accepted": True, "pending_count": pending}

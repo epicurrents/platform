@@ -1,0 +1,322 @@
+"""Validating submissions to a release-gated dataset: the profile registry, the gate, the spool and who may submit.
+
+A pooled dataset cannot trust an arriving file the way an upload trusts its author: the
+file was prepared elsewhere against a published profile, and a file that departs from the
+profile either fingerprints its origin (a site's channel template, a vendor's sampling
+rate) or carries what the profile said to leave behind (header identification, annotation
+text). The gate here checks a submission against a registered :class:`IngestProfile` and
+answers with a list of violations, and the endpoint that calls it writes nothing, no row
+and no file, until the list is empty. Today a file that fails ingest lands as a FAILED
+recording until purge, which is the wrong outcome for bytes that might identify someone.
+
+The split is deliberate. The platform owns the checks any pooled dataset needs, the ones
+that read the EDF header and the sidecar's shape: identification fields blanked exactly
+as the platform's own de-identifier writes them, no annotation channel, the channel set
+and order, the sampling rate, the physical and digital ranges, the length on one of the
+fixed durations, forbidden sidecar keys refused rather than dropped, and the declared hash
+equal to the received bytes. The project owns the profile's values, whatever the sidecar
+must say beyond its shape (``validate_sidecar``) and what happens to the sidecar once the
+recording exists (``ingest``). A deployment that registers no profile has no submission
+path; its upload endpoint and bulk import are untouched.
+
+The registry is inert until a profile is registered from a project's ``apps.py::ready()``.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import math
+from collections.abc import Callable
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+from django.conf import settings
+
+# What ``recordings.processors.edf._build_clean_header`` writes into the four identification
+# fields. A submission must arrive already carrying them: a file that does not has either not
+# been through the preparation tool or has been altered since. ``test_submissions`` pins these
+# to the de-identifier's actual output so the two cannot drift apart.
+BLANK_PATIENT = "X X X X"
+BLANK_RECORDING = "Startdate X X X X"
+BLANK_START_DATE = "01.01.85"
+BLANK_START_TIME = "00.00.00"
+
+# Sidecar keys no pooled submission may carry, whatever the profile says. Free text a person
+# typed at the centre, an annotator's name and any timestamp are what the preparation removes;
+# a sidecar carrying one of these was not prepared by the tool, and rejecting it is what keeps
+# a filter that quietly drops text from being a filter nobody notices when it stops working.
+DEFAULT_FORBIDDEN_SIDECAR_KEYS: tuple[str, ...] = (
+    "annotations",
+    "text",
+    "annotator",
+    "created_at",
+    "modified_at",
+    "timestamp",
+    "acquired_at",
+    "recording_date",
+    "patient",
+    "subject",
+)
+
+DECLARED_HASH_KEY = "recording_sha256"
+
+_FLOAT_TOLERANCE = 1e-6
+
+
+@dataclass(frozen=True)
+class Violation:
+    """One reason a submission was refused.
+
+    ``code`` is a stable token the audit row counts by; ``message`` is for the contributor and
+    may quote the file (a channel label, a value), which is why it never reaches the trail.
+    """
+
+    code: str
+    message: str
+
+
+@dataclass(frozen=True)
+class IngestProfile:
+    """The rules a submission to one dataset is checked against.
+
+    Every field that describes the file is optional so a profile can pin what matters to its
+    pool: an empty ``channels`` tuple checks no channel names, a ``None`` rate checks no rate.
+    ``channels`` are compared against each channel's canonical label where the platform
+    resolves one (``Fp1``, ``C3-P3``) and against the raw label otherwise (``ECG``), in file
+    order. ``durations_seconds`` lists the excerpt lengths a file may have.
+
+    ``validate_sidecar`` receives the sidecar after the shape checks passed and returns
+    further violations; ``ingest`` receives the created recording and the sidecar, inside the
+    ingest transaction, and writes whatever the project derives from it (events under a code
+    vocabulary, say). Both are optional. ``forbidden_sidecar_keys`` extends the default set;
+    it cannot shrink it.
+    """
+
+    key: str
+    channels: tuple[str, ...] = ()
+    sampling_rate: float | None = None
+    physical_unit: str | None = None
+    physical_min: float | None = None
+    physical_max: float | None = None
+    digital_min: int | None = None
+    digital_max: int | None = None
+    durations_seconds: tuple[float, ...] = ()
+    required_sidecar_keys: tuple[str, ...] = ()
+    forbidden_sidecar_keys: tuple[str, ...] = ()
+    validate_sidecar: Callable[[dict], list[Violation]] | None = field(default=None, compare=False)
+    ingest: Callable[[Any, dict], None] | None = field(default=None, compare=False)
+
+    @property
+    def all_forbidden_sidecar_keys(self) -> frozenset[str]:
+        """The default forbidden keys plus the profile's own."""
+        return frozenset(DEFAULT_FORBIDDEN_SIDECAR_KEYS) | frozenset(self.forbidden_sidecar_keys)
+
+
+_PROFILES: dict[str, IngestProfile] = {}
+
+
+def register_ingest_profile(profile: IngestProfile) -> None:
+    """Register ``profile`` under its key, replacing an earlier registration of the same key.
+
+    Called from a project's ``apps.py::ready()``. Replacement rather than refusal, because
+    ``ready()`` runs once per process and a test that registers a fixture profile must be able
+    to do so repeatedly.
+    """
+    if not profile.key or not profile.key.replace("_", "").replace("-", "").replace(".", "").isalnum():
+        raise ValueError(f"Ingest profile key {profile.key!r} must be a non-empty identifier.")
+    _PROFILES[profile.key] = profile
+
+
+def get_ingest_profile(key: str) -> IngestProfile | None:
+    """The profile registered under ``key``, or ``None``."""
+    return _PROFILES.get(key)
+
+
+def registered_ingest_profiles() -> list[IngestProfile]:
+    """Every registered profile, ordered by key."""
+    return [_PROFILES[key] for key in sorted(_PROFILES)]
+
+
+def reset_ingest_profiles() -> None:
+    """Clear the registry. Test use only."""
+    _PROFILES.clear()
+
+
+# ---------------------------------------------------------------------------
+# The gate
+# ---------------------------------------------------------------------------
+
+
+def _read(data: bytes, offset: int, width: int) -> str:
+    return data[offset : offset + width].decode("ascii", errors="replace").strip()
+
+
+def _nearly(a: float, b: float) -> bool:
+    return math.isclose(a, b, rel_tol=0.0, abs_tol=_FLOAT_TOLERANCE)
+
+
+def _forbidden_keys_in(value: Any, forbidden: frozenset[str], path: str = "") -> list[str]:
+    """Every forbidden key found anywhere in ``value``, as dotted paths."""
+    found: list[str] = []
+    if isinstance(value, dict):
+        for key, child in value.items():
+            here = f"{path}.{key}" if path else str(key)
+            if str(key) in forbidden:
+                found.append(here)
+            found.extend(_forbidden_keys_in(child, forbidden, here))
+    elif isinstance(value, list):
+        for index, child in enumerate(value):
+            found.extend(_forbidden_keys_in(child, forbidden, f"{path}[{index}]"))
+    return found
+
+
+def validate_file(profile: IngestProfile, data: bytes) -> list[Violation]:
+    """Check the recording bytes against ``profile``. Reads nothing but the header."""
+    from recordings.processors.edf import EdfParseError, parse_edf_header, parse_signal_infos
+
+    violations: list[Violation] = []
+    if len(data) < 256:
+        return [Violation("format", "The file is too short to hold an EDF header.")]
+    try:
+        header = parse_edf_header(data)
+    except EdfParseError as exc:
+        return [Violation("format", f"Not an EDF or BDF file: {exc}")]
+    signals = parse_signal_infos(data, header)
+    if header.signal_count and not signals:
+        return [Violation("format", "The signal header is truncated or corrupt.")]
+
+    # Identification fields, byte for byte what the de-identifier writes. Read from the raw
+    # bytes rather than the parsed header so nothing the parser normalises can pass.
+    if _read(data, 8, 80) != BLANK_PATIENT:
+        violations.append(Violation("identification", "The patient identification field is not blanked."))
+    if _read(data, 88, 80) != BLANK_RECORDING:
+        violations.append(Violation("identification", "The recording identification field is not blanked."))
+    if _read(data, 168, 8) != BLANK_START_DATE or _read(data, 176, 8) != BLANK_START_TIME:
+        violations.append(Violation("identification", "The start date and time are not the de-identified values."))
+
+    if any(s.is_annotation_channel for s in signals):
+        violations.append(Violation("annotations", "The file carries an annotation channel; export without TALs."))
+
+    expected_size = header.header_record_bytes + header.record_byte_size * header.data_record_count
+    if header.data_record_count < 0 or expected_size != len(data):
+        violations.append(Violation("truncated", "The file length does not match its header."))
+
+    data_channels = [s for s in signals if not s.is_annotation_channel]
+    if profile.channels:
+        found = tuple((s.canonical_label or s.label.strip()) for s in data_channels)
+        if found != tuple(profile.channels):
+            violations.append(
+                Violation(
+                    "channels",
+                    f"Channel set or order differs from the profile: got {list(found)}, "
+                    f"expected {list(profile.channels)}.",
+                )
+            )
+
+    for index, signal in enumerate(data_channels):
+        where = f"channel {index + 1} ({signal.label.strip()!r})"
+        if profile.sampling_rate is not None and not _nearly(signal.sampling_rate, profile.sampling_rate):
+            violations.append(
+                Violation(
+                    "sampling_rate",
+                    f"{where}: {signal.sampling_rate:g} Hz, profile requires {profile.sampling_rate:g}.",
+                )
+            )
+        if profile.physical_unit is not None and signal.physical_unit.strip() != profile.physical_unit:
+            violations.append(
+                Violation(
+                    "unit",
+                    f"{where}: unit {signal.physical_unit.strip()!r}, profile requires {profile.physical_unit!r}.",
+                )
+            )
+        if profile.physical_min is not None and not _nearly(signal.physical_min, profile.physical_min):
+            violations.append(
+                Violation("range", f"{where}: physical minimum {signal.physical_min:g} differs from the profile.")
+            )
+        if profile.physical_max is not None and not _nearly(signal.physical_max, profile.physical_max):
+            violations.append(
+                Violation("range", f"{where}: physical maximum {signal.physical_max:g} differs from the profile.")
+            )
+        if profile.digital_min is not None and signal.digital_min != profile.digital_min:
+            violations.append(
+                Violation("range", f"{where}: digital minimum {signal.digital_min} differs from the profile.")
+            )
+        if profile.digital_max is not None and signal.digital_max != profile.digital_max:
+            violations.append(
+                Violation("range", f"{where}: digital maximum {signal.digital_max} differs from the profile.")
+            )
+
+    if profile.durations_seconds:
+        length = header.data_record_count * header.data_record_duration
+        if not any(_nearly(length, allowed) for allowed in profile.durations_seconds):
+            violations.append(
+                Violation(
+                    "duration",
+                    f"Length {length:g} s is not one of the profile's durations {list(profile.durations_seconds)}.",
+                )
+            )
+    return violations
+
+
+def validate_sidecar(profile: IngestProfile, sidecar: Any, data: bytes) -> list[Violation]:
+    """Check the sidecar's shape, its forbidden keys and its declared hash, then ask the profile."""
+    if not isinstance(sidecar, dict):
+        return [Violation("sidecar_shape", "The sidecar must be a JSON object.")]
+    violations: list[Violation] = []
+    for path in _forbidden_keys_in(sidecar, profile.all_forbidden_sidecar_keys):
+        violations.append(Violation("sidecar_forbidden_key", f"The sidecar carries the forbidden key {path!r}."))
+    for key in (DECLARED_HASH_KEY, *profile.required_sidecar_keys):
+        if key not in sidecar:
+            violations.append(Violation("sidecar_missing_key", f"The sidecar lacks the required key {key!r}."))
+    declared = sidecar.get(DECLARED_HASH_KEY)
+    if isinstance(declared, str) and DECLARED_HASH_KEY in sidecar:
+        if declared.strip().lower() != hashlib.sha256(data).hexdigest():
+            violations.append(
+                Violation("sidecar_hash", "The declared recording hash does not match the received bytes.")
+            )
+    elif DECLARED_HASH_KEY in sidecar:
+        violations.append(Violation("sidecar_hash", "The declared recording hash must be a hex string."))
+    if violations:
+        return violations
+    if profile.validate_sidecar is not None:
+        violations.extend(profile.validate_sidecar(sidecar))
+    return violations
+
+
+def validate_submission(profile: IngestProfile, data: bytes, sidecar: Any) -> list[Violation]:
+    """Every violation of ``profile`` by the pair. Empty means the submission may be accepted."""
+    return validate_file(profile, data) + validate_sidecar(profile, sidecar, data)
+
+
+# ---------------------------------------------------------------------------
+# Who may submit, and where accepted files wait
+# ---------------------------------------------------------------------------
+
+
+def can_submit_to_dataset(user: Any, dataset: Any) -> bool:
+    """True when ``user`` belongs to the dataset's submission group and the dataset is release-gated.
+
+    Group membership only: a dataset manager who is not in the group does not submit, and a
+    superuser is not implied. The gate on the dataset is required because a submission into an
+    ungated dataset would surface on arrival, which is the one thing pooling exists to prevent.
+    """
+    if user is None or not getattr(user, "is_authenticated", False):
+        return False
+    if not getattr(dataset, "release_gated", False) or dataset.submission_group_id is None:
+        return False
+    if getattr(dataset, "deleted_at", None) is not None:
+        return False
+    return user.groups.filter(pk=dataset.submission_group_id).exists()
+
+
+def submission_spool_root() -> Path:
+    """The directory accepted submissions wait in until the pooled ingest run takes them."""
+    configured = getattr(settings, "RECORDINGS_SUBMISSION_SPOOL_PATH", "") or ""
+    if configured:
+        root = Path(configured)
+    else:
+        root = Path(settings.RECORDINGS_STAGING_PATH) / "submissions"
+    if not root.is_absolute():
+        root = Path(settings.BASE_DIR) / root
+    return root

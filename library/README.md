@@ -61,7 +61,7 @@ Also carries a `viewer_config` JSONField — a flat per-dataset viewer-settings 
 
 Like `Collection`, `Dataset` declares reverse `GenericRelation` fields for `AccessRight`, `CollectionItem`, `TaggedItem`, and the four annotation types — same rationale, same cross-reference.
 
-A `release_gated` flag turns on [release gating](#release-gating): members stay hidden from every reader but the dataset's managers until a release run publishes them, no member resolves for a request carrying a share token, and a released member is dated by its release month. Only the author or a superuser may change the flag through `PATCH /datasets/{id}/`, since turning it off publishes every unreleased member at once.
+A `release_gated` flag turns on [release gating](#release-gating): members stay hidden from every reader but the dataset's managers until a release run publishes them, no member resolves for a request carrying a share token, and a released member is dated by its release month. Only the author or a superuser may change the flag through `PATCH /datasets/{id}/`, since turning it off publishes every unreleased member at once. `submission_group`, a nullable FK to `auth.Group` under the same rule, names who may feed a gated dataset through the validating submission path; contributors are not managers and see nothing of the pool.
 
 ### `DatasetMeta`
 
@@ -127,6 +127,7 @@ Same CRUD + items shape as Collections at `/datasets/`, plus the access surface 
 - Access rights propagate downward to items via the permission extension (see [Permission extensions](#permission-extensions)).
 - `viewer_config` — returned in the dataset response and settable via `PATCH /datasets/{id}/` (write access required, validated as a flat object). The viewer layers it on top of the deployment's project-level config when the dataset is opened.
 - `release_gated` — returned in the dataset response and settable via `PATCH /datasets/{id}/` by the author or a superuser only (403 for a `can_write` grantee). In a gated dataset `GET /datasets/{id}/items/` lists unreleased members to managers only, orders by name (lower-cased display name, else stored name) instead of `added_at`, carries each row's `release_month`, and serves the release month as `added_at` to readers who are not managers. `GET /datasets/{id}/`, the item, folder and snapshot listings all answer 403 to a share-token request on a gated dataset, and a snapshot's manifest omits unreleased members. See [release gating](#release-gating).
+- `submission_group_id` — returned in the dataset response and settable via the same PATCH by the author or a superuser only (403 for a `can_write` grantee, 400 for an unknown group, `null` closes the path). Members of the group may submit prepared recordings through `/recordings/api/v1/submissions/` while the dataset is release-gated ([recordings/README.md → Submissions](../recordings/README.md#submissions)).
 - `object_hash`, `license_spdx`, `license_url` — dataset responses carry the opaque identifier and the [DatasetMeta](#models) licence pair (`null` when undeclared); the licence fields are settable via the same PATCH.
 - Snapshots: `POST /datasets/{id}/snapshots/` (write access) seals the current membership; `GET /datasets/{id}/snapshots/` lists newest-first without manifests; `GET /datasets/snapshots/{hash}/` returns one with its manifest. No update or delete routes exist — see [DatasetSnapshot](#models).
 - All `/datasets/{id}/...` routes resolve the dataset `object_hash` or the integer PK — see [Identifiers](#identifiers).
@@ -245,7 +246,9 @@ A release-gated dataset is a pool whose members must not surface one by one as t
 
 **Withdrawal** is `manage.py purge_dataset_recordings` in the recordings app, keyed on `Recording.file_hash` and scoped to members of release-gated datasets; its per-hash report is the platform's only answer to whether a submitted hash exists ([recordings/README.md → Soft delete and purge](../recordings/README.md#soft-delete-and-purge)). A deployment that sets `LIBRARY_RELEASE_GATED_DEPLOYMENT` refuses to boot with `RECORDINGS_ORIGINALS_PATH` configured ([checks.py](checks.py)), because a pool keeps no copy its contributors do not also hold and the purge never reaches that volume.
 
-Still to come from the plan's Phase 7: the validating ingest path with pooled batch ingest, and the access and anonymity reports.
+**Feeding the pool** is the validating submission path in the recordings app ([recordings/README.md → Submissions](../recordings/README.md#submissions)): members of the dataset's `submission_group` open batches and submit prepared files, each checked against a registered ingest profile and written nowhere unless it passes; an hourly run ingests accepted files from every batch in random order under the system user, as unreleased members. Both the group and the gate are the author's to set, on the same PATCH route. A release run is also registered as the `library.release_dataset` maintenance operation, so a curator with no shell runs it from the Maintenance tab.
+
+Still to come from the plan's Phase 7: the access and anonymity reports.
 
 ## Identifiers
 

@@ -182,6 +182,45 @@ def _grant_assessments_args(args: NoArgs) -> list[str]:
     return ["--format", "json"]
 
 
+class ReleaseDatasetArgs(Schema):
+    """Arguments of ``library.release_dataset``: which dataset, as of when, and the run's record fields."""
+
+    dataset: str = Field(..., pattern=r"^[0-9A-Fa-f]{32}$", description="The dataset's public hash.")
+    as_of: str | None = Field(
+        None,
+        pattern=r"^\d{4}-\d{2}-\d{2}$",
+        description="Run as of this date (YYYY-MM-DD); today when omitted. Members uploaded in month M are eligible from M+2.",
+    )
+    dry_run: bool = Field(False, description="Report the eligible and selected members without publishing anything.")
+    profile_version: str | None = Field(
+        None, pattern=r"^[A-Za-z0-9._-]{1,64}$", description="The preparation profile version in force, for the record."
+    )
+    k: int | None = Field(None, ge=1, description="The equivalence-class size applied, for the record.")
+    m: int | None = Field(None, ge=1, description="The distinct-contributor minimum applied, for the record.")
+    assessment_reference: str | None = Field(
+        None,
+        pattern=r"^[^\r\n]{1,512}$",
+        description="A reference to the written assessment this run relies on, for the record.",
+    )
+
+
+def _release_dataset_args(args: ReleaseDatasetArgs) -> list[str]:
+    argv = [args.dataset, "--format", "json"]
+    if args.as_of:
+        argv += ["--as-of", args.as_of]
+    if args.dry_run:
+        argv.append("--dry-run")
+    if args.profile_version:
+        argv += ["--profile-version", args.profile_version]
+    if args.k is not None:
+        argv += ["--k", str(args.k)]
+    if args.m is not None:
+        argv += ["--m", str(args.m)]
+    if args.assessment_reference:
+        argv += ["--assessment-reference", args.assessment_reference]
+    return argv
+
+
 class PlatformUpdateArgs(Schema):
     """Arguments of ``platform.update``: an already-uploaded package, by hash."""
 
@@ -283,6 +322,22 @@ def register_core_operations() -> None:
             command="grant_assessments",
             command_args=_grant_assessments_args,
             requires_step_up=False,
+        )
+    )
+    register_operation(
+        Operation(
+            key="library.release_dataset",
+            executor=CELERY,
+            label="Release dataset members",
+            description=(
+                "Run a release on a release-gated dataset: publish the eligible members (uploaded in month M, "
+                "eligible from the start of M+2, subset decided by the project's selector) and record the run with "
+                "the profile version, the k and m conditions and the assessment reference given here. A dry run "
+                "reports the eligible and selected members and writes nothing."
+            ),
+            args_schema=ReleaseDatasetArgs,
+            command="release_dataset",
+            command_args=_release_dataset_args,
         )
     )
     register_operation(

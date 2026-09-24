@@ -64,6 +64,22 @@ class RecordingsConfig(AppConfig):
         # writing to the permanent trail what a single upload does not.
         register_masked_fields("recordings.importjob", {"source_path"})
         register_masked_fields("recordings.importjobfile", {"relative_path", "error"})
+        # A submission file's declared hash becomes Recording.file_hash at ingest
+        # and its sidecar is what the profile's ingest callable writes from, so
+        # either one in the permanent trail is a join from a recording back to
+        # the batch and its contributor. The live row is deleted once ingested;
+        # the trail must not keep what the row gives up. `error` may quote paths.
+        register_masked_fields("recordings.submissionfile", {"file_hash", "sidecar", "error"})
+        # Art. 15: a batch is the contributor's own activity record. It carries
+        # the dataset and the counts; the sidecars and hashes are gone with the
+        # file rows, so nothing of another subject is in it.
+        from user.export import register_export_relation
+
+        register_export_relation(
+            "recordings.submissionbatch",
+            "contributor",
+            fields=("profile_key", "ingested_count", "created_at"),
+        )
         # The read-visibility gate is what makes FAILED / trashed hiding hold
         # on surfaces that resolve recordings through the generic permission
         # resolver rather than the recordings API — see recordings/permissions.py.

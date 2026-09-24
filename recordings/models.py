@@ -18,6 +18,8 @@
     One job per import run; one file row per discovered file.
 """
 
+import secrets
+
 from django.conf import settings
 from django.contrib.contenttypes.fields import GenericForeignKey, GenericRelation
 from django.contrib.contenttypes.models import ContentType
@@ -434,3 +436,107 @@ class ImportJobFile(models.Model):
         indexes = [
             models.Index(fields=["job", "status"]),
         ]
+
+
+class SubmissionBatch(models.Model):
+    """One contributor's batch of prepared recordings submitted to a release-gated dataset.
+
+    The batch is the audit target of every submission request, so the trail names
+    the contributor and the dataset without naming a recording. A recording
+    ingested from a batch carries no reference back to it: the pooled ingest task
+    (``recordings.tasks.ingest_pooled_submissions``) creates the recording under
+    the system user and deletes the file row, leaving the batch with counts only.
+    What remains is the correlation between a batch's timestamps and the
+    recordings that appeared a pooling delay later, inside the operator's own
+    database; the compliance document records that as an operator-level residual.
+
+    ``contributor`` is nullable so that erasing the account clears the one link
+    a batch holds to a person; the batch itself is not personal data once that
+    link is gone.
+    """
+
+    dataset = models.ForeignKey(
+        "library.Dataset",
+        on_delete=models.CASCADE,
+        related_name="submission_batches",
+    )
+    contributor = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="submission_batches",
+    )
+    # Public identifier, mirroring Dataset.object_hash: random, never sequential.
+    object_hash = models.CharField(max_length=32, unique=True, editable=False)
+    # The registered ingest profile every file in the batch was validated against.
+    profile_key = models.CharField(max_length=64)
+    # Files that finished ingest are deleted rather than kept, so the counts are the
+    # batch's only record of them.
+    ingested_count = models.PositiveIntegerField(default=0)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        indexes = [
+            models.Index(fields=["dataset", "created_at"]),
+        ]
+
+    def save(self, *args, **kwargs):
+        if not self.object_hash:
+            self.object_hash = secrets.token_hex(16).upper()
+        super().save(*args, **kwargs)
+
+    def __str__(self) -> str:
+        return f"SubmissionBatch({self.object_hash} dataset={self.dataset_id})"
+
+
+class SubmissionFile(models.Model):
+    """A validated submission waiting in the spool for the pooled ingest run.
+
+    Written only after the whole submission passed the profile's gate, so a row
+    never describes bytes that might carry identifying content. No client
+    filename is kept: ``stored_name`` is a random token, as for an upload.
+    ``sidecar`` is the validated sidecar document, handed to the profile's
+    ``ingest`` callable when the recording is created. ``file_hash`` is the
+    digest the sidecar declared and the server verified; it is also
+    ``Recording.file_hash`` after ingest, which is why both it and the sidecar
+    are masked out of the audit trail (``recordings.apps``) and the row is
+    deleted once ingested: kept, the pair would be a join from a recording
+    back to its batch.
+
+    A row that fails ingest stays, with ``status`` ``failed`` and the error
+    text, for the operator; its recording exists as a hidden FAILED row.
+    """
+
+    class Status(models.TextChoices):
+        PENDING = "pending", "Pending"
+        FAILED = "failed", "Failed"
+
+    batch = models.ForeignKey(
+        SubmissionBatch,
+        on_delete=models.CASCADE,
+        related_name="files",
+    )
+    stored_name = models.CharField(max_length=255, unique=True)
+    file_extension = models.CharField(max_length=32)
+    file_path = models.CharField(max_length=1024)
+    file_size = models.BigIntegerField()
+    file_hash = models.CharField(max_length=64)
+    sidecar_hash = models.CharField(max_length=64)
+    sidecar = models.JSONField(default=dict)
+    status = models.CharField(
+        max_length=16,
+        choices=Status.choices,
+        default=Status.PENDING,
+        db_index=True,
+    )
+    error = models.TextField(blank=True, default="")
+    received_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        indexes = [
+            models.Index(fields=["status", "received_at"]),
+        ]
+
+    def __str__(self) -> str:
+        return f"SubmissionFile({self.stored_name} [{self.status}] batch={self.batch_id})"

@@ -98,6 +98,10 @@ The refresh deliberately leaves `Interruption` and "Original annotations" rows a
 
 Progress tracking for the bulk-import management command. `ImportJob` is one row per `import_recordings` invocation; `ImportJobFile` is one row per file discovered. The job's `status` is `in_progress` → `completed` | `aborted`; only one `in_progress` job may exist at a time. Files can resume from where the previous run stopped — see the [bulk import](#bulk-import-via-import_recordings) section.
 
+### `SubmissionBatch` and `SubmissionFile`
+
+The validating [submission](#submissions) path's rows. A batch is one contributor's set of prepared recordings for one release-gated dataset, identified by a random `object_hash`, and the audit target of every submission request; `contributor` is `SET_NULL` so erasing the account clears its one link to a person. A file row is an accepted submission waiting in the spool: the random `stored_name`, the verified `file_hash`, the sidecar and a status of `pending` or `failed`. It has no recording foreign key by design and is deleted once its recording exists.
+
 ## Ingest pipelines
 
 A *recording pipeline* is a named set of processing options applied to an EDF/BDF file at ingest. Defined in [pipelines.py](pipelines.py) as the `RecordingPipeline` dataclass:
@@ -390,6 +394,10 @@ Mounted at `/recordings/api/v1/`. Full request/response detail in [api/v1/ninja.
 | `GET` | `/{hash}/access/` | List the access rights granted on a recording. See [Access management](#access-management). |
 | `PATCH` | `/{hash}/access/{right_id}/` | Record, update or clear the sharer's contextual assessment on one access right. |
 | `DELETE` | `/{hash}/access/{right_id}` | Revoke one access right. |
+| `POST` | `/submissions/batches` | Open a batch for submitting prepared recordings to a release-gated dataset. See [Submissions](#submissions). |
+| `GET` | `/submissions/batches` | The caller's own batches with their counts; `?dataset=<hash>` filters. |
+| `GET` | `/submissions/batches/{hash}` | One of the caller's batches. Another contributor's batch answers 404. |
+| `POST` | `/submissions/batches/{hash}/files` | Submit one prepared file with its sidecar. **202** accepted into the spool, **422** refused with the violations and nothing written. |
 
 ### Access management
 
@@ -446,6 +454,18 @@ Recordings with `status=FAILED` are visible only to the author and to superusers
 Enforcement is two-layer. The read-visibility gate `recording_hidden_from_reader` in [permissions.py](permissions.py), registered with the permission resolver from `RecordingsConfig.ready()`, denies `can_read_object` itself for FAILED (non-author) and trashed recordings — so surfaces outside this app that resolve recordings generically (the annotations API, extension grants) hide them without knowing the rule. `_failed_hidden_for_caller(recording, user, fed)` in [api/v1/ninja.py](api/v1/ninja.py) is the endpoint-side layer: every recording surface checks it *before* its read-permission check, so a grantee with a valid `AccessRight` on a FAILED recording sees 404 rather than the resolver's 403 — indistinguishable from absence, because the data they would receive is meaningless and the failure detail is author-private.
 
 Defense in depth on the serve path: when a recording is somehow READY but `RecordingMeta` is missing (a race window or pathological state), the serve helper refuses raw bytes to `apply_middleware=True` callers and returns 403 with `{"code": "recording_unprocessed", "detail": "..."}` rather than leaking the unrewritten header.
+
+## Submissions
+
+The validating counterpart of `/upload`, for a [release-gated dataset](../library/README.md#release-gating) fed by contributors who prepared their recordings elsewhere against a published profile. A pooled dataset cannot trust an arriving file the way an upload trusts its author: a file that departs from the profile either fingerprints its origin (a site's channel template, a vendor's sampling rate) or carries what the profile said to leave behind (header identification, annotation text). The path is inert on a deployment that registers no profile; the upload endpoint and the bulk import are not involved and do not change.
+
+**Who may submit.** Members of the dataset's `submission_group` (set by the dataset author on `PATCH /api/v1/library/datasets/{id}/`), and only while the dataset is release-gated, since a submission into an ungated dataset would surface on arrival. Managers are not implied contributors and superusers are not either; `can_submit_to_dataset` in [submissions.py](submissions.py) is the single check. A contributor sees their own batches and nothing of the pool until a release publishes it.
+
+**The gate.** `POST /submissions/batches/{hash}/files` reads the file and the sidecar into memory under `RECORDINGS_SUBMISSION_MAX_SIZE`, checks them against the batch's `IngestProfile`, and writes nothing until the violation list is empty: no row, no file. The platform's checks read the EDF header and the sidecar's shape: the four identification fields blanked exactly as `_build_clean_header` writes them, no annotation channel, the file length matching its header, the channel set and order (canonical labels where the platform resolves one, raw labels otherwise), the sampling rate, the unit and the physical and digital ranges, the length on one of the profile's fixed durations, the forbidden sidecar keys (`annotations`, `text`, `annotator`, timestamps and subject keys, plus whatever the profile adds) refused wherever they occur rather than dropped, the required keys present, and `recording_sha256` equal to the digest of the received bytes. Every check the profile leaves unset is skipped. The profile's own `validate_sidecar` runs once the shape checks pass. A refusal answers 422 with `{code, message}` rows; the audit row (`recordings.submission.file.reject`, target the batch) carries the codes and their count, never a message, because a message may quote a site channel label. An acceptance writes the bytes to the spool under a random name (the client filename is not kept) with a `SubmissionFile` row holding the verified hash and the sidecar, and answers 202.
+
+**Batches and the pooled run.** A batch (`SubmissionBatch`) belongs to a dataset and a contributor and is the audit target of every request, so the trail names the contributor and the dataset without naming a recording. `ingest_pooled_submissions` runs hourly under `recordings.submission.ingest` and takes every accepted file older than `RECORDINGS_SUBMISSION_POOLING_DELAY_HOURS` across all batches, shuffled with a system random source, and for each creates the recording under the system user with the spool name as `original_name`, a membership in the batch's dataset (unreleased, so hidden), hands the sidecar to the profile's `ingest` callable inside the same transaction, deletes the file row, and queues `process_recording` after the commit so the de-identification pass runs on the submitted bytes as defence in depth. The recording carries nothing that names the batch; the batch is left with `ingested_count`. `SubmissionFile.file_hash` and `sidecar` are masked out of the audit trail, since kept there they would join a recording back to its batch. What the operator's own database still holds is the correlation between a batch's timestamps and the recordings that appeared one delay later, recorded in [docs/anonymisation-compliance.md](../docs/anonymisation-compliance.md) as an operator-level residual. A file that fails ingest keeps its row as `failed` with the error for the operator and is not retried; after `RECORDINGS_SUBMISSION_FAILED_RETENTION_DAYS` the run unlinks the spooled bytes and deletes the row under `recordings.submission.purge`, since the contributor holds the file anyway.
+
+**The profile.** `IngestProfile` in [submissions.py](submissions.py), registered from a project's `apps.py::ready()` with `register_ingest_profile`. The platform owns the checks; the project owns the values, `validate_sidecar` (whatever the sidecar must say beyond its shape: enums, a vocabulary, an embargo attestation) and `ingest` (what to write from the sidecar once the recording exists, events under a code vocabulary say). `forbidden_sidecar_keys` extends the default set and cannot shrink it.
 
 ## Soft delete and purge
 
@@ -621,6 +641,10 @@ What happens at ingest, in order:
 | `RECORDINGS_DISCARD_EMBEDDED_ANNOTATIONS` | `False` | Write no annotation row for events that arrived inside the file. Gap records are unaffected. |
 | `RECORDINGS_DISCARD_SOURCE_CHANNEL_METADATA` | `False` | Store no `SignalInfo.source_*` values — the pre-cleaning channel originals. The cleaned values are unaffected. |
 | `RECORDINGS_ALLOW_PRESERVE_ANNOTATIONS` | `True` | When false, a caller may not ask for annotation text to be kept in the stored file. |
+| `RECORDINGS_SUBMISSION_MAX_SIZE` | `64 * 1024 * 1024` (64 MiB) | Cap on a submitted file or sidecar, read into memory for the gate. Prepared excerpts, not whole recordings. See [Submissions](#submissions). |
+| `RECORDINGS_SUBMISSION_POOLING_DELAY_HOURS` | `24` | How long an accepted submission waits in the spool before the hourly pooled run may take it. |
+| `RECORDINGS_SUBMISSION_SPOOL_PATH` | `<staging>/submissions` | Where accepted submissions wait. |
+| `RECORDINGS_SUBMISSION_FAILED_RETENTION_DAYS` | `30` | How long a failed submission's row and spooled bytes stay for the operator before the hourly run removes both. |
 
 ## Ingest privacy overrides
 
@@ -648,6 +672,7 @@ Coverage is in [recordings/tests/test_ingest_privacy_overrides.py](tests/test_in
 | Reverse relation from project model to `Recording` | Standard FK / `OneToOneField` from your project model. See [projects/example/models.py](../projects/example/models.py) for the worked pattern. |
 | Re-emit an EDF/BDF header after a structural transform | `build_header(header, signal_infos)` from [recordings/processors/edf.py](processors/edf.py) — see [Building headers](#building-headers). |
 | Build recording bytes for a test | `make_edf_bytes()` from [recordings/testing.py](testing.py) — see [Test helpers](#test-helpers). |
+| Validate and ingest submissions to a release-gated dataset | `register_ingest_profile(IngestProfile(...))` from your project's `apps.py::ready()`; see [Submissions](#submissions). The platform checks the file and the sidecar's shape; the profile supplies the values, `validate_sidecar` and `ingest`. |
 
 ### Building headers
 

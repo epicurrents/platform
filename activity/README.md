@@ -566,6 +566,13 @@ To check the table against the tree, walk the AST for `log_activity` / `with_sys
 | `recordings.set_mains` | `bulk_set_mains` |
 | `recordings.stored_hash.backfill` | `handle` † |
 | `recordings.status` | `recording_status` |
+| `recordings.submission.batch.create` | `create_submission_batch` |
+| `recordings.submission.batch.list` | `list_submission_batches` |
+| `recordings.submission.batch.read` | `get_submission_batch` |
+| `recordings.submission.file.accept` | `submit_file` |
+| `recordings.submission.file.reject` | `submit_file` |
+| `recordings.submission.ingest` | `ingest_pooled_submissions` † |
+| `recordings.submission.purge` | `ingest_pooled_submissions` † |
 | `recordings.trash` | `delete_recording` |
 | `recordings.update` | `update_recording` |
 | `recordings.upload` | `upload_recording` |

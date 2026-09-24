@@ -167,6 +167,14 @@ CELERY_BEAT_SCHEDULE = {
         # Runs every 3 hours. Adjust via django-celery-beat admin if needed.
         "schedule": 3 * 60 * 60,
     },
+    "ingest-pooled-submissions": {
+        "task": "recordings.tasks.ingest_pooled_submissions",
+        # Hourly. Takes every accepted submission older than
+        # RECORDINGS_SUBMISSION_POOLING_DELAY_HOURS across all batches, in
+        # random order. Returns at once where nothing is waiting, which is
+        # every deployment without a registered ingest profile.
+        "schedule": 60 * 60,
+    },
     "purge-deleted-media": {
         "task": "media.tasks.purge_deleted_media",
         # Runs every 3 hours, alongside the recordings purge.
@@ -647,7 +655,9 @@ REMOTE_UPDATE_ENABLED = env_bool("REMOTE_UPDATE_ENABLED", default=False)
 # Minutes an applied update waits for a superuser's confirmation before the
 # agent rolls it back. A request may name its own window; both are clamped to
 # 5–1440 by the agent as well as here.
-REMOTE_UPDATE_VERIFY_WINDOW_MINUTES = min(1440, max(5, config("REMOTE_UPDATE_VERIFY_WINDOW_MINUTES", default=30, cast=int)))
+REMOTE_UPDATE_VERIFY_WINDOW_MINUTES = min(
+    1440, max(5, config("REMOTE_UPDATE_VERIFY_WINDOW_MINUTES", default=30, cast=int))
+)
 # Largest package the upload endpoint accepts, in bytes; also declared to the
 # proxy's body limit guard.
 REMOTE_UPDATE_MAX_PACKAGE_SIZE = config("REMOTE_UPDATE_MAX_PACKAGE_SIZE", default=1024 * 1024 * 1024, cast=int)
@@ -768,6 +778,19 @@ LIBRARY_TAG_CREATION_REQUIRES_STAFF = env_bool("LIBRARY_TAG_CREATION_REQUIRES_ST
 # release runs) keeps no copy of a submission its contributor does not also hold, so the
 # originals volume is refused at boot while this is on (library/checks.py). Set by the project.
 LIBRARY_RELEASE_GATED_DEPLOYMENT = env_bool("LIBRARY_RELEASE_GATED_DEPLOYMENT", default=False)
+# The validating submission path (recordings/submissions.py). Inert without a registered
+# ingest profile. A submission is read into memory and checked before anything is written,
+# so its own cap is small next to RECORDINGS_MAX_UPLOAD_SIZE: prepared excerpts, not whole
+# recordings. Accepted files wait in the spool (default: a directory under the staging path)
+# until the hourly ingest run takes every file older than the pooling delay.
+RECORDINGS_SUBMISSION_MAX_SIZE = config("RECORDINGS_SUBMISSION_MAX_SIZE", default=64 * 1024 * 1024, cast=int)
+RECORDINGS_SUBMISSION_POOLING_DELAY_HOURS = config("RECORDINGS_SUBMISSION_POOLING_DELAY_HOURS", default=24, cast=int)
+RECORDINGS_SUBMISSION_SPOOL_PATH = config("RECORDINGS_SUBMISSION_SPOOL_PATH", default="")
+# A submission that failed ingest keeps its row and spooled bytes this long for the operator
+# to read the error, then the hourly run unlinks and deletes both.
+RECORDINGS_SUBMISSION_FAILED_RETENTION_DAYS = config(
+    "RECORDINGS_SUBMISSION_FAILED_RETENTION_DAYS", default=30, cast=int
+)
 
 # ──────────────────────────────────────────────────────────────────────────────
 # External login — OpenID Connect (Microsoft Entra ID).

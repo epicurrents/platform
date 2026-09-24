@@ -38,6 +38,7 @@ import MediaPickerDialog from '#components/MediaPickerDialog.vue'
 import { useRecordingsStore } from '#stores/recordings'
 import { useLibraryStore } from '#stores/library'
 import { useAuthStore } from '#stores/auth'
+import { listGroups, type Group } from '#api/user'
 import { toastNameWarnings } from '#lib/nameWarnings'
 import { showToast } from '#lib/toast'
 import ViewerConfigEditor from '#components/ViewerConfigEditor.vue'
@@ -412,7 +413,25 @@ async function submitMoveItem() {
 const showEdit = ref(false)
 const editLoading = ref(false)
 const editError = ref<string | null>(null)
-const input = reactive({ editName: '', editDescription: '', editReleaseGated: false })
+const input = reactive({ editName: '', editDescription: '', editReleaseGated: false, editSubmissionGroup: '' })
+// Groups for the submission-group selector; loaded once, when the edit
+// dialog first opens for someone who may change it.
+const groups = ref<Group[]>([])
+const groupsLoading = ref(false)
+
+async function loadGroups() {
+    if (groups.value.length || groupsLoading.value) {
+        return
+    }
+    groupsLoading.value = true
+    try {
+        groups.value = await listGroups()
+    } catch {
+        groups.value = []
+    } finally {
+        groupsLoading.value = false
+    }
+}
 
 function openEdit() {
     if (!dataset.value) {
@@ -421,8 +440,12 @@ function openEdit() {
     input.editName = dataset.value.name
     input.editDescription = dataset.value.description
     input.editReleaseGated = dataset.value.release_gated ?? false
+    input.editSubmissionGroup = dataset.value.submission_group_id == null ? '' : String(dataset.value.submission_group_id)
     editError.value = null
     showEdit.value = true
+    if (canEditConfig.value) {
+        loadGroups()
+    }
 }
 
 function closeEdit() {
@@ -443,6 +466,7 @@ async function submitEdit() {
         }
         if (canEditConfig.value) {
             payload.release_gated = input.editReleaseGated
+            payload.submission_group_id = input.editSubmissionGroup ? Number(input.editSubmissionGroup) : null
         }
         dataset.value = await updateDataset(datasetId.value, payload)
         showEdit.value = false
@@ -937,6 +961,25 @@ const assessFn = (right: AccessRight, payload: AssessmentPayload) =>
             </wa-switch>
             <p v-if="canEditConfig" class="dataset-view__hint">
                 {{ t('Members of a release-gated dataset stay hidden from readers until a release run publishes them, never resolve through a share link, and are dated by their release month rather than their upload time. Turning the gate off publishes every unreleased member.', SCOPE) }}
+            </p>
+            <wa-select v-if="canEditConfig && input.editReleaseGated"
+                :disabled="editLoading || groupsLoading"
+                :label="t('Submission group', SCOPE)"
+                :placeholder="groupsLoading ? t('Loading…', SCOPE) : t('No group (submissions closed)', SCOPE)"
+                size="s"
+                v-wa="[input, 'editSubmissionGroup']"
+            >
+                <wa-option value="">{{ t('No group (submissions closed)', SCOPE) }}</wa-option>
+                <wa-option
+                    v-for="group in groups"
+                    :key="group.id"
+                    :value="String(group.id)"
+                >
+                    {{ group.name }}
+                </wa-option>
+            </wa-select>
+            <p v-if="canEditConfig && input.editReleaseGated" class="dataset-view__hint">
+                {{ t('Members of the submission group may submit prepared recordings to this dataset through the validating submission path. They see their own batches and nothing of the pool until a release publishes it.', SCOPE) }}
             </p>
         </div>
         <div slot="footer" class="form-actions">
