@@ -1,9 +1,10 @@
 """Vocabulary registry for standardised annotation codes.
 
-Core ships the mechanism only — the same registry pattern as ``register_read_permission_extension`` and
-``register_csv_subconverter`` — and contains zero vocabularies. A plugin or project that owns a coding
-standard registers a validator from its ``AppConfig.ready()``; a deployment with nothing registered
-validates nothing, unchanged from before the registry existed.
+The registry follows the same pattern as ``register_read_permission_extension`` and
+``register_csv_subconverter``. Core registers its own two vocabularies, the acquisition-scoped categories
+of the sets the viewer ships (``annotations/core_vocabularies.py``), and no external one: a plugin or
+project that owns a coding standard registers a validator from its ``AppConfig.ready()``, and a
+``standard`` nobody registered is validated by nobody.
 
 The validator is a callable rather than a term list because a vocabulary's rules are not always
 membership: HED has value placeholders and group structure, ICD-10 has check-character rules. A list would

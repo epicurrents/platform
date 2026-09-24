@@ -1,7 +1,7 @@
 """Contract tests for the annotation vocabulary registry.
 
-Core ships the mechanism with zero vocabularies, so the vocabulary registered here — inside the test
-suite, never in production code — is what proves the contract: a registered validator gates API writes
+The vocabulary registered here — inside the test suite, never in production code — is what proves the
+contract independently of the two core registers in ``annotations.core_vocabularies``: a registered validator gates API writes
 for its standard, an unregistered standard passes untouched by default, and the strict setting flips that
 default. Enforcement is at the API layer only; the server-side ORM bypass at the end is deliberate
 behaviour, not a gap.
