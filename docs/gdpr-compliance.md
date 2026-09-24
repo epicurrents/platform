@@ -223,6 +223,13 @@ This document is enforced, not aspirational:
   release-gated dataset adds its two reports to the sweep, the access report
   for the half year and the anonymity report for every release
   ([library/README.md → Release gating](../library/README.md#release-gating)).
+  The anonymisation lens keeps its own date: the Currency block in
+  [anonymisation-compliance.md](anonymisation-compliance.md#currency) records
+  the last full reading, `grant_assessments` prints it at the head of the
+  sweep, `manage.py check` warns once it is overdue, and the
+  [`anonymisation` review agent](../.review/agents/anonymisation.md) fails
+  every commit from that day until the document has been re-read and the
+  date moved.
 - **At release:** the operator-facing fact sheet (docs.epicurrents.io →
   Platform → Data protection, source in the docs/epicurrents submodule)
   summarises this document for deployment operators. Changes to the

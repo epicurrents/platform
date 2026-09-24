@@ -166,7 +166,10 @@ scripts/manage.sh grant_assessments
 
 Every grant with an assessment date is one to hand back to whoever made it,
 whatever its status column says; the `--due` filter is for the routine
-six-monthly sweep, not for this. The output names grantees by kind and id
+six-monthly sweep, not for this. The second line of the output says which
+version of the guidelines the platform's own assessment is written against
+and whether its half-yearly reading is overdue; after an incident that
+reading is due whatever the date says. The output names grantees by kind and id
 only, and the reference column is whatever the sharer wrote. The PUBLIC
 column counts how many of the recordings a grant covers are recorded as
 taken from a published dataset, the case where the finding can rest on the

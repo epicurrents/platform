@@ -1,5 +1,19 @@
 """Validating submissions to a release-gated dataset: the profile registry, the gate, the spool and who may submit.
 
+⚠️ LOAD-BEARING — the submission gate.
+The gate is what keeps a pooled dataset's members indistinguishable by origin, and what keeps
+bytes that might identify someone from being written anywhere. Every check in
+:func:`validate_file` and :func:`validate_sidecar` is a fingerprint or an identifier the profile
+promised is absent: blanked identification fields as the de-identifier writes them, no
+annotation channel, the channel set and order, the rate, ranges, length, the forbidden sidecar
+keys and the declared hash. Dropping one, or letting a failing check repair the file instead of
+refusing it, admits the site's or the vendor's signature into the pool with every locally
+written test still green. The endpoint contract is the other half: a refused submission writes
+no row and no file. Contract tests are in ``recordings/tests/test_submissions.py`` (``TestGate``
+pins each check, including the blank fields against the de-identifier's actual output,
+``TestBatchEndpoints`` the write-nothing refusal, ``TestPooledIngest`` the random order, the
+system author and the masked trail).
+
 A pooled dataset cannot trust an arriving file the way an upload trusts its author: the
 file was prepared elsewhere against a published profile, and a file that departs from the
 profile either fingerprints its origin (a site's channel template, a vendor's sampling

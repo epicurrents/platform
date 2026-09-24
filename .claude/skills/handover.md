@@ -22,6 +22,7 @@ Match by what the change touches rather than by which app it lives in:
 | adds or modifies a model field, an audit or log metadata write, an outbound integration, or a deletion / retention path | `gdpr-compliance` |
 | touches any file in the [load-bearing registry](../../AGENTS.md#files-currently-marked) | `load-bearing-diff-reviewer` |
 | adds or modifies docstrings, READMEs, or other in-repo Markdown | `documentation-style` |
+| touches the anonymisation path — the release gate, the submission gate, the dataset reports, the grant assessment record, the published-source field, the de-identification record, text hygiene, the annotation export or redaction, [docs/anonymisation-compliance.md](../../docs/anonymisation-compliance.md), or any user-facing string, notice or document describing what a recipient receives | `anonymisation` |
 
 Several usually apply at once; run them in parallel. A finding is ordinary work — fix it and add the regression test, rather than arguing it into a different category. If you disagree with one, say so explicitly in the handover with the reasoning, so the disagreement is visible rather than silent.
 

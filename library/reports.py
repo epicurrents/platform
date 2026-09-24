@@ -1,5 +1,16 @@
 """The two reports a release-gated dataset keeps beside its assessment: who reads it, and how its classes size up.
 
+⚠️ LOAD-BEARING — the ¶ 41 and ¶ 89 evidence.
+These reports are what a deployment hands to a supervisory authority, or to itself at the
+six-monthly sweep, as the record that its pool is what the assessment says it is. Two failure
+directions are silent. A report that names a reader, a contributor or a centre publishes what the
+pool was built to hide, so the access report counts and never names, and the anonymity report
+repeats m rather than recomputing it. And a report that flatters, by counting a withdrawn member
+into the pool, reading a re-written member as unchanged, or computing min k over a pool that is
+not the pool as released up to that run, certifies an anonymity the data does not have. Contract
+tests are in ``library/tests/test_reports.py`` (``TestAccessReport``, ``TestAnonymityReport``,
+and the command classes for the output shape).
+
 Both are read-only computations over what the platform already records, presented by the
 ``dataset_access_report`` and ``dataset_anonymity_report`` commands and their maintenance
 operations.

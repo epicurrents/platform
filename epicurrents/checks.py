@@ -1,4 +1,4 @@
-"""Django system checks: a project's or plugin's declared platform version, and the text-hygiene patterns.
+"""Django system checks: the platform pin, the text-hygiene patterns and the anonymisation assessment's age.
 
 A project lives in its own repository now, and nothing keeps it in step with the
 platform it is checked out beside. The failure that follows is rarely a clean
@@ -39,6 +39,7 @@ from django.apps import apps as django_apps
 from django.conf import settings
 from django.core.checks import Error, Tags, Warning, register
 
+from epicurrents.assessment import assessment_currency
 from epicurrents.version import InvalidVersion, __version__, compatible_range, satisfies
 
 # Apps that are the platform itself, and so cannot be pinned to it. Everything
@@ -137,3 +138,30 @@ def check_text_hygiene_patterns(app_configs, **kwargs):
                 )
             )
     return issues
+
+
+@register(Tags.security)
+def check_assessment_currency(app_configs, **kwargs):
+    """Warn when the anonymisation assessment is past its review date.
+
+    A warning rather than an error: an overdue review is a document to re-read, not a reason to
+    keep a deployment from booting, and the pressure it applies is that every ``manage.py check``
+    and every deploy repeats it until ``ASSESSMENT_REVIEWED_ON`` moves. The date moves in
+    ``epicurrents/assessment.py`` and in the document's Currency block together.
+    """
+    currency = assessment_currency()
+    if not currency["overdue"]:
+        return []
+    return [
+        Warning(
+            f"The anonymisation assessment was last reviewed on {currency['reviewed_on'].isoformat()} and its "
+            f"review was due on {currency['review_by'].isoformat()}, {-currency['days_remaining']} day(s) ago.",
+            hint=(
+                "Re-read docs/anonymisation-compliance.md against the current serving surfaces and the current "
+                f"version of the {currency['guidelines']} (the assessment cites version "
+                f"{currency['guidelines_version']}, {currency['guidelines_status']}), then move reviewed_on in "
+                "its Currency block and ASSESSMENT_REVIEWED_ON in epicurrents/assessment.py in the same commit."
+            ),
+            id="epicurrents.W020",
+        )
+    ]

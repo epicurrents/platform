@@ -26,6 +26,11 @@ the DOI or URL of the published dataset the author says the data was taken from.
 every covered recording is recorded as public is one where the finding can rest on the publisher's
 own statement (paragraph 26); the count is the author's assertion repeated, not a check of it.
 
+Every run opens with the currency of the platform's own assessment, from ``epicurrents.assessment``:
+the guidelines version the document is written against, when it was last read in full and when
+the next reading is due, flagged when overdue. The sweep is where that reading happens, so the
+listing that drives it says whether the document it rests on is itself current.
+
 Reads only. The run is recorded as an ``Activity`` row with counts, so the trail shows when the
 sweep was made, which is part of what paragraph 41 asks to be kept.
 
@@ -48,6 +53,7 @@ from django.core.management.base import BaseCommand
 from django.db.models import F
 from django.utils import timezone
 
+from epicurrents.assessment import ASSESSMENT_REVIEW_INTERVAL_DAYS, assessment_currency
 from epicurrents.models import AccessRight
 
 STATUS_NONE = "none"
@@ -56,8 +62,9 @@ STATUS_STALE = "stale"
 STATUS_REPROCESSED = "reprocessed"
 DUE_STATUSES = (STATUS_STALE, STATUS_REPROCESSED)
 
-#: Half a year: the cadence of the GDPR sweep in docs/gdpr-compliance.md.
-DEFAULT_OLDER_THAN_DAYS = 183
+#: Half a year: the cadence of the GDPR sweep in docs/gdpr-compliance.md, the same interval the
+#: platform's own assessment is reviewed on.
+DEFAULT_OLDER_THAN_DAYS = ASSESSMENT_REVIEW_INTERVAL_DAYS
 
 
 def _target_of(right: AccessRight) -> str:
@@ -222,8 +229,14 @@ class Command(BaseCommand):
         }
         if options["due"]:
             rows = [r for r in rows if r["status"] in DUE_STATUSES]
+        currency = assessment_currency()
         report = {
             "generated_at": timezone.now().isoformat(),
+            "assessment": {
+                **currency,
+                "reviewed_on": currency["reviewed_on"].isoformat(),
+                "review_by": currency["review_by"].isoformat(),
+            },
             "older_than_days": older_than,
             "counts": counts,
             "public_source_only": sum(
@@ -238,6 +251,17 @@ class Command(BaseCommand):
 
     def _write_text(self, report: dict, *, due_only: bool) -> None:
         self.stdout.write(f"Grant assessments, {report['generated_at']}; stale after {report['older_than_days']} days")
+        currency = report["assessment"]
+        line = (
+            f"Assessment against {currency['guidelines']} version {currency['guidelines_version']} "
+            f"({currency['guidelines_status']}); reviewed {currency['reviewed_on']}, "
+        )
+        if currency["overdue"]:
+            line += f"review OVERDUE since {currency['review_by']} ({-currency['days_remaining']} days)"
+            self.stdout.write(self.style.WARNING(line))
+        else:
+            line += f"next review by {currency['review_by']} ({currency['days_remaining']} days)"
+            self.stdout.write(line)
         self.stdout.write("")
         self.stdout.write(
             f"{'GRANT':>6}  {'OBJECT':44}  {'TARGET':14}  {'DEID':4}  {'PUBLIC':7}  {'ASSESSED':10}  {'STATUS':11}  "

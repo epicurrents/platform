@@ -26,6 +26,7 @@ before flagging anything.
 
 | File | Agent | What it exempts |
 |---|---|---|
+| [anonymisation.md](anonymisation.md) | `.review/agents/anonymisation.md` | The contexts in which "anonymous" and its cognates are correct because they describe something other than the platform's output: an instrument, a deployment's finding, the anonymity report's identifiers, a negation, the unauthenticated caller, the compatibility alias, and the documents where the words are the subject. |
 | [audit-trail-completeness.md](audit-trail-completeness.md) | `.review/agents/audit-trail-completeness.md` | API endpoints that don't interact with stored data (health checks, public-key publication, computed artifacts that don't depend on a specific user's data, static API-shape lookups). |
 | [csrf-coverage.md](csrf-coverage.md) | `.review/agents/csrf-coverage.md` | Unsafe-method endpoints no session-cookie caller can reach — pre-auth endpoints, and endpoints authenticated by a credential a browser does not attach automatically (body token, query-param share token, bearer JWT) — plus logout, whose forged call has no effect worth preventing. |
 | [gdpr-compliance.md](gdpr-compliance.md) | `.review/agents/gdpr-compliance.md` | Personal-data-shaped model fields that are out of scope for subject-erasure registration or a retention path — recording-subject PHI erased with its row, user-chosen labels, and a remote controller's pseudonymous identifiers. |

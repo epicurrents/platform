@@ -1,5 +1,20 @@
 """Release gating for datasets: hidden until released, refused to share-token callers, dated by release month.
 
+⚠️ LOAD-BEARING — the release gate.
+Three decisions here are what the anonymity argument of a release-gated dataset rests on, and
+each fails silently. :func:`member_hidden_from_reader` is what keeps an unreleased member from
+surfacing one by one as it arrives, and a member from resolving for a request carrying a share
+token; a narrowed condition serves a pooled recording to a forwardable link with nothing in any
+log to notice. :func:`release_month_for` and :func:`release_month_subquery` replace the upload time
+with the release month, and :func:`member_name_subquery` keeps a listing from being an arrival
+order; either regressing reinstates the arrival timing the pool exists to hide. And
+:func:`eligibility_cutoff` with :func:`eligible_items` is the cadence: a member uploaded in M
+eligible from the run at the start of M+2, one regime for backlog and new submissions alike, so
+the release month says nothing about which kind a recording is. Contract
+tests are in ``library/tests/test_release.py`` (``TestMemberGate``, ``TestRecordingSurfaces``,
+``TestDatasetSurfaces``, ``TestCadence``, ``TestReleaseCommand``); the assessment that depends on
+them is ``docs/anonymisation-compliance.md``.
+
 A release-gated dataset (``Dataset.release_gated``) is a pool whose members must not surface one
 by one as they arrive. Three rules follow, all enforced here and registered from
 ``library.apps.LibraryConfig.ready()``:
