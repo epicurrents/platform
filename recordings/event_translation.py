@@ -17,6 +17,11 @@ written nowhere but the raw record the two seams keep already, the ``"Original a
 ``"Source events"`` bundles, which follow the annotation-text rule like every other row. A silently wrong term is
 worse than an untranslated event, so nothing here coerces a string to its nearest term.
 
+A source may also declare its own term: the viewer's EDF export writes the code of each event it has coded into
+the footer it embeds (``recordings.container``). A declared code is honoured before any mapper is asked, under the
+same fail-closed rule: one no pinned vocabulary has is ignored, logged without its value since it came with the
+file, and the event is translated like any other.
+
 Two kinds of mapper, tried in this order until one answers:
 
 * Python mappers registered with :func:`register_event_translation` from a project's or plugin's
@@ -65,13 +70,16 @@ class SourceEvent:
 
     ``type`` is the vendor's event type where the source distinguishes one (a converter sidecar's ``events``), and
     empty for a text annotation (an EDF+ TAL, a sidecar's ``annotations``); ``label`` is the text or the vendor
-    label. ``onset`` is in the seam's time base, a data position for the TAL path.
+    label. ``onset`` is in the seam's time base, a data position for the TAL path. ``code`` is the term the source
+    itself declares, where it carries one of the platform's own vocabularies (the viewer's embedded footer), and
+    empty otherwise.
     """
 
     onset: float
     duration: float | None
     label: str = ""
     type: str = ""
+    code: str = ""
 
 
 @dataclass(frozen=True)
@@ -318,10 +326,19 @@ def _loggable(code: str) -> str:
 def translate_source_event(source: SourceEvent) -> ResolvedTerm | None:
     """The term *source* translates to, or ``None`` when nothing registered or configured knows it.
 
-    Registered mappers are asked first, in registration order, then the tables in configuration order, and the
-    first answer that resolves to a term of a pinned vocabulary wins. Nothing here logs the source's text: a vendor
-    string in a permanent log stream is the exposure the translation exists to prevent.
+    A code the source declares itself is resolved first; then registered mappers are asked in registration order,
+    then the tables in configuration order, and the first answer that resolves to a term of a pinned vocabulary
+    wins. Nothing here logs the source's text: a vendor string in a permanent log stream is the exposure the
+    translation exists to prevent.
     """
+    if source.code:
+        from annotations.core_vocabularies import find_acquisition_term
+
+        term = find_acquisition_term(source.code)
+        if term is not None:
+            return ResolvedTerm(standard=term.standard, code=term.code, name=term.name, event_class=term.event_class)
+        # Unlike a mapper's answer, a declared code came with the file, so its value stays out of the log.
+        logger.warning("event translation: the source declared a code no vocabulary has; ignored.")
     for entry in _MAPPERS:
         try:
             answer = entry.mapper(source)

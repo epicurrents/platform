@@ -13,7 +13,8 @@ Usage
         [--resume | --discard]
 
 ``source_path``
-    Directory containing EDF/BDF files (and optional ``.json`` sidecars).
+    Directory containing EDF/BDF files (and optional ``.json`` sidecars). A file the viewer exported as a
+    container has its footer detached and stored as rows, as on the upload path.
 
 ``--username``
     Username of the user who will own all imported recordings. The user must
@@ -528,7 +529,11 @@ class Command(BaseCommand):
             shutil.rmtree(source_for_edf.parent, ignore_errors=True)
 
         # ── EDF processing ────────────────────────────────────────────────────
+        from recordings.container import detach_footer, footer_carries_events, save_footer_events
+
         try:
+            # A container exported by the viewer: the footer is detached first, as on the upload path.
+            footer = detach_footer(permanent_path)
             result = process_edf_file(
                 permanent_path,
                 strip_annotation_text=pipeline.header.strip_annotation_text,
@@ -554,8 +559,17 @@ class Command(BaseCommand):
             )
 
             _save_edf_results(
-                recording, result, events_from_sidecar=sidecar_carries_events(sidecar_data_from_converter)
+                recording,
+                result,
+                events_from_sidecar=sidecar_carries_events(sidecar_data_from_converter)
+                or footer_carries_events(footer),
             )
+            if footer is not None:
+                try:
+                    save_footer_events(recording, footer)
+                except ValueError as exc:
+                    # Source path logged deliberately; see the failure log in handle().
+                    logger.warning("import_recordings: footer events of %s not saved: %s", abs_path, exc)
 
             if sidecar_data_from_converter is not None:
                 try:

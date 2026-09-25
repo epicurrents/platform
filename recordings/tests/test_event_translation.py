@@ -112,6 +112,20 @@ class TestMappers:
         assert (term.standard, term.code, term.name) == ("epicurrents.eeg", "EEG_ACT_EC", "Eyes closed")
         assert translate_source_event(SourceEvent(1.0, None, type="something else")) is None
 
+    def test_a_code_the_source_declares_is_resolved_before_any_mapper(self):
+        register_event_translation(lambda s: "EEG_ACT_EC", name=MAPPER)
+        term = translate_source_event(SourceEvent(1.0, None, label="anything", code="EEG_ACT_HV"))
+        assert (term.standard, term.code) == ("epicurrents.eeg", "EEG_ACT_HV")
+
+    def test_a_declared_code_no_vocabulary_has_is_logged_and_the_mappers_are_asked(self, caplog):
+        register_event_translation(lambda s: "EEG_ACT_EC" if s.label == VENDOR_LABEL else None, name=MAPPER)
+        with caplog.at_level(logging.WARNING, logger="recordings.event_translation"):
+            term = translate_source_event(SourceEvent(1.0, None, label=VENDOR_LABEL, code="EEG_NOT_A_TERM"))
+        assert term.code == "EEG_ACT_EC"
+        assert "declared a code" in caplog.text
+        assert "EEG_NOT_A_TERM" not in caplog.text
+        assert VENDOR_LABEL not in caplog.text
+
     def test_a_translation_carries_its_meta(self):
         register_event_translation(lambda s: Translation("BIO_TECH_TRIGGER", {"number": "3"}), name=MAPPER)
         term = translate_source_event(SourceEvent(1.0, None, label="TRIG 3"))

@@ -19,6 +19,8 @@ process_recording Celery task
     │  move to RECORDINGS_UPLOAD_PATH
     │  os.utime → epoch 0 (de-identification)
     │  if extension has a converter: run it, replace stored file
+    │  if the file is the viewer's container (EDF EC: marker):
+    │    detach the JSON footer, keep the EDF alone
     │  parse EDF/BDF header, strip annotation TALs (default)
     │  de-identify channel block: canonical labels, blank
     │    transducers, reconstructed prefiltering (source_* kept)
@@ -28,7 +30,8 @@ process_recording Celery task
     │    version and the annotation-text flag
     │  write Interruption rows, one Event per embedded text event
     │    (translated to the platform vocabulary, else a text-free
-    │    placeholder) and the "Original annotations" raw record
+    │    placeholder) and the "Original annotations" raw record;
+    │    a detached footer's coded events and interruptions the same way
     │  on processing failure: populate Recording.processing_error
     │    and (if mode in {"failed", "all"}) preserve the original
     │  audit: final transition row carries a SignalInfo digest and the
@@ -391,6 +394,8 @@ Two kinds of mapper, asked in this order until one answers. A project or plugin 
 ```
 
 A converter that emits a sidecar writes the same events into the EDF it produces, as annotation records. Both ingest paths ask `sidecar_carries_events` in [converters/sidecar.py](converters/sidecar.py) and, when the sidecar passes the schema and has at least one item, the TAL seam writes no `Event` rows: the sidecar keeps the vendor's event type, which the text of a TAL has lost, and a second set of rows would put every event on the recording twice. Both raw records are still written. A converter that emits no sidecar, an empty one or one the schema refuses has its TALs translated like any EDF+.
+
+The viewer's EDF export writes the platform its own shape, and it is the shape most recordings arrive in, since most are converted in the browser. The export is a container: an EDF with the EDF+ header conventions for its identification fields, no annotation channel, and a JSON footer after the last data record holding the sidecar the viewer's encoder builds, marked in the header's reserved field as `EDF EC:<byte size of header and records>:<footer size in whole KiB>`. [container.py](container.py) detaches the footer on both ingest paths before the processor runs, truncating the file and restoring a standard reserved field, so the stored recording is the EDF alone and the container is transport only; a marker that disagrees with the file's length or with the header's own geometry, or a footer that is not a JSON object, fails the recording rather than storing it, and under preservation mode `failed` the bytes as uploaded are stashed before the detach so a failure that follows preserves the container. Each footer event becomes an `Event` through the same writer, resolved from the code it declares under `epicurrents.eeg` or `epicurrents.biosignal` before any mapper is asked, so a recording the viewer coded needs no table on the platform; an event that declares no code is translated by its text like any other, and its class decides whether the placeholder is a source annotation (a `comment`) or a source event. The footer's interruptions become `Interruption` rows, in the data time the viewer keeps them in, and the raw record of both is written as "Source events". The footer's labels are read by nothing yet. An ordinary EDF carries no marker and never reaches the module.
 
 `manage.py check` refuses a table that does not parse (`recordings.E001`) or names a literal code outside the pinned vocabularies (`recordings.E002`), because both otherwise fail quietly as events that never translate. `RECORDINGS_DISCARD_EMBEDDED_ANNOTATIONS` skips the raw record and the placeholders and keeps the translated events: a term of the platform's own vocabulary and a timestamp carries nothing from the file. Tests in [tests/test_event_translation.py](tests/test_event_translation.py); design and term tables in [docs/engineering-notes/annotation-event-vocabulary.md](../docs/engineering-notes/annotation-event-vocabulary.md).
 

@@ -123,7 +123,8 @@ def _save_edf_results(recording, result, *, events_from_sidecar: bool = False) -
       a text-free placeholder otherwise (``recordings.event_translation``).
       Skipped when *events_from_sidecar* is set: a converter that emitted a
       sidecar wrote the same events into its EDF, and the sidecar seam, which
-      keeps the vendor's event type, has written the rows for them.
+      keeps the vendor's event type, has written the rows for them; the
+      footer of the viewer's container owns its rows the same way.
     - One :class:`~annotations.models.Annotation` row (name "Original
       annotations") when embedded text events or gaps are present: the raw
       record, holding what the file said.
@@ -305,6 +306,9 @@ def process_recording(recording_id: int, preserve_annotations: bool = False):
 
     For recognised formats (EDF / BDF) the header is parsed, de-identified,
     and rewritten; signal metadata, gaps, and embedded annotations are stored.
+    A file the viewer exported as a container (an EDF with a JSON footer, see
+    :mod:`recordings.container`) has its footer detached first, and the events
+    and interruptions the footer carries are stored from it.
     If format processing fails the recording is kept but marked as FAILED so
     the user is not misled into thinking the file is ready to open in the
     viewer. The original file is always preserved so users can still download
@@ -526,8 +530,42 @@ def _process_recording_body(*, recording, recording_id, staging_path, preserve_a
                     # is the regression the copy was added to close, on the one route
                     # the copy does not cover. Nothing downstream reads the object.
                     strip_annotation_text = False
+                # The viewer's container carries its events and interruptions
+                # in a footer rather than in annotation records. Detached first,
+                # so the processor and the stored file see an ordinary EDF.
+                from recordings.container import (
+                    detach_footer,
+                    footer_carries_events,
+                    is_container,
+                    save_footer_events,
+                )
+                from recordings.preservation import stash_source_bytes
+
+                footer = None
+                if is_container(permanent_path):
+                    # Detaching rewrites the file, so the bytes as uploaded are
+                    # stashed first, where mode "failed" finds them should the
+                    # processing that follows fail.
+                    stash_source_bytes(recording, permanent_path)
+                    footer = detach_footer(permanent_path)
                 result = process_edf_file(permanent_path, strip_annotation_text=strip_annotation_text)
-                _save_edf_results(recording, result, events_from_sidecar=sidecar_carries_events(sidecar_data))
+                if footer is not None:
+                    recording.file_size = permanent_path.stat().st_size
+                    recording.save(update_fields=["file_size"])
+                _save_edf_results(
+                    recording,
+                    result,
+                    events_from_sidecar=sidecar_carries_events(sidecar_data) or footer_carries_events(footer),
+                )
+                if footer is not None:
+                    try:
+                        save_footer_events(recording, footer)
+                    except ValueError as exc:
+                        # The recording is still a recording; the footer's
+                        # events are what a malformed footer costs.
+                        logger.warning(
+                            "process_recording: footer events of recording %d not saved: %s", recording_id, exc
+                        )
 
                 logger.info(
                     "process_recording: EDF/BDF processing succeeded for recording %d "
@@ -560,8 +598,9 @@ def _process_recording_body(*, recording, recording_id, staging_path, preserve_a
 
         # ── Stored-bytes digest ──────────────────────────────────────────────
         # Taken after the last in-place rewrite so it describes the file as served. Left empty on
-        # failure: the file then still holds the bytes as uploaded, and a digest of those is
-        # ``file_hash`` under another name.
+        # failure: the file then still holds the bytes as uploaded (a detached footer aside, which
+        # the stash above keeps for mode "failed"), and a digest of those is ``file_hash`` under
+        # another name.
         from recordings.metadata import stored_hash_of
 
         stored_hash = "" if format_error else stored_hash_of(permanent_path)

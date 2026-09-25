@@ -315,10 +315,18 @@ def _stash_path_for(recording_id: int) -> Path:
 
 
 def _on_pre_convert(recording, source_path: Path, ext: str) -> None:
-    """pre_convert handler — stash source bytes when mode is ``"failed"``.
+    """pre_convert handler — stash source bytes when mode is ``"failed"``."""
+    stash_source_bytes(recording, source_path)
 
-    Skipped for mode ``"all"`` (the staging-file preservation at task start
-    already covers it) and mode ``"none"`` (nothing to preserve at all).
+
+def stash_source_bytes(recording, source_path: Path) -> None:
+    """Stash a copy of *source_path* for the failure path when mode is ``"failed"``.
+
+    Called before any step that rewrites the stored file in place and may be
+    followed by a processing failure: the conversion of a vendor format, and
+    the detaching of a container's footer. Skipped for mode ``"all"`` (the
+    staging-file preservation at task start already covers it) and mode
+    ``"none"`` (nothing to preserve at all).
     """
     if _current_mode() != MODE_FAILED:
         return
