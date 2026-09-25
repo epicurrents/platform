@@ -2,7 +2,8 @@
 
 The properties under test: an ordinary EDF is never touched; a container is stored as the EDF alone, with a
 standard reserved field; the footer's events reach ``Event`` rows through the code each declares, without any
-mapper or table; and a container that is not what its marker says is refused rather than stored.
+mapper or table; its labels reach ``Label`` rows only through a code a registered vocabulary accepts, carrying none
+of the template's text; and a container that is not what its marker says is refused rather than stored.
 """
 
 from __future__ import annotations
@@ -17,15 +18,19 @@ from django.contrib.contenttypes.models import ContentType
 from django.test import override_settings
 from model_bakery import baker
 
-from annotations.models import Annotation, Code, Event, Interruption
+from annotations.models import Annotation, Code, Event, Interruption, Label
+from annotations.vocabularies import register_vocabulary, unregister_vocabulary
 from recordings.container import (
     ContainerError,
     detach_footer,
     footer_carries_events,
     footer_events,
     footer_interruptions,
+    footer_label_codes,
     read_container_marker,
     save_footer_events,
+    save_footer_labels,
+    save_viewer_sidecar,
 )
 from recordings.event_translation import (
     PLACEHOLDER_ANNOTATION_NAME,
@@ -79,6 +84,41 @@ def _events(recording):
 
 def _codes(event):
     return list(Code.objects.filter(content_type=ContentType.objects.get_for_model(Event), object_id=str(event.pk)))
+
+
+#: A fictional project vocabulary for the subject facts a label carries.
+SUBJECT = "epicurrents.fixture.subject"
+SUBJECT_TERMS = {"AGE_20_29": "Age 20-29", "SEX_F": "Female"}
+
+
+@pytest.fixture
+def subject_vocabulary():
+    def validate(value, meta):
+        if value not in SUBJECT_TERMS:
+            raise ValueError(f"term {value!r} is not in {SUBJECT}")
+
+    register_vocabulary(SUBJECT, label="Fixture subject", validator=validate, term_name=SUBJECT_TERMS.get)
+    yield
+    unregister_vocabulary(SUBJECT)
+
+
+def _label(**fields):
+    template = {"class": "label", "priority": 200, "value": "", "annotator": "Dr X", "text": "a note"}
+    template.update(fields)
+    return template
+
+
+def _labels(recording):
+    return list(Label.objects.filter(target_object_id=str(recording.pk)).order_by("object_hash"))
+
+
+def _label_codes(label):
+    return [
+        (c.standard, c.value)
+        for c in Code.objects.filter(
+            content_type=ContentType.objects.get_for_model(Label), object_id=str(label.pk)
+        ).order_by("standard")
+    ]
 
 
 class TestMarker:
@@ -321,6 +361,150 @@ class TestSave:
 
 
 @pytest.mark.django_db
+class TestFooterLabels:
+    def test_each_label_yields_its_string_codes_in_the_order_declared(self):
+        footer = {
+            "labels": [
+                _label(codes={SUBJECT: "SEX_F", "icd10": "G40.3"}),
+                _label(),
+                _label(codes={SUBJECT: 3, "": "X", "other": ""}),
+            ]
+        }
+        assert footer_label_codes(footer) == [[(SUBJECT, "SEX_F"), ("icd10", "G40.3")], [], []]
+
+    def test_no_labels_key_is_no_labels(self):
+        assert footer_label_codes({}) == []
+
+    @pytest.mark.parametrize(
+        ("footer", "message"),
+        [
+            ({"labels": {}}, 'footer "labels" is not a list'),
+            ({"labels": ["x"]}, r"footer labels\[0\] is not an object"),
+            ({"labels": [_label(codes=["SEX_F"])]}, r'footer labels\[0\] "codes" is not an object'),
+        ],
+    )
+    def test_a_malformed_label_is_named(self, footer, message):
+        with pytest.raises(ValueError, match=message):
+            footer_label_codes(footer)
+
+
+class TestSaveLabels:
+    def test_an_accepted_code_becomes_a_system_label_named_by_the_term(self, recording, subject_vocabulary):
+        from epicurrents.system_user import get_system_user
+
+        written = save_footer_labels(
+            recording, {"labels": [_label(value="twenty-something", label="Age", codes={SUBJECT: "AGE_20_29"})]}
+        )
+        assert written == (1, 0)
+        (label,) = _labels(recording)
+        assert (label.name, label.value, label.author) == ("Age 20-29", "AGE_20_29", get_system_user())
+        assert _label_codes(label) == [(SUBJECT, "AGE_20_29")]
+
+    def test_nothing_of_the_template_text_is_stored(self, recording, subject_vocabulary):
+        save_footer_labels(
+            recording,
+            {"labels": [_label(value="Jane, 24", label="Jane's age", text="seen 3.4.", codes={SUBJECT: "AGE_20_29"})]},
+        )
+        stored = json.dumps(list(Label.objects.values()), default=str) + json.dumps(
+            list(Code.objects.values("value", "meta"))
+        )
+        for text in ("Jane", "seen", "Dr X", "a note"):
+            assert text not in stored
+
+    def test_a_label_without_a_code_writes_nothing_and_is_counted_without_its_value(
+        self, recording, subject_vocabulary, caplog
+    ):
+        with caplog.at_level(logging.INFO, logger="recordings.container"):
+            written = save_footer_labels(recording, {"labels": [_label(value="Jane, 24")]})
+        assert written == (0, 1)
+        assert _labels(recording) == []
+        assert "1 of 1 labels" in caplog.text
+        assert "Jane" not in caplog.text
+
+    def test_a_standard_nobody_registered_is_refused_even_outside_strict_mode(self, recording):
+        with override_settings(ANNOTATION_CODE_STRICT_VOCABULARY=False):
+            written = save_footer_labels(recording, {"labels": [_label(codes={"icd10": "G40.3"})]})
+        assert written == (0, 1)
+        assert Label.objects.count() == 0
+
+    def test_a_value_the_vocabulary_rejects_is_refused(self, recording, subject_vocabulary):
+        assert save_footer_labels(recording, {"labels": [_label(codes={SUBJECT: "AGE_24"})]}) == (0, 1)
+        assert Label.objects.count() == 0
+
+    def test_a_validator_that_fails_otherwise_refuses_the_code(self, recording):
+        def broken(value, meta):
+            raise TypeError("bug")
+
+        register_vocabulary("epicurrents.fixture.broken", label="Broken", validator=broken)
+        try:
+            written = save_footer_labels(recording, {"labels": [_label(codes={"epicurrents.fixture.broken": "X"})]})
+        finally:
+            unregister_vocabulary("epicurrents.fixture.broken")
+        assert written == (0, 1)
+
+    def test_only_the_accepted_codes_of_a_label_are_kept_and_the_first_names_it(self, recording, subject_vocabulary):
+        save_footer_labels(
+            recording, {"labels": [_label(codes={"icd10": "G40.3", SUBJECT: "SEX_F", "epicurrents.eeg": "EEG_ACT_HV"})]}
+        )
+        (label,) = _labels(recording)
+        assert (label.name, label.value) == ("Female", "SEX_F")
+        assert _label_codes(label) == [("epicurrents.eeg", "EEG_ACT_HV"), (SUBJECT, "SEX_F")]
+
+    def test_a_vocabulary_that_names_no_terms_leaves_the_code_as_the_name(self, recording):
+        register_vocabulary("epicurrents.fixture.plain", label="Plain", validator=lambda value, meta: None)
+        try:
+            save_footer_labels(recording, {"labels": [_label(codes={"epicurrents.fixture.plain": "P1"})]})
+        finally:
+            unregister_vocabulary("epicurrents.fixture.plain")
+        (label,) = _labels(recording)
+        assert (label.name, label.value) == ("P1", "P1")
+
+    def test_a_malformed_footer_writes_nothing(self, recording, subject_vocabulary):
+        with pytest.raises(ValueError):
+            save_footer_labels(recording, {"labels": [_label(codes={SUBJECT: "SEX_F"}), "x"]})
+        assert Label.objects.count() == 0
+
+    def test_labels_are_written_under_the_discard_setting(self, recording, subject_vocabulary):
+        with override_settings(RECORDINGS_DISCARD_EMBEDDED_ANNOTATIONS=True):
+            assert save_footer_labels(recording, {"labels": [_label(codes={SUBJECT: "SEX_F"})]}) == (1, 0)
+
+
+class TestSaveViewerSidecar:
+    def test_a_malformed_part_writes_nothing_from_the_other_parts(self, recording, subject_vocabulary):
+        document = {
+            "events": [_event(codes={"epicurrents.eeg": "EEG_ACT_HV"})],
+            "interruptions": [[1, 2]],
+            "labels": "x",
+        }
+        with pytest.raises(ValueError, match='footer "labels" is not a list'):
+            save_viewer_sidecar(recording, document)
+        assert _events(recording) == []
+        assert Interruption.objects.count() == 0
+
+    def test_it_writes_the_events_interruptions_and_coded_labels(self, recording, subject_vocabulary):
+        save_viewer_sidecar(
+            recording,
+            {
+                "events": [_event(codes={"epicurrents.eeg": "EEG_ACT_HV"})],
+                "interruptions": [[1, 2]],
+                "labels": [_label(codes={SUBJECT: "SEX_F"})],
+            },
+        )
+        assert [e.name for e in _events(recording)] == ["Hyperventilation"]
+        assert Interruption.objects.filter(target_object_id=str(recording.pk)).count() == 1
+        assert [label.name for label in _labels(recording)] == ["Female"]
+
+    def test_discarding_the_text_overrides_the_setting(self, recording):
+        with override_settings(RECORDINGS_DISCARD_EMBEDDED_ANNOTATIONS=False):
+            save_viewer_sidecar(
+                recording,
+                {"events": [_event(codes={"epicurrents.eeg": "EEG_ACT_HV"}), _event(start=2, value="a note")]},
+                discard_text=True,
+            )
+        assert [e.name for e in _events(recording)] == ["Hyperventilation"]
+        assert not Annotation.objects.filter(target_object_id=str(recording.pk)).exists()
+
+
 class TestUpload:
     """The upload path end to end: a container in, a plain EDF and its rows out."""
 
@@ -349,7 +533,7 @@ class TestUpload:
                 _event(start=1.5, value="a bedside note") | {"class": "comment"},
             ],
             "interruptions": [[1, 3]],
-            "labels": [],
+            "labels": [_label(codes={"epicurrents.eeg": "EEG_ACT_HV"}), _label(value="uncoded")],
             "subject": {"patientId": None, "recordingDate": None, "recordingId": None},
         }
         recording = self._process(user, tmp_path, _make_container(footer))
@@ -367,6 +551,8 @@ class TestUpload:
         ]
         names = set(Annotation.objects.filter(target_object_id=str(recording.pk)).values_list("name", flat=True))
         assert names == {"Source events"}
+        (label,) = _labels(recording)
+        assert (label.name, _label_codes(label)) == ("Hyperventilation", [("epicurrents.eeg", "EEG_ACT_HV")])
 
     def test_an_ordinary_edf_upload_is_unchanged(self, user, tmp_path):
         recording = self._process(user, tmp_path, _plain_edf())
@@ -409,7 +595,11 @@ class TestImport:
         src.mkdir()
         (src / "rec.edf").write_bytes(
             _make_container(
-                {"events": [_event(value="HV", codes={"epicurrents.eeg": "EEG_ACT_HV"})], "interruptions": [[1, 2]]}
+                {
+                    "events": [_event(value="HV", codes={"epicurrents.eeg": "EEG_ACT_HV"})],
+                    "interruptions": [[1, 2]],
+                    "labels": [_label(codes={"epicurrents.biosignal": "BIO_TECH_PAUSE"})],
+                }
             )
         )
         with override_settings(RECORDINGS_UPLOAD_PATH=str(tmp_path / "uploads")):
@@ -424,3 +614,5 @@ class TestImport:
         (event,) = _events(recording)
         assert (event.name, [c.value for c in _codes(event)]) == ("Hyperventilation", ["EEG_ACT_HV"])
         assert Interruption.objects.filter(target_object_id=str(recording.pk)).count() == 1
+        (label,) = _labels(recording)
+        assert (label.name, label.value) == ("Recording paused", "BIO_TECH_PAUSE")

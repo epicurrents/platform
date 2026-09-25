@@ -529,7 +529,7 @@ class Command(BaseCommand):
             shutil.rmtree(source_for_edf.parent, ignore_errors=True)
 
         # ── EDF processing ────────────────────────────────────────────────────
-        from recordings.container import detach_footer, footer_carries_events, save_footer_events
+        from recordings.container import detach_footer, footer_carries_events, save_viewer_sidecar
 
         try:
             # A container exported by the viewer: the footer is detached first, as on the upload path.
@@ -566,10 +566,10 @@ class Command(BaseCommand):
             )
             if footer is not None:
                 try:
-                    save_footer_events(recording, footer)
+                    save_viewer_sidecar(recording, footer)
                 except ValueError as exc:
                     # Source path logged deliberately; see the failure log in handle().
-                    logger.warning("import_recordings: footer events of %s not saved: %s", abs_path, exc)
+                    logger.warning("import_recordings: footer rows of %s not saved: %s", abs_path, exc)
 
             if sidecar_data_from_converter is not None:
                 try:

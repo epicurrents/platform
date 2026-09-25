@@ -248,6 +248,20 @@ class TestGate:
             validate_submission(_profile(forbidden_sidecar_keys=("centre",)), data, own)
         )
 
+    def test_a_sidecar_the_pooled_ingest_could_not_read_is_refused(self):
+        data = _edf()
+        malformed = _sidecar(data, events=[{"class": "event", "duration": 0}])
+        violations = validate_submission(_profile(), data, malformed)
+        assert _codes(violations) == {"sidecar_shape"}
+        assert any("events[0] has no numeric start" in v.message for v in violations)
+        viewer = _sidecar(
+            data,
+            events=[{"class": "event", "start": 1, "duration": 0, "value": "", "codes": {}}],
+            interruptions=[[2, 1]],
+            labels=[{"class": "label", "value": "", "codes": {}}],
+        )
+        assert validate_submission(_profile(), data, viewer) == []
+
     def test_required_keys_and_declared_hash(self):
         data = _edf()
         missing = {"recording_sha256": hashlib.sha256(data).hexdigest()}
@@ -679,6 +693,43 @@ class TestPooledIngest:
         assert ingest_pooled_submissions() == {"ingested": 0, "failed": 1}
         trashed.refresh_from_db()
         assert "no longer an open" in trashed.error
+
+    def test_the_sidecar_rows_are_written_without_the_file_text_whatever_the_setting(self, pool, spool, settings):
+        from annotations.models import Annotation, Code, Event, Interruption, Label
+
+        settings.RECORDINGS_DISCARD_EMBEDDED_ANNOTATIONS = False
+        _spooled(
+            pool,
+            spool,
+            sidecar_extra={
+                "events": [
+                    {
+                        "class": "activation",
+                        "start": 1,
+                        "duration": 3,
+                        "value": "",
+                        "codes": {"epicurrents.eeg": "EEG_ACT_HV"},
+                    },
+                    {"class": "event", "start": 2, "duration": 0, "value": "vendor marker 17"},
+                ],
+                "interruptions": [[4, 1]],
+                "labels": [
+                    {"class": "label", "value": "", "codes": {"epicurrents.biosignal": "BIO_TECH_PAUSE"}},
+                    {"class": "label", "value": "uncoded"},
+                ],
+            },
+        )
+        assert ingest_pooled_submissions() == {"ingested": 1, "failed": 0}
+        target = str(Recording.objects.get().pk)
+        (event,) = Event.objects.filter(target_object_id=target)
+        assert event.name == "Hyperventilation"
+        assert Code.objects.filter(object_id=str(event.pk), standard="epicurrents.eeg").exists()
+        assert Interruption.objects.filter(target_object_id=target).count() == 1
+        (label,) = Label.objects.filter(target_object_id=target)
+        assert label.value == "BIO_TECH_PAUSE"
+        assert not Annotation.objects.filter(target_object_id=target).exists()
+        stored = json.dumps(list(Event.objects.values("name")) + list(Label.objects.values("name", "value")))
+        assert "vendor marker" not in stored and "uncoded" not in stored
 
     def test_processing_the_ingested_recording(self, pool, spool, django_capture_on_commit_callbacks):
         _spooled(pool, spool)

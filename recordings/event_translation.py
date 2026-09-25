@@ -376,13 +376,15 @@ def placeholder_name(source: SourceEvent) -> str:
     return PLACEHOLDER_EVENT_NAME if source.type else PLACEHOLDER_ANNOTATION_NAME
 
 
-def write_source_events(recording, sources: list[SourceEvent], *, hash_prefix: str) -> int:
+def write_source_events(
+    recording, sources: list[SourceEvent], *, hash_prefix: str, discard_text: bool | None = None
+) -> int:
     """Write one ``Event`` row per source event on *recording*, translated where anything translates it.
 
     *hash_prefix* keeps the two seams' rows apart: the row for the event at *index* carries the hash suffix
     ``"<hash_prefix>:<index>"``, so a seam called once per ingest writes distinct hashes. Under
-    ``RECORDINGS_DISCARD_EMBEDDED_ANNOTATIONS`` the placeholders are skipped and only translated events are written.
-    Returns the number of translated events.
+    ``RECORDINGS_DISCARD_EMBEDDED_ANNOTATIONS`` the placeholders are skipped and only translated events are written;
+    *discard_text* set to a bool decides it instead of the setting. Returns the number of translated events.
     """
     from django.conf import settings
     from django.contrib.contenttypes.models import ContentType
@@ -390,7 +392,9 @@ def write_source_events(recording, sources: list[SourceEvent], *, hash_prefix: s
     from annotations.models import Code, Event
     from epicurrents.system_user import get_system_user
 
-    discard = getattr(settings, "RECORDINGS_DISCARD_EMBEDDED_ANNOTATIONS", False)
+    discard = (
+        getattr(settings, "RECORDINGS_DISCARD_EMBEDDED_ANNOTATIONS", False) if discard_text is None else discard_text
+    )
     recording_ct = ContentType.objects.get_for_model(recording, for_concrete_model=False)
     event_ct = None
     system_user = None

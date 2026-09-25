@@ -537,7 +537,7 @@ def _process_recording_body(*, recording, recording_id, staging_path, preserve_a
                     detach_footer,
                     footer_carries_events,
                     is_container,
-                    save_footer_events,
+                    save_viewer_sidecar,
                 )
                 from recordings.preservation import stash_source_bytes
 
@@ -559,12 +559,12 @@ def _process_recording_body(*, recording, recording_id, staging_path, preserve_a
                 )
                 if footer is not None:
                     try:
-                        save_footer_events(recording, footer)
+                        save_viewer_sidecar(recording, footer)
                     except ValueError as exc:
                         # The recording is still a recording; the footer's
-                        # events are what a malformed footer costs.
+                        # rows are what a malformed footer costs.
                         logger.warning(
-                            "process_recording: footer events of recording %d not saved: %s", recording_id, exc
+                            "process_recording: footer rows of recording %d not saved: %s", recording_id, exc
                         )
 
                 logger.info(
@@ -969,6 +969,7 @@ def _ingest_submission_file(item) -> bool:
     from epicurrents.models import AccessRight
     from epicurrents.system_user import get_system_user
     from library.models import DatasetItem
+    from recordings.container import save_viewer_sidecar
     from recordings.models import Recording, SubmissionFile, stored_original_name
     from recordings.submissions import get_ingest_profile
 
@@ -1009,6 +1010,10 @@ def _ingest_submission_file(item) -> bool:
                 can_share=True,
             )
             DatasetItem.objects.create(dataset=batch.dataset, content_type=recording_ct, object_id=str(recording.pk))
+            # The gate checked the sidecar's shape, so a failure here is a bug and
+            # fails the file. A pool keeps none of the file's text, whatever the
+            # deployment setting says.
+            save_viewer_sidecar(recording, item.sidecar, discard_text=True)
             if profile.ingest is not None:
                 profile.ingest(recording, item.sidecar)
             # Several files of one batch share the run; re-read the count rather

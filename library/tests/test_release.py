@@ -555,6 +555,18 @@ class TestOriginalsCheck:
         settings.RECORDINGS_ORIGINALS_PATH = "/mnt/originals"
         assert check(None) == []
 
+    def test_release_gated_deployment_must_discard_embedded_text(self, settings):
+        from library.checks import check_release_gated_deployment_discards_embedded_text as check
+
+        settings.LIBRARY_RELEASE_GATED_DEPLOYMENT = True
+        settings.RECORDINGS_DISCARD_EMBEDDED_ANNOTATIONS = False
+        assert [error.id for error in check(None)] == ["library.E002"]
+        settings.RECORDINGS_DISCARD_EMBEDDED_ANNOTATIONS = True
+        assert check(None) == []
+        settings.LIBRARY_RELEASE_GATED_DEPLOYMENT = False
+        settings.RECORDINGS_DISCARD_EMBEDDED_ANNOTATIONS = False
+        assert check(None) == []
+
     def test_the_release_reference_is_registered_for_erasure_as_it_is_for_export(self):
         from activity.erasure import registered_subject_pii
         from user.export import RELATION_HANDLING

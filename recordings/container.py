@@ -11,11 +11,18 @@ in the sidecar shape the viewer's ``EdfEncoder`` defines. The reserved field of 
 The container is transport only. Ingest detaches the footer before the EDF processor sees the file, so the stored
 recording is the EDF alone with a standard reserved field, and the footer's contents become rows: one ``Event``
 per event through ``recordings.event_translation``, resolved from the code the event declares and falling back to
-the mappers and tables for one that declares none, one ``Interruption`` per interruption, and the raw record.
-A file whose reserved field carries no marker is left alone, so an ordinary EDF upload never reaches this module's
-writes. The footer's labels, its channel descriptions and its subject fields are read by nothing here: a rater's
-labels are theirs and ingest writes under the system user, the channel block is de-identified from the file itself,
-and identification has no place on the platform.
+the mappers and tables for one that declares none, one ``Interruption`` per interruption, the raw record, and
+one ``Label`` per label that declares a code of a registered vocabulary. A file whose reserved field carries no
+marker is left alone, so an ordinary EDF upload never reaches this module's writes. The footer's channel
+descriptions and its subject fields are read by nothing here: the channel block is de-identified from the file
+itself, and identification has no place on the platform. A label without a code is not stored either, since what
+it carries is text.
+
+The footer is the viewer's sidecar appended to the file, and a pooled submission sends the same sidecar beside a
+plain EDF. Both reach the same pool, the upload through a release run and the submission through the pooled ingest,
+so both are written by :func:`save_viewer_sidecar`. The pooled ingest always discards what carries the file's text;
+the upload path follows ``RECORDINGS_DISCARD_EMBEDDED_ANNOTATIONS``, which a release-gated deployment must set
+(``library.E002``), so every recording that can reach a pool arrives in the same shape.
 """
 
 from __future__ import annotations
@@ -202,15 +209,15 @@ def footer_carries_events(footer: dict | None) -> bool:
         return False
 
 
-def save_footer_events(recording, footer: dict) -> None:
+def save_footer_events(recording, footer: dict, *, discard_text: bool | None = None) -> None:
     """Write the footer's events and interruptions as rows on *recording*, and the raw record of both.
 
-    Nothing else in the footer is stored: not its labels, not an event's free text beyond the value the raw record
-    keeps, not its subject fields. Raises ``ValueError`` on a footer whose events or interruptions are not the shape the viewer writes; the callers
-    log it per recording and ingest continues, as they do for a converter's sidecar. Under
-    ``RECORDINGS_DISCARD_EMBEDDED_ANNOTATIONS`` the raw record is not written and the placeholders are skipped by the
-    writer; the interruptions are written regardless, as the EDF+ seam does, because a gap is geometry rather than
-    annotation.
+    Nothing else in the footer is stored here: not an event's free text beyond the value the raw record keeps, not
+    its subject fields; the labels are :func:`save_footer_labels`'s. Raises ``ValueError`` on a footer whose events or
+    interruptions are not the shape the viewer writes. Under ``RECORDINGS_DISCARD_EMBEDDED_ANNOTATIONS`` the raw
+    record is not written and the placeholders are skipped by the writer; *discard_text* set to a bool decides it
+    instead of the setting. The interruptions are written regardless, as the EDF+ seam does, because a gap is geometry
+    rather than annotation.
     """
     from django.conf import settings
     from django.contrib.contenttypes.models import ContentType
@@ -236,9 +243,12 @@ def save_footer_events(recording, footer: dict) -> None:
             duration=duration,
         )
 
-    write_source_events(recording, sources, hash_prefix="footer-event")
+    discard = (
+        getattr(settings, "RECORDINGS_DISCARD_EMBEDDED_ANNOTATIONS", False) if discard_text is None else discard_text
+    )
+    write_source_events(recording, sources, hash_prefix="footer-event", discard_text=discard)
 
-    if getattr(settings, "RECORDINGS_DISCARD_EMBEDDED_ANNOTATIONS", False):
+    if discard:
         return
 
     content: dict = {}
@@ -261,3 +271,144 @@ def save_footer_events(recording, footer: dict) -> None:
         object_hash=annotation_hash(recording.pk, "footer-events"),
         content=content,
     )
+
+
+def footer_label_codes(footer: dict) -> list[list[tuple[str, str]]]:
+    """The codes each of the footer's ``labels`` declares, as ``(standard, value)`` pairs in the order declared.
+
+    One list per label, in footer order, empty for a label that declares none; a code whose value is not a non-empty
+    string is no code, as for an event. Nothing else of a label is read. Raises ``ValueError`` naming the first item
+    that is not the shape the viewer writes.
+    """
+    labels = footer.get("labels")
+    if labels is None:
+        return []
+    if not isinstance(labels, list):
+        raise ValueError('footer "labels" is not a list')  # noqa: TRY004 — one type per violation
+    declared: list[list[tuple[str, str]]] = []
+    for index, item in enumerate(labels):
+        if not isinstance(item, dict):
+            raise ValueError(f"footer labels[{index}] is not an object")  # noqa: TRY004 — one type per violation
+        codes = item.get("codes")
+        if codes is not None and not isinstance(codes, dict):
+            raise ValueError(f'footer labels[{index}] "codes" is not an object')
+        declared.append(
+            [
+                (standard, value)
+                for standard, value in (codes or {}).items()
+                if isinstance(standard, str) and standard and isinstance(value, str) and value
+            ]
+        )
+    return declared
+
+
+def _accepted_code(standard: str, value: str):
+    """The vocabulary registered for *standard* when it accepts *value*, else ``None``: the registry, fail-closed.
+
+    Unlike the API's ``validate_code``, an unregistered standard is refused whatever the strict-vocabulary setting
+    says, because a code nobody validates is text a file supplied.
+    """
+    from annotations.vocabularies import get_vocabulary
+
+    vocabulary = get_vocabulary(standard)
+    if vocabulary is None:
+        return None
+    try:
+        vocabulary.validator(value, None)
+    except Exception:  # a validator is project code, so any failure of it refuses the code
+        return None
+    return vocabulary
+
+
+def _term_name(vocabulary, value: str) -> str | None:
+    """The display name *vocabulary* gives *value*, or ``None`` when it gives none or its lookup fails."""
+    if vocabulary.term_name is None:
+        return None
+    try:
+        name = vocabulary.term_name(value)
+    except Exception:  # project code, as for the validator; the code stands in for the name
+        return None
+    return name if isinstance(name, str) and name else None
+
+
+def save_footer_labels(recording, footer: dict) -> tuple[int, int]:
+    """Write one system-authored ``Label`` on *recording* per footer label declaring an accepted code.
+
+    A code is accepted when a vocabulary is registered for its standard and that vocabulary's validator accepts the
+    value. The label's accepted codes become its ``Code`` rows; its ``name`` is the display name the first accepted
+    code's vocabulary gives the term, or the code where it gives none, and its ``value`` is that code, never the
+    template's own value. A label with no accepted code writes nothing: there is no placeholder, since a label
+    records a fact rather than a moment, and nothing of the template's text or annotator is stored anywhere.
+    Returns ``(written, skipped)`` and logs the skipped count, never a value. Raises ``ValueError`` as
+    :func:`footer_label_codes` does, before any row is written.
+    """
+    from django.contrib.contenttypes.models import ContentType
+
+    from annotations.models import Code, Label
+    from epicurrents.system_user import get_system_user
+
+    declared = footer_label_codes(footer)
+    written = skipped = 0
+    system_user = None
+    recording_ct = label_ct = None
+    for index, codes in enumerate(declared):
+        accepted = [
+            (standard, value, vocabulary)
+            for standard, value in codes
+            if (vocabulary := _accepted_code(standard, value))
+        ]
+        if not accepted:
+            skipped += 1
+            continue
+        if system_user is None:
+            system_user = get_system_user()
+            recording_ct = ContentType.objects.get_for_model(recording, for_concrete_model=False)
+            label_ct = ContentType.objects.get_for_model(Label)
+        _, first_value, first_vocabulary = accepted[0]
+        name = _term_name(first_vocabulary, first_value) or first_value
+        label = Label.objects.create(
+            author=system_user,
+            target_content_type=recording_ct,
+            target_object_id=str(recording.pk),
+            object_hash=annotation_hash(recording.pk, f"footer-label:{index}"),
+            name=name[:255],
+            value=first_value,
+        )
+        for standard, value, _ in accepted:
+            Code.objects.create(content_type=label_ct, object_id=str(label.pk), standard=standard, value=value)
+        written += 1
+    if skipped:
+        logger.info(
+            "save_footer_labels: %d of %d labels of recording %s declared no accepted code and were not stored",
+            skipped,
+            len(declared),
+            recording.pk,
+        )
+    return written, skipped
+
+
+def check_viewer_sidecar(document: Any) -> None:
+    """Raise ``ValueError`` naming the first part of *document* that is not the viewer's sidecar shape.
+
+    The events, the interruptions and the labels are checked; every other key is left to whoever reads it. The
+    message names a position, never a value, so it can be shown and logged.
+    """
+    if not isinstance(document, dict):
+        raise ValueError("the sidecar is not a JSON object")  # noqa: TRY004 — one type per violation
+    footer_events(document)
+    footer_interruptions(document)
+    footer_label_codes(document)
+
+
+def save_viewer_sidecar(recording, document: dict, *, discard_text: bool | None = None) -> None:
+    """Write the rows of the viewer's sidecar on *recording*: its events, interruptions and coded labels.
+
+    One writer for both ways a viewer export reaches the platform, the footer of an uploaded container and the
+    sidecar of a pooled submission. The whole document is checked before anything is written, so a malformed one
+    writes nothing and raises ``ValueError``. *discard_text* set to a bool decides whether the placeholders and the
+    raw record are skipped, instead of ``RECORDINGS_DISCARD_EMBEDDED_ANNOTATIONS``; the coded labels carry no text
+    and are written either way.
+    """
+    check_viewer_sidecar(document)
+    save_footer_events(recording, document, discard_text=discard_text)
+    save_footer_labels(recording, document)

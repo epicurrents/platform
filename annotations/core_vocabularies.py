@@ -134,7 +134,15 @@ def _validator(standard: str):
     return validate
 
 
+def _term_name(code: str) -> str | None:
+    """The name of the acquisition term *code* names, under whichever standard owns it."""
+    term = find_acquisition_term(code)
+    return term.name if term else None
+
+
 def register_core_vocabularies() -> None:
     """Register the pinned vocabularies; called from ``AnnotationsConfig.ready()``."""
     for standard, pin in VOCABULARY_PINS.items():
-        register_vocabulary(standard, label=pin.label, version=pin.version, validator=_validator(standard))
+        register_vocabulary(
+            standard, label=pin.label, version=pin.version, validator=_validator(standard), term_name=_term_name
+        )

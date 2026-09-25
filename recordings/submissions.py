@@ -102,8 +102,8 @@ class IngestProfile:
 
     ``validate_sidecar`` receives the sidecar after the shape checks passed and returns
     further violations; ``ingest`` receives the created recording and the sidecar, inside the
-    ingest transaction, and writes whatever the project derives from it (events under a code
-    vocabulary, say). Both are optional. ``forbidden_sidecar_keys`` extends the default set;
+    ingest transaction, after the platform has written the sidecar's events, interruptions and
+    coded labels, and writes whatever else the project derives from it. Both are optional. ``forbidden_sidecar_keys`` extends the default set;
     it cannot shrink it.
     """
 
@@ -339,7 +339,15 @@ def validate_sidecar(profile: IngestProfile, sidecar: Any, data: bytes) -> list[
     """Check the sidecar's shape, its forbidden keys and its declared hash, then ask the profile."""
     if not isinstance(sidecar, dict):
         return [Violation("sidecar_shape", "The sidecar must be a JSON object.")]
+    from recordings.container import check_viewer_sidecar
+
     violations: list[Violation] = []
+    try:
+        # The pooled ingest writes the events, interruptions and labels from the sidecar, so a sidecar
+        # it could not read is refused here rather than failing after acceptance.
+        check_viewer_sidecar(sidecar)
+    except ValueError as exc:
+        violations.append(Violation("sidecar_shape", f"The sidecar is not the viewer's shape: {exc}."))
     for path in _forbidden_keys_in(sidecar, profile.all_forbidden_sidecar_keys):
         violations.append(Violation("sidecar_forbidden_key", f"The sidecar carries the forbidden key {path!r}."))
     for key in (DECLARED_HASH_KEY, *profile.required_sidecar_keys):
