@@ -175,7 +175,7 @@ Viewer first, platform second: nothing here is touched until the JSON files exis
 | C2. Translation registry, `Event` rows with codes, raw record kept, fail-closed placeholder | platform recordings | M | built 2026-09-24 |
 | C3. Vendor mappings: the Nicolet `.e` reader in the viewer and the table for its server-side converter | viewer nic-reader, deployment data | S | built 2026-09-24 |
 | E. The container: the export embeds the coded events as a footer, ingest detaches it and resolves the declared codes | viewer edf-reader, platform recordings | M | built 2026-09-25 |
-| F. Submit to the platform from the viewer's file menu, for any reader, as the container | viewer core, interface, platform SPA | M | planned, section 8 |
+| F. Submit to the platform from the viewer's file menu, for any reader, as the container | viewer core, edf-reader, interface, platform SPA | M | core transform and EDF `selection` built 2026-09-25; the rest planned, section 8 |
 | G. Coded labels in the footer become `Label` rows with their codes | platform recordings, annotations | S | planned, section 8 |
 | H. A teaching project's span selection, age, sex and coded recording labels on the submit flow | edu project | M | planned, section 8 |
 | D. The viewer documentation's annotations page, coded annotations section | docs submodule | S | at release |
