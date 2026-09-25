@@ -37,12 +37,14 @@ from recordings.submissions import (
     BLANK_RECORDING,
     BLANK_START_DATE,
     BLANK_START_TIME,
+    DEFAULT_FORBIDDEN_SIDECAR_KEYS,
     IngestProfile,
     Violation,
     can_submit_to_dataset,
     get_ingest_profile,
     register_ingest_profile,
     reset_ingest_profiles,
+    validate_file,
     validate_submission,
 )
 from recordings.tasks import ingest_pooled_submissions
@@ -288,6 +290,21 @@ class TestGate:
         with pytest.raises(ValueError):
             register_ingest_profile(IngestProfile(key="not a key!"))
 
+    @pytest.mark.parametrize(
+        "channel", ["Chin", "Fz-Cz", "T3", "EEG Fp1", "Fp1 ", "", "X" * 17, "Kanavaä", "EDF Annotations"]
+    )
+    def test_registry_refuses_a_channel_the_platform_resolves_elsewhere(self, channel):
+        with pytest.raises(ValueError, match="no file can carry"):
+            register_ingest_profile(_profile(channels=("Fp1", channel)))
+        assert get_ingest_profile("test.pool") is None
+
+    @pytest.mark.parametrize("channel", ["Fp1", "T7", "C3-P3", "EMG/Chin", "LOC", "ECG", "Photic"])
+    def test_a_channel_labelled_as_published_passes_the_gate(self, channel):
+        profile = _profile(channels=(channel,))
+        register_ingest_profile(profile)
+        signals = [{**SIGNALS[0], "label": channel}]
+        assert validate_file(profile, _edf(signals=signals)) == []
+
 
 # ---------------------------------------------------------------------------
 # Who may submit
@@ -449,6 +466,54 @@ class TestBatchEndpoints:
         data = _edf()
         assert _submit(client, batch["hash"], data, _sidecar(data)).status_code == 403
         assert SubmissionFile.objects.count() == 0
+
+    def test_profile_serves_every_checked_value(self, pool):
+        dataset, contributor, _group = pool
+        client = _client(contributor)
+        batch = _open_batch(client, dataset)
+        response = client.get(f"{BATCHES_URL}/{batch['hash']}/profile")
+        assert response.status_code == 200, response.content
+        assert response.json() == {
+            "key": "test.pool",
+            "channels": ["Fp1", "Fp2"],
+            "sampling_rate": 256.0,
+            "physical_unit": "uV",
+            "physical_min": -100.0,
+            "physical_max": 100.0,
+            "digital_min": -32768,
+            "digital_max": 32767,
+            "durations_seconds": [2.0],
+            "required_sidecar_keys": ["recording_sha256", "profile_version"],
+            "forbidden_sidecar_keys": sorted(DEFAULT_FORBIDDEN_SIDECAR_KEYS),
+        }
+        activity = Activity.objects.filter(verb="recordings.submission.batch.profile.read").latest("pk")
+        assert activity.target_object_id == str(SubmissionBatch.objects.get().pk)
+
+    def test_profile_includes_the_profiles_own_forbidden_keys(self, pool):
+        dataset, contributor, _group = pool
+        register_ingest_profile(_profile(forbidden_sidecar_keys=("site",)))
+        client = _client(contributor)
+        batch = _open_batch(client, dataset)
+        keys = client.get(f"{BATCHES_URL}/{batch['hash']}/profile").json()["forbidden_sidecar_keys"]
+        assert keys == sorted({*DEFAULT_FORBIDDEN_SIDECAR_KEYS, "site"})
+
+    def test_profile_follows_the_batch_rules(self, pool, make_user):
+        dataset, contributor, group = pool
+        client = _client(contributor)
+        batch = _open_batch(client, dataset)
+        url = f"{BATCHES_URL}/{batch['hash']}/profile"
+
+        other = make_user()
+        other.groups.add(group)
+        assert _client(other).get(url).status_code == 404
+        assert Client().get(url).status_code == 401
+
+        reset_ingest_profiles()
+        assert client.get(url).status_code == 409
+        register_ingest_profile(_profile())
+
+        contributor.groups.remove(group)
+        assert client.get(url).status_code == 403
 
     def test_erasing_the_contributor_keeps_the_batch_unlinked(self, pool):
         dataset, contributor, _group = pool

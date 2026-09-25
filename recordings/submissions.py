@@ -136,9 +136,18 @@ def register_ingest_profile(profile: IngestProfile) -> None:
     Called from a project's ``apps.py::ready()``. Replacement rather than refusal, because
     ``ready()`` runs once per process and a test that registers a fixture profile must be able
     to do so repeatedly.
+
+    A profile naming a channel no file can carry is refused here, at boot, rather than by
+    refusing every submission later: see :func:`unsatisfiable_channels`.
     """
     if not profile.key or not profile.key.replace("_", "").replace("-", "").replace(".", "").isalnum():
         raise ValueError(f"Ingest profile key {profile.key!r} must be a non-empty identifier.")
+    unsatisfiable = unsatisfiable_channels(profile)
+    if unsatisfiable:
+        raise ValueError(
+            f"Ingest profile {profile.key!r} names channels no file can carry: {unsatisfiable}. A channel must fit "
+            f"an EDF label (at most 16 printable ASCII characters) and be the label the platform resolves it to."
+        )
     _PROFILES[profile.key] = profile
 
 
@@ -155,6 +164,59 @@ def registered_ingest_profiles() -> list[IngestProfile]:
 def reset_ingest_profiles() -> None:
     """Clear the registry. Test use only."""
     _PROFILES.clear()
+
+
+def gate_label(label: str) -> str:
+    """The label the gate compares a channel labelled ``label`` by, exactly as :func:`validate_file` derives it."""
+    from recordings.processors.channel_labels import classify_channel
+    from recordings.processors.edf import extract_signal_type
+
+    return classify_channel(label, extract_signal_type(label))[1] or label.strip()
+
+
+def unsatisfiable_channels(profile: IngestProfile) -> list[str]:
+    """The profile's channels that a file labelling a channel with that exact name would not satisfy.
+
+    Two ways a channel can be met by no label at all: it does not fit the EDF label field, which
+    holds 16 bytes of printable ASCII and names the annotation channel ``EDF Annotations``; or the
+    platform's resolver maps it elsewhere (``Chin`` to ``EMG/Chin``, ``Fz-Cz`` to ``Fz``), since
+    the gate compares the canonical label where it resolves one. The published profile promises
+    that a channel labelled as listed passes, which is what lets a preparation tool write the list
+    verbatim.
+    """
+    from recordings.processors.edf import _SW_LABEL
+
+    def writable(channel: str) -> bool:
+        return (
+            0 < len(channel) <= _SW_LABEL
+            and channel.isascii()
+            and channel.isprintable()
+            and channel.lower() not in ("edf annotations", "bdf annotations")
+        )
+
+    return [channel for channel in profile.channels if not writable(channel) or gate_label(channel) != channel]
+
+
+def public_profile(profile: IngestProfile) -> dict[str, Any]:
+    """What a contributor's preparation tool needs to produce a file the gate accepts.
+
+    Every value the platform checks, with the forbidden sidecar keys in full (the defaults and the
+    profile's own) and the name of the declared-hash key. ``validate_sidecar`` and ``ingest`` are
+    code and are not published; the gate still runs the former on every submission.
+    """
+    return {
+        "key": profile.key,
+        "channels": list(profile.channels),
+        "sampling_rate": profile.sampling_rate,
+        "physical_unit": profile.physical_unit,
+        "physical_min": profile.physical_min,
+        "physical_max": profile.physical_max,
+        "digital_min": profile.digital_min,
+        "digital_max": profile.digital_max,
+        "durations_seconds": list(profile.durations_seconds),
+        "required_sidecar_keys": [DECLARED_HASH_KEY, *profile.required_sidecar_keys],
+        "forbidden_sidecar_keys": sorted(profile.all_forbidden_sidecar_keys),
+    }
 
 
 # ---------------------------------------------------------------------------

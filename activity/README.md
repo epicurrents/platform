@@ -571,6 +571,7 @@ To check the table against the tree, walk the AST for `log_activity` / `with_sys
 | `recordings.submission.batch.create` | `create_submission_batch` |
 | `recordings.submission.batch.list` | `list_submission_batches` |
 | `recordings.submission.batch.read` | `get_submission_batch` |
+| `recordings.submission.batch.profile.read` | `get_submission_batch_profile` |
 | `recordings.submission.file.accept` | `submit_file` |
 | `recordings.submission.file.reject` | `submit_file` |
 | `recordings.submission.ingest` | `ingest_pooled_submissions` † |

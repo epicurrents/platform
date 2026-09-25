@@ -2971,6 +2971,22 @@ class SubmissionBatchOut(Schema):
     created_at: datetime
 
 
+class SubmissionProfileOut(Schema):
+    """The public shape of a batch's ingest profile: every value the gate checks a submission against."""
+
+    key: str
+    channels: list[str]
+    sampling_rate: float | None
+    physical_unit: str | None
+    physical_min: float | None
+    physical_max: float | None
+    digital_min: int | None
+    digital_max: int | None
+    durations_seconds: list[float]
+    required_sidecar_keys: list[str]
+    forbidden_sidecar_keys: list[str]
+
+
 class SubmissionViolationOut(Schema):
     """One reason a submission was refused."""
 
@@ -3085,6 +3101,26 @@ def get_submission_batch(request, batch_hash: str):
     batch = _get_own_batch(user, batch_hash)
     log_activity(verb="recordings.submission.batch.read", target=batch)
     return _batch_out(batch)
+
+
+@api.get("/submissions/batches/{batch_hash}/profile", response=SubmissionProfileOut)
+def get_submission_batch_profile(request, batch_hash: str):
+    """The rules one of the caller's batches checks each file against, for preparing a file before it is sent.
+
+    A channel labelled exactly as listed passes the channel check, which registration guarantees.
+    Readable while the caller may still submit to the batch's dataset, as the file endpoint is.
+    """
+    from recordings.submissions import can_submit_to_dataset, get_ingest_profile, public_profile
+
+    user = _require_auth(request)
+    batch = _get_own_batch(user, batch_hash)
+    if not can_submit_to_dataset(user, batch.dataset):
+        raise HttpError(403, "You may not submit to this dataset")
+    profile = get_ingest_profile(batch.profile_key)
+    if profile is None:
+        raise HttpError(409, "The batch's ingest profile is no longer registered")
+    log_activity(verb="recordings.submission.batch.profile.read", target=batch)
+    return public_profile(profile)
 
 
 @api.post(
