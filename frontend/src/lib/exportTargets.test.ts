@@ -147,6 +147,20 @@ describe('createSubmissionTarget', () => {
         expect(await sentSidecar()).toEqual({ version: '1.0', band: 'A2', recording_sha256: sha256 })
     })
 
+    it('sends nothing when the host declines to extend the sidecar, and reports its reason as written', async () => {
+        const target = createSubmissionTarget(batch, makeProfile(), {
+            extendSidecar: () => {
+                throw new Error('The submission was cancelled.')
+            },
+        })!
+        const result = await target.submit({ data: bytes, sidecar: '{}' })
+        expect(result).toEqual({
+            message: 'The sidecar could not be prepared: The submission was cancelled.',
+            success: false,
+        })
+        expect(mockSubmit).not.toHaveBeenCalled()
+    })
+
     it('refuses locally when the sidecar lacks a key the profile requires', async () => {
         const target = createSubmissionTarget(batch, makeProfile({ required_sidecar_keys: ['recording_sha256', 'band'] }))!
         const result = await target.submit({ data: bytes, sidecar: '{}' })

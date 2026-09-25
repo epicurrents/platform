@@ -1,6 +1,6 @@
 # Annotation event vocabulary — the acquisition set
 
-**Status:** v1.9, 2026-09-25. Design settled and built through the vendor mappings, the container the viewer's export produces for the platform, submitting from the viewer and the coded labels of the footer; what remains is planned in section 8: the teaching project's side, and the documentation at release. Last privacy item on the [ROADMAP](../../ROADMAP.md) ("annotation event vocabulary still fingerprints the acquisition software") and Phase 4 of the [channel de-identification plan](channel-deidentification-plan.md).
+**Status:** v1.10, 2026-09-25. Design settled and built through the vendor mappings, the container the viewer's export produces for the platform, submitting from the viewer, the coded labels of the footer and the teaching project's submission path; what remains is planned in section 8: the teaching project's release side, and the documentation at release. Last privacy item on the [ROADMAP](../../ROADMAP.md) ("annotation event vocabulary still fingerprints the acquisition software") and Phase 4 of the [channel de-identification plan](channel-deidentification-plan.md).
 
 **This is the initial vocabulary.** It carries what a reader needs to explain a change in the signal by something that happened in the room, and no more. Terms will be added along the way, and the crosswalk columns filled, as SNOMED CT concepts are adopted for them; adding a term is an entry in a JSON file and a log row below, not a redesign.
 
@@ -177,7 +177,7 @@ Viewer first, platform second: nothing here is touched until the JSON files exis
 | E. The container: the export embeds the coded events as a footer, ingest detaches it and resolves the declared codes | viewer edf-reader, platform recordings | M | built 2026-09-25 |
 | F. Submit to the platform from the viewer's file menu, for any reader, as the container | viewer core, edf-reader, interface, platform SPA, edu frontend | M | built 2026-09-25 |
 | G. Coded labels in the footer become `Label` rows with their codes | platform recordings, annotations | S | built 2026-09-25 |
-| H. A teaching project's span selection, age, sex and coded recording labels on the submit flow | edu project | M | planned, section 8 |
+| H. A teaching project's span selection and coded recording labels on the submit flow | edu project | M | submission path built 2026-09-25; release side planned, section 8 |
 | D. The viewer documentation's annotations page, coded annotations section | docs submodule | S | at release |
 
 Steps A and B change published surface in two viewer packages: `CodedEventProperties` gains two optional fields and `GenericBiosignalEvent` gains a table, which is an addition and part of core's pending 2.1.0 release; `EegEvent` loses five statics it now inherits with the same signatures, which is not a change to callers.
@@ -235,7 +235,14 @@ The plan for the rest, written so that it can be picked up cold. Three pieces of
 
 ### H. The teaching project's side of the submit flow
 
-Built on F and G, in the edu repository, after the platform has its profile and selector work: the project's `IngestProfile`, whose public shape the project's frontend fetches and hands to the viewer as constraints, so the range, channels and rate are chosen in the generic dialog; entering the age band and the sex, and later the recording type and an ICD-10 code, as coded labels from closed lists the project's vocabulary defines, never as free text. The platform writes the sidecar's events, interruptions and coded labels itself (step G), and the project's `IngestProfile.ingest` writes only what it derives beyond them. The edu items from the anonymisation plan stand as listed there: the release selector, the equivalence-class function, `LIBRARY_RELEASE_GATED_DEPLOYMENT = True`, and the dataset note's work-required list.
+Built on F and G, in the edu repository, after the platform has its profile and selector work: the project's `IngestProfile`, whose public shape the project's frontend fetches and hands to the viewer as constraints, so the range, channels and rate are chosen in the generic dialog; entering the age band, and later an ICD-10 code, as coded labels from closed lists the project's vocabulary defines, never as free text. Sex is not collected: the project's dataset note records the decision, since it halves k and rarely changes interpretation. The platform writes the sidecar's events, interruptions and coded labels itself (step G), and the project's `IngestProfile.ingest` writes only what it derives beyond them. The edu items from the anonymisation plan stand as listed there: the release selector, the equivalence-class function, `LIBRARY_RELEASE_GATED_DEPLOYMENT = True`, and the dataset note's work-required list.
+
+**As built (2026-09-25), the submission path.** The project registers one profile per recording class, with the version in the key. Only adult routine EEG exists so far, `edu.adult-routine.v1`: the nineteen 10-20 electrodes and ECG in the platform's canonical order, 200 Hz, 5, 10 or 20 minutes. It also registers two vocabularies, `epicurrents.edu.recording_class` and `epicurrents.edu.age_band`, from one JSON file that the project's frontend reads as well.
+- The age band is chosen in a dialog the project's `extendSidecar` opens at send time. It travels as a coded label, which step G writes like any other.
+- The recording class follows from the profile, so the profile's `ingest` writes it as a coded label. That makes it the one row the project derives beyond the sidecar.
+- The profile's sidecar check refuses a sidecar with no band, with two, with one outside the class's list, or with a class of its own.
+
+The release side, the embargo attestation and the at-least-one-event rule remain, and are listed in the project's dataset note.
 
 ### What the anonymisation work still leaves open on the platform
 
@@ -251,6 +258,7 @@ The phased plan in [anonymisation-compliance-plan.md](anonymisation-compliance-p
 
 | Date | Change |
 |---|---|
+| 2026-09-25 | v1.10. Step H's submission path built in the teaching project. It registers an adult routine profile and two coded vocabularies; the age band is entered at send time and the recording class is written by the profile's ingest. The H paragraph is corrected: sex is not collected, as the project's dataset note had already decided. |
 | 2026-09-25 | v1.9. Step G built: coded footer labels become system-authored `Label` rows through `save_footer_labels`, fail-closed against the registry, which gains an optional `term_name` lookup to name them. One writer for the footer and a pooled submission's sidecar, since both feed the same pool: the pooled ingest writes the rows itself with the text discarded, the gate refuses a sidecar it could not read, and a release-gated deployment must discard embedded text on the upload path too. Step F's row in section 7 marked built. |
 | 2026-09-25 | v1.8. The targets built: the SPA registers the upload and holds a submission template, and the teaching project registers its batches from it, so the profiles stay project configuration. The exporter removes a target's forbidden metadata keys at any depth, since the gate forbids keys the de-identification only blanks; the template declares the file's hash. The SPA's viewer lib registers the EDF exporter, which it had lacked. |
 | 2026-09-25 | v1.7. Only a resource the viewer opened from a local file can be sent to a target; the loader records the origin, and an unknown origin counts as remote. The viewer holds no knowledge of the platform: the host fills a generic export-target slot in the viewer config, the SPA with the upload and the teaching project's frontend with its batches and their constraints, which it fetches from the platform. No platform connector in core. |

@@ -145,7 +145,9 @@ export function createSubmissionTarget(
                 sidecar[DECLARED_HASH_KEY] = await sha256Hex(file.data)
             } catch (error) {
                 return {
-                    message: t('The sidecar could not be prepared: {reason}', SCOPE, { reason: String(error) }),
+                    message: t('The sidecar could not be prepared: {reason}', SCOPE, {
+                        reason: error instanceof Error ? error.message : String(error),
+                    }),
                     success: false,
                 }
             }
