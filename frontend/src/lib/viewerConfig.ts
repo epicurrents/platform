@@ -22,7 +22,7 @@ import type { EpicurrentsApp, SettingsValue } from '@epicurrents/core/dist/types
  * the device copy at startup and writes changes back to it.
  *
  * Only pass it for a signed-in session: the endpoint is session-authenticated, and a share-token or
- * anonymous viewer would just collect 401s.
+ * unauthenticated viewer would just collect 401s.
  *
  * Built from `VITE_API_BASE_URL` for the same reason [`#lib/http`](http.ts) is — the viewer resolves
  * this with `fetch`, which would otherwise send it to the document origin and miss a split-origin
