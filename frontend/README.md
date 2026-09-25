@@ -32,6 +32,8 @@ Nothing, for a base deployment. `npm run build` and `npm run test` need no `view
 
 `@epicurrents/core` is a dev dependency and pinned to an exact version, both deliberately. Dev, because every import of it is `import type` and its runtime closure is large; exact, because a published version does not currently identify a source state (see [ROADMAP.md](../ROADMAP.md)), so a range would let the types drift under the build without anything saying so.
 
+API newer than the pinned release is declared in [core-global-augment.ts](src/types/core-global-augment.ts) until a release carries it, mirroring the core declaration. Today that is the export-target registry: `EpicurrentsApp`'s three registry methods and the `SignalExport*` types a target is built from. The mirrored types are interfaces where core's are type aliases, so pinning a release that declares them fails the build at each one to delete.
+
 Two things still reach the checkout. An active project's frontend does: its `scoped-event-log` import is a single module, but a project that constructs annotations through a dynamic `#epicurrents/eeg-module` import pulls the core runtime into a lazily loaded chunk — the route [ROADMAP.md](../ROADMAP.md) plans to replace with the viewer's template methods. And the per-project viewer lib built by [vite.config.base.ts](vite.config.base.ts) bundles the interface from source. Both are why a deployment still needs the submodule even though the base SPA does not.
 
 ## Environment Variables
@@ -144,6 +146,17 @@ Then choose variants in templates with the `library` attribute:
 
 This is backwards-compatible: existing icons that omit `library` continue to
 resolve through the default icon library.
+
+## Viewer export targets
+
+The viewer's file menu offers "Send recording to" entries for a recording opened from a local file, one per export target the host registers with `registerSignalExportTarget`; a recording loaded from a URL is offered none, which core enforces. The viewer knows no platform endpoint, so each target's `submit` is platform code. [lib/exportTargets.ts](src/lib/exportTargets.ts) holds the templates:
+
+- `createUploadTarget` sends the de-identified container (the EDF with its sidecar embedded as a footer, so its event codes arrive) to the person's own recordings. [ViewerView.vue](src/views/ViewerView.vue) registers it as `platform/upload` for a signed-in session without a share token.
+- `createSubmissionTarget(batch, profile, options)` turns a batch's published ingest profile into the export dialog's constraints, asks for a plain de-identified EDF and its de-identified sidecar, declares the file's SHA-256 in the sidecar as `recording_sha256`, and posts both to the batch. It returns null for a profile whose digital range is not the encoder's −32768 to 32767, which no export can meet. `options` carries what a project fine-tunes: the label, constraints replacing the profile's key by key, and `extendSidecar` for the sidecar keys a profile requires.
+
+Which batches become targets is the project's configuration, not the SPA's: a project calls the template from its `onAppReady`, so a profile can change without a platform release. The profile's forbidden sidecar keys become the constraint's `forbiddenMetadataKeys`, which the export dialog passes to the exporter to remove at any depth, since the gate refuses a sidecar carrying one even where the de-identification only blanks it (`subject`, `text`).
+
+A target reports its outcome as a message rather than throwing, and the gate's 422 is an outcome, not an error. The per-project viewer lib registers the EDF exporter the targets encode with, in [src/viewer/base.ts](src/viewer/base.ts).
 
 ## Routes
 

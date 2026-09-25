@@ -171,6 +171,28 @@ export interface SubmissionBatch {
     created_at: string
 }
 
+/**
+ * The public shape of a batch's ingest profile: every value the gate checks a submission against. Null where the
+ * profile leaves a value unchecked.
+ */
+export interface SubmissionProfile {
+    key: string
+    /** Channel labels, in the order the file must carry them. */
+    channels: string[]
+    sampling_rate: number | null
+    physical_unit: string | null
+    physical_min: number | null
+    physical_max: number | null
+    digital_min: number | null
+    digital_max: number | null
+    /** The lengths a file may have, in seconds. Empty when any length passes. */
+    durations_seconds: number[]
+    /** Keys the sidecar must carry, `recording_sha256` first. */
+    required_sidecar_keys: string[]
+    /** Keys refused anywhere in the sidecar, at any depth. */
+    forbidden_sidecar_keys: string[]
+}
+
 /** One reason the gate refused a submitted file. */
 export interface SubmissionViolation {
     code: string
@@ -196,6 +218,15 @@ export async function listSubmissionBatches(datasetHash?: string): Promise<Submi
 
 export async function getSubmissionBatch(batchHash: string): Promise<SubmissionBatch> {
     const response = await http.get<SubmissionBatch>(`/recordings/api/v1/submissions/batches/${batchHash}`)
+    return response.data
+}
+
+/**
+ * The ingest profile a batch's submissions are checked against, for preparing a file in the browser. Answers 403 once
+ * the caller may no longer submit to the batch's dataset and 409 while the profile is not registered.
+ */
+export async function getSubmissionProfile(batchHash: string): Promise<SubmissionProfile> {
+    const response = await http.get<SubmissionProfile>(`/recordings/api/v1/submissions/batches/${batchHash}/profile`)
     return response.data
 }
 

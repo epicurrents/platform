@@ -19,6 +19,52 @@
 
 export {}
 
+/*
+ * The export-target registry (core's `src/types/reader.ts` and `EpicurrentsApp` in
+ * `src/types/application.ts`) is newer than the pinned `@epicurrents/core` release, so its types
+ * are declared here until that release carries them. They mirror the core declarations, which are
+ * type aliases: once a release declaring them is pinned, these interfaces collide with the aliases
+ * and the compiler names every one to delete. `SignalExportConstraints` is declared in full, since
+ * a target states it; `EpicurrentsApp` gains only the registry's three methods.
+ */
+declare module '@epicurrents/core/dist/types' {
+    interface EpicurrentsApp {
+        /**
+         * The export targets offered for `resource`: every registered target for a resource opened
+         * from local files, none otherwise.
+         */
+        getSignalExportTargets(resource: import('@epicurrents/core/dist/types').DataResource): Map<string, SignalExportTarget>
+        /** Register `target` under `name`, replacing any target already registered under it. */
+        registerSignalExportTarget(name: string, target: SignalExportTarget): void
+        /** Remove the target registered under `name`. False if there was none. */
+        unregisterSignalExportTarget(name: string): boolean
+    }
+    interface SignalExportConstraints {
+        amplitudeRange?: [number, number]
+        channels?: string[]
+        durations?: number[]
+        forbiddenMetadataKeys?: string[]
+        samplingRate?: number
+        unit?: string
+    }
+    interface SignalExportFile {
+        data: ArrayBuffer
+        sidecar: string | null
+    }
+    interface SignalExportTarget {
+        constraints?: SignalExportConstraints
+        format: string
+        label: string
+        options?: Record<string, unknown>
+        sidecar?: boolean
+        submit(file: SignalExportFile): Promise<SignalExportTargetResult>
+    }
+    interface SignalExportTargetResult {
+        message: string
+        success: boolean
+    }
+}
+
 declare module '@epicurrents/core/dist/types' {
     interface EpicurrentsGlobal {
         /**

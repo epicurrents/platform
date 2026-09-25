@@ -23,6 +23,7 @@ import { waitForEventBus } from '#projects/eventBus'
 import { getViewerConfig } from '#api/viewerConfig'
 import { applyViewerSettingsOverrides, VIEWER_USER_SETTINGS_PATH } from '#lib/viewerConfig'
 import { leadFieldProvider } from '#viewer/leadFields'
+import { createUploadTarget } from '#lib/exportTargets'
 
 // The overlay panel comes from the active project if it defines one, otherwise
 // from the first enabled plugin that does. A page hosts a single overlay.
@@ -409,6 +410,14 @@ onMounted(async () => {
                 applyViewerSettingsOverrides(epic, overrides)
             } catch (err) {
                 console.warn('[viewer-config] could not load deployment overrides:', err)
+            }
+            // A recording the person opened from their own disk can be uploaded to
+            // their recordings from the viewer's file menu; the viewer offers it for
+            // nothing it loaded from a URL. Signed-in sessions only, since the upload is
+            // session-authenticated, and never under a share token, whose holder has no
+            // recordings of their own here.
+            if (auth.user && !shareToken.value) {
+                epic.registerSignalExportTarget('platform/upload', createUploadTarget())
             }
             // Wait for the event bus to be live (may resolve asynchronously after
             // createEpicurrentsApp), then give the plugin a chance to configure
