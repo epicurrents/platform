@@ -4,9 +4,9 @@
  *
  * The viewer knows nothing of the platform. It keeps a registry of targets, each a label, the format it takes,
  * optional constraints and a function receiving the finished bytes, and the host fills it. This module builds the
- * two kinds the platform has: the plain upload to the person's own recordings, and a submission to a batch, checked
- * against the batch's ingest profile. Which targets a viewer offers is the host's configuration — the viewer page
- * registers the upload, and a project registers its batches, with the labels and adjustments its profiles need.
+ * two kinds the platform has: the plain upload to the person's own recordings, and a submission to a pool, checked
+ * against the pool's ingest profile. Which targets a viewer offers is the host's configuration — the viewer page
+ * registers the upload, and a project registers its pools, with the labels and adjustments its profiles need.
  *
  * @package    epicurrents-platform
  */
@@ -20,7 +20,7 @@ import type {
 import {
     submitFile,
     uploadRecording,
-    type SubmissionBatch,
+    type SubmissionPool,
     type SubmissionProfile,
 } from '#api/recordings'
 import { t } from '#i18n'
@@ -57,7 +57,7 @@ async function sha256Hex(data: ArrayBuffer): Promise<string> {
  * Translate a profile's public shape into export constraints, or null when the viewer cannot produce a file the
  * profile accepts. The one such case today is a digital range other than {@link EXPORT_DIGITAL_RANGE}, which the
  * encoder does not let an export choose.
- * @param profile - The batch's profile as the platform serves it.
+ * @param profile - The pool's profile as the platform serves it.
  */
 export function profileConstraints(profile: SubmissionProfile): SignalExportConstraints | null {
     const digital = [profile.digital_min, profile.digital_max]
@@ -111,18 +111,17 @@ export function createUploadTarget(label?: string): SignalExportTarget {
 }
 
 /**
- * A submission to `batch`, checked against its profile: the profile's constraints restrict the export dialog, the
+ * A submission to `pool`, checked against its profile: the profile's constraints restrict the export dialog, the
  * file is a plain EDF, and the de-identified sidecar travels beside it with the file's hash declared. Null when the
  * viewer cannot meet the profile (see {@link profileConstraints}).
- * @param batch - The batch the submissions go to.
- * @param profile - The batch's profile as the platform serves it.
+ * @param pool - The pool the submissions go to, with its profile as the platform serves it.
  * @param options - The host's adjustments: a label, constraints and the sidecar keys the profile requires.
  */
 export function createSubmissionTarget(
-    batch: SubmissionBatch,
-    profile: SubmissionProfile,
+    pool: SubmissionPool,
     options: SubmissionTargetOptions = {},
 ): SignalExportTarget | null {
+    const profile = pool.profile
     const constraints = profileConstraints(profile)
     if (!constraints) {
         return null
@@ -130,7 +129,7 @@ export function createSubmissionTarget(
     return {
         constraints: { ...constraints, ...(options.constraints ?? {}) },
         format: 'edf',
-        label: options.label ?? t('Submission batch {batch}', SCOPE, { batch: batch.hash.slice(0, 8) }),
+        label: options.label ?? t('Submission pool: {name}', SCOPE, { name: pool.name }),
         options: { deidentify: true, deidentifySidecar: true, embedFooter: false },
         sidecar: true,
         async submit(file: SignalExportFile): Promise<SignalExportTargetResult> {
@@ -160,15 +159,13 @@ export function createSubmissionTarget(
             }
             try {
                 const result = await submitFile(
-                    batch.hash,
+                    pool.dataset_hash,
                     new File([file.data], 'recording.edf', { type: 'application/octet-stream' }),
                     new Blob([JSON.stringify(sidecar)], { type: 'application/json' }),
                 )
                 if (result.accepted) {
                     return {
-                        message: t('Accepted. Recordings waiting in the batch: {count}.', SCOPE, {
-                            count: result.pending_count,
-                        }),
+                        message: t('Accepted. The recording joins the pool at the next pooled ingest.', SCOPE),
                         success: true,
                     }
                 }

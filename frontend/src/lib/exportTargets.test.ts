@@ -1,5 +1,5 @@
 /**
- * Tests for the viewer export-target templates: how a batch's published profile becomes export constraints, and what
+ * Tests for the viewer export-target templates: how a pool's published profile becomes export constraints, and what
  * each target sends and reports back. The sidecar's declared hash is pinned against the bytes, since the submission
  * gate refuses a file whose declared hash differs from what arrived.
  */
@@ -16,21 +16,11 @@ vi.mock('#i18n', () => ({
         key.replace(/\{(\w+)\}/g, (_match, name: string) => String(params[name])),
 }))
 
-import { submitFile, uploadRecording, type SubmissionBatch, type SubmissionProfile } from '#api/recordings'
+import { submitFile, uploadRecording, type SubmissionPool, type SubmissionProfile } from '#api/recordings'
 import { createSubmissionTarget, createUploadTarget, profileConstraints } from './exportTargets'
 
 const mockSubmit = vi.mocked(submitFile)
 const mockUpload = vi.mocked(uploadRecording)
-
-const batch: SubmissionBatch = {
-    hash: '0123456789abcdef0123456789abcdef',
-    dataset_hash: 'f'.repeat(32),
-    profile: 'fictional.profile',
-    pending_count: 0,
-    failed_count: 0,
-    ingested_count: 0,
-    created_at: '2026-09-01T00:00:00Z',
-}
 
 function makeProfile(overrides: Partial<SubmissionProfile> = {}): SubmissionProfile {
     return {
@@ -47,6 +37,11 @@ function makeProfile(overrides: Partial<SubmissionProfile> = {}): SubmissionProf
         forbidden_sidecar_keys: ['subject', 'text'],
         ...overrides,
     }
+}
+
+/** A pool as the platform lists it, with `profile` in place of its published profile. */
+function makePool(profile: SubmissionProfile = makeProfile()): SubmissionPool {
+    return { dataset_hash: 'f'.repeat(32), name: 'Fictional pool', profile }
 }
 
 const bytes = new Uint8Array([1, 2, 3, 4]).buffer
@@ -116,39 +111,43 @@ describe('createUploadTarget', () => {
 
 describe('createSubmissionTarget', () => {
     it('is null for a profile the viewer cannot meet', () => {
-        expect(createSubmissionTarget(batch, makeProfile({ digital_max: 2047 }))).toBeNull()
+        expect(createSubmissionTarget(makePool(makeProfile({ digital_max: 2047 })))).toBeNull()
     })
 
     it('asks for a plain de-identified file and its de-identified sidecar', () => {
-        const target = createSubmissionTarget(batch, makeProfile())!
+        const target = createSubmissionTarget(makePool())!
         expect(target.format).toBe('edf')
         expect(target.sidecar).toBe(true)
         expect(target.options).toEqual({ deidentify: true, deidentifySidecar: true, embedFooter: false })
     })
 
+    it('is labelled by the pool unless the host names it', () => {
+        expect(createSubmissionTarget(makePool())!.label).toBe('Submission pool: Fictional pool')
+    })
+
     it('lets the host replace a constraint and the label', () => {
-        const target = createSubmissionTarget(batch, makeProfile(), {
+        const target = createSubmissionTarget(makePool(), {
             constraints: { durations: [30] },
-            label: 'Fictional pool',
+            label: 'Fictional target',
         })!
-        expect(target.label).toBe('Fictional pool')
+        expect(target.label).toBe('Fictional target')
         expect(target.constraints?.durations).toEqual([30])
         expect(target.constraints?.samplingRate).toBe(128)
     })
 
     it('declares the hash of the bytes it sends, after the host extends the sidecar', async () => {
-        mockSubmit.mockResolvedValue({ accepted: true, pending_count: 3 })
-        const target = createSubmissionTarget(batch, makeProfile(), {
+        mockSubmit.mockResolvedValue({ accepted: true })
+        const target = createSubmissionTarget(makePool(), {
             extendSidecar: (sidecar) => ({ ...sidecar, recording_sha256: 'forged', band: 'A2' }),
         })!
         const result = await target.submit({ data: bytes, sidecar: JSON.stringify({ version: '1.0' }) })
-        expect(result).toEqual({ message: 'Accepted. Recordings waiting in the batch: 3.', success: true })
-        expect(mockSubmit.mock.calls[0][0]).toBe(batch.hash)
+        expect(result).toEqual({ message: 'Accepted. The recording joins the pool at the next pooled ingest.', success: true })
+        expect(mockSubmit.mock.calls[0][0]).toBe('f'.repeat(32))
         expect(await sentSidecar()).toEqual({ version: '1.0', band: 'A2', recording_sha256: sha256 })
     })
 
     it('sends nothing when the host declines to extend the sidecar, and reports its reason as written', async () => {
-        const target = createSubmissionTarget(batch, makeProfile(), {
+        const target = createSubmissionTarget(makePool(), {
             extendSidecar: () => {
                 throw new Error('The submission was cancelled.')
             },
@@ -162,7 +161,8 @@ describe('createSubmissionTarget', () => {
     })
 
     it('refuses locally when the sidecar lacks a key the profile requires', async () => {
-        const target = createSubmissionTarget(batch, makeProfile({ required_sidecar_keys: ['recording_sha256', 'band'] }))!
+        const profile = makeProfile({ required_sidecar_keys: ['recording_sha256', 'band'] })
+        const target = createSubmissionTarget(makePool(profile))!
         const result = await target.submit({ data: bytes, sidecar: '{}' })
         expect(result.success).toBe(false)
         expect(result.message).toContain('band')
@@ -177,20 +177,20 @@ describe('createSubmissionTarget', () => {
                 { code: 'channels', message: 'Wrong channels.' },
             ],
         })
-        const result = await createSubmissionTarget(batch, makeProfile())!.submit({ data: bytes, sidecar: '{}' })
+        const result = await createSubmissionTarget(makePool())!.submit({ data: bytes, sidecar: '{}' })
         expect(result).toEqual({ message: 'Refused: Wrong length. Wrong channels.', success: false })
     })
 
     it('reports a missing hash function rather than throwing', async () => {
         const digest = vi.spyOn(crypto.subtle, 'digest').mockRejectedValue(new Error('insecure context'))
-        const result = await createSubmissionTarget(batch, makeProfile())!.submit({ data: bytes, sidecar: '{}' })
+        const result = await createSubmissionTarget(makePool())!.submit({ data: bytes, sidecar: '{}' })
         digest.mockRestore()
         expect(result.success).toBe(false)
         expect(mockSubmit).not.toHaveBeenCalled()
     })
 
     it('reports a sidecar that is not JSON without sending anything', async () => {
-        const result = await createSubmissionTarget(batch, makeProfile())!.submit({ data: bytes, sidecar: '{' })
+        const result = await createSubmissionTarget(makePool())!.submit({ data: bytes, sidecar: '{' })
         expect(result.success).toBe(false)
         expect(mockSubmit).not.toHaveBeenCalled()
     })

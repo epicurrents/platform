@@ -11,10 +11,16 @@ It must also set ``RECORDINGS_DISCARD_EMBEDDED_ANNOTATIONS``. A pool is fed by t
 submission and an ordinary upload joining the dataset through a release run, and the pooled ingest never keeps the
 file's text; an upload written under the default would carry its placeholders and raw record into the same pool.
 Registered here rather than in the project because every project running such a dataset needs the same refusals.
+
+A submission pool's group exists for the pool alone (``library.pools``), and the endpoints refuse a grant or a role on
+it. ``library.W001`` reports one that acquired either through another path — a management command, a fixture, a
+direct database write — since its contributors would then hold something beyond the pool. It reads the database, so
+it runs where database checks run: ``migrate`` and ``check --database default``.
 """
 
 from django.conf import settings
-from django.core.checks import Error, Tags, register
+from django.core.checks import Error, Tags, Warning, register
+from django.db import DatabaseError
 
 
 @register(Tags.compatibility)
@@ -55,3 +61,46 @@ def check_release_gated_deployment_discards_embedded_text(app_configs, **kwargs)
             id="library.E002",
         )
     ]
+
+
+@register(Tags.database)
+def check_pool_groups_grant_nothing(app_configs, databases=None, **kwargs):
+    """Warn about a pool group that an access grant targets or that carries a project role."""
+    if not databases:
+        return []
+    from epicurrents.models import AccessRight
+    from library.models import Dataset
+    from user.roles import read_group_roles
+
+    try:
+        pools = list(Dataset.objects.filter(submission_group__isnull=False).select_related("submission_group"))
+        if not pools:
+            return []
+        groups = [dataset.submission_group for dataset in pools]
+        granted = set(
+            AccessRight.objects.filter(access_target_group__in=groups).values_list("access_target_group_id", flat=True)
+        )
+        roles = read_group_roles(groups)
+    except DatabaseError:
+        # Before the first migrate there is nothing to check.
+        return []
+    warnings = []
+    for dataset in pools:
+        group = dataset.submission_group
+        held = []
+        if group.pk in granted:
+            held.append("an access grant")
+        if any(value is not None for value in roles.get(group.pk, {}).values()):
+            held.append("a project role")
+        if held:
+            warnings.append(
+                Warning(
+                    f"The submission pool group {group.pk} of dataset {dataset.object_hash} holds {' and '.join(held)}.",
+                    hint=(
+                        "A pool group exists for the pool alone, and its contributors joined it to submit. Revoke "
+                        "the grant and clear the role."
+                    ),
+                    id="library.W001",
+                )
+            )
+    return warnings

@@ -211,6 +211,9 @@ onMounted(load)
                         >
                             {{ badge.value }}
                         </wa-badge>
+                        <wa-badge v-if="group.dedicated_to?.kind === 'submission_pool'" appearance="outlined" variant="brand">
+                            {{ t('Submission pool', SCOPE) }}
+                        </wa-badge>
                     </div>
                     <span class="list-row-meta">
                         {{ t('{count} members', SCOPE, { count: group.member_count }) }}
@@ -218,7 +221,7 @@ onMounted(load)
                     <span class="list-row-meta">
                         {{ t('{count} grants', SCOPE, { count: group.grant_count }) }}
                     </span>
-                    <div v-if="canWrite" class="list-row-actions">
+                    <div v-if="canWrite && !group.dedicated_to" class="list-row-actions">
                         <wa-dropdown
                             placement="bottom-end"
                             @click.stop

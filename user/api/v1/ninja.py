@@ -890,12 +890,17 @@ def list_groups(request):
     """List all groups available for access-right grants.
 
     Requires authentication.  Returns groups ordered by name.
-    Only the ``id`` and ``name`` fields are exposed.
+    Only the ``id`` and ``name`` fields are exposed. A dedicated group
+    (``user.dedicated_groups``) grants nothing and is left out.
     """
     from django.contrib.auth.models import Group
 
+    from user.dedicated_groups import dedicated_groups
+
     _require_auth(request)
     groups = list(Group.objects.order_by("name"))
+    owned = dedicated_groups(group.pk for group in groups)
+    groups = [group for group in groups if group.pk not in owned]
     log_activity(
         verb="user.group.list",
         metadata={"returned_count": len(groups)},

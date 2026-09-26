@@ -217,18 +217,31 @@ class Dataset(models.Model):
             "and serve the release month in place of the upload time."
         ),
     )
-    # Members of this group may submit prepared recordings to the dataset through
-    # the validating submission path (``recordings.submissions``). Contributors
-    # are not managers: they see their own batches and nothing of the pool.
-    # SET_NULL so deleting the group closes the path without touching the
-    # dataset.
-    submission_group = models.ForeignKey(
+    # A submission pool is a release-gated dataset with a registered ingest
+    # profile: members of its dedicated group submit prepared recordings through
+    # the validating submission path (``recordings.submissions``). The rules on
+    # configuring, locking and dissolving a pool are in ``library.pools``.
+    # Contributors are not managers: they see nothing of the pool.
+    submission_profile = models.CharField(
+        max_length=64,
+        blank=True,
+        default="",
+        help_text="Key of the registered ingest profile submissions are checked against; empty when not a pool.",
+    )
+    # The group exists for the pool alone and is created and removed with it.
+    # PROTECT, because deleting it would silently close the pool: the admin
+    # endpoint refuses a pool group, and this keeps any other path from trying.
+    submission_group = models.OneToOneField(
         "auth.Group",
         null=True,
         blank=True,
-        on_delete=models.SET_NULL,
-        related_name="submission_datasets",
-        help_text="Group whose members may submit prepared recordings to this release-gated dataset.",
+        on_delete=models.PROTECT,
+        related_name="submission_pool",
+        help_text="The pool's dedicated group, whose members may submit prepared recordings.",
+    )
+    submissions_open = models.BooleanField(
+        default=False,
+        help_text="Whether the pool accepts new submissions; closing it leaves the spool and the ledgers alone.",
     )
 
     # Reverse GenericRelations so hard-delete cascades cleanly through every

@@ -1,12 +1,12 @@
-"""The validating submission path: the gate, the batch endpoints, the pooled ingest run, and the dataset field.
+"""The validating submission path: the gate, the pool endpoints, the ledger and the pooled ingest run.
 
 Covers ``recordings.submissions`` (profile registry and every generic check, pinned to what the
-de-identifier actually writes), the four ``/submissions/...`` endpoints (who may submit, a refusal
-writing nothing, an acceptance writing the spool and a row with no client filename, the audit rows
-carrying codes and never a message), ``ingest_pooled_submissions`` (the delay, the system author,
-the dataset membership, the deleted file row, the profile's ingest callable, the failure path),
-``Dataset.submission_group`` on the PATCH surface, and the ``library.release_dataset`` maintenance
-operation.
+de-identifier actually writes), the ``/submissions/...`` endpoints (who may submit, a refusal
+writing nothing, an acceptance writing the spool and a row with no client filename on a ledger the
+server resolves, the audit rows carrying codes and never a message), ``ingest_pooled_submissions``
+(the delay, the system author, the dataset membership, the deleted file row, the profile's ingest
+callable, the failure path), and the ``library.release_dataset`` maintenance operation. Configuring
+a pool is covered in ``library/tests/test_pools.py``.
 """
 
 from __future__ import annotations
@@ -24,13 +24,12 @@ from django.test import Client
 from django.utils import timezone
 
 from activity.models import Activity, ObjectChangeLog
-from conftest import patch_json, post_json
 from epicurrents.models import AccessRight
 from epicurrents.permissions import can_read_object
 from epicurrents.system_user import get_system_user
 from library.models import Dataset, DatasetItem
 from maintenance.operations import get_operation
-from recordings.models import Recording, SubmissionBatch, SubmissionFile
+from recordings.models import Recording, SubmissionFile, SubmissionLedger
 from recordings.processors.edf import _build_clean_header, parse_edf_header, parse_signal_infos
 from recordings.submissions import (
     BLANK_PATIENT,
@@ -52,7 +51,8 @@ from recordings.tests.test_edf_processor import _make_edf_data, _make_edf_header
 
 pytestmark = pytest.mark.django_db
 
-BATCHES_URL = "/recordings/api/v1/submissions/batches"
+POOLS_URL = "/recordings/api/v1/submissions/pools"
+PROFILES_URL = "/recordings/api/v1/submissions/profiles"
 
 SIGNALS = [
     {"label": "EEG Fp1", "unit": "uV", "phys_min": -100.0, "phys_max": 100.0, "sample_count": 256},
@@ -116,10 +116,17 @@ def spool(settings, tmp_path):
 
 @pytest.fixture
 def pool(make_user):
-    """A gated dataset with a submission group holding one contributor; returns (dataset, contributor, group)."""
+    """An open pool whose group holds one contributor; returns (dataset, contributor, group)."""
     author = make_user()
     group = Group.objects.create(name="Contributors")
-    dataset = Dataset.objects.create(author=author, name="Pool", release_gated=True, submission_group=group)
+    dataset = Dataset.objects.create(
+        author=author,
+        name="Pool",
+        release_gated=True,
+        submission_profile="test.pool",
+        submission_group=group,
+        submissions_open=True,
+    )
     contributor = make_user()
     contributor.groups.add(group)
     register_ingest_profile(_profile())
@@ -132,16 +139,10 @@ def _client(user) -> Client:
     return client
 
 
-def _open_batch(client, dataset, profile="test.pool"):
-    response = post_json(client, BATCHES_URL, {"dataset": dataset.object_hash, "profile": profile})
-    assert response.status_code == 201, response.content
-    return response.json()
-
-
-def _submit(client, batch_hash, data: bytes, sidecar, *, filename="prepared.edf"):
+def _submit(client, dataset, data: bytes, sidecar, *, filename="prepared.edf"):
     body = sidecar if isinstance(sidecar, bytes) else json.dumps(sidecar).encode()
     return client.post(
-        f"{BATCHES_URL}/{batch_hash}/files",
+        f"{POOLS_URL}/{dataset.object_hash}/files",
         {
             "file": SimpleUploadedFile(filename, data, content_type="application/octet-stream"),
             "sidecar": SimpleUploadedFile("prepared.json", body, content_type="application/json"),
@@ -326,7 +327,7 @@ class TestGate:
 
 
 class TestWhoMaySubmit:
-    def test_group_member_on_gated_dataset_only(self, pool, make_user, superuser):
+    def test_group_member_of_an_open_pool_only(self, pool, make_user, superuser):
         dataset, contributor, group = pool
         assert can_submit_to_dataset(contributor, dataset)
         assert not can_submit_to_dataset(make_user(), dataset)
@@ -336,158 +337,46 @@ class TestWhoMaySubmit:
         dataset.release_gated = False
         assert not can_submit_to_dataset(contributor, dataset)
         dataset.release_gated = True
+        dataset.submissions_open = False
+        assert not can_submit_to_dataset(contributor, dataset)
+        dataset.submissions_open = True
+        dataset.submission_profile = ""
+        assert not can_submit_to_dataset(contributor, dataset)
+        dataset.submission_profile = "test.pool"
         dataset.submission_group = None
         assert not can_submit_to_dataset(contributor, dataset)
 
-    def test_endpoints_refuse_outsiders(self, pool, make_user):
-        dataset, contributor, _group = pool
-        assert (
-            Client()
-            .post(
-                BATCHES_URL,
-                json.dumps({"dataset": dataset.object_hash, "profile": "test.pool"}),
-                content_type="application/json",
-            )
-            .status_code
-            == 401
-        )
+    def test_endpoints_refuse_outsiders_as_though_no_pool_existed(self, pool, spool, make_user):
+        dataset, contributor, group = pool
+        data = _edf()
+        assert Client().get(POOLS_URL).status_code == 401
+        assert _submit(Client(), dataset, data, _sidecar(data)).status_code == 401
         outsider = _client(make_user())
-        response = post_json(outsider, BATCHES_URL, {"dataset": dataset.object_hash, "profile": "test.pool"})
-        assert response.status_code == 403
-        assert SubmissionBatch.objects.count() == 0
-        ungated = Dataset.objects.create(author=dataset.author, name="Open", submission_group=dataset.submission_group)
-        assert (
-            post_json(
-                _client(contributor), BATCHES_URL, {"dataset": ungated.object_hash, "profile": "test.pool"}
-            ).status_code
-            == 403
-        )
-        assert (
-            post_json(_client(contributor), BATCHES_URL, {"dataset": "nope", "profile": "test.pool"}).status_code == 404
-        )
-
-    def test_unknown_profile(self, pool):
-        dataset, contributor, _group = pool
-        response = post_json(_client(contributor), BATCHES_URL, {"dataset": dataset.object_hash, "profile": "other"})
-        assert response.status_code == 400
-        assert SubmissionBatch.objects.count() == 0
+        assert outsider.get(POOLS_URL).json() == []
+        assert _submit(outsider, dataset, data, _sidecar(data)).status_code == 404
+        assert _submit(_client(dataset.author), dataset, data, _sidecar(data)).status_code == 404
+        other = Dataset.objects.create(author=dataset.author, name="Plain")
+        assert _submit(_client(contributor), other, data, _sidecar(data)).status_code == 404
+        assert SubmissionLedger.objects.count() == 0
+        assert SubmissionFile.objects.count() == 0
 
 
 # ---------------------------------------------------------------------------
-# Batches and files
+# Pools, the ledger and files
 # ---------------------------------------------------------------------------
 
 
-class TestBatchEndpoints:
-    def test_open_list_and_read_own_batches(self, pool, make_user):
+class TestPoolEndpoints:
+    def test_lists_open_pools_with_their_profiles(self, pool, make_user):
         dataset, contributor, group = pool
         client = _client(contributor)
-        batch = _open_batch(client, dataset)
-        assert set(batch) == {
-            "hash",
-            "dataset_hash",
-            "profile",
-            "pending_count",
-            "failed_count",
-            "ingested_count",
-            "created_at",
-        }
-        assert batch["dataset_hash"] == dataset.object_hash
-        assert batch["pending_count"] == 0
-        row = SubmissionBatch.objects.get(object_hash=batch["hash"])
-        assert row.contributor == contributor
-        activity = Activity.objects.filter(verb="recordings.submission.batch.create").latest("pk")
-        assert activity.target_object_id == str(row.pk)
-
-        listing = client.get(BATCHES_URL)
-        assert [b["hash"] for b in listing.json()] == [batch["hash"]]
-        assert client.get(BATCHES_URL, {"dataset": dataset.object_hash}).json()[0]["hash"] == batch["hash"]
-        assert client.get(f"{BATCHES_URL}/{batch['hash']}").json()["hash"] == batch["hash"]
-
-        other = make_user()
-        other.groups.add(group)
-        other_client = _client(other)
-        assert other_client.get(BATCHES_URL).json() == []
-        assert other_client.get(f"{BATCHES_URL}/{batch['hash']}").status_code == 404
-        assert _submit(other_client, batch["hash"], _edf(), _sidecar(_edf())).status_code == 404
-
-    def test_rejected_file_writes_nothing(self, pool, spool):
-        dataset, contributor, _group = pool
-        client = _client(contributor)
-        batch = _open_batch(client, dataset)
-        data = _edf(patient="Jane Doe")
-        sidecar = _sidecar(data, annotations=[{"text": "Jane had a seizure"}])
-        response = _submit(client, batch["hash"], data, sidecar)
-        assert response.status_code == 422, response.content
-        body = response.json()
-        assert body["accepted"] is False
-        codes = {v["code"] for v in body["violations"]}
-        assert {"identification", "sidecar_forbidden_key"} <= codes
-        assert SubmissionFile.objects.count() == 0
-        assert not spool.exists() or not any(spool.iterdir())
-        activity = Activity.objects.filter(verb="recordings.submission.file.reject").latest("pk")
-        assert activity.target_object_id == str(SubmissionBatch.objects.get().pk)
-        assert activity.metadata["violation_count"] == len(body["violations"])
-        assert set(activity.metadata["violation_codes"]) == codes
-        assert "Jane" not in json.dumps(activity.metadata)
-        assert client.get(f"{BATCHES_URL}/{batch['hash']}").json()["pending_count"] == 0
-
-    def test_invalid_json_sidecar_is_a_shape_violation(self, pool, spool):
-        dataset, contributor, _group = pool
-        client = _client(contributor)
-        batch = _open_batch(client, dataset)
-        response = _submit(client, batch["hash"], _edf(), b"{not json")
-        assert response.status_code == 422
-        assert {v["code"] for v in response.json()["violations"]} == {"sidecar_shape"}
-        assert SubmissionFile.objects.count() == 0
-
-    def test_accepted_file_waits_in_the_spool_without_its_filename(self, pool, spool):
-        dataset, contributor, _group = pool
-        client = _client(contributor)
-        batch = _open_batch(client, dataset)
-        data = _edf()
-        response = _submit(client, batch["hash"], data, _sidecar(data), filename="patient-4711.edf")
-        assert response.status_code == 202, response.content
-        assert response.json() == {"accepted": True, "pending_count": 1}
-        row = SubmissionFile.objects.get()
-        assert row.status == SubmissionFile.Status.PENDING
-        assert row.file_extension == ".edf"
-        assert row.file_hash == hashlib.sha256(data).hexdigest()
-        assert row.sidecar["profile_version"] == "1"
-        assert "patient-4711" not in row.stored_name
-        assert "patient-4711" not in json.dumps(row.sidecar)
-        files = list(spool.iterdir())
-        assert [p.name for p in files] == [row.stored_name]
-        assert files[0].read_bytes() == data
-        assert Activity.objects.filter(verb="recordings.submission.file.accept").exists()
-        assert client.get(f"{BATCHES_URL}/{batch['hash']}").json()["pending_count"] == 1
-
-    def test_only_edf_or_bdf_and_size_cap(self, pool, spool, settings):
-        dataset, contributor, _group = pool
-        client = _client(contributor)
-        batch = _open_batch(client, dataset)
-        data = _edf()
-        assert _submit(client, batch["hash"], data, _sidecar(data), filename="x.csv").status_code == 400
-        settings.RECORDINGS_SUBMISSION_MAX_SIZE = 100
-        assert _submit(client, batch["hash"], data, _sidecar(data)).status_code == 413
-        assert SubmissionFile.objects.count() == 0
-
-    def test_membership_withdrawn_closes_the_batch(self, pool, spool):
-        dataset, contributor, group = pool
-        client = _client(contributor)
-        batch = _open_batch(client, dataset)
-        contributor.groups.remove(group)
-        data = _edf()
-        assert _submit(client, batch["hash"], data, _sidecar(data)).status_code == 403
-        assert SubmissionFile.objects.count() == 0
-
-    def test_profile_serves_every_checked_value(self, pool):
-        dataset, contributor, _group = pool
-        client = _client(contributor)
-        batch = _open_batch(client, dataset)
-        response = client.get(f"{BATCHES_URL}/{batch['hash']}/profile")
+        response = client.get(POOLS_URL)
         assert response.status_code == 200, response.content
-        assert response.json() == {
+        (row,) = response.json()
+        assert set(row) == {"dataset_hash", "name", "profile"}
+        assert row["dataset_hash"] == dataset.object_hash
+        assert row["name"] == "Pool"
+        assert row["profile"] == {
             "key": "test.pool",
             "channels": ["Fp1", "Fp2"],
             "sampling_rate": 256.0,
@@ -500,41 +389,140 @@ class TestBatchEndpoints:
             "required_sidecar_keys": ["recording_sha256", "profile_version"],
             "forbidden_sidecar_keys": sorted(DEFAULT_FORBIDDEN_SIDECAR_KEYS),
         }
-        activity = Activity.objects.filter(verb="recordings.submission.batch.profile.read").latest("pk")
-        assert activity.target_object_id == str(SubmissionBatch.objects.get().pk)
+        activity = Activity.objects.filter(verb="recordings.submission.pool.list").latest("pk")
+        assert activity.metadata == {"returned_count": 1}
+        assert activity.target_content_type is None
+        assert SubmissionLedger.objects.count() == 0
 
-    def test_profile_includes_the_profiles_own_forbidden_keys(self, pool):
+    def test_listing_leaves_out_closed_unregistered_and_trashed_pools(self, pool):
         dataset, contributor, _group = pool
-        register_ingest_profile(_profile(forbidden_sidecar_keys=("site",)))
         client = _client(contributor)
-        batch = _open_batch(client, dataset)
-        keys = client.get(f"{BATCHES_URL}/{batch['hash']}/profile").json()["forbidden_sidecar_keys"]
-        assert keys == sorted({*DEFAULT_FORBIDDEN_SIDECAR_KEYS, "site"})
+        Dataset.objects.filter(pk=dataset.pk).update(submissions_open=False)
+        assert client.get(POOLS_URL).json() == []
+        Dataset.objects.filter(pk=dataset.pk).update(submissions_open=True, deleted_at=timezone.now())
+        assert client.get(POOLS_URL).json() == []
+        Dataset.objects.filter(pk=dataset.pk).update(deleted_at=None)
+        reset_ingest_profiles()
+        assert client.get(POOLS_URL).json() == []
 
-    def test_profile_follows_the_batch_rules(self, pool, make_user):
+    def test_listing_includes_the_profiles_own_forbidden_keys(self, pool):
+        _dataset, contributor, _group = pool
+        register_ingest_profile(_profile(forbidden_sidecar_keys=("site",)))
+        (row,) = _client(contributor).get(POOLS_URL).json()
+        assert row["profile"]["forbidden_sidecar_keys"] == sorted({*DEFAULT_FORBIDDEN_SIDECAR_KEYS, "site"})
+
+    def test_registered_profiles_are_listed_for_configuring_a_pool(self, pool, make_user):
+        register_ingest_profile(_profile(key="test.other", channels=()))
+        client = _client(make_user())
+        assert Client().get(PROFILES_URL).status_code == 401
+        response = client.get(PROFILES_URL)
+        assert [row["key"] for row in response.json()] == ["test.other", "test.pool"]
+        assert Activity.objects.filter(verb="recordings.submission.profile.list").exists()
+
+    def test_rejected_file_writes_nothing_and_audits_against_the_pool(self, pool, spool):
+        dataset, contributor, _group = pool
+        client = _client(contributor)
+        data = _edf(patient="Jane Doe")
+        sidecar = _sidecar(data, annotations=[{"text": "Jane had a seizure"}])
+        response = _submit(client, dataset, data, sidecar)
+        assert response.status_code == 422, response.content
+        body = response.json()
+        assert body["accepted"] is False
+        codes = {v["code"] for v in body["violations"]}
+        assert {"identification", "sidecar_forbidden_key"} <= codes
+        assert SubmissionFile.objects.count() == 0
+        assert SubmissionLedger.objects.count() == 0
+        assert not spool.exists() or not any(spool.iterdir())
+        activity = Activity.objects.filter(verb="recordings.submission.file.reject").latest("pk")
+        assert activity.target_content_type == ContentType.objects.get_for_model(Dataset)
+        assert activity.target_object_id == str(dataset.pk)
+        assert activity.metadata["violation_count"] == len(body["violations"])
+        assert set(activity.metadata["violation_codes"]) == codes
+        assert "Jane" not in json.dumps(activity.metadata)
+
+    def test_invalid_json_sidecar_is_a_shape_violation(self, pool, spool):
+        dataset, contributor, _group = pool
+        response = _submit(_client(contributor), dataset, _edf(), b"{not json")
+        assert response.status_code == 422
+        assert {v["code"] for v in response.json()["violations"]} == {"sidecar_shape"}
+        assert SubmissionFile.objects.count() == 0
+
+    def test_accepted_file_waits_in_the_spool_on_a_ledger_the_server_creates(self, pool, spool):
+        dataset, contributor, _group = pool
+        client = _client(contributor)
+        data = _edf()
+        response = _submit(client, dataset, data, _sidecar(data), filename="patient-4711.edf")
+        assert response.status_code == 202, response.content
+        assert response.json() == {"accepted": True}
+        ledger = SubmissionLedger.objects.get()
+        assert (ledger.dataset, ledger.contributor) == (dataset, contributor)
+        row = SubmissionFile.objects.get()
+        assert row.ledger == ledger
+        assert row.status == SubmissionFile.Status.PENDING
+        assert row.file_extension == ".edf"
+        assert row.file_hash == hashlib.sha256(data).hexdigest()
+        assert row.sidecar["profile_version"] == "1"
+        assert "patient-4711" not in row.stored_name
+        assert "patient-4711" not in json.dumps(row.sidecar)
+        files = list(spool.iterdir())
+        assert [p.name for p in files] == [row.stored_name]
+        assert files[0].read_bytes() == data
+        activity = Activity.objects.filter(verb="recordings.submission.file.accept").latest("pk")
+        assert activity.target_content_type == ContentType.objects.get_for_model(SubmissionLedger)
+        assert activity.target_object_id == str(ledger.pk)
+        assert activity.metadata == {"ledger_created": True}
+
+    def test_one_ledger_per_contributor_per_pool(self, pool, spool, make_user):
         dataset, contributor, group = pool
         client = _client(contributor)
-        batch = _open_batch(client, dataset)
-        url = f"{BATCHES_URL}/{batch['hash']}/profile"
-
+        for _ in range(2):
+            data = _edf()
+            assert _submit(client, dataset, data, _sidecar(data)).status_code == 202
+        assert SubmissionLedger.objects.count() == 1
+        assert SubmissionFile.objects.count() == 2
+        assert Activity.objects.filter(verb="recordings.submission.file.accept").latest("pk").metadata == {
+            "ledger_created": False
+        }
         other = make_user()
         other.groups.add(group)
-        assert _client(other).get(url).status_code == 404
-        assert Client().get(url).status_code == 401
+        data = _edf()
+        assert _submit(_client(other), dataset, data, _sidecar(data)).status_code == 202
+        assert SubmissionLedger.objects.filter(dataset=dataset).count() == 2
 
-        reset_ingest_profiles()
-        assert client.get(url).status_code == 409
-        register_ingest_profile(_profile())
-
-        contributor.groups.remove(group)
-        assert client.get(url).status_code == 403
-
-    def test_erasing_the_contributor_keeps_the_batch_unlinked(self, pool):
+    def test_only_edf_or_bdf_and_size_cap(self, pool, spool, settings):
         dataset, contributor, _group = pool
-        batch = SubmissionBatch.objects.create(dataset=dataset, contributor=contributor, profile_key="test.pool")
+        client = _client(contributor)
+        data = _edf()
+        assert _submit(client, dataset, data, _sidecar(data), filename="x.csv").status_code == 400
+        settings.RECORDINGS_SUBMISSION_MAX_SIZE = 100
+        assert _submit(client, dataset, data, _sidecar(data)).status_code == 413
+        assert SubmissionFile.objects.count() == 0
+        assert SubmissionLedger.objects.count() == 0
+
+    def test_membership_withdrawn_or_intake_closed_refuses_the_file(self, pool, spool):
+        dataset, contributor, group = pool
+        client = _client(contributor)
+        data = _edf()
+        Dataset.objects.filter(pk=dataset.pk).update(submissions_open=False)
+        assert _submit(client, dataset, data, _sidecar(data)).status_code == 404
+        Dataset.objects.filter(pk=dataset.pk).update(submissions_open=True)
+        contributor.groups.remove(group)
+        assert _submit(client, dataset, data, _sidecar(data)).status_code == 404
+        assert SubmissionFile.objects.count() == 0
+
+    def test_unregistered_profile_answers_409(self, pool, spool):
+        dataset, contributor, _group = pool
+        reset_ingest_profiles()
+        data = _edf()
+        assert _submit(_client(contributor), dataset, data, _sidecar(data)).status_code == 409
+        assert SubmissionFile.objects.count() == 0
+
+    def test_erasing_the_contributor_keeps_the_ledger_unlinked(self, pool):
+        dataset, contributor, _group = pool
+        ledger = SubmissionLedger.objects.create(dataset=dataset, contributor=contributor)
         contributor.delete()
-        batch.refresh_from_db()
-        assert batch.contributor is None
+        ledger.refresh_from_db()
+        assert ledger.contributor is None
 
 
 # ---------------------------------------------------------------------------
@@ -545,9 +533,9 @@ class TestBatchEndpoints:
 _NAMES = itertools.count(1)
 
 
-def _spooled(pool_fixture, spool, *, age_hours=48, sidecar_extra=None, batch=None):
+def _spooled(pool_fixture, spool, *, age_hours=48, sidecar_extra=None, ledger=None):
     dataset, contributor, _group = pool_fixture
-    batch = batch or SubmissionBatch.objects.create(dataset=dataset, contributor=contributor, profile_key="test.pool")
+    ledger = ledger or SubmissionLedger.objects.get_or_create(dataset=dataset, contributor=contributor)[0]
     data = _edf()
     spool.mkdir(parents=True, exist_ok=True)
     stored_name = f"{next(_NAMES):032X}.edf"
@@ -555,7 +543,7 @@ def _spooled(pool_fixture, spool, *, age_hours=48, sidecar_extra=None, batch=Non
     path.write_bytes(data)
     sidecar = _sidecar(data, **(sidecar_extra or {}))
     row = SubmissionFile.objects.create(
-        batch=batch,
+        ledger=ledger,
         stored_name=stored_name,
         file_extension=".edf",
         file_path=str(path),
@@ -616,27 +604,27 @@ class TestPooledIngest:
         assert not can_read_object(contributor, recording)
         assert ingested == [(recording.pk, row.sidecar)]
         assert not SubmissionFile.objects.filter(pk=row.pk).exists()
-        assert SubmissionBatch.objects.get().ingested_count == 1
-        assert not any(f.name == "batch" or f.name == "submission" for f in Recording._meta.get_fields())
+        assert SubmissionLedger.objects.get().ingested_count == 1
+        assert not any(f.name in ("ledger", "batch", "submission") for f in Recording._meta.get_fields())
         activity = Activity.objects.get(verb="recordings.submission.ingest")
-        assert activity.metadata == {"file_count": 1, "batch_count": 1}
+        assert activity.metadata == {"file_count": 1, "ledger_count": 1}
         assert activity.actor is None
         assert activity.target_content_type is None
 
-    def test_takes_every_batch_in_one_run(self, pool, spool, make_user, django_capture_on_commit_callbacks):
+    def test_takes_every_ledger_in_one_run(self, pool, spool, make_user, django_capture_on_commit_callbacks):
         dataset, _contributor, group = pool
         other = make_user()
         other.groups.add(group)
-        other_batch = SubmissionBatch.objects.create(dataset=dataset, contributor=other, profile_key="test.pool")
+        other_ledger = SubmissionLedger.objects.create(dataset=dataset, contributor=other)
         _spooled(pool, spool)
-        _spooled(pool, spool, batch=other_batch)
-        _spooled(pool, spool, batch=other_batch)
+        _spooled(pool, spool, ledger=other_ledger)
+        _spooled(pool, spool, ledger=other_ledger)
         with django_capture_on_commit_callbacks(execute=False):
             assert ingest_pooled_submissions() == {"ingested": 3, "failed": 0}
         assert Recording.objects.count() == 3
         assert SubmissionFile.objects.count() == 0
-        assert Activity.objects.get(verb="recordings.submission.ingest").metadata["batch_count"] == 2
-        assert sorted(SubmissionBatch.objects.values_list("ingested_count", flat=True)) == [1, 2]
+        assert Activity.objects.get(verb="recordings.submission.ingest").metadata["ledger_count"] == 2
+        assert sorted(SubmissionLedger.objects.values_list("ingested_count", flat=True)) == [1, 2]
 
     def test_failure_keeps_the_row_for_the_operator(self, pool, spool):
         register_ingest_profile(_profile(ingest=lambda recording, sidecar: 1 / 0))
@@ -646,7 +634,7 @@ class TestPooledIngest:
         assert row.status == SubmissionFile.Status.FAILED
         assert "ZeroDivisionError" in row.error
         assert Recording.objects.count() == 0
-        assert SubmissionBatch.objects.get().ingested_count == 0
+        assert SubmissionLedger.objects.get().ingested_count == 0
 
     def test_missing_profile_or_file_fails_that_submission_only(self, pool, spool, django_capture_on_commit_callbacks):
         good = _spooled(pool, spool)
@@ -692,7 +680,14 @@ class TestPooledIngest:
         trashed = _spooled(pool, spool)
         assert ingest_pooled_submissions() == {"ingested": 0, "failed": 1}
         trashed.refresh_from_db()
-        assert "no longer an open" in trashed.error
+        assert "no longer a release-gated submission pool" in trashed.error
+
+    def test_closed_intake_still_ingests_what_was_accepted(self, pool, spool, django_capture_on_commit_callbacks):
+        dataset, _contributor, _group = pool
+        _spooled(pool, spool)
+        Dataset.objects.filter(pk=dataset.pk).update(submissions_open=False)
+        with django_capture_on_commit_callbacks(execute=False):
+            assert ingest_pooled_submissions() == {"ingested": 1, "failed": 0}
 
     def test_the_sidecar_rows_are_written_without_the_file_text_whatever_the_setting(self, pool, spool, settings):
         from annotations.models import Annotation, Code, Event, Interruption, Label
@@ -741,48 +736,8 @@ class TestPooledIngest:
 
 
 # ---------------------------------------------------------------------------
-# The dataset field and the maintenance operation
+# The maintenance operation
 # ---------------------------------------------------------------------------
-
-
-class TestDatasetSubmissionGroup:
-    def test_author_sets_and_clears_it(self, make_user):
-        author = make_user()
-        group = Group.objects.create(name="Centres")
-        dataset = Dataset.objects.create(author=author, name="Pool", release_gated=True)
-        client = _client(author)
-        url = f"/api/v1/library/datasets/{dataset.object_hash}/"
-        assert client.get(url).json()["submission_group_id"] is None
-        response = patch_json(client, url, {"submission_group_id": group.pk})
-        assert response.status_code == 200, response.content
-        assert response.json()["submission_group_id"] == group.pk
-        dataset.refresh_from_db()
-        assert dataset.submission_group == group
-        activity = Activity.objects.filter(verb="library.dataset.update").latest("pk")
-        assert activity.metadata["fields_updated"] == ["submission_group"]
-        assert patch_json(client, url, {"submission_group_id": None}).json()["submission_group_id"] is None
-        assert patch_json(client, url, {"submission_group_id": 999999}).status_code == 400
-        assert patch_json(client, url, {"name": "Renamed"}).status_code == 200
-        dataset.refresh_from_db()
-        assert dataset.submission_group is None
-
-    def test_write_grantee_may_not(self, make_user):
-        author = make_user()
-        grantee = make_user()
-        group = Group.objects.create(name="Centres")
-        dataset = Dataset.objects.create(author=author, name="Pool", release_gated=True)
-        AccessRight.objects.create(
-            content_type=ContentType.objects.get_for_model(Dataset),
-            object_id=str(dataset.pk),
-            access_giver=author,
-            access_target=grantee,
-            can_read=True,
-            can_write=True,
-        )
-        client = _client(grantee)
-        url = f"/api/v1/library/datasets/{dataset.object_hash}/"
-        assert patch_json(client, url, {"submission_group_id": group.pk}).status_code == 403
-        assert patch_json(client, url, {"name": "Renamed"}).status_code == 200
 
 
 class TestMaintenanceOperation:

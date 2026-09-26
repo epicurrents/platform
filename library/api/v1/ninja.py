@@ -67,6 +67,7 @@ from epicurrents.models import AccessRight
 from epicurrents.permissions import can_modify_object
 from epicurrents.security_log import log_security_event
 from epicurrents.text_hygiene import NameWarningOut, name_warnings
+from library import pools
 from library.item_access import user_can_read_item
 from library.models import (
     Collection,
@@ -84,6 +85,7 @@ from library.permissions import (
     ensure_can_write_collection,
 )
 from library.tag_scope import can_create_tag, tag_reachable, visible_tag_ids
+from user.dedicated_groups import dedicated_group
 
 api = NinjaAPI(
     title="Library API",
@@ -129,10 +131,8 @@ class CollectionPatchIn(Schema):
     license_url: str | None = None
     # Datasets only — release gating (library/release.py). The author or a
     # superuser may change it; turning it off publishes every unreleased member.
+    # A submission pool's gate is its configuration's (library/pools.py).
     release_gated: bool | None = None
-    # Datasets only — the submission group; null closes the path. Same rule as
-    # release_gated: the author or a superuser, never a write grantee.
-    submission_group_id: int | None = None
 
 
 class CollectionOut(Schema):
@@ -156,9 +156,6 @@ class CollectionOut(Schema):
     license_url: str | None = None
     # Datasets only — members are hidden until a release run publishes them.
     release_gated: bool = False
-    # Datasets only — the group whose members may submit prepared recordings
-    # through the validating submission path; null when the path is closed.
-    submission_group_id: int | None = None
 
 
 class CollectionWriteOut(CollectionOut):
@@ -1413,7 +1410,6 @@ def _dataset_out(dataset: Dataset) -> dict:
         "license_spdx": meta.license_spdx if meta else None,
         "license_url": meta.license_url if meta else None,
         "release_gated": dataset.release_gated,
-        "submission_group_id": dataset.submission_group_id,
     }
 
 
@@ -1480,25 +1476,9 @@ def update_dataset(request, dataset_id: str, payload: CollectionPatchIn):
 
         if not can_modify_object(user=user, obj=dataset):
             raise HttpError(403, "Only the dataset's author or a superuser may change release gating")
+        _pool_rule(pools.ensure_gate_unchanged, dataset, payload.release_gated)
         dataset.release_gated = payload.release_gated
         fields_updated.append("release_gated")
-    if "submission_group_id" in payload.model_fields_set and payload.submission_group_id != dataset.submission_group_id:
-        # Who may feed the pool is the author's decision for the same reason
-        # as the gate: a contributor's submissions surface to every reader
-        # once released.
-        from django.contrib.auth.models import Group
-
-        from epicurrents.permissions import can_modify_object
-
-        if not can_modify_object(user=user, obj=dataset):
-            raise HttpError(403, "Only the dataset's author or a superuser may change the submission group")
-        if (
-            payload.submission_group_id is not None
-            and not Group.objects.filter(pk=payload.submission_group_id).exists()
-        ):
-            raise HttpError(400, "Unknown group")
-        dataset.submission_group_id = payload.submission_group_id
-        fields_updated.append("submission_group")
 
     meta_updates: dict[str, str] = {}
     if payload.license_spdx is not None:
@@ -1537,12 +1517,156 @@ def delete_dataset(request, dataset_id: str):
     dataset = _get_active_dataset(dataset_id)
     if not can_write_object(user=user, obj=dataset):
         raise HttpError(403, "You do not have permission to delete this dataset")
+    _pool_rule(pools.ensure_deletable, dataset)
 
     with transaction.atomic():
         dataset.deleted_at = timezone.now()
         dataset.save(update_fields=["deleted_at", "modified_at"])
         log_activity(verb="library.dataset.trash", target=dataset)
     return {"status": "ok"}
+
+
+# ---------------------------------------------------------------------------
+# Submission pools
+# ---------------------------------------------------------------------------
+#
+# The rules are in library/pools.py; these endpoints are the dataset page's
+# client for them. Every operation, reading included, is the author's or a
+# superuser's: the totals describe what contributors sent, and a write grantee
+# manages the dataset's contents, not who may feed it.
+
+
+def _pool_rule(rule, *args) -> None:
+    """Run a pool rule, answering its refusal with the status it names."""
+    try:
+        rule(*args)
+    except pools.PoolError as exc:
+        raise HttpError(exc.status, exc.message) from exc
+
+
+class PoolOut(Schema):
+    """A dataset's submission-pool state, as the dataset page shows it to the author."""
+
+    # The registered ingest profile's key; null when the dataset is not a pool.
+    profile: str | None
+    group_id: int | None
+    group_name: str | None
+    open: bool
+    # A file has been accepted into a ledger: the profile, group and gate are fixed.
+    filling: bool
+    # Not a pool and empty, so it can become one.
+    configurable: bool
+    # Totals over every contributor together, never per contributor.
+    pending_count: int
+    failed_count: int
+    ingested_count: int
+
+
+class PoolIn(Schema):
+    """Configure a dataset as a pool checked against a registered ingest profile."""
+
+    profile: str
+
+
+class PoolPatchIn(Schema):
+    """Open or close intake, or change the profile of a pool that has not filled."""
+
+    open: bool | None = None
+    profile: str | None = None
+
+
+def _get_managed_pool_dataset(user, dataset_id: str):
+    dataset = _get_active_dataset(dataset_id)
+    if not can_modify_object(user=user, obj=dataset):
+        raise HttpError(403, "Only the dataset's author or a superuser may manage its submission pool")
+    return dataset
+
+
+def _pool_out(dataset: Dataset) -> dict:
+    if not pools.is_pool(dataset):
+        return {
+            "profile": None,
+            "group_id": None,
+            "group_name": None,
+            "open": False,
+            "filling": False,
+            "configurable": not pools.has_members(dataset) and not pools.is_filling(dataset),
+            "pending_count": 0,
+            "failed_count": 0,
+            "ingested_count": 0,
+        }
+    totals = pools.pool_totals(dataset)
+    group = dataset.submission_group
+    return {
+        "profile": dataset.submission_profile,
+        "group_id": group.pk if group else None,
+        "group_name": group.name if group else None,
+        "open": dataset.submissions_open,
+        "filling": pools.is_filling(dataset),
+        "configurable": False,
+        "pending_count": totals["pending"],
+        "failed_count": totals["failed"],
+        "ingested_count": totals["ingested"],
+    }
+
+
+@api.get("/datasets/{dataset_id}/pool/", response=PoolOut)
+def get_dataset_pool(request, dataset_id: str):
+    """The dataset's submission-pool state, for the author or a superuser."""
+    user = _require_auth(request)
+    dataset = _get_managed_pool_dataset(user, dataset_id)
+    log_activity(verb="library.dataset.pool.read", target=dataset)
+    return _pool_out(dataset)
+
+
+@api.post("/datasets/{dataset_id}/pool/", response={201: PoolOut})
+def configure_dataset_pool(request, dataset_id: str, payload: PoolIn):
+    """Make an empty dataset a submission pool: the profile, a new dedicated group, the gate on and intake closed."""
+    user = _require_auth(request)
+    dataset = _get_managed_pool_dataset(user, dataset_id)
+    with transaction.atomic():
+        _pool_rule(pools.configure_pool, dataset, payload.profile)
+        log_activity(verb="library.dataset.pool.create", target=dataset)
+    return 201, _pool_out(dataset)
+
+
+@api.patch("/datasets/{dataset_id}/pool/", response=PoolOut)
+def update_dataset_pool(request, dataset_id: str, payload: PoolPatchIn):
+    """Open or close intake, which a pool allows in every state, or change the profile before the pool fills."""
+    user = _require_auth(request)
+    dataset = _get_managed_pool_dataset(user, dataset_id)
+    fields_updated: list[str] = []
+    with transaction.atomic():
+        if payload.profile is not None:
+            _pool_rule(pools.change_profile, dataset, payload.profile)
+            fields_updated.append("submission_profile")
+        if payload.open is not None:
+            _pool_rule(pools.set_intake, dataset, payload.open)
+            fields_updated.append("submissions_open")
+        log_activity(
+            verb="library.dataset.pool.update",
+            target=dataset,
+            metadata={"fields_updated": fields_updated},
+        )
+    return _pool_out(dataset)
+
+
+@api.delete("/datasets/{dataset_id}/pool/", response=PoolOut)
+def dissolve_dataset_pool(request, dataset_id: str):
+    """Dissolve a pool that has not filled: its configuration and its group go, and the gate turns off."""
+    user = _require_auth(request)
+    dataset = _get_managed_pool_dataset(user, dataset_id)
+    with transaction.atomic():
+        try:
+            member_count = pools.dissolve_pool(dataset)
+        except pools.PoolError as exc:
+            raise HttpError(exc.status, exc.message) from exc
+        log_activity(
+            verb="library.dataset.pool.delete",
+            target=dataset,
+            metadata={"member_count": member_count},
+        )
+    return _pool_out(dataset)
 
 
 # ---------------------------------------------------------------------------
@@ -1633,6 +1757,7 @@ def add_dataset_item(request, dataset_id: str, payload: CollectionItemIn):
     dataset = _get_active_dataset(dataset_id)
     if not can_write_object(user=user, obj=dataset):
         raise HttpError(403, "You do not have permission to modify this dataset")
+    _pool_rule(pools.ensure_membership_editable, dataset)
 
     ct = ContentType.objects.filter(pk=payload.content_type_id).first()
     if ct is None:
@@ -1675,6 +1800,7 @@ def remove_dataset_item(request, dataset_id: str, item_id: int):
     item = DatasetItem.objects.filter(pk=item_id, dataset=dataset).first()
     if item is None:
         raise HttpError(404, "Item not found in this dataset")
+    _pool_rule(pools.ensure_membership_editable, dataset)
 
     with transaction.atomic():
         log_activity(verb="library.dataset.item.remove", target=item)
@@ -2213,6 +2339,8 @@ def grant_dataset_access(request, dataset_id: str, payload: GrantAccessIn):
     elif payload.access_target_group_id is not None:
         if not Group.objects.filter(pk=payload.access_target_group_id).exists():
             raise HttpError(400, f"Group {payload.access_target_group_id} not found")
+        if dedicated_group(payload.access_target_group_id) is not None:
+            raise HttpError(400, f"Group {payload.access_target_group_id} exists for one purpose and grants nothing")
         kwargs["access_target_group_id"] = payload.access_target_group_id
 
     else:

@@ -79,8 +79,17 @@ const roleValues = reactive<Record<string, string>>({})
 
 const canWrite = computed(() => authStore.isSuperuser)
 
-/** Nothing role-shaped renders on a deployment whose active project registers none. */
-const hasRoles = computed(() => roleProviders.value.length > 0)
+/**
+ * Nothing role-shaped renders on a deployment whose active project registers none, nor on a group another feature
+ * owns, which the server refuses a role on.
+ */
+const hasRoles = computed(() => roleProviders.value.length > 0 && !group.value?.dedicated_to)
+
+/** The pool this group feeds, when a submission pool owns it. */
+const pool = computed(() => {
+    const owner = group.value?.dedicated_to
+    return owner?.kind === 'submission_pool' ? owner : null
+})
 
 /** This group's members, as far as the account roster reaches. */
 const members = computed(() => {
@@ -237,6 +246,16 @@ onMounted(load)
                 </div>
             </header>
 
+            <wa-callout v-if="pool" class="admin-owner-callout" variant="brand">
+                {{ t('This group feeds the submission pool of the dataset "{name}". Its members may submit prepared recordings to that dataset and nothing else: the group carries no access grant or role, and it is removed with the pool.', SCOPE, { name: pool.name }) }}
+                <router-link class="admin-callout-link" :to="{ name: 'dataset', params: { id: pool.object_hash } }">
+                    {{ t('Open the dataset', SCOPE) }}
+                </router-link>
+            </wa-callout>
+            <wa-callout v-else-if="group.dedicated_to" class="admin-owner-callout" variant="neutral">
+                {{ t('This group belongs to another feature. It carries no access grant or role, and it is removed with its owner.', SCOPE) }}
+            </wa-callout>
+
             <section class="admin-section">
                 <div class="section-header">
                     <h2>{{ t('Group', SCOPE) }}</h2>
@@ -250,7 +269,7 @@ onMounted(load)
                         :label="t('Name', SCOPE)"
                         v-wa="[form, 'name']"
                     ></wa-input>
-                    <wa-select v-for="provider in roleProviders"
+                    <wa-select v-for="provider in (hasRoles ? roleProviders : [])"
                         :key="provider.key"
                         :disabled="!canWrite"
                         :label="provider.label"
@@ -328,6 +347,15 @@ onMounted(load)
     display: flex;
     flex-direction: column;
     gap: var(--wa-space-s);
+}
+
+.admin-owner-callout {
+    margin-bottom: var(--wa-space-l);
+}
+
+.admin-callout-link {
+    display: block;
+    margin-top: var(--wa-space-xs);
 }
 
 .admin-hint {

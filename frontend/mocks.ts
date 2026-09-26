@@ -68,6 +68,7 @@
  *   GET    /api/v1/library/datasets/{id}/items/
  *   POST   /api/v1/library/datasets/{id}/items/
  *   DELETE /api/v1/library/datasets/{id}/items/{itemId}/
+ *   GET    /api/v1/library/datasets/{id}/pool/        (never a pool: no ingest profiles)
  *   GET    /api/v1/library/datasets/{id}/access/
  *   POST   /api/v1/library/datasets/{id}/access/
  *   DELETE /api/v1/library/datasets/{id}/access/{rightId}/
@@ -1189,6 +1190,7 @@ function groupOut(group: MockAuthGroup) {
         member_count: group.memberIds.length,
         grant_count: group.grantCount,
         roles: { ...group.roles },
+        dedicated_to: null,
     }
 }
 
@@ -2407,6 +2409,25 @@ export async function handleMock(
                 _state.datasetItems.push(item)
                 return send(res, 201, itemOut(item))
             }
+        }
+    }
+
+    // GET /api/v1/library/datasets/{id}/pool/ — the mock has no ingest profiles, so no dataset is a pool
+    {
+        const m = path.match(/^\/api\/v1\/library\/datasets\/(\d+)\/pool\/$/)
+        if (m && method === 'GET') {
+            const dsId = Number(m[1])
+            return send(res, 200, {
+                configurable: !_state.datasetItems.some(i => i._parent_id === dsId),
+                failed_count: 0,
+                filling: false,
+                group_id: null,
+                group_name: null,
+                ingested_count: 0,
+                open: false,
+                pending_count: 0,
+                profile: null,
+            })
         }
     }
 

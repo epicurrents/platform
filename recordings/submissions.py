@@ -1,4 +1,4 @@
-"""Validating submissions to a release-gated dataset: the profile registry, the gate, the spool and who may submit.
+"""Validating submissions to a submission pool: the profile registry, the gate, the spool and who may submit.
 
 ⚠️ LOAD-BEARING — the submission gate.
 The gate is what keeps a pooled dataset's members indistinguishable by origin, and what keeps
@@ -11,8 +11,8 @@ refusing it, admits the site's or the vendor's signature into the pool with ever
 written test still green. The endpoint contract is the other half: a refused submission writes
 no row and no file. Contract tests are in ``recordings/tests/test_submissions.py`` (``TestGate``
 pins each check, including the blank fields against the de-identifier's actual output,
-``TestBatchEndpoints`` the write-nothing refusal, ``TestPooledIngest`` the random order, the
-system author and the masked trail).
+``TestPoolEndpoints`` the write-nothing refusal and the ledger as the audit target,
+``TestPooledIngest`` the random order, the system author and the masked trail).
 
 A pooled dataset cannot trust an arriving file the way an upload trusts its author: the
 file was prepared elsewhere against a published profile, and a file that departs from the
@@ -379,15 +379,19 @@ def validate_submission(profile: IngestProfile, data: bytes, sidecar: Any) -> li
 
 
 def can_submit_to_dataset(user: Any, dataset: Any) -> bool:
-    """True when ``user`` belongs to the dataset's submission group and the dataset is release-gated.
+    """True when ``dataset`` is an open submission pool and ``user`` belongs to its group.
 
     Group membership only: a dataset manager who is not in the group does not submit, and a
     superuser is not implied. The gate on the dataset is required because a submission into an
-    ungated dataset would surface on arrival, which is the one thing pooling exists to prevent.
+    ungated dataset would surface on arrival, which is the one thing pooling exists to prevent;
+    a pool always has it on (``library.pools``), and the check is repeated here rather than
+    trusted. A pool with intake closed accepts nothing.
     """
     if user is None or not getattr(user, "is_authenticated", False):
         return False
     if not getattr(dataset, "release_gated", False) or dataset.submission_group_id is None:
+        return False
+    if not getattr(dataset, "submission_profile", "") or not getattr(dataset, "submissions_open", False):
         return False
     if getattr(dataset, "deleted_at", None) is not None:
         return False

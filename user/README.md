@@ -69,7 +69,7 @@ Mounted at `/api/v1/user/`. Full request/response detail in [api/v1/ninja.py](ap
 | `POST` | `/reset-password` | Request a password reset link by email. Rate-limited per email address. |
 | `POST` | `/reset-password/confirm` | Validate a reset token and set a new password. |
 | `GET` | `/search?q=...` | Search active users by username / first name / last name. Used by sharing flows. Returns up to 20 matches; `q` must be at least 2 chars. |
-| `GET` | `/groups` | List all Django groups (for `AccessRight` group targets). |
+| `GET` | `/groups` | List the Django groups an `AccessRight` may target, leaving out [dedicated groups](#dedicated-groups). |
 | `GET` | `/preferences?scope=viewer` | The caller's stored client settings for that scope, as `{ scope, settings }`. An unknown scope is not an error — it yields an empty map, which is what a client that has never saved anything should see. |
 | `PUT` | `/preferences?scope=viewer` | Replace the caller's stored settings for that scope. The whole map is replaced rather than merged: the client owns the settings and sends a complete snapshot, so merging would resurrect settings the user has since cleared. Rejects keys that do not look like `<module>.<field>` setting paths, values that are not primitives or short flat lists of them, and blobs over 16 KiB serialized. The total-size cap is the bound that matters: the per-field limits multiply out to tens of megabytes, and every accepted blob is written to `ObjectChangeLog` twice (before and after state) and kept forever. |
 | `GET` | `/auth-config` | Public list of external login providers the SPA should offer. Empty when OIDC is disabled. |
@@ -110,10 +110,10 @@ The one endpoint below with no client is `PUT /admin/groups/{id}/members`. Both 
 | `POST` | `/admin/accounts/{id}/invite` | Superuser | Send the set-password invitation again. Refused once the account has a password of its own. Answers `{status, invitation_sent}`. |
 | `DELETE` | `/admin/accounts/{id}/2fa` | Superuser | Remove an account's second factor, for a lost authenticator. Step-up in the body; 409 on the caller's own account. See [Two-factor authentication](#two-factor-authentication-totp). |
 | `PUT` | `/admin/accounts/{id}/groups` | Superuser | Replace one account's group membership. Step-up when it adds a group. |
-| `GET` | `/admin/groups` | Staff | Groups with member and grant counts and their project roles. |
+| `GET` | `/admin/groups` | Staff | Groups with member and grant counts, their project roles, and `dedicated_to` naming the feature that owns a [dedicated group](#dedicated-groups). |
 | `POST` | `/admin/groups` | Superuser | Create a group. |
-| `PATCH` | `/admin/groups/{id}` | Superuser | Rename a group and/or set its [project roles](#project-roles). Step-up when a role is set to a value. |
-| `DELETE` | `/admin/groups/{id}` | Superuser | Delete a group, refused while grants target it. |
+| `PATCH` | `/admin/groups/{id}` | Superuser | Rename a group and/or set its [project roles](#project-roles); a role on a dedicated group answers 409. Step-up when a role is set to a value. |
+| `DELETE` | `/admin/groups/{id}` | Superuser | Delete a group, refused while grants target it and for a dedicated group. |
 | `PUT` | `/admin/groups/{id}/members` | Superuser | Replace one group's membership. Step-up when it adds a member. |
 | `GET` | `/admin/roles` | Staff | Project-supplied roles this deployment defines. |
 
@@ -188,6 +188,12 @@ register_role_provider(
 Core calls the registry when serialising a user (`roles` on `UserOut` / `AccountOut`, the union over their groups) and when serialising or editing groups (`roles` on `GroupDetailOut`; `PATCH /admin/groups/{id}` carries a `roles` map, where a write outside the provider's declared choices is refused with a 400 before the provider is called and an explicit `null` clears the role). `read_groups` takes the groups of interest in one call so a roster page costs one provider query, not one per group. A provider that raises on read is reported as empty rather than propagating — a project whose role table has not migrated yet should not turn every user lookup into a 500.
 
 `roles` in a group PATCH is a partial map: an absent key is left alone, so a client that does not know a project's role exists cannot clear it. There is no per-account role write — assigning a role is a membership change.
+
+## Dedicated groups
+
+Some groups exist for one purpose another feature owns, and must grant nothing else. A [submission pool](../library/README.md#submission-pools)'s contributor group is the first: its members joined it to submit to one dataset, and a grant or a role on it would hand every contributor something beyond that. [dedicated_groups.py](dedicated_groups.py) is the registry: the owning app registers a resolver from its `AppConfig.ready()` with `register_dedicated_group_resolver(kind, resolver)`, where `resolver` takes group primary keys and returns a `DedicatedGroup` (`kind`, and the owner's `object_hash` and `name`) for each it owns. `dedicated_groups(ids)` answers in batch for the listings, `dedicated_group(id)` for one.
+
+Core then refuses the three ways a group acquires meaning elsewhere, each at its own endpoint: an access grant targeting it (the dataset grant endpoint and the upload's `group_access` answer 400, and `GET /groups` leaves it out), a project role written on it (409; clearing stays allowed), and deleting it (409). `GroupDetailOut.dedicated_to` names the owner, and the group admin page shows a banner in place of the role selectors. A grant or role that reaches a dedicated group through any other path is the owning feature's check to report.
 
 ## Security mechanisms
 

@@ -1,4 +1,4 @@
-"""Django app configuration — registers the dataset read-permission extensions and the release gates."""
+"""Django app configuration — registers the dataset read-permission extensions, the release gates and the pool groups."""
 
 from django.apps import AppConfig
 
@@ -44,6 +44,20 @@ class LibraryConfig(AppConfig):
         # from share-token callers so a join link lists no members either.
         register_read_visibility_gate("recordings.recording", member_hidden_from_reader)
         register_read_visibility_gate("library.dataset", dataset_hidden_from_reader)
+
+        # A submission pool's group exists for the pool alone: registering it as
+        # dedicated makes the grant, role and group-delete endpoints refuse it.
+        from library.pools import POOL_GROUP_KIND, resolve_pool_groups
+        from user.dedicated_groups import register_dedicated_group_resolver
+
+        register_dedicated_group_resolver(POOL_GROUP_KIND, resolve_pool_groups)
+
+        from django.db.models.signals import post_delete
+
+        from library.models import Dataset
+        from library.pools import remove_group_with_dataset
+
+        post_delete.connect(remove_group_with_dataset, sender=Dataset, dispatch_uid="library.pool_group_with_dataset")
 
         # Art. 15 subject export: snapshots a user authored are their activity
         # record. The manifest itself is deliberately NOT exported — it holds

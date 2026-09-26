@@ -5,6 +5,7 @@ import { useRecordingSelection } from '#composables/useRecordingSelection'
 import { t } from '#i18n'
 import { setPageTitle } from '#router'
 import AccessRightsPanel from '#components/AccessRightsPanel.vue'
+import DatasetPoolSection from '#components/DatasetPoolSection.vue'
 import MediaListRow from '#components/MediaListRow.vue'
 import EditRecordingDialog from '#components/EditRecordingDialog.vue'
 import RecordingListRow from '#components/RecordingListRow.vue'
@@ -31,6 +32,7 @@ import {
     type AccessRight,
     type AssessmentPayload,
     type DatasetFolder,
+    type DatasetPool,
 } from '#api/library'
 import { getMediaContentTypeId } from '#api/media'
 import { getRecordingDetail, recordingName, type Recording } from '#api/recordings'
@@ -38,7 +40,6 @@ import MediaPickerDialog from '#components/MediaPickerDialog.vue'
 import { useRecordingsStore } from '#stores/recordings'
 import { useLibraryStore } from '#stores/library'
 import { useAuthStore } from '#stores/auth'
-import { listGroups, type Group } from '#api/user'
 import { toastNameWarnings } from '#lib/nameWarnings'
 import { showToast } from '#lib/toast'
 import ViewerConfigEditor from '#components/ViewerConfigEditor.vue'
@@ -115,6 +116,26 @@ const canEditConfig = computed(() =>
 // grantees see the tree read-only. The backend enforces write access on every
 // mutation regardless.
 const canManageFolders = canEditConfig
+
+// ── Submission pool ───────────────────────────────────────────────────────
+
+// Reported by the pool section, which only the owner sees. A pool owns its
+// gate and its membership: members arrive through the submission gate and are
+// withdrawn through purge, so the page offers neither the gate switch nor
+// adding and removing items by hand.
+const pool = ref<DatasetPool | null>(null)
+const isPool = computed(() => !!pool.value?.profile)
+
+async function onPoolChange (next: DatasetPool, changed: boolean) {
+    pool.value = next
+    if (changed) {
+        try {
+            dataset.value = await getDataset(datasetId.value)
+        } catch {
+            // The pool section already reported the write; a stale gate flag here is cosmetic.
+        }
+    }
+}
 
 async function onSaveViewerConfig (overrides: ViewerSettingsOverrides) {
     if (!dataset.value) {
@@ -413,25 +434,7 @@ async function submitMoveItem() {
 const showEdit = ref(false)
 const editLoading = ref(false)
 const editError = ref<string | null>(null)
-const input = reactive({ editName: '', editDescription: '', editReleaseGated: false, editSubmissionGroup: '' })
-// Groups for the submission-group selector; loaded once, when the edit
-// dialog first opens for someone who may change it.
-const groups = ref<Group[]>([])
-const groupsLoading = ref(false)
-
-async function loadGroups() {
-    if (groups.value.length || groupsLoading.value) {
-        return
-    }
-    groupsLoading.value = true
-    try {
-        groups.value = await listGroups()
-    } catch {
-        groups.value = []
-    } finally {
-        groupsLoading.value = false
-    }
-}
+const input = reactive({ editName: '', editDescription: '', editReleaseGated: false })
 
 function openEdit() {
     if (!dataset.value) {
@@ -440,12 +443,8 @@ function openEdit() {
     input.editName = dataset.value.name
     input.editDescription = dataset.value.description
     input.editReleaseGated = dataset.value.release_gated ?? false
-    input.editSubmissionGroup = dataset.value.submission_group_id == null ? '' : String(dataset.value.submission_group_id)
     editError.value = null
     showEdit.value = true
-    if (canEditConfig.value) {
-        loadGroups()
-    }
 }
 
 function closeEdit() {
@@ -464,9 +463,8 @@ async function submitEdit() {
             name: input.editName.trim(),
             description: input.editDescription.trim(),
         }
-        if (canEditConfig.value) {
+        if (canEditConfig.value && !isPool.value) {
             payload.release_gated = input.editReleaseGated
-            payload.submission_group_id = input.editSubmissionGroup ? Number(input.editSubmissionGroup) : null
         }
         dataset.value = await updateDataset(datasetId.value, payload)
         showEdit.value = false
@@ -734,7 +732,7 @@ const assessFn = (right: AccessRight, payload: AssessmentPayload) =>
             <!-- ── Items section ──────────────────────────────────────── -->
             <div class="section-header">
                 <h2>{{ t('Items', SCOPE) }}</h2>
-                <wa-dropdown
+                <wa-dropdown v-if="!isPool || canManageFolders"
                     placement="bottom-end"
                     @wa-select="handleAddNew"
                 >
@@ -747,11 +745,11 @@ const assessFn = (right: AccessRight, payload: AssessmentPayload) =>
                         <wa-icon name="plus" slot="start"></wa-icon>
                         {{ t('Add new', SCOPE) }}
                     </wa-button>
-                    <wa-dropdown-item value="recording">
+                    <wa-dropdown-item v-if="!isPool" value="recording">
                         <wa-icon name="file-music" slot="icon"></wa-icon>
                         {{ t('Recording', SCOPE) }}
                     </wa-dropdown-item>
-                    <wa-dropdown-item value="media">
+                    <wa-dropdown-item v-if="!isPool" value="media">
                         <wa-icon name="file" slot="icon"></wa-icon>
                         {{ t('Media file', SCOPE) }}
                     </wa-dropdown-item>
@@ -830,7 +828,7 @@ const assessFn = (right: AccessRight, payload: AssessmentPayload) =>
                                         <wa-icon name="folder-open" slot="icon"></wa-icon>
                                         {{ t('Move to folder', SCOPE) }}
                                     </wa-dropdown-item>
-                                    <wa-dropdown-item value="remove" variant="danger">
+                                    <wa-dropdown-item v-if="!isPool" value="remove" variant="danger">
                                         <wa-icon name="xmark" slot="icon"></wa-icon>
                                         {{ t('Remove from dataset', SCOPE) }}
                                     </wa-dropdown-item>
@@ -852,7 +850,7 @@ const assessFn = (right: AccessRight, payload: AssessmentPayload) =>
                                         <wa-icon name="folder-open" slot="icon"></wa-icon>
                                         {{ t('Move to folder', SCOPE) }}
                                     </wa-dropdown-item>
-                                    <wa-dropdown-item value="remove" variant="danger">
+                                    <wa-dropdown-item v-if="!isPool" value="remove" variant="danger">
                                         <wa-icon name="xmark" slot="icon"></wa-icon>
                                         {{ t('Remove from dataset', SCOPE) }}
                                     </wa-dropdown-item>
@@ -915,6 +913,8 @@ const assessFn = (right: AccessRight, payload: AssessmentPayload) =>
 
             <template v-if="canEditConfig">
                 <wa-divider class="section-divider"></wa-divider>
+                <DatasetPoolSection :datasetId="datasetId" @change="onPoolChange"></DatasetPoolSection>
+                <wa-divider class="section-divider"></wa-divider>
                 <wa-details :summary="t('Viewer settings', SCOPE)">
                     <p class="dataset-viewer-config__hint">
                         {{ t('Override viewer defaults for this dataset. These apply on top of the deployment defaults whenever the dataset is opened in the viewer. Leave empty to use the deployment defaults.', SCOPE) }}
@@ -952,34 +952,20 @@ const assessFn = (right: AccessRight, payload: AssessmentPayload) =>
                 size="s"
                 v-wa="[input, 'editDescription']"
             ></wa-textarea>
-            <wa-switch v-if="canEditConfig"
-                :disabled="editLoading"
-                size="s"
-                v-wa="[input, 'editReleaseGated']"
-            >
-                {{ t('Release-gated', SCOPE) }}
-            </wa-switch>
-            <p v-if="canEditConfig" class="dataset-view__hint">
-                {{ t('Members of a release-gated dataset stay hidden from readers until a release run publishes them, never resolve through a share link, and are dated by their release month rather than their upload time. Turning the gate off publishes every unreleased member.', SCOPE) }}
-            </p>
-            <wa-select v-if="canEditConfig && input.editReleaseGated"
-                :disabled="editLoading || groupsLoading"
-                :label="t('Submission group', SCOPE)"
-                :placeholder="groupsLoading ? t('Loading…', SCOPE) : t('No group (submissions closed)', SCOPE)"
-                size="s"
-                v-wa="[input, 'editSubmissionGroup']"
-            >
-                <wa-option value="">{{ t('No group (submissions closed)', SCOPE) }}</wa-option>
-                <wa-option
-                    v-for="group in groups"
-                    :key="group.id"
-                    :value="String(group.id)"
+            <template v-if="canEditConfig && !isPool">
+                <wa-switch
+                    :disabled="editLoading"
+                    size="s"
+                    v-wa="[input, 'editReleaseGated']"
                 >
-                    {{ group.name }}
-                </wa-option>
-            </wa-select>
-            <p v-if="canEditConfig && input.editReleaseGated" class="dataset-view__hint">
-                {{ t('Members of the submission group may submit prepared recordings to this dataset through the validating submission path. They see their own batches and nothing of the pool until a release publishes it.', SCOPE) }}
+                    {{ t('Release-gated', SCOPE) }}
+                </wa-switch>
+                <p class="dataset-view__hint">
+                    {{ t('Members of a release-gated dataset stay hidden from readers until a release run publishes them, never resolve through a share link, and are dated by their release month rather than their upload time. Turning the gate off publishes every unreleased member.', SCOPE) }}
+                </p>
+            </template>
+            <p v-else-if="canEditConfig" class="dataset-view__hint">
+                {{ t('The release gate belongs to the submission pool and stays on while the pool exists.', SCOPE) }}
             </p>
         </div>
         <div slot="footer" class="form-actions">

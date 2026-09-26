@@ -73,7 +73,7 @@ from django.contrib.auth import get_user_model
 from django.contrib.auth.models import Group
 from django.contrib.contenttypes.models import ContentType
 from django.db import transaction
-from django.db.models import Count, F, Q, prefetch_related_objects
+from django.db.models import F, Q, prefetch_related_objects
 from django.http import FileResponse, HttpResponse, JsonResponse, StreamingHttpResponse
 from django.utils import timezone
 from django.utils.dateparse import parse_datetime
@@ -1413,6 +1413,12 @@ def upload_recording(
         if missing_group_ids:
             staging_path.unlink(missing_ok=True)
             raise HttpError(400, f"Unknown group ids in group_access: {missing_group_ids}")
+        from user.dedicated_groups import dedicated_groups
+
+        dedicated_ids = sorted(dedicated_groups(group_ids))
+        if dedicated_ids:
+            staging_path.unlink(missing_ok=True)
+            raise HttpError(400, f"Groups that exist for one purpose grant nothing: {dedicated_ids}")
 
     # Create the Recording row and all AccessRights atomically so a partial
     # failure never leaves a row without its owner's access right. Enqueue the
@@ -2941,38 +2947,21 @@ def revoke_recording_access(request, hash: str, right_id: int):
     return {"status": "ok"}
 
 
-# ── Validating submissions to a release-gated dataset ────────────────────────
+# ── Validating submissions to a submission pool ──────────────────────────────
 #
-# The pooled counterpart of /upload. A contributor opens a batch against a
-# dataset whose submission group they belong to, then adds files one request at
-# a time; each is checked against the registered ingest profile in memory and
-# is written nowhere unless the gate passes (recordings/submissions.py). Every
-# request audits against the batch, never a recording: the recordings are
-# created later by the pooled ingest task under the system user, in random
-# order across batches, and carry no reference back.
-
-
-class SubmissionBatchIn(Schema):
-    """Open a batch against a dataset, checked under a registered ingest profile."""
-
-    dataset: str
-    profile: str
-
-
-class SubmissionBatchOut(Schema):
-    """A contributor's view of one batch: identifiers and counts, never a file."""
-
-    hash: str
-    dataset_hash: str
-    profile: str
-    pending_count: int
-    failed_count: int
-    ingested_count: int
-    created_at: datetime
+# The pooled counterpart of /upload. A contributor lists the open pools whose
+# group they belong to, then adds files one request at a time; each is checked
+# against the pool's ingest profile in memory and is written nowhere unless the
+# gate passes (recordings/submissions.py). An accepted file is recorded on the
+# contributor's ledger for the pool, which the server creates with their first
+# accepted file and never names to them. Every accepted request audits against
+# the ledger and every refusal against the pool, never a recording: the
+# recordings are created later by the pooled ingest task under the system user,
+# in random order across ledgers, and carry no reference back.
 
 
 class SubmissionProfileOut(Schema):
-    """The public shape of a batch's ingest profile: every value the gate checks a submission against."""
+    """The public shape of an ingest profile: every value the gate checks a submission against."""
 
     key: str
     channels: list[str]
@@ -2985,6 +2974,14 @@ class SubmissionProfileOut(Schema):
     durations_seconds: list[float]
     required_sidecar_keys: list[str]
     forbidden_sidecar_keys: list[str]
+
+
+class SubmissionPoolOut(Schema):
+    """An open pool the caller may submit to, with the profile a file is prepared against."""
+
+    dataset_hash: str
+    name: str
+    profile: SubmissionProfileOut
 
 
 class SubmissionViolationOut(Schema):
@@ -3005,146 +3002,87 @@ class SubmissionAcceptedOut(Schema):
     """The gate's answer to an accepted file: it now waits in the spool for the pooled run."""
 
     accepted: bool = True
-    pending_count: int
 
 
-def _get_submission_dataset(identifier: str):
-    """Resolve an active dataset by its 32-character hash, or 404."""
+def _get_submission_pool(user, identifier: str):
+    """Resolve a pool the caller may submit to by its dataset hash, or 404.
+
+    A dataset that exists but is not open to the caller reads as absent, so the endpoint does not tell a
+    non-member which datasets are pools.
+    """
     from library.models import Dataset
+    from recordings.submissions import can_submit_to_dataset
 
     value = (identifier or "").strip()
     dataset = None
     if len(value) == 32 and value.isalnum():
         dataset = Dataset.objects.filter(deleted_at__isnull=True, object_hash=value.upper()).first()
-    if dataset is None:
-        raise HttpError(404, "Dataset not found")
+    if dataset is None or not can_submit_to_dataset(user, dataset):
+        raise HttpError(404, "Submission pool not found")
     return dataset
 
 
-def _get_own_batch(user, batch_hash: str):
-    """Resolve one of the caller's batches by hash, or 404 (a batch that is not theirs reads as absent)."""
-    from recordings.models import SubmissionBatch
+@api.get("/submissions/profiles", response=list[SubmissionProfileOut])
+def list_submission_profiles(request):
+    """Every ingest profile this deployment registers, for choosing one when configuring a pool."""
+    from recordings.submissions import public_profile, registered_ingest_profiles
 
-    value = (batch_hash or "").strip()
-    batch = None
-    if len(value) == 32 and value.isalnum():
-        batch = (
-            SubmissionBatch.objects.filter(object_hash=value.upper(), contributor=user)
-            .select_related("dataset")
-            .first()
-        )
-    if batch is None:
-        raise HttpError(404, "Batch not found")
-    return batch
+    _require_auth(request)
+    profiles = [public_profile(profile) for profile in registered_ingest_profiles()]
+    log_activity(verb="recordings.submission.profile.list", metadata={"returned_count": len(profiles)})
+    return profiles
 
 
-def _batch_out(batch) -> dict:
-    from recordings.models import SubmissionFile
+@api.get("/submissions/pools", response=list[SubmissionPoolOut])
+def list_submission_pools(request):
+    """The open pools the caller may submit to, each with its published profile, ordered by name.
 
-    counts = {
-        row["status"]: row["n"] for row in batch.files.values("status").annotate(n=Count("id")).values("status", "n")
-    }
-    return {
-        "hash": batch.object_hash,
-        "dataset_hash": batch.dataset.object_hash,
-        "profile": batch.profile_key,
-        "pending_count": counts.get(SubmissionFile.Status.PENDING, 0),
-        "failed_count": counts.get(SubmissionFile.Status.FAILED, 0),
-        "ingested_count": batch.ingested_count,
-        "created_at": batch.created_at,
-    }
-
-
-@api.post("/submissions/batches", response={201: SubmissionBatchOut})
-def create_submission_batch(request, payload: SubmissionBatchIn):
-    """Open a batch for submitting prepared recordings to a release-gated dataset.
-
-    The caller must belong to the dataset's submission group, and ``profile`` must name a
-    registered ingest profile. A dataset the caller may not submit to answers 403 whether or
-    not it exists for them otherwise; the batch is the audit target of every later request.
+    A pool whose profile this deployment no longer registers is left out: nothing sent to it could pass.
     """
-    from recordings.models import SubmissionBatch
-    from recordings.submissions import can_submit_to_dataset, get_ingest_profile
+    from library.models import Dataset
+    from recordings.submissions import get_ingest_profile, public_profile
 
     user = _require_auth(request)
-    dataset = _get_submission_dataset(payload.dataset)
-    if not can_submit_to_dataset(user, dataset):
-        raise HttpError(403, "You may not submit to this dataset")
-    profile = get_ingest_profile((payload.profile or "").strip())
-    if profile is None:
-        raise HttpError(400, "Unknown ingest profile")
-
-    with transaction.atomic():
-        batch = SubmissionBatch.objects.create(dataset=dataset, contributor=user, profile_key=profile.key)
-        log_activity(verb="recordings.submission.batch.create", target=batch)
-    return 201, _batch_out(batch)
-
-
-@api.get("/submissions/batches", response=list[SubmissionBatchOut])
-def list_submission_batches(request, dataset: str | None = Query(None, description="Filter by dataset hash")):
-    """List the caller's own batches, newest first."""
-    from recordings.models import SubmissionBatch
-
-    user = _require_auth(request)
-    qs = SubmissionBatch.objects.filter(contributor=user).select_related("dataset").order_by("-created_at", "-pk")
-    if dataset:
-        qs = qs.filter(dataset=_get_submission_dataset(dataset))
-    batches = list(qs)
-    log_activity(verb="recordings.submission.batch.list", metadata={"count": len(batches)})
-    return [_batch_out(batch) for batch in batches]
-
-
-@api.get("/submissions/batches/{batch_hash}", response=SubmissionBatchOut)
-def get_submission_batch(request, batch_hash: str):
-    """One of the caller's batches with its counts."""
-    user = _require_auth(request)
-    batch = _get_own_batch(user, batch_hash)
-    log_activity(verb="recordings.submission.batch.read", target=batch)
-    return _batch_out(batch)
-
-
-@api.get("/submissions/batches/{batch_hash}/profile", response=SubmissionProfileOut)
-def get_submission_batch_profile(request, batch_hash: str):
-    """The rules one of the caller's batches checks each file against, for preparing a file before it is sent.
-
-    A channel labelled exactly as listed passes the channel check, which registration guarantees.
-    Readable while the caller may still submit to the batch's dataset, as the file endpoint is.
-    """
-    from recordings.submissions import can_submit_to_dataset, get_ingest_profile, public_profile
-
-    user = _require_auth(request)
-    batch = _get_own_batch(user, batch_hash)
-    if not can_submit_to_dataset(user, batch.dataset):
-        raise HttpError(403, "You may not submit to this dataset")
-    profile = get_ingest_profile(batch.profile_key)
-    if profile is None:
-        raise HttpError(409, "The batch's ingest profile is no longer registered")
-    log_activity(verb="recordings.submission.batch.profile.read", target=batch)
-    return public_profile(profile)
+    candidates = Dataset.objects.filter(
+        deleted_at__isnull=True,
+        release_gated=True,
+        submissions_open=True,
+        submission_group__in=user.groups.all(),
+    ).exclude(submission_profile="")
+    pools = []
+    for dataset in candidates.order_by("name", "pk"):
+        profile = get_ingest_profile(dataset.submission_profile)
+        if profile is None:
+            continue
+        pools.append({"dataset_hash": dataset.object_hash, "name": dataset.name, "profile": public_profile(profile)})
+    log_activity(verb="recordings.submission.pool.list", metadata={"returned_count": len(pools)})
+    return pools
 
 
 @api.post(
-    "/submissions/batches/{batch_hash}/files",
+    "/submissions/pools/{dataset_hash}/files",
     response={202: SubmissionAcceptedOut, 422: SubmissionRejectedOut},
 )
 def submit_file(
     request,
-    batch_hash: str,
+    dataset_hash: str,
     file: UploadedFile = File(...),
     sidecar: UploadedFile = File(...),
 ):
-    """Submit one prepared recording with its sidecar to a batch.
+    """Submit one prepared recording with its sidecar to a pool.
 
     Both parts are read into memory under ``RECORDINGS_SUBMISSION_MAX_SIZE`` and checked
-    against the batch's ingest profile. A file that fails answers 422 with every violation
-    and writes nothing: no row, no file, and an audit row carrying the violation codes and
-    their count, never a message. An accepted file is written to the spool with a random
-    name (the client filename is not kept) and waits for the pooled ingest run.
+    against the pool's ingest profile. A file that fails answers 422 with every violation
+    and writes nothing: no row, no file, and an audit row against the pool carrying the
+    violation codes and their count, never a message. An accepted file is written to the
+    spool with a random name (the client filename is not kept), recorded on the caller's
+    ledger for the pool, created now if this is their first accepted file, and waits for
+    the pooled ingest run.
 
-    The batch's dataset must still be one the caller may submit to: a group membership
-    withdrawn after the batch was opened closes the batch too.
+    The pool must be open and the caller in its group at the time of the request: a
+    membership withdrawn or intake closed since answers as though the pool did not exist.
     """
-    from recordings.models import SubmissionFile
+    from recordings.models import SubmissionFile, SubmissionLedger
     from recordings.submissions import (
         Violation,
         can_submit_to_dataset,
@@ -3155,12 +3093,10 @@ def submit_file(
     )
 
     user = _require_auth(request)
-    batch = _get_own_batch(user, batch_hash)
-    if not can_submit_to_dataset(user, batch.dataset):
-        raise HttpError(403, "You may not submit to this dataset")
-    profile = get_ingest_profile(batch.profile_key)
+    dataset = _get_submission_pool(user, dataset_hash)
+    profile = get_ingest_profile(dataset.submission_profile)
     if profile is None:
-        raise HttpError(409, "The batch's ingest profile is no longer registered")
+        raise HttpError(409, "The pool's ingest profile is no longer registered")
 
     max_size = getattr(settings, "RECORDINGS_SUBMISSION_MAX_SIZE", 64 * 1024 * 1024)
     if file.size > max_size or sidecar.size > max_size:
@@ -3180,9 +3116,11 @@ def submit_file(
         violations = validate_submission(profile, data, sidecar_document)
     if violations:
         rows = [{"code": v.code, "message": v.message} for v in violations]
+        # Against the pool rather than the ledger: a refusal writes nothing, and a
+        # contributor's first file may be refused before any ledger exists.
         log_activity(
             verb="recordings.submission.file.reject",
-            target=batch,
+            target=dataset,
             metadata={
                 "violation_count": len(rows),
                 "violation_codes": sorted({row["code"] for row in rows}),
@@ -3199,8 +3137,14 @@ def submit_file(
     spool_path.write_bytes(data)
     try:
         with transaction.atomic():
+            # The pool's row lock, the one its configuration writes take: a dissolve or a
+            # closed intake that committed since the check above refuses this file.
+            dataset = type(dataset).objects.select_for_update().get(pk=dataset.pk)
+            if not can_submit_to_dataset(user, dataset):
+                raise HttpError(404, "Submission pool not found")
+            ledger, created = SubmissionLedger.objects.get_or_create(dataset=dataset, contributor=user)
             SubmissionFile.objects.create(
-                batch=batch,
+                ledger=ledger,
                 stored_name=stored_name,
                 file_extension=extension,
                 file_path=str(spool_path),
@@ -3209,9 +3153,8 @@ def submit_file(
                 sidecar_hash=hashlib.sha256(json.dumps(sidecar_document, sort_keys=True).encode()).hexdigest(),
                 sidecar=sidecar_document,
             )
-            log_activity(verb="recordings.submission.file.accept", target=batch)
+            log_activity(verb="recordings.submission.file.accept", target=ledger, metadata={"ledger_created": created})
     except Exception:
         spool_path.unlink(missing_ok=True)
         raise
-    pending = batch.files.filter(status=SubmissionFile.Status.PENDING).count()
-    return 202, {"accepted": True, "pending_count": pending}
+    return 202, {"accepted": True}

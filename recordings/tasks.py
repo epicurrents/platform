@@ -872,17 +872,17 @@ def _purge_deleted_recordings_body(*, cutoff, retention_days):
 
 @shared_task
 def ingest_pooled_submissions() -> dict:
-    """Ingest every accepted submission older than the pooling delay, in random order across batches.
+    """Ingest every accepted submission older than the pooling delay, in random order across ledgers.
 
     The pooled counterpart of the upload's immediate ``process_recording``. A submission
     accepted by the gate (``recordings.submissions``) waits in the spool until it is older
     than ``RECORDINGS_SUBMISSION_POOLING_DELAY_HOURS``; this run then takes every such file
-    from every batch, shuffles them, and creates each recording under the system user with a
-    membership in the batch's dataset. The recording carries nothing that names the batch,
-    and the file row is deleted once the recording exists, so the batch is left with counts.
-    What the operator's own database still holds is the correlation between a batch's
-    timestamps and the recordings that appeared one delay later, which the compliance
-    document records as an operator-level residual.
+    from every ledger, shuffles them, and creates each recording under the system user as an
+    unreleased member of the ledger's pool. The recording carries nothing that names the
+    ledger, and the file row is deleted once the recording exists, so the ledger is left with
+    counts. What the operator's own database still holds is the correlation between a
+    ledger's timestamps and the recordings that appeared one delay later, which the
+    compliance document records as an operator-level residual.
 
     One audited scope covers the run (``recordings.submission.ingest``, no target, the counts
     in the metadata); each recording's creation is recorded under it. Processing is queued
@@ -908,23 +908,23 @@ def ingest_pooled_submissions() -> dict:
     cutoff = timezone.now() - timedelta(hours=delay_hours)
     pending = list(
         SubmissionFile.objects.filter(status=SubmissionFile.Status.PENDING, received_at__lt=cutoff).select_related(
-            "batch", "batch__dataset"
+            "ledger", "ledger__dataset"
         )
     )
     if not pending:
         return {"ingested": 0, "failed": 0}
 
     # A system source, not the default generator: the order is the one thing a reader of the
-    # audit trail could use to regroup a run into its batches.
+    # audit trail could use to regroup a run into its ledgers.
     import secrets
 
     secrets.SystemRandom().shuffle(pending)
-    batch_count = len({item.batch_id for item in pending})
+    ledger_count = len({item.ledger_id for item in pending})
     ingested = failed = 0
     with with_system_activity(
         "recordings.submission.ingest",
         interface=Activity.Interface.CELERY,
-        metadata={"file_count": len(pending), "batch_count": batch_count},
+        metadata={"file_count": len(pending), "ledger_count": ledger_count},
     ):
         for item in pending:
             if _ingest_submission_file(item):
@@ -973,17 +973,19 @@ def _ingest_submission_file(item) -> bool:
     from recordings.models import Recording, SubmissionFile, stored_original_name
     from recordings.submissions import get_ingest_profile
 
-    batch = item.batch
-    profile = get_ingest_profile(batch.profile_key)
+    ledger = item.ledger
+    pool = ledger.dataset
+    profile = get_ingest_profile(pool.submission_profile)
     try:
         if profile is None:
-            raise RuntimeError(f"Ingest profile {batch.profile_key!r} is no longer registered")
+            raise RuntimeError(f"Ingest profile {pool.submission_profile!r} is no longer registered")
         if not Path(item.file_path).exists():
             raise FileNotFoundError("The spooled file is missing")
-        if batch.dataset.deleted_at is not None or not batch.dataset.release_gated:
-            # The pool closed after the batch was opened: nothing may enter a
-            # trashed dataset, and an ungated one would publish on arrival.
-            raise RuntimeError("The batch's dataset is no longer an open release-gated pool")
+        if pool.deleted_at is not None or not pool.release_gated or not pool.submission_profile:
+            # Nothing may enter a trashed dataset, and an ungated one would publish
+            # on arrival. Closed intake is not a reason: the file was accepted while
+            # the pool was open.
+            raise RuntimeError("The ledger's dataset is no longer a release-gated submission pool")
         system_user = get_system_user()
         with transaction.atomic():
             recording = Recording.objects.create(
@@ -1009,18 +1011,18 @@ def _ingest_submission_file(item) -> bool:
                 can_write=True,
                 can_share=True,
             )
-            DatasetItem.objects.create(dataset=batch.dataset, content_type=recording_ct, object_id=str(recording.pk))
+            DatasetItem.objects.create(dataset=pool, content_type=recording_ct, object_id=str(recording.pk))
             # The gate checked the sidecar's shape, so a failure here is a bug and
             # fails the file. A pool keeps none of the file's text, whatever the
             # deployment setting says.
             save_viewer_sidecar(recording, item.sidecar, discard_text=True)
             if profile.ingest is not None:
                 profile.ingest(recording, item.sidecar)
-            # Several files of one batch share the run; re-read the count rather
+            # Several files of one ledger share the run; re-read the count rather
             # than trusting the instance loaded with the file row.
-            batch.refresh_from_db(fields=["ingested_count"])
-            batch.ingested_count += 1
-            batch.save(update_fields=["ingested_count"])
+            ledger.refresh_from_db(fields=["ingested_count"])
+            ledger.ingested_count += 1
+            ledger.save(update_fields=["ingested_count"])
             item.delete()
             recording_id = recording.pk
             transaction.on_commit(lambda: process_recording.delay(recording_id))

@@ -29,8 +29,6 @@ export interface Collection {
     license_url: string | null
     /** Datasets only — members stay hidden from readers until a release run publishes them. */
     release_gated?: boolean
-    /** Datasets only — the group whose members may submit prepared recordings; null when the path is closed. */
-    submission_group_id?: number | null
     /** Create and update responses only: free-text warnings for `name` and `description`. */
     warnings?: NameWarning[]
 }
@@ -244,7 +242,6 @@ export async function updateDataset(
         license_spdx?: string
         license_url?: string
         release_gated?: boolean
-        submission_group_id?: number | null
     },
 ): Promise<Collection> {
     const response = await http.patch<Collection>(`/api/v1/library/datasets/${id}/`, payload)
@@ -253,6 +250,53 @@ export async function updateDataset(
 
 export async function deleteDataset(id: number | string): Promise<void> {
     await http.delete(`/api/v1/library/datasets/${id}/`)
+}
+
+// ---------------------------------------------------------------------------
+// Submission pools
+// ---------------------------------------------------------------------------
+
+/** A dataset's submission-pool state, as its author or a superuser sees it. */
+export interface DatasetPool {
+    /** Not a pool and empty, so it can become one. */
+    configurable: boolean
+    failed_count: number
+    /** A file has been accepted from a contributor: the profile, group and gate are fixed. */
+    filling: boolean
+    group_id: number | null
+    group_name: string | null
+    ingested_count: number
+    /** Whether the pool accepts new submissions. */
+    open: boolean
+    pending_count: number
+    /** Key of the registered ingest profile; null when the dataset is not a pool. */
+    profile: string | null
+}
+
+export async function getDatasetPool(id: number | string): Promise<DatasetPool> {
+    const response = await http.get<DatasetPool>(`/api/v1/library/datasets/${id}/pool/`)
+    return response.data
+}
+
+/** Make an empty dataset a pool checked against `profile`: a new dedicated group, the gate on and intake closed. */
+export async function configureDatasetPool(id: number | string, profile: string): Promise<DatasetPool> {
+    const response = await http.post<DatasetPool>(`/api/v1/library/datasets/${id}/pool/`, { profile })
+    return response.data
+}
+
+/** Open or close intake, or change the profile of a pool that has not filled. */
+export async function updateDatasetPool(
+    id: number | string,
+    payload: { open?: boolean; profile?: string },
+): Promise<DatasetPool> {
+    const response = await http.patch<DatasetPool>(`/api/v1/library/datasets/${id}/pool/`, payload)
+    return response.data
+}
+
+/** Dissolve a pool that has not filled; its group is deleted and the gate turns off. */
+export async function dissolveDatasetPool(id: number | string): Promise<DatasetPool> {
+    const response = await http.delete<DatasetPool>(`/api/v1/library/datasets/${id}/pool/`)
+    return response.data
 }
 
 // ---------------------------------------------------------------------------

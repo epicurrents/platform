@@ -487,6 +487,10 @@ To check the table against the tree, walk the AST for `log_activity` / `with_sys
 | `library.dataset.item.move` | `move_dataset_item` |
 | `library.dataset.item.remove` | `remove_dataset_item` |
 | `library.dataset.list` | `list_datasets` |
+| `library.dataset.pool.create` | `configure_dataset_pool` |
+| `library.dataset.pool.delete` | `dissolve_dataset_pool` |
+| `library.dataset.pool.read` | `get_dataset_pool` |
+| `library.dataset.pool.update` | `update_dataset_pool` |
 | `library.dataset.read` | `get_dataset` |
 | `library.dataset.release` | `handle` † |
 | `library.dataset.snapshot.create` | `create_dataset_snapshot` |
@@ -568,13 +572,11 @@ To check the table against the tree, walk the AST for `log_activity` / `with_sys
 | `recordings.set_mains` | `bulk_set_mains` |
 | `recordings.stored_hash.backfill` | `handle` † |
 | `recordings.status` | `recording_status` |
-| `recordings.submission.batch.create` | `create_submission_batch` |
-| `recordings.submission.batch.list` | `list_submission_batches` |
-| `recordings.submission.batch.read` | `get_submission_batch` |
-| `recordings.submission.batch.profile.read` | `get_submission_batch_profile` |
 | `recordings.submission.file.accept` | `submit_file` |
 | `recordings.submission.file.reject` | `submit_file` |
 | `recordings.submission.ingest` | `ingest_pooled_submissions` † |
+| `recordings.submission.pool.list` | `list_submission_pools` |
+| `recordings.submission.profile.list` | `list_submission_profiles` |
 | `recordings.submission.purge` | `ingest_pooled_submissions` † |
 | `recordings.trash` | `delete_recording` |
 | `recordings.update` | `update_recording` |

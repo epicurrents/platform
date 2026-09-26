@@ -444,47 +444,58 @@ class ImportJobFile(models.Model):
         ]
 
 
-class SubmissionBatch(models.Model):
-    """One contributor's batch of prepared recordings submitted to a release-gated dataset.
+class SubmissionLedger(models.Model):
+    """One contributor's record for one submission pool: who submitted there, and how many of their files ingested.
 
-    The batch is the audit target of every submission request, so the trail names
-    the contributor and the dataset without naming a recording. A recording
-    ingested from a batch carries no reference back to it: the pooled ingest task
-    (``recordings.tasks.ingest_pooled_submissions``) creates the recording under
-    the system user and deletes the file row, leaving the batch with counts only.
-    What remains is the correlation between a batch's timestamps and the
-    recordings that appeared a pooling delay later, inside the operator's own
-    database; the compliance document records that as an operator-level residual.
+    The ledger is the audit target of every accepted submission, so the trail names
+    the contributor and the pool without naming a recording. It stores nothing:
+    accepted files wait in the spool (``SubmissionFile``) and then as unreleased
+    members of the pool. The server creates a contributor's ledger with their first
+    accepted file and never shows it to them; one per contributor per pool.
 
-    ``contributor`` is nullable so that erasing the account clears the one link
-    a batch holds to a person; the batch itself is not personal data once that
-    link is gone.
+    A recording ingested from the spool carries no reference back to the ledger: the
+    pooled ingest task (``recordings.tasks.ingest_pooled_submissions``) creates the
+    recording under the system user and deletes the file row, leaving the ledger
+    with counts only. What remains is the correlation between a ledger's timestamps
+    and the recordings that appeared a pooling delay later, inside the operator's
+    own database; the compliance document records that as an operator-level
+    residual.
+
+    ``contributor`` is nullable so that erasing the account clears the one link a
+    ledger holds to a person; the ledger itself is not personal data once that link
+    is gone. The profile is the pool's (``Dataset.submission_profile``), which
+    cannot change once a ledger exists.
     """
 
     dataset = models.ForeignKey(
         "library.Dataset",
         on_delete=models.CASCADE,
-        related_name="submission_batches",
+        related_name="submission_ledgers",
     )
     contributor = models.ForeignKey(
         settings.AUTH_USER_MODEL,
         null=True,
         blank=True,
         on_delete=models.SET_NULL,
-        related_name="submission_batches",
+        related_name="submission_ledgers",
     )
-    # Public identifier, mirroring Dataset.object_hash: random, never sequential.
+    # A locator for the audit trail, mirroring Dataset.object_hash: random, never sequential.
     object_hash = models.CharField(max_length=32, unique=True, editable=False)
-    # The registered ingest profile every file in the batch was validated against.
-    profile_key = models.CharField(max_length=64)
-    # Files that finished ingest are deleted rather than kept, so the counts are the
-    # batch's only record of them.
+    # Files that finished ingest are deleted rather than kept, so the count is the
+    # ledger's only record of them.
     ingested_count = models.PositiveIntegerField(default=0)
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
         indexes = [
-            models.Index(fields=["dataset", "created_at"]),
+            models.Index(fields=["dataset", "created_at"], name="recordings__dataset_8f664b_idx"),
+        ]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["dataset", "contributor"],
+                condition=models.Q(contributor__isnull=False),
+                name="submission_ledger_one_per_contributor",
+            ),
         ]
 
     def save(self, *args, **kwargs):
@@ -493,7 +504,7 @@ class SubmissionBatch(models.Model):
         super().save(*args, **kwargs)
 
     def __str__(self) -> str:
-        return f"SubmissionBatch({self.object_hash} dataset={self.dataset_id})"
+        return f"SubmissionLedger({self.object_hash} dataset={self.dataset_id})"
 
 
 class SubmissionFile(models.Model):
@@ -508,7 +519,7 @@ class SubmissionFile(models.Model):
     ``Recording.file_hash`` after ingest, which is why both it and the sidecar
     are masked out of the audit trail (``recordings.apps``) and the row is
     deleted once ingested: kept, the pair would be a join from a recording
-    back to its batch.
+    back to its ledger.
 
     A row that fails ingest stays, with ``status`` ``failed`` and the error
     text, for the operator; its recording exists as a hidden FAILED row.
@@ -518,8 +529,8 @@ class SubmissionFile(models.Model):
         PENDING = "pending", "Pending"
         FAILED = "failed", "Failed"
 
-    batch = models.ForeignKey(
-        SubmissionBatch,
+    ledger = models.ForeignKey(
+        SubmissionLedger,
         on_delete=models.CASCADE,
         related_name="files",
     )
@@ -545,4 +556,4 @@ class SubmissionFile(models.Model):
         ]
 
     def __str__(self) -> str:
-        return f"SubmissionFile({self.stored_name} [{self.status}] batch={self.batch_id})"
+        return f"SubmissionFile({self.stored_name} [{self.status}] ledger={self.ledger_id})"
