@@ -34,19 +34,38 @@ sed_inplace() {
     sed "$script" "$file" > "$tmp" && mv "$tmp" "$file"
 }
 
-# Read current project from .env
-CURRENT_PROJECT=$(grep '^EPICURRENTS_PROJECT=' "$ENV_FILE" | cut -d= -f2 || true)
-if [[ -z "$CURRENT_PROJECT" ]]; then
-    echo "Error: EPICURRENTS_PROJECT not set in $ENV_FILE" >&2
+# Set KEY=VALUE in FILE: replace the line where the key is present, append it
+# where it is not, and create the file if it does not exist. A key missing from
+# the file would otherwise leave the edit silently undone.
+set_env_key() {
+    local file="$1" key="$2" value="$3" escaped
+    touch "$file"
+    if grep -q "^${key}=" "$file"; then
+        # Escape sed replacement-string metacharacters in the value. Without
+        # this, `&` expands to the matched text and `\` is treated as an escape;
+        # `|` is escaped too because it is the delimiter below.
+        escaped=$(printf '%s' "$value" | sed -e 's/[\\&|]/\\&/g')
+        sed_inplace "s|^${key}=.*|${key}=${escaped}|" "$file"
+    else
+        printf '%s=%s\n' "$key" "$value" >> "$file"
+    fi
+}
+
+if [[ ! -f "$ENV_FILE" ]]; then
+    echo "Error: $ENV_FILE not found" >&2
     exit 1
 fi
+
+# Read current project from .env. Blank or absent means the base platform with
+# no project active, which is a valid state to switch from.
+CURRENT_PROJECT=$(grep '^EPICURRENTS_PROJECT=' "$ENV_FILE" | cut -d= -f2- || true)
 
 if [[ "$CURRENT_PROJECT" == "$NEW_PROJECT" ]]; then
     echo "Project is already '$NEW_PROJECT' — nothing to do."
     exit 0
 fi
 
-echo "==> Switching project: $CURRENT_PROJECT → $NEW_PROJECT"
+echo "==> Switching project: ${CURRENT_PROJECT:-(none)} → $NEW_PROJECT"
 echo ""
 
 # 1. Ensure db and redis are running (idempotent)
@@ -60,21 +79,18 @@ $COMPOSE stop web celery celery-beat || true
 echo ""
 
 # 3. Deactivate current project against PostgreSQL
-echo "--- Step 3/6: Deactivating project '$CURRENT_PROJECT'..."
-$COMPOSE run --rm --no-deps web python manage.py deactivate_project
+if [[ -n "$CURRENT_PROJECT" ]]; then
+    echo "--- Step 3/6: Deactivating project '$CURRENT_PROJECT'..."
+    $COMPOSE run --rm --no-deps web python manage.py deactivate_project
+else
+    echo "--- Step 3/6: No project active — nothing to deactivate."
+fi
 echo ""
 
-# 4. Update .env files (portable in-place sed — see sed_inplace above)
-# Escape sed replacement-string metacharacters in the project name. Without
-# this, `&` expands to the matched text and `\` is treated as an escape,
-# corrupting .env for projects whose names contain either character. `|` is
-# escaped too because it's the delimiter used in the s|...|...| commands
-# below.
-NEW_PROJECT_ESCAPED=$(printf '%s' "$NEW_PROJECT" | sed -e 's/[\\&|]/\\&/g')
-
+# 4. Update .env files
 echo "--- Step 4/6: Updating environment files..."
-sed_inplace "s|^EPICURRENTS_PROJECT=.*|EPICURRENTS_PROJECT=${NEW_PROJECT_ESCAPED}|" "$ENV_FILE"
-sed_inplace "s|^VITE_PROJECT=.*|VITE_PROJECT=${NEW_PROJECT_ESCAPED}|" "$FRONTEND_ENV"
+set_env_key "$ENV_FILE" EPICURRENTS_PROJECT "$NEW_PROJECT"
+set_env_key "$FRONTEND_ENV" VITE_PROJECT "$NEW_PROJECT"
 echo "    .env:          EPICURRENTS_PROJECT=${NEW_PROJECT}"
 echo "    frontend/.env: VITE_PROJECT=${NEW_PROJECT}"
 echo ""

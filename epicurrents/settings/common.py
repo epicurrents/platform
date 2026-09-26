@@ -170,7 +170,7 @@ CELERY_BEAT_SCHEDULE = {
     "ingest-pooled-submissions": {
         "task": "recordings.tasks.ingest_pooled_submissions",
         # Hourly. Takes every accepted submission older than
-        # RECORDINGS_SUBMISSION_POOLING_DELAY_HOURS across all batches, in
+        # RECORDINGS_SUBMISSION_POOLING_DELAY_HOURS across all ledgers, in
         # random order. Returns at once where nothing is waiting, which is
         # every deployment without a registered ingest profile.
         "schedule": 60 * 60,
