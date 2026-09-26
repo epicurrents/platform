@@ -86,7 +86,7 @@ by default and carries no content until the operator opts in.
 |---|---|
 | Access (Art. 15) | `manage.py export_user --username <name>` produces a plain-text document covering every relation to the user model; the classification is validated at `manage.py check`. Operator-run, not self-service — verifying the requester is the subject is not a software problem. See [user/README.md](../user/README.md#subject-access-export-gdpr-art-15). |
 | Rectification (Art. 16) | Profile PATCH (`/api/v1/user/me`); recording `display_name` PATCH; annotation CRUD. |
-| Erasure (Art. 17) | Accounts: `erase_user` (inventory dry run, file unlinks, session flush, cascade, audit-trail tombstoning). Recordings/media/library: trash + purge pipelines. Audit trail: tombstone + re-seal design keeps the integrity chain verifiable — see [activity/README.md](../activity/README.md#subject-erasure-gdpr-art-17). |
+| Erasure (Art. 17) | Accounts: `erase_user` (inventory dry run, file unlinks, session flush, cascade, audit-trail tombstoning). Recordings/media/library: trash + purge pipelines. Audit trail: tombstone + re-seal design keeps the integrity chain verifiable — see [activity/README.md](../activity/README.md#subject-erasure-gdpr-art-17). Submission-pool members: `purge_dataset_recordings` on the hash from the contributor's receipt. |
 | Restriction (Art. 18) | Soft-delete (trash) restricts visibility while preserving data during the retention window. |
 | Portability (Art. 20) | Authors download their recordings raw; annotations/events/labels have per-type `/mine` JSON endpoints. `manage.py export_user --format json` gives the machine-readable form. |
 | Transparency (Art. 13/14) | [privacy-notice-template.md](privacy-notice-template.md) — two notices, since account holders are Art. 13 and recording subjects are Art. 14 with a source-disclosure duty. Software-determined facts are filled in; controller identity, lawful basis, transfer mechanisms and retention overrides are `[FILL]` markers the operator completes, and the conditional blocks are keyed to the setting that enables each feature. Publishing it is the operator's step, and the platform has no page that serves it — see [Known gaps](#known-gaps). |
@@ -139,6 +139,8 @@ Operator runbook for an Art. 17 request from an account holder:
 For recording subjects, the equivalent is trashing the recording (or the
 operator deleting it) and letting the purge task complete after the retention
 window; preserved originals follow step 3.
+
+A recording in a submission pool has no owner to trash it: it is authored by the system user and joined to no contributor. Its withdrawal is `purge_dataset_recordings <sha256>`, keyed on the SHA-256 of the file as submitted. The contributor holds that hash on the receipt the viewer handed back at acceptance, and nothing else does, since the submission is dithered and a re-export gives other bytes. A request that arrives without the receipt cannot be fulfilled for a pooled recording, which the answer to the requester should say.
 
 ## Known gaps
 

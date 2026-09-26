@@ -59,8 +59,14 @@ declare module '@epicurrents/core/dist/types' {
         sidecar?: boolean
         submit(file: SignalExportFile): Promise<SignalExportTargetResult>
     }
+    interface SignalExportReceipt {
+        data: string
+        fileName: string
+        mimeType: string
+    }
     interface SignalExportTargetResult {
         message: string
+        receipt?: SignalExportReceipt
         success: boolean
     }
 }

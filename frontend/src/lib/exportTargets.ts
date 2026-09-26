@@ -14,6 +14,7 @@
 import type {
     SignalExportConstraints,
     SignalExportFile,
+    SignalExportReceipt,
     SignalExportTarget,
     SignalExportTargetResult,
 } from '@epicurrents/core/dist/types'
@@ -51,6 +52,39 @@ export interface SubmissionTargetOptions {
 async function sha256Hex(data: ArrayBuffer): Promise<string> {
     const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', data))
     return Array.from(digest, (byte) => byte.toString(16).padStart(2, '0')).join('')
+}
+
+/**
+ * The receipt for a file a pool accepted. It names the file by the SHA-256 of the bytes sent, which is the one
+ * reference withdrawal from a pool is keyed on: the platform keeps no record of who submitted a recording, and a
+ * submission is dithered, so exporting the recording again does not reproduce the hash. The contributor is the only
+ * holder of the reference, which is why it is handed to them rather than kept anywhere.
+ * @param pool - The pool that accepted the file.
+ * @param sha256 - Hex SHA-256 of the bytes sent.
+ */
+export function submissionReceipt(pool: SubmissionPool, sha256: string): SignalExportReceipt {
+    const lines = [
+        t('Submission receipt', SCOPE),
+        '',
+        t('Pool: {name}', SCOPE, { name: pool.name }),
+        t('Pool reference: {hash}', SCOPE, { hash: pool.dataset_hash }),
+        // The day only: the receipt may be forwarded whole, and an exact time could be matched to a ledger's.
+        t('Submitted on: {date}', SCOPE, { date: new Date().toISOString().slice(0, 10) }),
+        t('Recording reference (SHA-256 of the submitted file): {hash}', SCOPE, { hash: sha256 }),
+        '',
+        t(
+            'Keep this receipt. To withdraw the recording from the pool, give the recording reference to the ' +
+                'operator of this service. The reference is the only way to find the recording: the service does ' +
+                'not record who submitted it, and exporting the recording again gives a different reference.',
+            SCOPE,
+        ),
+        '',
+    ]
+    return {
+        data: lines.join('\n'),
+        fileName: `submission-receipt-${sha256.slice(0, 12)}.txt`,
+        mimeType: 'text/plain',
+    }
 }
 
 /**
@@ -130,10 +164,12 @@ export function createSubmissionTarget(
         constraints: { ...constraints, ...(options.constraints ?? {}) },
         format: 'edf',
         label: options.label ?? t('Submission pool: {name}', SCOPE, { name: pool.name }),
-        options: { deidentify: true, deidentifySidecar: true, embedFooter: false },
+        // Dithered, so the submitted bytes cannot be found by re-encoding a copy of the original; see the receipt.
+        options: { deidentify: true, deidentifySidecar: true, dither: true, embedFooter: false },
         sidecar: true,
         async submit(file: SignalExportFile): Promise<SignalExportTargetResult> {
             let sidecar: Record<string, unknown> = {}
+            let sha256 = ''
             try {
                 sidecar = file.sidecar ? JSON.parse(file.sidecar) : {}
                 if (options.extendSidecar) {
@@ -141,7 +177,8 @@ export function createSubmissionTarget(
                 }
                 // Inside the guard: `crypto.subtle` exists only in a secure context, so on a
                 // deployment served over plain HTTP the hash cannot be declared.
-                sidecar[DECLARED_HASH_KEY] = await sha256Hex(file.data)
+                sha256 = await sha256Hex(file.data)
+                sidecar[DECLARED_HASH_KEY] = sha256
             } catch (error) {
                 return {
                     message: t('The sidecar could not be prepared: {reason}', SCOPE, {
@@ -166,6 +203,7 @@ export function createSubmissionTarget(
                 if (result.accepted) {
                     return {
                         message: t('Accepted. The recording joins the pool at the next pooled ingest.', SCOPE),
+                        receipt: submissionReceipt(pool, sha256),
                         success: true,
                     }
                 }

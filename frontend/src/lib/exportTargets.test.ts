@@ -118,7 +118,7 @@ describe('createSubmissionTarget', () => {
         const target = createSubmissionTarget(makePool())!
         expect(target.format).toBe('edf')
         expect(target.sidecar).toBe(true)
-        expect(target.options).toEqual({ deidentify: true, deidentifySidecar: true, embedFooter: false })
+        expect(target.options).toEqual({ deidentify: true, deidentifySidecar: true, dither: true, embedFooter: false })
     })
 
     it('is labelled by the pool unless the host names it', () => {
@@ -141,9 +141,29 @@ describe('createSubmissionTarget', () => {
             extendSidecar: (sidecar) => ({ ...sidecar, recording_sha256: 'forged', band: 'A2' }),
         })!
         const result = await target.submit({ data: bytes, sidecar: JSON.stringify({ version: '1.0' }) })
-        expect(result).toEqual({ message: 'Accepted. The recording joins the pool at the next pooled ingest.', success: true })
+        expect(result).toMatchObject({
+            message: 'Accepted. The recording joins the pool at the next pooled ingest.',
+            success: true,
+        })
         expect(mockSubmit.mock.calls[0][0]).toBe('f'.repeat(32))
         expect(await sentSidecar()).toEqual({ version: '1.0', band: 'A2', recording_sha256: sha256 })
+    })
+
+    it('hands back a receipt naming the file by the hash of the bytes sent', async () => {
+        // Withdrawal is keyed on this hash alone, and a dithered export cannot reproduce it.
+        mockSubmit.mockResolvedValue({ accepted: true })
+        const result = await createSubmissionTarget(makePool())!.submit({ data: bytes, sidecar: '{}' })
+        expect(result.receipt).toMatchObject({ fileName: `submission-receipt-${sha256.slice(0, 12)}.txt`, mimeType: 'text/plain' })
+        expect(result.receipt!.data).toContain(sha256)
+        expect(result.receipt!.data).toContain('f'.repeat(32))
+        // The day, never the time: a forwarded receipt must not carry a timestamp to match against a ledger.
+        expect(result.receipt!.data).not.toMatch(/\d{2}:\d{2}/)
+    })
+
+    it('hands back no receipt for a refused file', async () => {
+        mockSubmit.mockResolvedValue({ accepted: false, violations: [{ code: 'duration', message: 'Wrong length.' }] })
+        const result = await createSubmissionTarget(makePool())!.submit({ data: bytes, sidecar: '{}' })
+        expect(result.receipt).toBeUndefined()
     })
 
     it('sends nothing when the host declines to extend the sidecar, and reports its reason as written', async () => {
