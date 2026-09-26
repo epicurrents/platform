@@ -244,6 +244,45 @@ Built on F and G, in the edu repository, after the platform has its profile and 
 
 The release side, the embargo attestation and the at-least-one-event rule remain, and are listed in the project's dataset note.
 
+### H2. Configuring a submission pool (planned 2026-09-26)
+
+**Why.** A deployment without shell access has to be able to set up a pool, and today only part of it is in the UI. The dataset page's edit dialog has the release-gated switch and a submission-group picker. Nothing ties a profile to a dataset, so a contributor may open a batch under any registered profile, and nothing but the API opens one.
+
+**Terms.** A *pool* is a release-gated dataset fed through the submission gate. A *ledger* is one contributor's record for one pool: who submitted, under which profile, and how many files are pending, failed or ingested. It is the target of their audit rows, which is what keeps the contributor unjoinable from any one recording. It is storage for nothing. Today it is `SubmissionBatch`, renamed `SubmissionLedger` in this step. Files wait in two places, neither of them the ledger:
+- the *spool*, for the pooling delay, before ingest turns them into recordings;
+- as *unreleased members* of the pool, until their *equivalence class* holds k recordings from m contributors and a release run publishes it.
+
+The equivalence class is the unit of release; a ledger never is.
+
+**Model.** A pool is four fields on `Dataset`:
+- `release_gated`
+- `submission_profile`, the key of the registered profile, new
+- `submission_group`, made one-to-one
+- `submissions_open`, new, which replaces nulling the group as the way to close intake
+
+A ledger takes its profile from the dataset.
+
+**Rules, enforced by the API and shown by the UI.**
+- A pool is configured on an empty dataset only (no members).
+- Once *filling*, meaning a file has been accepted into any of its ledgers, the profile and the group cannot change and the gate cannot be turned off. Intake can still be closed and reopened. The pool cannot be dissolved, and the dataset cannot be deleted while it has members; withdrawal goes through the purge path.
+- Before it fills, a pool can be dissolved. This removes the configuration and its group.
+
+**The group is dedicated.**
+- The platform creates it when the pool is configured, and it belongs to that pool alone.
+- It grants nothing else: an `AccessRight` targeting it is refused, a project role on it is refused, and it cannot be deleted while its pool exists.
+- A system check reports a pool group that has acquired a grant or a role through any other path.
+- Membership is managed on the existing group admin page, which shows that the group feeds a pool and hides its role selectors.
+
+**Screens.**
+- **Dataset page, "Submission pool" section.** Visible to the author and superusers, in three states:
+  - *Not a pool:* a "Make this a submission pool" action, disabled with its reason on a non-empty dataset. It opens a dialog to choose a profile from the registered profiles, with a summary of each (channels, rate, durations).
+  - *Configured:* the profile, a link to the group, the intake switch and "Dissolve pool".
+  - *Filling:* the same, with the profile and gate read-only and marked as locked, and totals of pending, ingested and failed files, never per contributor.
+  - The release-gated switch stays for datasets that are not pools, where uploads join through a release run.
+- **Group admin page.** The pool banner, and no role selectors on a pool group.
+- **Contributor side.** `GET /submissions/pools` lists the open pools the caller may submit to, with their public profiles, and the project frontend registers a viewer target per pool. The target posts to `POST /submissions/pools/{dataset}/files`. The server resolves the caller's ledger for that pool, creating it with their first accepted file. The frontend never opens, lists or names a ledger, and the contributor never learns one exists. One ledger per contributor per pool is enough: the audit trail needs a target that is not a recording, and "never one batch alone" is carried by the m contributors a class needs before release.
+- **Release runs.** Unchanged: the existing maintenance operation. The class function and selector are the next slice.
+
 ### What the anonymisation work still leaves open on the platform
 
 The phased plan in [anonymisation-compliance-plan.md](anonymisation-compliance-plan.md) is shipped through Phase 8. What remains on the platform side of that plan, and of this note, is small and listed here so it is not lost; the ROADMAP's privacy and recordings sections carry the longer list of adjacent items, which are not part of this plan.
