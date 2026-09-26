@@ -28,7 +28,8 @@ See AGENTS.md → *Load-bearing files* before modifying.  The contract
 tests in ``recordings/tests/test_edf_processor.py::TestRewriteEdfHeader``
 assert each PHI-removal byte explicitly (``test_patient_field_blanked``,
 ``test_recording_field_blanked``, ``test_start_date_replaced``,
-``test_start_time_zeroed``) plus EDF+C/EDF+D marker preservation, BDF
+``test_start_time_zeroed``) plus the EDF+C/EDF+D marker (kept only with an
+annotation signal), BDF
 binary version byte, ASCII cleaning, and data-records-untouched
 invariants.
 
@@ -44,7 +45,8 @@ Processing steps
 1. Parse the file header leniently (non-fatal field errors are skipped).
 2. Scan annotation channels (TAL format) to extract embedded text events and
    detect data gaps in discontinuous recordings.
-3. Rewrite the header in-place to strict EDF+/BDF+ compliance:
+3. Rewrite the header in-place to strict EDF/BDF compliance:
+   - EDF+/BDF+ marker kept only when the file has an annotation signal.
    - All text fields cleaned to 7-bit ASCII.
    - Full de-identification of patient and recording fields.
    - Recording date/time replaced with the EDF+ de-identification convention.
@@ -287,7 +289,7 @@ def wall_clock_to_data_position(onset: float, gaps: GapMap) -> float:
 # ``recordings/tests/test_deidentification_record.py`` pins a digest of their
 # source against this value, so the bump cannot be forgotten, and the report
 # command flags every recording written by an older pass.
-DEIDENTIFICATION_VERSION = 1
+DEIDENTIFICATION_VERSION = 2
 
 
 @dataclass
@@ -1547,7 +1549,10 @@ def reorder_edf_channels(path: Path, header: EdfHeader, signal_infos: list[EdfSi
 
 
 def _build_clean_header(header: EdfHeader, signal_infos: list[EdfSignalInfo]) -> bytes:
-    """Assemble a strictly EDF+/BDF+ compliant, de-identified header bytestring.
+    """Assemble a strictly spec-compliant, de-identified header bytestring.
+
+    The EDF+/BDF+ marker is written only when *signal_infos* carries an annotation
+    signal, which the plus formats require; any other file stays plain EDF or BDF.
 
     De-identification rules (EDF+ spec §2.1.3.1 / BDF equivalent):
     - Patient field  → ``"X X X X"`` (code sex birthdate name all unknown).
@@ -1591,9 +1596,14 @@ def _build_clean_header(header: EdfHeader, signal_infos: list[EdfSignalInfo]) ->
     hdr_bytes_bytes = _pad(str(hdr_bytes_value), _FW_HEADER_BYTES)
 
     # ── Reserved / EDF+ marker ────────────────────────────────────────────
+    # The plus marker promises an annotation signal (EDF+ spec §2.1.3.1), so a file
+    # without one stays plain: marking it EDF+C produces a file strict readers refuse.
     fmt_upper = base_format.upper()
-    continuity = "D" if header.discontinuous else "C"
-    reserved_str = f"{fmt_upper}+{continuity}"
+    if any(s.is_annotation_channel for s in signal_infos):
+        continuity = "D" if header.discontinuous else "C"
+        reserved_str = f"{fmt_upper}+{continuity}"
+    else:
+        reserved_str = ""
     reserved_bytes = _pad(reserved_str, _FW_RESERVED)
 
     # ── Record count, duration, signal count ──────────────────────────────

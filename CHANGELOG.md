@@ -8,6 +8,10 @@ Entries are written for the person deciding whether to upgrade, so the ones that
 
 ## [Unreleased]
 
+### Fixed
+
+- **A plain EDF or BDF is stored as plain EDF or BDF.** The de-identification pass marked every stored file `EDF+C` (or `BDF+C`) whether it had an annotation signal or not, and the plus formats require one, so every plain upload, every converted file and every pooled submission was stored as a file strict EDF readers refuse. The marker is now written only with an annotation signal. `DEIDENTIFICATION_VERSION` is 2; recordings written by version 1 keep the wrong marker until re-ingested, and `deidentification_report` flags them. [recordings/README.md → De-identification](recordings/README.md#de-identification).
+
 ### Changed
 
 - **`register_ingest_profile` refuses a profile naming a channel no file can carry.** The gate compares a channel's canonical label where the platform resolves one, so a profile channel the resolver maps elsewhere (`Chin` to `EMG/Chin`, `Fz-Cz` to `Fz`, `T3` to `T7`) refused every submission, as did one longer than the 16 printable ASCII characters an EDF label holds. Registration now raises `ValueError` naming the channels, which stops the boot of a project registering one; name them as the platform resolves them.

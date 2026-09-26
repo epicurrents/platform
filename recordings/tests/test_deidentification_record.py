@@ -48,6 +48,7 @@ from recordings.tests.test_edf_processor import _make_edfplus_file
 # existing version to a new digest, since recordings stamped with it were written by the old code.
 PINNED_SOURCE_DIGESTS = {
     1: "0a9d581ddfab1a3f05ffd1f7b024feff1ae13a4a38302c6173b2f3707d67b4a0",
+    2: "742540826cb2490ebfb2dbcd4677ccc1223a14c0eb44270b770e013736d5b79c",
 }
 
 SECRET = b"Seizure onset, patient Doe"
