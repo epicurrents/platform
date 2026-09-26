@@ -142,6 +142,8 @@ The operator-facing entry point is the [`erase_user` management command](../user
 
 Complementing retroactive erasure, `serialize_instance` masks registered credential fields *before* they reach any audit payload: the value is replaced by `"<masked:<digest12>>"`, a truncated SHA-256 of the stored value. Equal secrets mask identically (no phantom diffs), changed secrets produce a visible-but-opaque diff. Registered via `register_masked_fields` from the owning app's `ready()`: the user's `password` hash and the push subscription's `p256dh` / `auth` keys. Rollback skips masked sentinels so restoring an old state never clobbers a live secret with the placeholder string.
 
+A digest hides a value only from someone who does not hold it. Where the same value is recorded elsewhere in the trail, a digest of it is a join, so `register_masked_fields(..., withhold=True)` writes the constant `"<masked:withheld>"` instead. A withheld field leaves no diff when it changes, which suits fields fixed at creation. `registered_masked_fields` answers for both. The submission file row is the one user: its hash and size are the pooled recording's own, which that recording's trail rows carry in the clear ([recordings/README.md](../recordings/README.md)).
+
 Session rows are excluded from audit tracking entirely (`EXCLUDED_MODELS` in [signals.py](signals.py)): auditing them would write `session_key` — a live bearer credential — into the permanent trail on every login.
 
 ## Derived-row digests
@@ -702,7 +704,7 @@ If a project model needs to be excluded from auto-logging (e.g. an ephemeral cac
 Two registries exist for personal-data handling, both called from `AppConfig.ready()` (see [Subject erasure](#subject-erasure-gdpr-art-17)):
 
 - `activity.erasure.register_subject_pii` — declare which of the project model's audited fields carry a user's personal data, so `erase_subject` scrubs them on an Art. 17 request.
-- `activity.audit.register_masked_fields` — declare credential fields that must never reach the audit trail in the clear.
+- `activity.audit.register_masked_fields` — declare credential fields that must never reach the audit trail in the clear; `withhold=True` for fields whose digest would be a join.
 
 Field names in both are the **serialized attnames** `serialize_instance` writes, so a foreign key is `user_id` rather than `user`. Getting one wrong used to be free: a bad model label makes `erase_subject` skip the spec, a bad `owner_field` matches no rows, and a bad `pii_fields` entry is never found — all three leaving the erasure summary reporting zero for the model, which is what a legitimately clean run reports too. [activity/checks.py](checks.py) closes that with a Django system check validating every registration against the real model, so a typo fails `manage.py check` rather than surfacing as an unfulfillable erasure request months later.
 

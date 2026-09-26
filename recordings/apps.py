@@ -68,12 +68,18 @@ class RecordingsConfig(AppConfig):
         # writing to the permanent trail what a single upload does not.
         register_masked_fields("recordings.importjob", {"source_path"})
         register_masked_fields("recordings.importjobfile", {"relative_path", "error"})
-        # A submission file's declared hash becomes Recording.file_hash at ingest
-        # and its sidecar is what the profile's ingest callable writes from, so
-        # either one in the permanent trail is a join from a recording back to
-        # the ledger and its contributor. The live row is deleted once ingested;
-        # the trail must not keep what the row gives up. `error` may quote paths.
-        register_masked_fields("recordings.submissionfile", {"file_hash", "sidecar", "error"})
+        # A submission file's declared hash becomes Recording.file_hash at ingest,
+        # its size is the recording's size and its sidecar is what the recording's
+        # labels are written from, so any of them in the permanent trail joins a
+        # recording back to the ledger and its contributor. The live row is deleted
+        # once ingested; the trail must not keep what the row gives up. They are
+        # withheld rather than masked: the recording's own trail rows carry the
+        # hash and the size in the clear, and a mask is a digest recomputable from
+        # them. `error` may quote paths and joins nothing, so a mask does.
+        register_masked_fields(
+            "recordings.submissionfile", {"file_hash", "file_size", "sidecar", "sidecar_hash"}, withhold=True
+        )
+        register_masked_fields("recordings.submissionfile", {"error"})
         # Art. 15: a ledger is the contributor's own activity record. It carries
         # the pool and the count; the sidecars and hashes are gone with the
         # file rows, so nothing of another subject is in it.

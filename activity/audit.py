@@ -88,11 +88,17 @@ def _json_safe(value):
 # apps register their own fields from AppConfig.ready() — see
 # user/apps.py and notifications/apps.py for the core registrations.
 _MASKED_FIELDS: dict[str, frozenset[str]] = {}
+# Fields replaced by one constant rather than a digest of their value. A digest is
+# recomputable by anyone holding the value, so it hides a value only from someone
+# who does not already have it; these fields are ones whose value exists elsewhere
+# in the trail, where a digest of it would be a join.
+_WITHHELD_FIELDS: dict[str, frozenset[str]] = {}
 
 MASK_PREFIX = "<masked:"
+WITHHELD_SENTINEL = f"{MASK_PREFIX}withheld>"
 
 
-def register_masked_fields(model_label: str, fields) -> None:
+def register_masked_fields(model_label: str, fields, *, withhold: bool = False) -> None:
     """Register credential fields of *model_label* for write-time masking.
 
     ``model_label`` is the lowercase ``app_label.model_name`` pair. Masking
@@ -100,8 +106,17 @@ def register_masked_fields(model_label: str, fields) -> None:
     reaches ``before_state`` / ``changes`` / the integrity hash, so secrets
     (password hashes, push-encryption keys) never persist in the audit trail
     while unequal secrets still produce a visible diff.
+
+    With ``withhold`` the fields are written as the constant
+    ``WITHHELD_SENTINEL`` instead. The digest is an unsalted hash of the value,
+    so it can be recomputed from a copy of the value held anywhere else, the
+    trail included; withhold a field whose value is also recorded under another
+    row that must not be joinable to this one. A change to a withheld field
+    leaves no diff. The two registrations are kept apart, so a model may mask
+    some fields and withhold others.
     """
-    _MASKED_FIELDS[model_label] = frozenset(fields)
+    registry = _WITHHELD_FIELDS if withhold else _MASKED_FIELDS
+    registry[model_label] = frozenset(fields)
 
 
 def registered_masked_fields(model_label: str) -> frozenset[str]:
@@ -114,9 +129,11 @@ def registered_masked_fields(model_label: str) -> frozenset[str]:
     covers both — a project registering a new credential field is excluded from
     the export without having to know the export exists.
 
+    Withheld fields are included, since they are the same class of field.
+
     Read-only; registration stays with :func:`register_masked_fields`.
     """
-    return _MASKED_FIELDS.get(model_label, frozenset())
+    return _MASKED_FIELDS.get(model_label, frozenset()) | _WITHHELD_FIELDS.get(model_label, frozenset())
 
 
 def _mask_value(value) -> str:
@@ -136,16 +153,20 @@ def serialize_instance(instance) -> dict:
     """Serialize concrete model fields to a dict suitable for audit storage.
 
     Fields registered via ``register_masked_fields`` are replaced by a masked
-    digest sentinel; empty values (``None``, ``""``) pass through unmasked
+    digest sentinel, or by ``WITHHELD_SENTINEL`` where registered with
+    ``withhold``; empty values (``None``, ``""``) pass through unmasked
     because they carry no secret material.
     """
 
     label = f"{instance._meta.app_label}.{instance._meta.model_name}"
     masked = _MASKED_FIELDS.get(label, frozenset())
+    withheld = _WITHHELD_FIELDS.get(label, frozenset())
     data = {}
     for field in instance._meta.concrete_fields:
         value = getattr(instance, field.attname)
-        if field.attname in masked and value:
+        if field.attname in withheld and value not in (None, ""):
+            data[field.attname] = WITHHELD_SENTINEL
+        elif field.attname in masked and value:
             data[field.attname] = _mask_value(value)
         else:
             data[field.attname] = _json_safe(value)

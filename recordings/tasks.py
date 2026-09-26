@@ -920,18 +920,26 @@ def ingest_pooled_submissions() -> dict:
 
     secrets.SystemRandom().shuffle(pending)
     ledger_count = len({item.ledger_id for item in pending})
-    ingested = failed = 0
+    ingested: list = []
+    failures: list = []
     with with_system_activity(
         "recordings.submission.ingest",
         interface=Activity.Interface.CELERY,
         metadata={"file_count": len(pending), "ledger_count": ledger_count},
     ):
+        # Two phases, so the trail cannot pair a recording with its file row. The first writes
+        # only recordings, in the shuffled order; the second writes every file row and ledger
+        # change of the run, in primary-key order, after the last recording. Were a file row's
+        # deletion or its ledger's count written beside the recording it became, the rows'
+        # adjacency in the trail would name the ledger of every recording, whatever the order.
         for item in pending:
-            if _ingest_submission_file(item):
-                ingested += 1
+            error = _ingest_submission_file(item)
+            if error is None:
+                ingested.append(item)
             else:
-                failed += 1
-    return {"ingested": ingested, "failed": failed}
+                failures.append((item, error))
+        _settle_ingested_files(ingested, failures)
+    return {"ingested": len(ingested), "failed": len(failures)}
 
 
 def _purge_failed_submissions() -> int:
@@ -962,24 +970,71 @@ def _purge_failed_submissions() -> int:
     return len(stale)
 
 
-def _ingest_submission_file(item) -> bool:
-    """Create the recording for one spooled submission inside the open scope; False when it failed."""
+def _settle_ingested_files(ingested: list, failures: list) -> None:
+    """Write the run's file-row and ledger changes after all of its recordings, in key order.
+
+    A failed row is marked ``failed`` with its error, each ledger's count moves once by the
+    number of its files ingested, and each ingested row is deleted. Should this not complete,
+    the rows it did not reach stay ``pending`` while their recordings exist and their bytes
+    have moved, so the next run marks them failed as missing and the purge retires them: a
+    ledger then under-counts, and no file is ingested twice.
+    """
+    from collections import Counter
+
+    from django.db import transaction
+
+    from recordings.models import SubmissionFile, SubmissionLedger
+
+    with transaction.atomic():
+        for item, error in sorted(failures, key=lambda pair: pair[0].pk):
+            item.status = SubmissionFile.Status.FAILED
+            item.error = error[:2000]
+            item.save(update_fields=["status", "error", "stored_name", "file_path"])
+        counts = Counter(item.ledger_id for item in ingested)
+        for ledger in SubmissionLedger.objects.select_for_update().filter(pk__in=counts).order_by("pk"):
+            ledger.ingested_count += counts[ledger.pk]
+            ledger.save(update_fields=["ingested_count"])
+        for item in sorted(ingested, key=lambda row: row.pk):
+            item.delete()
+
+
+def _fresh_stored_name(directory: Path, extension: str) -> str:
+    """A random stored name no file in *directory* and no recording already has."""
+    import secrets
+
+    from recordings.models import Recording
+
+    while True:
+        name = f"{secrets.token_hex(16).upper()}{extension}"
+        if not (directory / name).exists() and not Recording.objects.filter(stored_name=name).exists():
+            return name
+
+
+def _ingest_submission_file(item) -> str | None:
+    """Create the recording for one spooled submission inside the open scope.
+
+    Returns ``None`` on success and the error to record otherwise. Writes the recording and
+    its rows only; the file row and the ledger are left to :func:`_settle_ingested_files`.
+    The spooled bytes are renamed to a fresh stored name first, so the recording shares no
+    name or path with the file row, whose own trail rows keep the spool name.
+    """
     from django.db import transaction
 
     from epicurrents.models import AccessRight
     from epicurrents.system_user import get_system_user
     from library.models import DatasetItem
     from recordings.container import save_viewer_sidecar
-    from recordings.models import Recording, SubmissionFile, stored_original_name
+    from recordings.models import Recording, stored_original_name
     from recordings.submissions import get_ingest_profile
 
-    ledger = item.ledger
-    pool = ledger.dataset
+    pool = item.ledger.dataset
     profile = get_ingest_profile(pool.submission_profile)
+    spooled = Path(item.file_path)
+    renamed: Path | None = None
     try:
         if profile is None:
             raise RuntimeError(f"Ingest profile {pool.submission_profile!r} is no longer registered")
-        if not Path(item.file_path).exists():
+        if not spooled.exists():
             raise FileNotFoundError("The spooled file is missing")
         if pool.deleted_at is not None or not pool.release_gated or not pool.submission_profile:
             # Nothing may enter a trashed dataset, and an ungated one would publish
@@ -987,16 +1042,19 @@ def _ingest_submission_file(item) -> bool:
             # the pool was open.
             raise RuntimeError("The ledger's dataset is no longer a release-gated submission pool")
         system_user = get_system_user()
+        stored_name = _fresh_stored_name(spooled.parent, item.file_extension)
+        renamed = spooled.with_name(stored_name)
+        os.replace(spooled, renamed)
         with transaction.atomic():
             recording = Recording.objects.create(
                 author=system_user,
-                # The spool name, never a client filename: nothing personal reaches the
+                # A fresh name, never a client filename: nothing personal reaches the
                 # author-private field either, and the discard override still applies.
-                original_name=stored_original_name(item.stored_name, item.file_extension),
-                stored_name=item.stored_name,
+                original_name=stored_original_name(stored_name, item.file_extension),
+                stored_name=stored_name,
                 file_extension=item.file_extension,
                 file_size=item.file_size,
-                file_path=item.file_path,
+                file_path=str(renamed),
                 file_hash=item.file_hash,
                 content_hash="",
                 status=Recording.Status.PENDING,
@@ -1018,19 +1076,22 @@ def _ingest_submission_file(item) -> bool:
             save_viewer_sidecar(recording, item.sidecar, discard_text=True)
             if profile.ingest is not None:
                 profile.ingest(recording, item.sidecar)
-            # Several files of one ledger share the run; re-read the count rather
-            # than trusting the instance loaded with the file row.
-            ledger.refresh_from_db(fields=["ingested_count"])
-            ledger.ingested_count += 1
-            ledger.save(update_fields=["ingested_count"])
-            item.delete()
             recording_id = recording.pk
             transaction.on_commit(lambda: process_recording.delay(recording_id))
     except Exception as exc:
         logger.exception("ingest_pooled_submissions: submission %s failed", item.stored_name)
-        # The atomic block rolled the row back to pending; mark it for the operator.
-        item.status = SubmissionFile.Status.FAILED
-        item.error = f"{type(exc).__name__}: {exc}"[:2000]
-        item.save(update_fields=["status", "error"])
-        return False
-    return True
+        if renamed is not None and renamed.exists():
+            # The recording was rolled back; put the bytes back where the file row says they are.
+            # A failure here must not end the run before its rows are settled. The row follows the
+            # bytes instead, so the purge still finds them; the fresh name joins nothing, since the
+            # recording that would have carried it was rolled back.
+            try:
+                os.replace(renamed, spooled)
+            except OSError:
+                logger.warning(
+                    "ingest_pooled_submissions: could not restore %s; the row now points at %s", spooled, renamed
+                )
+                item.stored_name = renamed.name
+                item.file_path = str(renamed)
+        return f"{type(exc).__name__}: {exc}"
+    return None

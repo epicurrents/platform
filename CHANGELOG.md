@@ -10,6 +10,7 @@ Entries are written for the person deciding whether to upgrade, so the ones that
 
 ### Fixed
 
+- **The permanent trail no longer joins a pooled recording to its ledger.** The pooled ingest reused the file row's stored name for the recording, masked the file row's hash with a digest the recording's own trail row recomputes, and wrote each file row's deletion beside the recording it became. The recording now gets a fresh stored name, the file row's hash, size, sidecar and sidecar hash are withheld from the trail, and the run writes its file-row and ledger changes after all of its recordings. `register_masked_fields` gained `withhold=True` for fields whose digest would be such a join. [recordings/README.md → Submissions](recordings/README.md#submissions).
 - **A plain EDF or BDF is stored as plain EDF or BDF.** The de-identification pass marked every stored file `EDF+C` (or `BDF+C`) whether it had an annotation signal or not, and the plus formats require one, so every plain upload, every converted file and every pooled submission was stored as a file strict EDF readers refuse. The marker is now written only with an annotation signal. `DEIDENTIFICATION_VERSION` is 2; recordings written by version 1 keep the wrong marker until re-ingested, and `deidentification_report` flags them. [recordings/README.md → De-identification](recordings/README.md#de-identification).
 
 ### Changed

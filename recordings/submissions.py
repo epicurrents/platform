@@ -12,7 +12,7 @@ written test still green. The endpoint contract is the other half: a refused sub
 no row and no file. Contract tests are in ``recordings/tests/test_submissions.py`` (``TestGate``
 pins each check, including the blank fields against the de-identifier's actual output,
 ``TestPoolEndpoints`` the write-nothing refusal and the ledger as the audit target,
-``TestPooledIngest`` the random order, the system author and the masked trail).
+``TestPooledIngest`` the random order and the system author, ``TestPooledIngestTrail`` the unjoinable trail).
 
 A pooled dataset cannot trust an arriving file the way an upload trusts its author: the
 file was prepared elsewhere against a published profile, and a file that departs from the

@@ -24,6 +24,7 @@ from django.test import Client
 from django.utils import timezone
 
 from activity.models import Activity, ObjectChangeLog
+from activity.system_activity import with_system_activity
 from epicurrents.models import AccessRight
 from epicurrents.permissions import can_read_object
 from epicurrents.system_user import get_system_user
@@ -557,6 +558,89 @@ def _spooled(pool_fixture, spool, *, age_hours=48, sidecar_extra=None, ledger=No
     return row
 
 
+def _trail_strings(payload) -> set[str]:
+    """Every string leaf of an audit payload long enough to identify something."""
+    if isinstance(payload, dict):
+        return set().union(*(_trail_strings(v) for v in payload.values())) if payload else set()
+    if isinstance(payload, list):
+        return set().union(*(_trail_strings(v) for v in payload)) if payload else set()
+    return {payload} if isinstance(payload, str) and len(payload) >= 12 else set()
+
+
+class TestPooledIngestTrail:
+    """The permanent trail must not join a pooled recording to its ledger.
+
+    Each test runs three files from two ledgers, so a join would have something to pick
+    between; with one file per run the run itself is the join, which the compliance
+    document records as the operator-level residual.
+    """
+
+    @pytest.fixture
+    def run(self, pool, spool, make_user, django_capture_on_commit_callbacks):
+        dataset, _contributor, group = pool
+        other = make_user()
+        other.groups.add(group)
+        # Accepted under an audited scope, as the endpoint does, so the trail holds each file
+        # row's creation as well as its deletion.
+        with with_system_activity("tests.submission.accept", interface=Activity.Interface.COMMAND):
+            other_ledger = SubmissionLedger.objects.create(dataset=dataset, contributor=other)
+            rows = [_spooled(pool, spool), _spooled(pool, spool, ledger=other_ledger), _spooled(pool, spool)]
+        with django_capture_on_commit_callbacks(execute=False):
+            assert ingest_pooled_submissions() == {"ingested": 3, "failed": 0}
+        return rows, Activity.objects.get(verb="recordings.submission.ingest")
+
+    @staticmethod
+    def _rows(model: str):
+        return ObjectChangeLog.objects.filter(content_type__app_label="recordings", content_type__model=model)
+
+    def test_no_file_or_ledger_row_carries_a_value_of_a_recording(self, run):
+        from activity.audit import _mask_value
+
+        recording_side = set()
+        for change in self._rows("recording"):
+            for value in _trail_strings(change.before_state) | _trail_strings(change.changes or {}):
+                recording_side |= {value, _mask_value(value)}
+        for recording in Recording.objects.all():
+            recording_side |= {recording.stored_name, recording.file_path, recording.file_hash}
+        ledger_side = set()
+        for change in self._rows("submissionfile") | self._rows("submissionledger"):
+            ledger_side |= _trail_strings(change.before_state) | _trail_strings(change.changes or {})
+        assert ledger_side
+        assert not recording_side & ledger_side
+
+    def test_the_joining_file_fields_are_withheld_not_masked(self, run):
+        from activity.audit import WITHHELD_SENTINEL
+
+        rows, _activity = run
+        states = [change.before_state for change in self._rows("submissionfile")]
+        assert len(states) == 2 * len(rows)
+        for state in states:
+            for field in ("file_hash", "file_size", "sidecar", "sidecar_hash"):
+                assert state[field] == WITHHELD_SENTINEL
+            assert state["error"] == ""
+
+    def test_file_and_ledger_rows_follow_every_recording_of_the_run(self, run):
+        _rows, activity = run
+        models = list(
+            ObjectChangeLog.objects.filter(activity=activity)
+            .order_by("pk")
+            .values_list("content_type__model", flat=True)
+        )
+        settled = [i for i, model in enumerate(models) if model in ("submissionfile", "submissionledger")]
+        recordings = [i for i, model in enumerate(models) if model == "recording"]
+        assert len(recordings) == 3
+        assert len(settled) == 3 + 2
+        assert max(recordings) < min(settled)
+        # Key order, not arrival or shuffle order.
+        file_ids = [
+            int(change.object_id)
+            for change in ObjectChangeLog.objects.filter(
+                activity=activity, content_type__model="submissionfile"
+            ).order_by("pk")
+        ]
+        assert file_ids == sorted(file_ids)
+
+
 class TestPooledIngest:
     def test_nothing_waiting(self):
         assert ingest_pooled_submissions() == {"ingested": 0, "failed": 0}
@@ -592,9 +676,12 @@ class TestPooledIngest:
 
         recording = Recording.objects.get()
         assert recording.author == get_system_user()
-        assert recording.stored_name == row.stored_name
+        # A fresh name: the recording names neither the spool file nor the file row.
+        assert recording.stored_name != row.stored_name
+        assert row.stored_name not in recording.file_path
+        assert recording.file_path == str(spool / recording.stored_name)
         assert recording.file_hash == row.file_hash
-        assert recording.original_name == row.stored_name
+        assert recording.original_name == recording.stored_name
         assert recording.display_name is None
         assert recording.status == Recording.Status.PENDING
         assert AccessRight.objects.filter(object_id=str(recording.pk), access_target=get_system_user()).exists()
@@ -632,9 +719,36 @@ class TestPooledIngest:
         assert ingest_pooled_submissions() == {"ingested": 0, "failed": 1}
         row.refresh_from_db()
         assert row.status == SubmissionFile.Status.FAILED
+        # The bytes renamed for the recording are put back under the row's own name.
+        assert [p.name for p in spool.iterdir()] == [row.stored_name]
         assert "ZeroDivisionError" in row.error
         assert Recording.objects.count() == 0
         assert SubmissionLedger.objects.get().ingested_count == 0
+
+    def test_a_failed_restore_leaves_the_row_pointing_at_the_bytes(self, pool, spool, monkeypatch):
+        # Both the ingest and the move back fail: the row must name the file where it lies,
+        # or the purge unlinks a path that no longer exists and orphans the bytes.
+        from recordings import tasks
+
+        register_ingest_profile(_profile(ingest=lambda recording, sidecar: 1 / 0))
+        row = _spooled(pool, spool)
+        real_replace = tasks.os.replace
+        calls = []
+
+        def replace(src, dst):
+            calls.append(src)
+            if len(calls) > 1:
+                raise OSError("restore refused")
+            real_replace(src, dst)
+
+        monkeypatch.setattr(tasks.os, "replace", replace)
+        assert ingest_pooled_submissions() == {"ingested": 0, "failed": 1}
+        monkeypatch.setattr(tasks.os, "replace", real_replace)
+        row.refresh_from_db()
+        assert row.status == SubmissionFile.Status.FAILED
+        assert row.stored_name != f"{1:032X}.edf"
+        assert [p.name for p in spool.iterdir()] == [row.stored_name]
+        assert row.file_path == str(spool / row.stored_name)
 
     def test_missing_profile_or_file_fails_that_submission_only(self, pool, spool, django_capture_on_commit_callbacks):
         good = _spooled(pool, spool)

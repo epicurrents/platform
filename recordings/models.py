@@ -516,13 +516,15 @@ class SubmissionFile(models.Model):
     ``sidecar`` is the validated sidecar document, handed to the profile's
     ``ingest`` callable when the recording is created. ``file_hash`` is the
     digest the sidecar declared and the server verified; it is also
-    ``Recording.file_hash`` after ingest, which is why both it and the sidecar
-    are masked out of the audit trail (``recordings.apps``) and the row is
-    deleted once ingested: kept, the pair would be a join from a recording
-    back to its ledger.
+    ``Recording.file_hash`` after ingest, as ``file_size`` is the recording's
+    size. The four values that recur on the recording's side (the hash, the
+    size, the sidecar and its hash) are withheld from the audit trail
+    (``recordings.apps``), the recording is given a fresh stored name, and the
+    row is deleted once ingested: kept, any of them would be a join from a
+    recording back to its ledger.
 
     A row that fails ingest stays, with ``status`` ``failed`` and the error
-    text, for the operator; its recording exists as a hidden FAILED row.
+    text, for the operator; no recording is left, since the ingest rolls back.
     """
 
     class Status(models.TextChoices):
