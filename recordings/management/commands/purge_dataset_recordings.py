@@ -10,6 +10,13 @@ whether a hash exists; no endpoint answers that question to any role. It is also
 Art. 17 path, since a pool's recordings belong to no platform user and account erasure never
 reaches them.
 
+A file still in a pool's spool, waiting for the pooling delay or for the pool's contributors, is
+matched by the same hash (``SubmissionFile.file_hash``) and purged the same way, so a withdrawal
+works whenever it arrives; the report does not say which stage a file was at. Spool rows are
+deleted first, under the row lock the pooled ingest takes before it creates a recording, so a
+withdrawal racing an ingest run either removes the file before it becomes a recording or finds the
+recording it became.
+
 Scope is members of release-gated datasets only, trashed ones included, so a centre's withdrawal
 cannot remove a platform user's own recording that happens to share the bytes; a match outside the
 scope is reported as not found. The originals preservation volume is never touched, as nowhere in
@@ -32,11 +39,12 @@ from pathlib import Path
 
 from django.contrib.contenttypes.models import ContentType
 from django.core.management.base import BaseCommand, CommandError
+from django.db import transaction
 
 from activity.models import Activity
 from activity.system_activity import with_system_activity
 from library.models import Dataset, DatasetItem
-from recordings.models import Recording
+from recordings.models import Recording, SubmissionFile
 
 STATUS_PURGED = "purged"
 STATUS_NOT_FOUND = "not found"
@@ -94,6 +102,7 @@ class Command(BaseCommand):
                 raise CommandError(f"Dataset {dataset.object_hash} is not release-gated")
 
         scope = _member_pks(dataset)
+        self._dataset = dataset
         rows: list[dict] = []
         if options["dry_run"]:
             for value in submitted:
@@ -106,7 +115,7 @@ class Command(BaseCommand):
                 metadata={"submitted_count": len(submitted)},
             ):
                 for value in submitted:
-                    rows.append(self._purge(value, scope))
+                    rows.append(self._purge(value))
 
         counts: dict[str, int] = {}
         for row in rows:
@@ -126,22 +135,47 @@ class Command(BaseCommand):
     def _matches(digest: str, scope: set[int]) -> list[Recording]:
         return list(Recording.objects.filter(file_hash__iexact=digest, pk__in=scope).order_by("pk"))
 
+    def _spooled(self, digest: str):
+        """Spool rows of release-gated pools (or of the given dataset) submitted as *digest*."""
+        rows = SubmissionFile.objects.filter(file_hash__iexact=digest, ledger__dataset__release_gated=True)
+        if self._dataset is not None:
+            rows = rows.filter(ledger__dataset=self._dataset)
+        return rows
+
     def _examine(self, value: str, scope: set[int]) -> dict:
         digest = _normalise(value)
         if digest is None:
             return {"hash": value.strip(), "status": STATUS_INVALID, "count": 0}
-        matches = self._matches(digest, scope)
-        status = STATUS_PURGED if matches else STATUS_NOT_FOUND
-        return {"hash": digest, "status": status, "count": len(matches)}
+        count = len(self._matches(digest, scope)) + self._spooled(digest).count()
+        status = STATUS_PURGED if count else STATUS_NOT_FOUND
+        return {"hash": digest, "status": status, "count": count}
 
-    def _purge(self, value: str, scope: set[int]) -> dict:
+    def _purge_spooled(self, digest: str) -> tuple[int, int]:
+        """Unlink and delete the spool rows matching *digest*; returns (found, purged)."""
+        found = purged = 0
+        with transaction.atomic():
+            for item in self._spooled(digest).select_for_update().order_by("pk"):
+                found += 1
+                try:
+                    Path(item.file_path).unlink(missing_ok=True)
+                except OSError as exc:
+                    self.stderr.write(f"Could not unlink spooled submission {item.pk}: {exc}")
+                    continue
+                item.delete()
+                purged += 1
+        return found, purged
+
+    def _purge(self, value: str) -> dict:
         digest = _normalise(value)
         if digest is None:
             return {"hash": value.strip(), "status": STATUS_INVALID, "count": 0}
-        matches = self._matches(digest, scope)
-        if not matches:
+        # The spool first: its lock is what an ingest run holding this file waits behind or finds gone. The
+        # membership is read after it, so a recording an ingest run committed meanwhile is in scope.
+        spooled_found, spooled_purged = self._purge_spooled(digest)
+        matches = self._matches(digest, _member_pks(self._dataset))
+        if not matches and not spooled_found:
             return {"hash": digest, "status": STATUS_NOT_FOUND, "count": 0}
-        purged = 0
+        purged = spooled_purged
         for recording in matches:
             file_path = Path(recording.file_path) if recording.file_path else None
             try:
@@ -154,6 +188,6 @@ class Command(BaseCommand):
                 continue
             recording.delete()
             purged += 1
-        if purged < len(matches):
+        if purged < len(matches) + spooled_found:
             return {"hash": digest, "status": STATUS_ERROR, "count": purged}
         return {"hash": digest, "status": STATUS_PURGED, "count": purged}

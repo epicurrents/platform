@@ -801,6 +801,12 @@ RECORDINGS_SUBMISSION_SPOOL_PATH = config("RECORDINGS_SUBMISSION_SPOOL_PATH", de
 RECORDINGS_SUBMISSION_FAILED_RETENTION_DAYS = config(
     "RECORDINGS_SUBMISSION_FAILED_RETENTION_DAYS", default=30, cast=int
 )
+# A pool whose profile sets m holds its files in the spool until m contributors have one ingested
+# or waiting. A file of a pool still short of m after this long is unlinked and its row deleted,
+# so a pool that never fills does not keep its contributors' files indefinitely.
+RECORDINGS_SUBMISSION_WAITING_RETENTION_DAYS = config(
+    "RECORDINGS_SUBMISSION_WAITING_RETENTION_DAYS", default=180, cast=int
+)
 
 # ──────────────────────────────────────────────────────────────────────────────
 # External login — OpenID Connect (Microsoft Entra ID).

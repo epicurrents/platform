@@ -27,8 +27,10 @@ from library.release import (
     eligibility_cutoff,
     eligible_items,
     member_hidden_from_reader,
+    register_equivalence_class,
     register_release_selector,
     release_month_for,
+    select_by_class_size,
     unreleased_member_ids,
 )
 from recordings.models import Recording
@@ -449,6 +451,54 @@ class TestCadence:
         dataset, items = _gated_dataset(author, august, september, failed, trashed)
         eligible = eligible_items(dataset, as_of=date(2026, 10, 1))
         assert [item.pk for item in eligible] == [items[0].pk]
+
+
+class TestClassSize:
+    """``select_by_class_size``: publish an eligible member once its class holds k recordings."""
+
+    @pytest.fixture(autouse=True)
+    def _classes(self):
+        # A recording's class is its display name; an empty name is unclassified.
+        register_equivalence_class(lambda recording: recording.display_name or None)
+        yield
+        register_equivalence_class(None)
+
+    def test_a_class_below_k_waits_and_one_at_k_is_published(self, make_user):
+        author = make_user()
+        small = _recording(author, index=0, display_name="small")
+        big = [_recording(author, index=n, display_name="big") for n in (1, 2, 3)]
+        dataset, items = _gated_dataset(author, small, *big)
+        selected = select_by_class_size(dataset, items, k=3)
+        assert [item.pk for item in selected] == [item.pk for item in items[1:]]
+
+    def test_released_members_count_towards_the_class(self, make_user):
+        author = make_user()
+        released = [_recording(author, index=n, display_name="c") for n in (0, 1)]
+        newcomer = _recording(author, index=2, display_name="c")
+        dataset, items = _gated_dataset(author, *released, newcomer)
+        _release(dataset, *items[:2])
+        assert [item.pk for item in select_by_class_size(dataset, [items[2]], k=3)] == [items[2].pk]
+
+    def test_a_trashed_released_member_no_longer_counts(self, make_user):
+        author = make_user()
+        released = [_recording(author, index=n, display_name="c") for n in (0, 1)]
+        newcomer = _recording(author, index=2, display_name="c")
+        dataset, items = _gated_dataset(author, *released, newcomer)
+        _release(dataset, *items[:2])
+        Recording.objects.filter(pk=released[0].pk).update(deleted_at=datetime.now(UTC))
+        assert select_by_class_size(dataset, [items[2]], k=3) == []
+
+    def test_unclassified_members_are_never_selected(self, make_user):
+        author = make_user()
+        members = [_recording(author, index=n, display_name="") for n in (0, 1)]
+        dataset, items = _gated_dataset(author, *members)
+        assert select_by_class_size(dataset, items, k=1) == []
+
+    def test_nothing_is_selected_without_a_class_function(self, make_user):
+        register_equivalence_class(None)
+        author = make_user()
+        dataset, items = _gated_dataset(author, _recording(author, index=0, display_name="c"))
+        assert select_by_class_size(dataset, items, k=1) == []
 
 
 class TestReleaseCommand:

@@ -262,6 +262,10 @@ export interface DatasetPool {
     configurable: boolean
     failed_count: number
     /** A file has been accepted from a contributor: the profile, group and gate are fixed. */
+    /** Active members of the contributor group. */
+    contributor_count: number
+    /** The profile's m: the contributor count intake needs before it opens; null when the profile sets none. */
+    contributors_required: number | null
     filling: boolean
     group_id: number | null
     group_name: string | null

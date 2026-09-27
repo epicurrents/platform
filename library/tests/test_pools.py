@@ -110,6 +110,8 @@ class TestConfigure:
             "pending_count": 0,
             "failed_count": 0,
             "ingested_count": 0,
+            "contributor_count": 0,
+            "contributors_required": None,
         }
         body = _configure(client, dataset)
         group = Group.objects.get(pk=body["group_id"])
@@ -185,6 +187,27 @@ class TestIntakeAndProfile:
 
     def test_not_a_pool(self, author, dataset):
         assert patch_json(_client(author), _pool_url(dataset), {"open": True}).status_code == 409
+
+    def test_intake_opens_only_once_the_group_has_m_active_members(self, author, dataset, make_user):
+        register_ingest_profile(IngestProfile(key="test.pool", m=2))
+        client = _client(author)
+        _configure(client, dataset)
+        state = client.get(_pool_url(dataset)).json()
+        assert (state["contributor_count"], state["contributors_required"]) == (0, 2)
+        dataset.submission_group.user_set.add(make_user(), make_user(is_active=False))
+        response = patch_json(client, _pool_url(dataset), {"open": True})
+        assert response.status_code == 409
+        assert "at least 2" in response.json()["detail"]
+        dataset.submission_group.user_set.add(make_user())
+        assert patch_json(client, _pool_url(dataset), {"open": True}).json()["open"] is True
+        assert patch_json(client, _pool_url(dataset), {"open": False}).json()["open"] is False
+
+    def test_closing_is_never_refused(self, author, dataset, make_user):
+        client = _client(author)
+        _configure(client, dataset)
+        assert patch_json(client, _pool_url(dataset), {"open": True}).json()["open"] is True
+        register_ingest_profile(IngestProfile(key="test.pool", m=5))
+        assert patch_json(client, _pool_url(dataset), {"open": False}).json()["open"] is False
 
 
 class TestDissolve:

@@ -68,6 +68,26 @@ const filesSummary = computed(() => {
         pending: pool.value.pending_count,
     })
 })
+const contributorsSummary = computed(() => {
+    if (!pool.value) {
+        return ''
+    }
+    if (pool.value.contributors_required === null) {
+        return t('{count} members', SCOPE, { count: pool.value.contributor_count })
+    }
+    return t('{count} members · {required} needed to open intake', SCOPE, {
+        count: pool.value.contributor_count,
+        required: pool.value.contributors_required,
+    })
+})
+// Opening is refused below the profile's m; closing never is, so an open pool keeps its switch.
+const intakeBlocked = computed(() => {
+    const current = pool.value
+    if (!current || current.open || current.contributors_required === null) {
+        return false
+    }
+    return current.contributor_count < current.contributors_required
+})
 const selectedProfile = computed(() => profiles.value.find(profile => profile.key === configureInput.profile) ?? null)
 
 function setPool (next: DatasetPool, changed = true) {
@@ -242,6 +262,7 @@ onMounted(load)
                         {{ pool.group_name }}
                     </router-link>
                     <span v-else>{{ pool.group_name }}</span>
+                    <span class="dataset-pool__quiet">{{ contributorsSummary }}</span>
                 </dd>
                 <dt>{{ t('Release gate', SCOPE) }}</dt>
                 <dd>
@@ -253,9 +274,12 @@ onMounted(load)
                     <dd>{{ filesSummary }}</dd>
                 </template>
             </dl>
-            <wa-switch :disabled="intakeSaving" size="s" v-wa="[intake, 'open']">
+            <wa-switch :disabled="intakeSaving || intakeBlocked" size="s" v-wa="[intake, 'open']">
                 {{ t('Accept submissions', SCOPE) }}
             </wa-switch>
+            <p v-if="intakeBlocked" class="dataset-pool__hint">
+                {{ t('Intake opens once the contributor group has {required} active members, so that no single contributor makes up the pool.', SCOPE, { required: pool.contributors_required }) }}
+            </p>
             <p class="dataset-pool__hint">
                 {{ t('Members of the group can send files only while intake is open. Closing it leaves files already accepted to be ingested.', SCOPE) }}
             </p>
@@ -363,6 +387,10 @@ onMounted(load)
     display: flex;
     gap: var(--wa-space-xs);
     margin: 0;
+}
+
+.dataset-pool__quiet {
+    color: var(--wa-color-text-quiet);
 }
 
 .dataset-pool__form {

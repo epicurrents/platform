@@ -105,6 +105,13 @@ class IngestProfile:
     ingest transaction, after the platform has written the sidecar's events, interruptions and
     coded labels, and writes whatever else the project derives from it. Both are optional. ``forbidden_sidecar_keys`` extends the default set;
     it cannot shrink it.
+
+    ``k`` and ``m`` are the pool's release conditions. ``k`` is the smallest equivalence class a release run publishes
+    from, applied by the project's selector (``library.release.select_by_class_size``); ``m`` is the number of active
+    members the pool's contributor group must have before intake opens (``library.pools.set_intake``). ``m`` is a
+    condition on the pool rather than on each class because counting distinct contributors per class means holding
+    which contributor fed which class, and beside the ingest runs that joins a recording back to its ledger. Both are
+    recorded on every release run.
     """
 
     key: str
@@ -120,6 +127,8 @@ class IngestProfile:
     forbidden_sidecar_keys: tuple[str, ...] = ()
     validate_sidecar: Callable[[dict], list[Violation]] | None = field(default=None, compare=False)
     ingest: Callable[[Any, dict], None] | None = field(default=None, compare=False)
+    k: int | None = None
+    m: int | None = None
 
     @property
     def all_forbidden_sidecar_keys(self) -> frozenset[str]:
@@ -138,10 +147,15 @@ def register_ingest_profile(profile: IngestProfile) -> None:
     to do so repeatedly.
 
     A profile naming a channel no file can carry is refused here, at boot, rather than by
-    refusing every submission later: see :func:`unsatisfiable_channels`.
+    refusing every submission later: see :func:`unsatisfiable_channels`. So is a ``k`` or ``m``
+    that is not a positive integer, which no release run or intake check could apply.
     """
     if not profile.key or not profile.key.replace("_", "").replace("-", "").replace(".", "").isalnum():
         raise ValueError(f"Ingest profile key {profile.key!r} must be a non-empty identifier.")
+    for name in ("k", "m"):
+        value = getattr(profile, name)
+        if value is not None and (isinstance(value, bool) or not isinstance(value, int) or value < 1):
+            raise ValueError(f"Ingest profile {profile.key!r} has {name}={value!r}; it must be a positive integer.")
     unsatisfiable = unsatisfiable_channels(profile)
     if unsatisfiable:
         raise ValueError(

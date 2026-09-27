@@ -10,6 +10,7 @@ The rules, in the order a pool meets them:
 
 * A pool is configured on an empty dataset only. Its members must all have passed the same gate, and a member
   that arrived another way carries whatever its uploader's site left in it.
+* Intake opens only once the contributor group has as many active members as the profile's ``m``.
 * Before it fills, the profile may change and the pool may be dissolved, which removes the configuration and the
   group and turns the gate off.
 * Once filling, the profile, the group and the gate are fixed: every member was checked against them. Intake can
@@ -133,11 +134,37 @@ def configure_pool(dataset: Any, profile_key: str) -> Group:
     return group
 
 
+def contributor_count(dataset: Any) -> int:
+    """The active members of the pool's contributor group: who could submit, not who has."""
+    group = getattr(dataset, "submission_group", None)
+    if group is None:
+        return 0
+    return group.user_set.filter(is_active=True).count()
+
+
+def required_contributors(dataset: Any) -> int | None:
+    """The profile's ``m``, the contributor count intake needs before it opens, or ``None`` when it sets none."""
+    from recordings.submissions import get_ingest_profile
+
+    profile = get_ingest_profile(getattr(dataset, "submission_profile", "") or "")
+    return profile.m if profile is not None else None
+
+
 def set_intake(dataset: Any, open_: bool) -> None:
-    """Open or close the pool to new submissions. Allowed in every state; files already accepted are unaffected."""
+    """Open or close the pool to new submissions. Allowed in every state; files already accepted are unaffected.
+
+    Opening is refused while the contributor group has fewer active members than the profile's ``m``. The pool's
+    contributor mix is a condition on the pool, not on each equivalence class, since counting contributors per class
+    would join a recording back to its ledger; the release gate counts k per class. The check applies when intake
+    opens: a member leaving later does not close it.
+    """
     _lock(dataset)
     if not is_pool(dataset):
         raise PoolError(409, "The dataset is not a submission pool.")
+    if open_:
+        required = required_contributors(dataset)
+        if required is not None and contributor_count(dataset) < required:
+            raise PoolError(409, f"The contributor group needs at least {required} active members before intake opens.")
     dataset.submissions_open = bool(open_)
     dataset.save(update_fields=["submissions_open"])
 

@@ -1560,6 +1560,9 @@ class PoolOut(Schema):
     pending_count: int
     failed_count: int
     ingested_count: int
+    # Active members of the contributor group, and the profile's m that intake needs before it opens (null: none).
+    contributor_count: int
+    contributors_required: int | None
 
 
 class PoolIn(Schema):
@@ -1594,6 +1597,8 @@ def _pool_out(dataset: Dataset) -> dict:
             "pending_count": 0,
             "failed_count": 0,
             "ingested_count": 0,
+            "contributor_count": 0,
+            "contributors_required": None,
         }
     totals = pools.pool_totals(dataset)
     group = dataset.submission_group
@@ -1607,6 +1612,8 @@ def _pool_out(dataset: Dataset) -> dict:
         "pending_count": totals["pending"],
         "failed_count": totals["failed"],
         "ingested_count": totals["ingested"],
+        "contributor_count": pools.contributor_count(dataset),
+        "contributors_required": pools.required_contributors(dataset),
     }
 
 

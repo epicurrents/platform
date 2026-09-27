@@ -12,7 +12,7 @@ order; either regressing reinstates the arrival timing the pool exists to hide. 
 eligible from the run at the start of M+2, one regime for backlog and new submissions alike, so
 the release month says nothing about which kind a recording is. Contract
 tests are in ``library/tests/test_release.py`` (``TestMemberGate``, ``TestRecordingSurfaces``,
-``TestDatasetSurfaces``, ``TestCadence``, ``TestReleaseCommand``); the assessment that depends on
+``TestDatasetSurfaces``, ``TestCadence``, ``TestClassSize``, ``TestReleaseCommand``); the assessment that depends on
 them is ``docs/anonymisation-compliance.md``.
 
 A release-gated dataset (``Dataset.release_gated``) is a pool whose members must not surface one
@@ -36,7 +36,8 @@ Releases run on a monthly cadence: a member uploaded in month M is eligible from
 start of M+2, so every member waits between one and two months and a month's submissions from
 every contributor surface together. The cadence is the platform's; which eligible members a run
 publishes is the project's, through :func:`register_release_selector`. Without a selector a run
-publishes everything eligible. The equivalence classes the anonymity report counts are the
+publishes everything eligible. :func:`select_by_class_size` is the class-size condition a selector
+builds on: an eligible member is published once its equivalence class holds k recordings. The equivalence classes the anonymity report counts are the
 project's too, through :func:`register_equivalence_class`; the reports themselves are in
 :mod:`library.reports`.
 """
@@ -305,7 +306,7 @@ def register_release_selector(selector: ReleaseSelector | None) -> None:
 
     The selector is called as ``selector(dataset, eligible, as_of=date)`` with the
     cadence-eligible unreleased members and returns a :class:`ReleaseDecision`. This is where
-    a project applies its own conditions: equivalence-class size, contributor mix, embargo
+    a project applies its own conditions: equivalence-class size (:func:`select_by_class_size`), embargo
     attestation, curator veto. One selector per deployment; registering a second replaces the
     first, since a dataset pool has one release policy.
     """
@@ -397,6 +398,55 @@ def deidentification_versions_of(items: list[DatasetItem]) -> list[int]:
         "deidentification_version", flat=True
     )
     return sorted({int(v) for v in versions if v is not None})
+
+
+def select_by_class_size(dataset: Dataset, eligible: list[DatasetItem], *, k: int) -> list[DatasetItem]:
+    """The eligible members whose equivalence class holds at least *k* recordings once this run publishes.
+
+    A class is counted over the pool as released and still readable (released, not trashed,
+    READY) plus the eligible members in it, so a class that reached k earlier takes new members one
+    at a time and one that has not waits until enough are eligible together. The class of a member
+    is the registered function's key in its string form, the same key the anonymity report sizes,
+    so the k a run records and the k the report finds agree. Unclassified members, and members that
+    are not recordings, are never selected; without a registered function nothing is. A building
+    block for a project's selector, which still decides what else a release needs.
+    """
+    from recordings.models import Recording
+
+    fn = equivalence_class_function()
+    if fn is None:
+        return []
+    recording_ct = ContentType.objects.get_for_model(Recording, for_concrete_model=False)
+    released_ids = list(
+        DatasetItem.objects.filter(dataset=dataset, content_type=recording_ct, release__isnull=False).values_list(
+            "object_id", flat=True
+        )
+    )
+    eligible_ids = [item.object_id for item in eligible if item.content_type_id == recording_ct.pk]
+    readable = Recording.objects.filter(deleted_at__isnull=True, status=Recording.Status.READY)
+    by_id = {
+        str(recording.pk): recording
+        for recording in readable.filter(pk__in=[int(pk) for pk in [*released_ids, *eligible_ids] if str(pk).isdigit()])
+    }
+
+    def class_of(object_id: str) -> str | None:
+        recording = by_id.get(str(object_id))
+        key = fn(recording) if recording is not None else None
+        return None if key is None else str(key)
+
+    sizes: dict[str, int] = {}
+    for object_id in [*released_ids, *eligible_ids]:
+        key = class_of(object_id)
+        if key is not None:
+            sizes[key] = sizes.get(key, 0) + 1
+    selected = []
+    for item in eligible:
+        if item.content_type_id != recording_ct.pk:
+            continue
+        key = class_of(item.object_id)
+        if key is not None and sizes[key] >= k:
+            selected.append(item)
+    return selected
 
 
 def decide_release(dataset: Dataset, *, as_of: date) -> tuple[list[DatasetItem], ReleaseDecision]:

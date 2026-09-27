@@ -2420,6 +2420,8 @@ export async function handleMock(
             return send(res, 200, {
                 configurable: !_state.datasetItems.some(i => i._parent_id === dsId),
                 failed_count: 0,
+                contributor_count: 0,
+                contributors_required: null,
                 filling: false,
                 group_id: null,
                 group_name: null,

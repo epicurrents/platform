@@ -890,10 +890,17 @@ def ingest_pooled_submissions() -> dict:
     on the submitted bytes as defence in depth. A file that fails to ingest keeps its row as
     ``failed`` with the error for the operator and is not retried.
 
+    A pool whose profile sets ``m`` is held until it has that many contributors: its files stay
+    in the spool while fewer than ``m`` of its ledgers have a file ingested or waiting, so the
+    run that first takes the pool's files takes them from ``m`` contributors, a file failing
+    at ingest aside. The count is the pool's, never a
+    class's, since contributors per class would join a recording to its ledger.
+
     Each run also retires failed rows older than ``RECORDINGS_SUBMISSION_FAILED_RETENTION_DAYS``,
-    unlinking the spooled bytes and deleting the row under ``recordings.submission.purge``, so a
-    contributor's file the platform could not ingest does not stay on disk indefinitely: the
-    operator has that long to read the error, and the contributor holds the file anyway.
+    and files of a held pool that have waited longer than
+    ``RECORDINGS_SUBMISSION_WAITING_RETENTION_DAYS``, unlinking the spooled bytes and deleting the
+    row under ``recordings.submission.purge``, so a contributor's file the platform could not or
+    did not ingest does not stay on disk indefinitely: the contributor holds the file anyway.
 
     Returns immediately when nothing is waiting, which is the case on every deployment
     without a registered ingest profile.
@@ -903,13 +910,15 @@ def ingest_pooled_submissions() -> dict:
     from recordings.models import SubmissionFile
 
     _purge_failed_submissions()
+    held = pools_short_of_contributors()
+    _retire_waiting_submissions(held)
 
     delay_hours = getattr(settings, "RECORDINGS_SUBMISSION_POOLING_DELAY_HOURS", 24)
     cutoff = timezone.now() - timedelta(hours=delay_hours)
     pending = list(
-        SubmissionFile.objects.filter(status=SubmissionFile.Status.PENDING, received_at__lt=cutoff).select_related(
-            "ledger", "ledger__dataset"
-        )
+        SubmissionFile.objects.filter(status=SubmissionFile.Status.PENDING, received_at__lt=cutoff)
+        .exclude(ledger__dataset_id__in=held)
+        .select_related("ledger", "ledger__dataset")
     )
     if not pending:
         return {"ingested": 0, "failed": 0}
@@ -936,27 +945,86 @@ def ingest_pooled_submissions() -> dict:
             error = _ingest_submission_file(item)
             if error is None:
                 ingested.append(item)
-            else:
+            elif error is not _WITHDRAWN:
                 failures.append((item, error))
         _settle_ingested_files(ingested, failures)
     return {"ingested": len(ingested), "failed": len(failures)}
 
 
+#: What :func:`_ingest_submission_file` returns for a file withdrawn while the run held it: neither ingested nor failed.
+_WITHDRAWN = "withdrawn"
+
+
+def pools_short_of_contributors() -> set[int]:
+    """Primary keys of the pools whose profile sets ``m`` and that have fewer than ``m`` contributors.
+
+    A contributor is a ledger with a file ingested or waiting in the spool; a ledger whose every
+    file failed contributed nothing. A pool whose profile is no longer registered is not held here:
+    its files fail at ingest, which is the existing answer to a profile gone missing.
+    """
+    from django.db.models import Exists, OuterRef, Q
+
+    from recordings.models import SubmissionFile, SubmissionLedger
+    from recordings.submissions import get_ingest_profile
+
+    waiting = SubmissionFile.objects.filter(ledger=OuterRef("pk"), status=SubmissionFile.Status.PENDING)
+    contributing = SubmissionLedger.objects.filter(Q(ingested_count__gt=0) | Exists(waiting)).values_list(
+        "dataset_id", "dataset__submission_profile"
+    )
+    counts: dict[int, int] = {}
+    profiles: dict[int, str] = {}
+    for dataset_id, profile_key in contributing:
+        counts[dataset_id] = counts.get(dataset_id, 0) + 1
+        profiles[dataset_id] = profile_key
+    held: set[int] = set()
+    for dataset_id, count in counts.items():
+        profile = get_ingest_profile(profiles[dataset_id] or "")
+        if profile is not None and profile.m is not None and count < profile.m:
+            held.add(dataset_id)
+    return held
+
+
 def _purge_failed_submissions() -> int:
     """Unlink and delete failed submission rows past the retention window; returns how many."""
-    from activity.models import Activity
-    from activity.system_activity import with_system_activity
     from recordings.models import SubmissionFile
 
     retention_days = getattr(settings, "RECORDINGS_SUBMISSION_FAILED_RETENTION_DAYS", 30)
     cutoff = timezone.now() - timedelta(days=retention_days)
     stale = list(SubmissionFile.objects.filter(status=SubmissionFile.Status.FAILED, received_at__lt=cutoff))
+    return _retire_submissions(stale, reason="failed", retention_days=retention_days)
+
+
+def _retire_waiting_submissions(held: set[int]) -> int:
+    """Unlink and delete files of the held pools that have waited past the waiting window; returns how many.
+
+    The hold is otherwise open-ended: a pool that never reaches its ``m`` would keep its
+    contributors' files on disk indefinitely, bytes nobody reads and nobody could release.
+    """
+    from recordings.models import SubmissionFile
+
+    if not held:
+        return 0
+    retention_days = getattr(settings, "RECORDINGS_SUBMISSION_WAITING_RETENTION_DAYS", 180)
+    cutoff = timezone.now() - timedelta(days=retention_days)
+    stale = list(
+        SubmissionFile.objects.filter(
+            status=SubmissionFile.Status.PENDING, received_at__lt=cutoff, ledger__dataset_id__in=held
+        )
+    )
+    return _retire_submissions(stale, reason="waiting", retention_days=retention_days)
+
+
+def _retire_submissions(stale: list, *, reason: str, retention_days: int) -> int:
+    """Unlink each file in *stale* and delete its row under ``recordings.submission.purge``; returns how many."""
+    from activity.models import Activity
+    from activity.system_activity import with_system_activity
+
     if not stale:
         return 0
     with with_system_activity(
         "recordings.submission.purge",
         interface=Activity.Interface.CELERY,
-        metadata={"count": len(stale), "retention_days": retention_days},
+        metadata={"count": len(stale), "reason": reason, "retention_days": retention_days},
     ):
         for item in stale:
             # File first: a row that outlives its bytes is a dead pointer, bytes that
@@ -964,7 +1032,7 @@ def _purge_failed_submissions() -> int:
             try:
                 Path(item.file_path).unlink(missing_ok=True)
             except OSError:
-                logger.warning("ingest_pooled_submissions: could not unlink failed submission %s", item.stored_name)
+                logger.warning("ingest_pooled_submissions: could not unlink retired submission %s", item.stored_name)
                 continue
             item.delete()
     return len(stale)
@@ -986,6 +1054,14 @@ def _settle_ingested_files(ingested: list, failures: list) -> None:
     from recordings.models import SubmissionFile, SubmissionLedger
 
     with transaction.atomic():
+        # A row withdrawn by purge_dataset_recordings during the run is gone; neither saved nor deleted again.
+        present = set(
+            SubmissionFile.objects.filter(pk__in=[item.pk for item in ingested] + [item.pk for item, _ in failures])
+            .select_for_update()
+            .values_list("pk", flat=True)
+        )
+        ingested = [item for item in ingested if item.pk in present]
+        failures = [(item, error) for item, error in failures if item.pk in present]
         for item, error in sorted(failures, key=lambda pair: pair[0].pk):
             item.status = SubmissionFile.Status.FAILED
             item.error = error[:2000]
@@ -1010,13 +1086,23 @@ def _fresh_stored_name(directory: Path, extension: str) -> str:
             return name
 
 
+class _Withdrawn(Exception):
+    """The file row was deleted by a withdrawal between the run's read and its transaction."""
+
+
 def _ingest_submission_file(item) -> str | None:
     """Create the recording for one spooled submission inside the open scope.
 
-    Returns ``None`` on success and the error to record otherwise. Writes the recording and
-    its rows only; the file row and the ledger are left to :func:`_settle_ingested_files`.
-    The spooled bytes are renamed to a fresh stored name first, so the recording shares no
-    name or path with the file row, whose own trail rows keep the spool name.
+    Returns ``None`` on success, :data:`_WITHDRAWN` for a file withdrawn meanwhile, and the error
+    to record otherwise. Writes the recording and its rows only; the file row and the ledger are
+    left to :func:`_settle_ingested_files`. The spooled bytes are renamed to a fresh stored name
+    first, so the recording shares no name or path with the file row, whose own trail rows keep
+    the spool name.
+
+    The transaction locks the file row before writing anything. ``purge_dataset_recordings``
+    deletes a matching spool row under the same lock before it looks for recordings, so a
+    withdrawal racing the run either removes the row first, and this file is discarded, or
+    waits for the recording and then finds it.
     """
     from django.db import transaction
 
@@ -1024,7 +1110,7 @@ def _ingest_submission_file(item) -> str | None:
     from epicurrents.system_user import get_system_user
     from library.models import DatasetItem
     from recordings.container import save_viewer_sidecar
-    from recordings.models import Recording, stored_original_name
+    from recordings.models import Recording, SubmissionFile, stored_original_name
     from recordings.submissions import get_ingest_profile
 
     pool = item.ledger.dataset
@@ -1046,6 +1132,8 @@ def _ingest_submission_file(item) -> str | None:
         renamed = spooled.with_name(stored_name)
         os.replace(spooled, renamed)
         with transaction.atomic():
+            if not SubmissionFile.objects.select_for_update().filter(pk=item.pk).exists():
+                raise _Withdrawn()
             recording = Recording.objects.create(
                 author=system_user,
                 # A fresh name, never a client filename: nothing personal reaches the
@@ -1078,6 +1166,14 @@ def _ingest_submission_file(item) -> str | None:
                 profile.ingest(recording, item.sidecar)
             recording_id = recording.pk
             transaction.on_commit(lambda: process_recording.delay(recording_id))
+    except _Withdrawn:
+        # The row went with the withdrawal; the bytes it pointed at go too.
+        if renamed is not None:
+            try:
+                renamed.unlink(missing_ok=True)
+            except OSError:
+                logger.warning("ingest_pooled_submissions: could not unlink withdrawn submission %s", renamed.name)
+        return _WITHDRAWN
     except Exception as exc:
         logger.exception("ingest_pooled_submissions: submission %s failed", item.stored_name)
         if renamed is not None and renamed.exists():

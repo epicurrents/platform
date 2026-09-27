@@ -15,6 +15,7 @@ import hashlib
 import itertools
 import json
 from datetime import timedelta
+from pathlib import Path
 
 import pytest
 from django.contrib.auth.models import Group
@@ -30,6 +31,7 @@ from epicurrents.permissions import can_read_object
 from epicurrents.system_user import get_system_user
 from library.models import Dataset, DatasetItem
 from maintenance.operations import get_operation
+from recordings import tasks
 from recordings.models import Recording, SubmissionFile, SubmissionLedger
 from recordings.processors.edf import _build_clean_header, parse_edf_header, parse_signal_infos
 from recordings.submissions import (
@@ -42,6 +44,7 @@ from recordings.submissions import (
     Violation,
     can_submit_to_dataset,
     get_ingest_profile,
+    public_profile,
     register_ingest_profile,
     reset_ingest_profiles,
     validate_file,
@@ -728,7 +731,6 @@ class TestPooledIngest:
     def test_a_failed_restore_leaves_the_row_pointing_at_the_bytes(self, pool, spool, monkeypatch):
         # Both the ingest and the move back fail: the row must name the file where it lies,
         # or the purge unlinks a path that no longer exists and orphans the bytes.
-        from recordings import tasks
 
         register_ingest_profile(_profile(ingest=lambda recording, sidecar: 1 / 0))
         row = _spooled(pool, spool)
@@ -779,7 +781,7 @@ class TestPooledIngest:
         assert SubmissionFile.objects.filter(pk=recent.pk, status=SubmissionFile.Status.FAILED).exists()
         assert (spool / recent.stored_name).exists()
         purge = Activity.objects.get(verb="recordings.submission.purge")
-        assert purge.metadata == {"count": 1, "retention_days": 30}
+        assert purge.metadata == {"count": 1, "reason": "failed", "retention_days": 30}
         assert ObjectChangeLog.objects.filter(activity=purge, action=ObjectChangeLog.ACTION_DELETE).count() == 1
 
     def test_closed_pool_fails_the_submission(self, pool, spool):
@@ -847,6 +849,116 @@ class TestPooledIngest:
         recording = Recording.objects.get()
         assert recording.status == Recording.Status.READY, recording.processing_error
         assert recording.stored_hash
+
+
+class TestContributorHold:
+    """A pool whose profile sets m ingests nothing until m of its ledgers have a file ingested or waiting."""
+
+    @staticmethod
+    def _second_ledger(pool_fixture, make_user):
+        dataset, _contributor, group = pool_fixture
+        other = make_user()
+        other.groups.add(group)
+        return SubmissionLedger.objects.create(dataset=dataset, contributor=other)
+
+    def test_a_pool_short_of_m_keeps_its_files_in_the_spool(self, pool, spool):
+        register_ingest_profile(_profile(m=2))
+        row = _spooled(pool, spool)
+        assert ingest_pooled_submissions() == {"ingested": 0, "failed": 0}
+        assert SubmissionFile.objects.filter(pk=row.pk, status=SubmissionFile.Status.PENDING).exists()
+        assert Path(row.file_path).exists()
+        assert Recording.objects.count() == 0
+
+    def test_the_mth_contributor_releases_the_hold_for_every_file(self, pool, spool, make_user):
+        register_ingest_profile(_profile(m=2))
+        _spooled(pool, spool)
+        _spooled(pool, spool, ledger=self._second_ledger(pool, make_user))
+        assert ingest_pooled_submissions() == {"ingested": 2, "failed": 0}
+        assert Recording.objects.count() == 2
+
+    def test_an_ingested_ledger_still_counts(self, pool, spool, make_user):
+        dataset, _contributor, _group = pool
+        register_ingest_profile(_profile(m=2))
+        earlier = self._second_ledger(pool, make_user)
+        SubmissionLedger.objects.filter(pk=earlier.pk).update(ingested_count=1)
+        _spooled(pool, spool)
+        assert ingest_pooled_submissions() == {"ingested": 1, "failed": 0}
+
+    def test_a_ledger_whose_files_all_failed_does_not_count(self, pool, spool, make_user):
+        register_ingest_profile(_profile(m=2))
+        failed = _spooled(pool, spool, ledger=self._second_ledger(pool, make_user))
+        SubmissionFile.objects.filter(pk=failed.pk).update(status=SubmissionFile.Status.FAILED)
+        _spooled(pool, spool)
+        assert ingest_pooled_submissions() == {"ingested": 0, "failed": 0}
+
+    def test_a_held_pool_does_not_hold_another(self, pool, spool, make_user):
+        register_ingest_profile(_profile(m=2))
+        register_ingest_profile(_profile(key="other.pool"))
+        other_group = Group.objects.create(name="Other contributors")
+        other = Dataset.objects.create(
+            author=make_user(),
+            name="Other pool",
+            release_gated=True,
+            submission_profile="other.pool",
+            submission_group=other_group,
+            submissions_open=True,
+        )
+        contributor = make_user()
+        contributor.groups.add(other_group)
+        _spooled(pool, spool)
+        _spooled((other, contributor, other_group), spool)
+        assert ingest_pooled_submissions() == {"ingested": 1, "failed": 0}
+        assert DatasetItem.objects.get().dataset == other
+
+    def test_a_file_waiting_past_the_window_is_retired(self, pool, spool, settings):
+        settings.RECORDINGS_SUBMISSION_WAITING_RETENTION_DAYS = 10
+        register_ingest_profile(_profile(m=2))
+        stale = _spooled(pool, spool, age_hours=11 * 24)
+        fresh = _spooled(pool, spool, age_hours=9 * 24)
+        ingest_pooled_submissions()
+        assert not SubmissionFile.objects.filter(pk=stale.pk).exists()
+        assert not Path(stale.file_path).exists()
+        assert SubmissionFile.objects.filter(pk=fresh.pk).exists()
+        purge = Activity.objects.get(verb="recordings.submission.purge")
+        assert purge.metadata == {"count": 1, "reason": "waiting", "retention_days": 10}
+
+    def test_an_unheld_pool_never_retires_a_waiting_file(self, pool, spool, settings):
+        settings.RECORDINGS_SUBMISSION_WAITING_RETENTION_DAYS = 10
+        settings.RECORDINGS_SUBMISSION_POOLING_DELAY_HOURS = 24 * 365
+        row = _spooled(pool, spool, age_hours=11 * 24)
+        ingest_pooled_submissions()
+        assert SubmissionFile.objects.filter(pk=row.pk).exists()
+
+
+class TestWithdrawalDuringIngest:
+    def test_a_row_withdrawn_before_the_transaction_leaves_no_recording_and_no_bytes(self, pool, spool):
+        row = _spooled(pool, spool)
+        item = SubmissionFile.objects.select_related("ledger", "ledger__dataset").get(pk=row.pk)
+        SubmissionFile.objects.filter(pk=row.pk).delete()
+        assert tasks._ingest_submission_file(item) == tasks._WITHDRAWN
+        assert Recording.objects.count() == 0
+        assert not any(spool.iterdir())
+
+    def test_settling_skips_a_row_withdrawn_during_the_run(self, pool, spool):
+        ingested = _spooled(pool, spool)
+        failed = _spooled(pool, spool)
+        SubmissionFile.objects.filter(pk__in=[ingested.pk, failed.pk]).delete()
+        tasks._settle_ingested_files([ingested], [(failed, "boom")])
+        assert SubmissionLedger.objects.get().ingested_count == 0
+        assert not SubmissionFile.objects.exists()
+
+
+class TestReleaseConditions:
+    @pytest.mark.parametrize("value", [0, -1, 1.5, True, "2"])
+    def test_a_k_or_m_that_is_not_a_positive_integer_is_refused(self, value):
+        with pytest.raises(ValueError, match="positive integer"):
+            register_ingest_profile(_profile(k=value))
+        with pytest.raises(ValueError, match="positive integer"):
+            register_ingest_profile(_profile(m=value))
+
+    def test_k_and_m_are_not_published_to_contributors(self):
+        published = public_profile(_profile(k=5, m=2))
+        assert "k" not in published and "m" not in published
 
 
 # ---------------------------------------------------------------------------

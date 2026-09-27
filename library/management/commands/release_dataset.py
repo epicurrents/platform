@@ -63,7 +63,7 @@ class Command(BaseCommand):
             "--profile-version", default="", help="Preparation profile version the members were checked against"
         )
         parser.add_argument("--k", type=int, help="Equivalence-class size in force")
-        parser.add_argument("--m", type=int, help="Minimum distinct contributors per class in force")
+        parser.add_argument("--m", type=int, help="Contributors the pool was held to before ingest (the profile's m)")
         parser.add_argument(
             "--sign-off",
             action="append",

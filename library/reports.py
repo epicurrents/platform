@@ -31,10 +31,10 @@ minimum k, the fraction of members below the recorded k, the prosecutor risk and
 follow. The classes come from the project's registered function; without one the report says so
 and computes nothing.
 
-What the platform cannot recompute, it reports as recorded. The distinct-contributor condition m
-needs to know which centre each recording came from, and the pooled ingest severs that link by
-design, so m is the project's to establish at release time and the platform only repeats the
-value the run stored. Journalist risk needs population frequencies the platform does not hold.
+What the platform cannot recompute, it reports as recorded. m is the number of contributors the
+pool was held to before the pooled ingest took any of its files; checking it against the released
+pool would need to know which centre each recording came from, and the ingest severs that link by
+design, so the platform only repeats the value the run stored. Journalist risk needs population frequencies the platform does not hold.
 """
 
 from __future__ import annotations
