@@ -499,7 +499,7 @@ class TestReconciliation:
         (wrong / packaging.TARBALL_NAME).write_bytes(data)
         assert ready.client.get(f"{BASE}/packages").json() == []
 
-    def test_a_confirmed_update_marks_its_package_applied(self, ready, write_status, no_push):
+    def _applied(self, ready, write_status):
         data = tarball()
         upload(ready, data)
         row = MaintenancePackage.objects.get()
@@ -509,9 +509,29 @@ class TestReconciliation:
         write_status(job.job_id, "succeeded", finished_at="2026-09-20T10:06:00Z")
         spool.sync(force=True)
         row.refresh_from_db()
+        return row
+
+    def test_a_confirmed_update_marks_its_package_applied(self, ready, write_status, no_push, monkeypatch):
+        row = self._applied(ready, write_status)
         assert row.state == "applied"
+        # The platform now runs the package's release, so the version check refuses it.
+        monkeypatch.setattr("maintenance.api.v1.ninja.VERSION_INFO", packaging.parse_version(NEWER))
         listed = ready.client.get(f"{BASE}/packages").json()[0]
         assert listed["state"] == "applied" and listed["applicable"] is False
+
+    def test_an_applied_package_a_rollback_made_newer_can_be_requested_again(self, ready, write_status, no_push):
+        # A rollback leaves the package applied and the platform on the older
+        # release; found on a real host, where it could only be re-applied by
+        # removing and uploading it again.
+        row = self._applied(ready, write_status)
+        assert row.state == "applied"
+        assert ready.client.get(f"{BASE}/packages").json()[0]["applicable"] is True
+        response = _post_json(
+            ready.client,
+            f"{BASE}/jobs",
+            {"operation": "platform.update", "args": {"package_sha256": row.sha256}, "password": PASSWORD},
+        )
+        assert response.status_code == 202, response.content
 
 
 @pytest.mark.django_db

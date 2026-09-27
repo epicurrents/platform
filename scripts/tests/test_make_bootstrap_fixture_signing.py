@@ -291,10 +291,11 @@ class TestSignedPackage:
 
 class TestPackagedReadme:
     @requires_built_frontend
-    def test_drop_directory_readme_names_the_sidecars_and_the_check(self, tmp_path):
+    def test_readme_names_the_drop_directory_sidecars_and_the_check(self, tmp_path):
         dest = tmp_path / "demo"
         assert _run(dest, "--demo").returncode == 0
-        text = (dest / "update" / "README.md").read_text()
+        text = (dest / "README.md").read_text()
+        assert "`update/`" in text
         assert ".manifest.json" in text and ".manifest.sig" in text
         assert "--check-archive" in text
 

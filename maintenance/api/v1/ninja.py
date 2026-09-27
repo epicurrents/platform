@@ -461,9 +461,15 @@ def _manifest_agent_version(manifest) -> int:
     return value if isinstance(value, int) and not isinstance(value, bool) else 0
 
 
+#: The package states a request may name. An applied package stays nameable
+#: because a rollback makes it newer than what runs again; while it is the
+#: release that runs, the version check refuses it.
+_NAMEABLE_STATES = (MaintenancePackage.State.AVAILABLE, MaintenancePackage.State.APPLIED)
+
+
 def _package_applicable(package) -> bool:
-    """Whether a request may name this package now: available, and newer than what runs."""
-    if package.state != MaintenancePackage.State.AVAILABLE:
+    """Whether a request may name this package now: available or applied, and newer than what runs."""
+    if package.state not in _NAMEABLE_STATES:
         return False
     try:
         return packaging.parse_version(package.version) > VERSION_INFO
@@ -706,7 +712,7 @@ def create_job(request, payload: JobCreateIn):
     if operation.executor == HOST:
         sha256 = getattr(args, "package_sha256", None)
         if sha256:
-            package = MaintenancePackage.objects.filter(sha256=sha256, state=MaintenancePackage.State.AVAILABLE).first()
+            package = MaintenancePackage.objects.filter(sha256=sha256, state__in=_NAMEABLE_STATES).first()
             if package is None:
                 raise HttpError(400, "No uploaded package has that hash, or it has not been verified.")
             if not _package_applicable(package):
@@ -751,7 +757,7 @@ def create_job(request, payload: JobCreateIn):
                 # waits and then sees this job in flight, or wins first and
                 # this request sees the package gone.
                 locked = MaintenancePackage.objects.select_for_update().filter(pk=package.pk).first()
-                if locked is None or locked.state != MaintenancePackage.State.AVAILABLE:
+                if locked is None or locked.state not in _NAMEABLE_STATES:
                     raise HttpError(409, "The package was removed while the request was being made.")
             job.save()
             # The row carries the operation, executor and target version; only
@@ -1088,7 +1094,7 @@ def delete_package(request, sha256: str):
     spool.sync()
     package = _get_package(sha256)
     with transaction.atomic():
-        package = MaintenancePackage.objects.select_for_update().select_related("uploaded_by").get(pk=package.pk)
+        package = MaintenancePackage.objects.select_for_update().get(pk=package.pk)
         if MaintenanceJob.objects.filter(in_flight=True, package=package).exists():
             raise HttpError(409, "A job in flight refers to this package.")
         if package.state == MaintenancePackage.State.PRUNED:

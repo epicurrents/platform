@@ -363,16 +363,17 @@ class TestDemoPackage:
         assert os.access(runner, os.X_OK)
         assert (dest / "README.md").is_file()
 
-    def test_bundles_update_sh_and_drop_dir(self, tmp_path):
+    def test_bundles_update_sh_but_no_drop_dir(self, tmp_path):
         # Archive-mode self-update (scripts/update.sh) needs the updater bundled
-        # at the deployment root, executable, plus its ./update drop dir and a
-        # root docker-compose.yml — update.sh's root marker and archive check.
+        # at the deployment root, executable, and a root docker-compose.yml —
+        # update.sh's root marker. The ./update drop dir is the deployment's:
+        # start.sh creates it, and update.sh refuses an archive that carries it.
         dest = tmp_path / "demo"
         assert _run(dest, "--demo").returncode == 0
         updater = dest / "update.sh"
         assert updater.is_file()
         assert os.access(updater, os.X_OK)
-        assert (dest / "update").is_dir()
+        assert not (dest / "update").exists()
         assert (dest / "docker-compose.yml").is_file()
 
     def test_omits_viewer_dist_source_and_ci_artifacts(self, tmp_path):

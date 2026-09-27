@@ -1594,22 +1594,11 @@ PREPARE
     info "Bundling update.sh"
     cp "$REPO_ROOT/scripts/update.sh" "$DEST/update.sh"
     chmod +x "$DEST/update.sh"
-    mkdir -p "$DEST/update"
-    cat > "$DEST/update/README.md" <<'DROP'
-# Update drop directory
-
-Drop a newer distribution tarball here (named `epicurrents*.tar.gz`), together
-with the `.manifest.json` and `.manifest.sig` files that came with it, and run
-`./update.sh` from the deployment root. The newest matching archive is applied
-over this deployment, preserving `.env` and your data; the database is migrated
-and the containers are recreated. A pre-update snapshot (code, database and
-`.env`) is written to `../backups/` first — undo with `./update.sh --rollback`.
-
-`./update.sh --check-archive update/<file>.tar.gz` verifies a package — its
-signature against `../RELEASE_KEY.pub`, its hash, its contents and its version —
-without touching the deployment.
-DROP
-    ok "update.sh + update/ drop dir"
+    # No update/ in the package: start.sh creates the spool as the account that
+    # runs the stack, and update.sh refuses an archive carrying an update/
+    # member, since that directory belongs to the deployment. The drop-directory
+    # instructions are in the package README instead.
+    ok "update.sh"
 
     if [ "$DIST" = true ]; then
         # A distribution had no way onto a tailnet: bootstrap.sh carries the
@@ -1772,6 +1761,19 @@ certificate for the name. Nothing else changes, and running it again is safe.
 The domain must resolve **before** you run it — the certificate is requested as
 Caddy starts, and the authority validates by connecting back on port 80. Open
 80 and 443 to the internet on any firewall in front of the host.
+
+## Apply a later release from a shell
+
+Put a newer distribution tarball (named `epicurrents*.tar.gz`) in `update/`,
+together with the `.manifest.json` and `.manifest.sig` files that came with it,
+and run `./update.sh` from the deployment root. The newest matching archive is
+applied over this deployment, preserving `.env` and your data; the database is
+migrated and the containers are recreated. A pre-update snapshot (code, database
+and `.env`) is written to `backups/` first — undo with `./update.sh --rollback`.
+
+`./update.sh --check-archive update/<file>.tar.gz` verifies a package — its
+signature against `RELEASE_KEY.pub`, its hash, its contents and its version —
+without touching the deployment.
 COMMON
         if [ "$DIST" = true ]; then
             cat <<'TAILNET'

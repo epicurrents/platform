@@ -147,8 +147,8 @@ def test_health_endpoint_responds():
 @requires_rsync
 def test_distribution_bundles_update_sh_for_archive_mode(tmp_path):
     # Archive mode (the dist's self-update path) consumes a tree whose root holds
-    # update.sh + docker-compose.yml and a ./update drop dir. Assemble a demo
-    # package and confirm the layout update.sh assumes is what the fixture ships.
+    # update.sh + docker-compose.yml. Assemble a demo package and confirm the
+    # layout update.sh assumes is what the fixture ships.
     dest = tmp_path / "demo"
     result = subprocess.run(
         ["bash", str(FIXTURE), str(dest), "--demo", "--force"],
@@ -160,8 +160,36 @@ def test_distribution_bundles_update_sh_for_archive_mode(tmp_path):
     assert result.returncode == 0, result.stderr
     assert (dest / "update.sh").is_file()
     assert os.access(dest / "update.sh", os.X_OK)
-    assert (dest / "update").is_dir()
+    assert not (dest / "update").exists()
     assert (dest / "docker-compose.yml").is_file()
+
+
+@requires_built_frontend
+@requires_rsync
+def test_a_packaged_archive_carries_no_member_update_sh_refuses(tmp_path):
+    # update.sh refuses an archive carrying anything that belongs to the
+    # deployment. The packager once shipped update/README.md, so every package
+    # it built was refused as `contents` on a real host while both halves passed
+    # their own tests. The pattern is read out of update.sh so the two move together.
+    body = (SCRIPTS_DIR / "update.sh").read_text()
+    match = re.search(r"grep -qE '(\^\(\\\.env[^']*)' <<< \"\$inner\"", body)
+    assert match, "update.sh no longer checks the archive's members against a deployment-owned pattern"
+    forbidden = re.compile(match.group(1))
+    dest = tmp_path / "pkg"
+    result = subprocess.run(
+        ["bash", str(FIXTURE), str(dest), "--demo", "--tarball", "--force"],
+        check=False,
+        cwd=str(REPO_ROOT),
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    listing = subprocess.run(
+        ["tar", "-tzf", f"{dest}.tar.gz"], check=True, capture_output=True, text=True
+    ).stdout.splitlines()
+    inner = [name.split("/", 1)[1] for name in listing if "/" in name and name.split("/", 1)[1]]
+    offenders = [name for name in inner if forbidden.search(name)]
+    assert not offenders, offenders
 
 
 # The machine-readable progress lines a caller that drives update.sh parses. A
