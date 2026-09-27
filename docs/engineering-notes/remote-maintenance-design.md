@@ -64,7 +64,7 @@ superuser browser ──► Django (web, uid 1000)          host agent (root, sy
 | The drain watched `inspect active` only | Watch active, reserved and the queue length, with beat already stopped; drain again before a rollback |
 | The system `openssl` on the packaging machine is LibreSSL, which cannot sign Ed25519 through `pkeyutl` | Sign through a Python helper using `cryptography`; keep `openssl` for host-side verification behind a version guard |
 | Password re-confirmation answers 409 for OIDC-provisioned accounts, which the admin API can promote to superuser | Step-up accepts TOTP alone for accounts without a usable password; an OIDC superuser without TOTP cannot use the feature and the UI says so |
-| A stale job left the platform locked until someone with shell arrived | A stale job whose log shows a snapshot rolls back to it; only a stale job with no snapshot stops dead |
+| A stale job left the platform locked until someone with shell arrived | A stale job whose status of record names a snapshot rolls back to it; only a stale job with no snapshot stops dead |
 
 ## Maintenance lock: suspending the platform while an update is in flight
 
@@ -95,13 +95,17 @@ Federated peers receive the same 503 with `Retry-After`; the federation client m
 
 ## Spool protocol
 
-`protocol: 1` in every JSON file, UTC ISO-8601 timestamps, every write is tmp + rename.
+`protocol: 1` in every JSON file, UTC ISO-8601 timestamps, every write is a fresh temporary file renamed into place.
+
+**The spool is one-way.** `update/` is bind-mounted read-write into the web and celery containers, so a compromised web tier controls every byte of it, and the agent is root. The agent therefore never follows a link there, never writes through a name it finds there, and never acts on anything it did not write itself. Its record — the status of each job, the active-run lock, the job logs, the flag and the heartbeat — lives in `/var/lib/epicurrents-updater/` (root, 0700); the spool receives published copies, each created with `O_CREAT|O_EXCL|O_NOFOLLOW` under a random name in a directory opened with `O_NOFOLLOW` relative to the one above it, handed to the tree owner with `fchown`, and renamed over whatever stood at the name. What it reads from the spool — a request, a package — is opened with `O_NOFOLLOW` and refused unless it is a regular file with one link and within a size cap. The markers are read for their presence only. `update.sh` holds to the same rule for the one file it writes there, the flag, and keeps its own state (the borg marker, the run lock, the unfinished-update marker) under `backups/`, which no container mounts.
 
 ```
-update/agent.json                 agent heartbeat: version, enabled, self_update, runtime, last_run, capabilities,
-                                  updater_script, key_id, next_key_id, snapshots[{name, taken_at, version, code, migrations}]
-update/lock                       agent: {pid, boot_id, job_id, since}; flock for the whole tick
-update/maintenance.json           lock flag, see above
+update/agent.json                 agent (published): heartbeat — version, enabled, self_update, runtime, last_run,
+                                  capabilities, updater_script, key_id, next_key_id,
+                                  snapshots[{name, taken_at, version, code, migrations}]
+update/maintenance.json           agent or update.sh (published): lock flag, see above
+update/erasures.jsonl             Django: account erasures {at, user_id, date_joined}, appended by erase_user; the agent
+                                  never reads it
 update/packages/.incoming-<tok>/  Django partial upload, never a package
 update/packages/<sha256>/         package.tar.gz, manifest.json, manifest.sig, upload.json
 update/configuration.json         agent (phase 5): the deployment's current value of every key on the agent's list,
@@ -109,22 +113,28 @@ update/configuration.json         agent (phase 5): the deployment's current valu
 update/jobs/<id>.json             Django request: operation, requested_by_id, args — {package_sha256, verify_window_minutes}
                                   for platform.update, {} for platform.backup, {snapshot, restore_database} for platform.rollback,
                                   {keys, sha256, verify_window_minutes} for platform.configure
+update/jobs/<id>.claimed.json     the same request, renamed by the agent when it takes it
 update/jobs/<id>.configuration.json  Django (phase 5): the values themselves, {protocol, set: {KEY: value}, clear: [KEY]};
                                   unlinked by the agent at the terminal state
-update/jobs/<id>.verify|.rollback Django markers: {at, by_user_id}
-update/jobs/<id>.status.json      agent: operation, state, reason, step, timestamps, verify_deadline, snapshot, post_snapshot,
-                                  migrations_applied, versions
-update/jobs/<id>.log              agent: tee of update.sh, head-truncated at 8 MiB
+update/jobs/<id>.verify|.rollback Django markers; content {at, by_user_id} is Django's own, the agent reads presence only
+update/jobs/<id>.status.json      agent (published): operation, state, reason, step, timestamps, verify_deadline, snapshot,
+                                  post_snapshot, migrations_applied, versions
+update/jobs/<id>.log              agent (published): tee of update.sh, head-truncated at 8 MiB, republished every
+                                  100 lines and at every status write
 ```
+
+**Claiming.** The agent takes a request by renaming `<id>.json` to `<id>.claimed.json` before it reads a byte of it, copies the claimed file into its state directory, and publishes a status of `requested` with step `check`. The platform's cancel is an unlink of `<id>.json`: it succeeds only while the request is unclaimed, and a `FileNotFoundError` means the agent has it, which the cancel endpoint answers with 409. Exactly one side wins, and the sync never moves a `cancelled` row again.
+
+**What the agent acts on.** A job exists for the agent only when its state directory holds a status for it: a `status.json` in the spool that the agent did not write is ignored, and so is a request for an id it has already handled. Snapshot names are checked against the shape `update.sh` writes on every read of the record, before a path is built from them. The markers count only for a job the agent itself took to `awaiting_verification` (or, for a late rollback, to `succeeded` — and then only while nothing else is in flight and no update or rollback settled after it), and only while `ENABLED=1`; the deadline counts regardless, so a disabled agent does not leave a deployment in its window for ever. Values from a request that reach the log or the journal are stripped of control characters.
 
 **State machine**, writer in parentheses:
 
 | From | To | Writer | Trigger |
 |---|---|---|---|
-| — | `requested` | Django | `POST /jobs`; request file written on commit |
-| `requested` | `cancelled` | Django | cancel, only while no status file exists |
+| — | `requested` | Django | `POST /jobs`; request file written once the row has committed |
+| `requested` | `cancelled` | Django | cancel, when the unlink of the unclaimed request succeeds |
 | `requested` | `accepted` | agent | protocol, operation allowlisted, no `.git`, `ENABLED=1`; for an update, package present, sha256 matches request and manifest, `--check-archive` passes, disk free; for a backup, disk free; for a rollback, a restorable snapshot of the expected name shape, with code when the database is kept, disk free |
-| `requested` | `failed` | agent | any check misses; `reason` is one of `refused_signature`, `refused_hash`, `refused_version_not_newer`, `refused_incompatible`, `refused_disk`, `refused_checkout`, `refused_updater_too_old`, `refused_operation`, `refused_protocol`, `refused_disabled`, `refused_snapshot`, `refused_code_only` |
+| `requested` | `failed` | agent | any check misses; `reason` is one of `refused_signature`, `refused_hash`, `refused_version_not_newer`, `refused_incompatible`, `refused_disk`, `refused_checkout`, `refused_updater_too_old`, `refused_operation`, `refused_protocol`, `refused_disabled`, `refused_snapshot`, `refused_code_only`, `refused_manifest`, `refused_contents`, `refused_locked`, `refused_unfinished`, `refused_request` (a request file that is not a plain readable file, or names another job), `refused_check` (a refusal `update.sh` did not name); `spool_unwritable` when the flag cannot be published, before anything changes |
 | `accepted` | `running` | agent | `update.sh` started; `step` follows the `::step=` lines |
 | `running` | `failed` | agent | exit ≠ 0 with no `::snapshot=` seen; nothing changed (`update_failed_before_snapshot`) |
 | `running` | `rolling_back` | agent | exit ≠ 0 after the snapshot (`update_failed`), or exit 0 but the gate fails within `HEALTH_TIMEOUT` (`health_failed`) |
@@ -137,8 +147,8 @@ update/jobs/<id>.log              agent: tee of update.sh, head-truncated at 8 M
 | `accepted` (configure) | `running` → `awaiting_verification` / `failed` / `rolling_back` | agent | phase 5: flag `updating`, `--snapshot pre-configure` (`snapshot_failed`, nothing changed), the `.env` rewrite, the app services recreated without a rebuild, then `/ready` 200 from the new containers within `HEALTH_TIMEOUT`; the window runs without a flag. Rollback restores `.env` from the snapshot and recreates again; the database is never touched |
 | `rolling_back` | `rollback_failed` | agent | either step fails; needs shell |
 | `succeeded` | `rolling_back` | agent | `.rollback` marker while the job's pre-update snapshot still exists (`late`); the same data-loss warning applies and the UI repeats it |
-| any in-flight | `rolling_back` | agent, next tick | lock pid dead or boot id differs (`stale`) and the log shows a `::snapshot=` line; a host reboot mid-update must not leave a shell-less instance locked when a rollback is well defined |
-| `requested`, `accepted`, `running` | `failed` | agent, next tick | stale with no snapshot in the log (`stale`); nothing was changed, and the agent never resumes a half-run update |
+| any in-flight | `rolling_back` | agent, next tick | lock pid dead or boot id differs (`stale`) and the status of record names the snapshot, which the agent writes the moment the `::snapshot=` line arrives; a host reboot mid-update must not leave a shell-less instance locked when a rollback is well defined |
+| `requested`, `accepted`, `running` | `failed` | agent, next tick | stale with no snapshot recorded (`stale`); nothing was changed, and the agent never resumes a half-run update |
 | any in-flight | `failed` | Django sync | neither request nor status file exists (`orphaned`) |
 
 In-flight set: `requested, accepted, running, awaiting_verification, rolling_back`. One job is in flight at a time across both tiers, enforced by a partial unique constraint on the row and by the spool lock; `compose stop celery` would kill a celery-tier job, which is why the tiers share the limit.
@@ -185,7 +195,7 @@ Phase 4 added to the agent, in [scripts/updater/README.md](../../scripts/updater
 
 **Refusals by name.** `update.sh` gained a `refuse` helper that prints `::refused=<token>` ahead of the `::failed=` line for the checks that can name their reason (`signature`, `hash`, `manifest`, `updater_too_old`, `incompatible`, `version_not_newer`; pinned in [scripts/tests/test_update_targets.py](../../scripts/tests/test_update_targets.py)), and the agent records `refused_<token>` as the job's reason; a refusal it cannot name is `refused_check` with the message in the log. The agent's own checks add `refused_disabled`, `refused_protocol`, `refused_operation`, `refused_hash` (a malformed or unknown hash, or a copy that does not hash to it), `refused_checkout` and `refused_disk`.
 
-Tick order on an accepted job: write the active-run lock (`update/lock`: pid, boot id, job id) and the flag (`updating`) → stop `celery-beat` → drain the worker → `update.sh --root … --archive <verified copy> --require-signature --release-key <root-owned key> --require-newer --skip-beat --keep-lock --yes`, teeing the log (head-capped at 8 MiB) and following the `::` lines → gate (`/api/v1/ready` answers 200 within `HEALTH_TIMEOUT`, and the web container reports the package's version) → flag to `verifying` with the deadline, lock removed → on the terminal state, start `celery-beat` and remove the flag. `borg` is left to `update.sh`, which already stops it and records whether to restart it. A rollback repeats the drain, then takes the `post-update` snapshot, then `update.sh --rollback --snapshot <the update's own> --yes --skip-beat --keep-lock`, then the gate against the version installed before. A rollback after `rollback_failed` leaves the flag up, since the platform is not serving reliably and the flag is what says why.
+Tick order on an accepted job: write the active-run lock (`active.lock` in the state directory: pid, boot id, job id) and the flag (`updating`) → stop `celery-beat` → drain the worker → `update.sh --root … --archive <verified copy> --require-signature --release-key <root-owned key> --require-newer --skip-beat --keep-lock --yes`, teeing the log (head-capped at 8 MiB) and following the `::` lines → gate (`/api/v1/ready` answers 200 within `HEALTH_TIMEOUT`, and the web container reports the package's version) → flag to `verifying` with the deadline, lock removed → on the terminal state, start `celery-beat` and remove the flag. `borg` is left to `update.sh`, which already stops it and records whether to restart it. A rollback repeats the drain, then takes the `post-update` snapshot, then `update.sh --rollback --snapshot <the update's own> --yes --skip-beat --keep-lock`, then the gate against the version installed before. A rollback after `rollback_failed` leaves the flag up, since the platform is not serving reliably and the flag is what says why.
 
 Two decisions the implementation made where the draft was silent. The `post-update` snapshot is required only when the platform served during a window: a rollback for `update_failed`, `health_failed` or `stale` has nothing in the database worth stranding a shell-less host over, so a failed post snapshot is logged and the rollback goes ahead; for `requested`, `deadline` and `late` it is `rollback_failed`, because data written since the update would otherwise be lost with no copy anywhere. And an interrupted rollback (a stale lock on a `rolling_back` job) is retried once and then given up as `rollback_failed`, rather than never resumed — the restore is idempotent, and a reboot during a rollback must not strand a shell-less instance when the rollback is well defined.
 

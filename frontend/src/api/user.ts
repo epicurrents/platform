@@ -16,10 +16,13 @@ export interface AuthUser {
     external_provider?: string | null
 }
 
+/** Profile edit. `password` and `totp_code` are the step-up credentials, required only when the address changes. */
 export interface ProfileUpdate {
     email?: string
     first_name?: string
     last_name?: string
+    password?: string
+    totp_code?: string
 }
 
 /** Auth-state probe result: `/api/v1/user/me` answers with HTTP 200 either way. */

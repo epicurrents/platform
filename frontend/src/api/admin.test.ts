@@ -28,6 +28,7 @@ vi.mock('#lib/http', () => ({
 }))
 
 import { rolesPayload, updateGroup, type GroupDetail } from '#api/admin'
+import { changedRoles } from '#lib/stepUp'
 import { http } from '#lib/http'
 
 const mockPatch = vi.mocked(http.patch)
@@ -100,5 +101,18 @@ describe('updateGroup request body', () => {
         })
         const [, body] = mockPatch.mock.calls[0]
         expect(body).toEqual({ roles: { demo_widget_tier: null } })
+    })
+})
+
+describe('an unchanged role form', () => {
+    it('sends no role at all, so a rename needs no confirmation and clears nothing', async () => {
+        const rendered = rolesPayload(
+            ['demo_widget_tier', 'demo_colour'],
+            { demo_widget_tier: 'tier_alpha', demo_colour: '' },
+        )
+        const roles = changedRoles(rendered, GROUP.roles)
+        await updateGroup(GROUP.id, { name: 'Renamed', ...(Object.keys(roles).length ? { roles } : {}) })
+        const body = mockPatch.mock.calls[0]?.[1] as Record<string, unknown>
+        expect(body).toEqual({ name: 'Renamed' })
     })
 })

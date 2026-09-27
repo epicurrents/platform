@@ -74,9 +74,33 @@ Event types in current use:
   and has no local password. Confirming such a link would mint a password that
   bypasses the tenant and email-domain gates the provider login is subject to,
   so the request is answered ``ok`` like every other reset request and no mail
-  is sent. ``actor_id`` is the account and ``provider`` names the provider. A
-  run of these against one account is someone testing whether the external
-  accounts have a second way in.
+  is sent. ``target_id`` is the account (the caller is anonymous, so there is
+  no actor) and ``provider`` names the provider. A run of these against one
+  account is someone testing whether the external accounts have a second way
+  in.
+- ``auth.email_changed`` — an account changed its own email address through
+  ``PATCH /me``, having passed step-up. ``actor_id`` identifies it. The address
+  is where a reset link goes, so a change followed shortly by a reset request
+  is the shape of a session being turned into an account.
+- ``admin.account_created`` — an operator created an account. ``actor_id`` is
+  the operator, ``target_id`` the account; ``is_staff``, ``is_superuser`` and
+  ``invited`` describe it. A new superuser is worth an alert on its own.
+- ``admin.account_privilege_changed`` — an operator changed an account's
+  ``is_staff`` or ``is_superuser``, or reactivated it. ``actor_id``,
+  ``target_id``, ``fields`` (what changed) and the resulting ``is_staff``,
+  ``is_superuser``, ``is_active``.
+- ``admin.account_email_changed`` — an operator changed an account's email
+  address. ``actor_id``, ``target_id``.
+- ``admin.password_set`` — an operator set another account's password.
+  ``actor_id``, ``target_id``.
+- ``admin.invitation_sent`` — an operator asked for an account's invitation to
+  be sent again. ``actor_id``, ``target_id``, and ``sent``, false when no mail
+  backend is configured and nothing was queued.
+- ``admin.group_membership_granted`` — an operator added members to a group.
+  ``actor_id``, and either ``target_id`` with ``group_ids`` (from the account
+  side) or ``group_id`` with ``added_count`` (from the group side).
+- ``admin.group_roles_granted`` — an operator set a project role on a group,
+  granting it to every member. ``actor_id``, ``group_id``, ``roles`` (keys).
 - ``permission.denied`` — a centralised ``ensure_*`` permission check refused
   the request. The specific permission (read / write / modify / annotate)
   is carried in the ``permission`` field.
@@ -134,7 +158,9 @@ Event types in current use:
   rename. Fields: ``change_id``, ``content_type``, ``digest_key``.
 - ``auth.stepup_failed`` — a step-up confirmation (``user.stepup``) before a
   sensitive request was refused. ``reason`` is ``password``, ``second_factor``
-  or ``locked_out``; ``actor_id`` identifies the account.
+  or ``locked_out``; ``actor_id`` identifies the account, and ``attempts`` (on
+  the first two) counts failures toward the step-up lockout, which shares its
+  failures with the login lockouts.
 - ``maintenance.job_requested`` — a superuser requested a maintenance
   operation. Fields: ``job_id``, ``operation``, ``executor``, ``actor_id``.
 - ``maintenance.rollback_requested`` — a superuser asked for an update to be
@@ -145,6 +171,12 @@ Event types in current use:
   here because a rollback restores the database dump and erases the audit rows
   written since the update's snapshot; the log stream survives. Fields:
   ``job_id``, ``operation``, ``state``, ``reason``.
+- ``maintenance.job_abandoned`` — a superuser failed a job in flight as
+  ``abandoned`` because its executor is gone: a celery-tier job whose worker
+  left no outcome, or a host-tier job while the agent's heartbeat is stale or
+  absent. Frees the one-in-flight slot, so a job the executor is in fact still
+  running can have a second started beside it; worth an alert. Fields:
+  ``job_id``, ``operation``, ``executor``, ``state_before``, ``actor_id``.
 - ``maintenance.package_uploaded`` — a superuser uploaded an update package
   that passed every check and now sits in the spool, where a request may name
   it; the moment new code enters a deployment. Fields: ``sha256``,

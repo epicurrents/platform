@@ -406,6 +406,8 @@ ACTIVITY_PATH_SKIP_LIST: tuple[str, ...] = (
     "/annotations/api/v1/health",  # annotations.health
     "/api/v1/notifications/vapid-public-key",  # static public push key
     "/api/v1/user/auth-config",  # public login-method discovery
+    "/api/v1/maintenance/lock",  # maintenance flag probe the SPA polls
+    "/api/v1/maintenance/lock/",
 )
 
 

@@ -53,6 +53,7 @@ without extending this table.
 | `federation.FederationAuditLog` | Peer URL, remote subject id, access records | `FEDERATION_AUDIT_RETENTION_DAYS` (default 2200 d ≈ 6 y; 0 = keep) | Pruning task; remote-subject sweep is a ROADMAP item |
 | `epicurrents.AccessRight` | Grantee FK / remote subject id | Life of grant; expired rows purged | Cascade with user / target object |
 | `django_session` | Session key, user pk (encoded) | 12 h in production (`SESSION_COOKIE_AGE`); expired rows reclaimed daily | Flushed by `erase_user`; excluded from audit tracking |
+| `update/erasures.jsonl` (maintenance spool) | One line per account erasure: timestamp, user pk, `date_joined` — no name, email or other identifier | Kept, append-only, for as long as a snapshot older than an erasure may be restored; not pruned | Outside the database on purpose, so a database restore cannot remove it; read to refuse and then undo the resurrection a restore would cause (see [Erasure procedure](#erasure-procedure) step 4) |
 | Recording originals volume (`RECORDINGS_ORIGINALS_PATH`) | Raw uploads incl. PHI + manifest | Operator-controlled (write-only for the platform) | Out-of-band; `erase_user` prints the stored names to reconcile |
 | Redis append-only file (`redis-data`) | Celery task arguments and results, hashed rate-limit keys, opaque federation replay `jti`s. Every task in the repo takes identifiers: the reset flow queues a user pk and mints the token in the worker, push payloads carry `display_name` and never `original_name`, and there is deliberately no generic task accepting a recipient address or message body | Until the next AOF rewrite (Redis defaults: 64 MB / 100 % growth), so effectively unbounded on a low-volume deployment | No erasure path; `erase_user` does not reach it, and `BGREWRITEAOF` only compacts. The control is therefore upstream and has to stay there — a task signature that accepts personal data puts it beyond recall |
 | Backups (borgmatic) | Everything above | ~6 months (7 daily / 4 weekly / 6 monthly), encrypted | See [Erasure and backups](#erasure-procedure) |
@@ -117,11 +118,21 @@ Operator runbook for an Art. 17 request from an account holder:
 3. If preservation is enabled, reconcile the write-only originals volume
    using the stored names the command prints (the platform never reads or
    deletes there).
-4. **Backups:** erased data persists in Borg snapshots until they rotate out
-   (~6 months at default retention). Record the request date; if a restore
-   is ever performed from a snapshot predating the erasure, re-run
-   `erase_user --user-id <pk> --yes` immediately after the restore. Do not
-   restore-and-forget.
+4. **Backups:** erased data persists in snapshots until they rotate out —
+   Borg snapshots after ~6 months at default retention, the update snapshots
+   under `backups/` as the update keep-count prunes them. `erase_user` records
+   every erasure in `update/erasures.jsonl` (pk and timestamps only).
+   - **A database restore from the Maintenance tab** (an update rollback that
+     restores the database, or `platform.rollback`) is refused with a 409
+     naming how many erasures postdate the snapshot, until the superuser
+     acknowledges them; once the restore settles, the platform re-erases every
+     recorded account that came back with the same pk and `date_joined`. No
+     manual step is needed, but check the job's outcome.
+   - **Any other restore** — Borg, or `update.sh --rollback` from a shell —
+     re-erases nothing on its own. Record the request date; after a restore
+     from a snapshot predating the erasure, run
+     `maintenance.erasures.reapply()` (or `erase_user --user-id <pk> --yes` per
+     account) immediately. Do not restore-and-forget.
 
 For recording subjects, the equivalent is trashing the recording (or the
 operator deleting it) and letting the purge task complete after the retention

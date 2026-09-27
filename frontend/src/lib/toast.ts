@@ -64,13 +64,14 @@ function _startTimer(id: number, ms: number): void {
  * @param duration - Override auto-derived duration; 0 = never dismiss.
  * @param action   - Optional action link rendered inside the toast (e.g. a "Reload" prompt). Pair with
  *                   `duration: 0` for prompts that must persist until the user acts.
+ * @returns The toast's id, for a caller that dismisses a persistent toast itself with `dismissToast`.
  */
 export function showToast(
     message: string | string[],
     variant: ToastVariant = 'neutral',
     duration?: number,
     action?: ToastAction,
-): void {
+): number {
     const lines = (Array.isArray(message) ? message : [message]).filter(line => line.length)
     const topic = lines.length > 1 ? lines[0] : undefined
     const body = lines.length > 1 ? lines.slice(1).join(' ') : (lines[0] ?? '')
@@ -80,6 +81,7 @@ export function showToast(
     if (actualDuration > 0) {
         _startTimer(id, actualDuration)
     }
+    return id
 }
 
 export function dismissToast(id: number): void {

@@ -500,11 +500,13 @@ To check the table against the tree, walk the AST for `log_activity` / `with_sys
 
 | Verb | Emitted by |
 |---|---|
+| `maintenance.job.abandon` | `abandon_job` |
 | `maintenance.job.cancel` | `cancel_job` |
 | `maintenance.job.create` | `create_job` |
 | `maintenance.job.list` | `list_jobs` |
 | `maintenance.job.log` | `get_job_log` |
 | `maintenance.job.read` | `get_job` |
+| `maintenance.job.reap` | `reap_stale_jobs` † |
 | `maintenance.job.rollback` | `rollback_job` |
 | `maintenance.job.run` | `run_job` † |
 | `maintenance.job.sync` | `spool.sync` † |

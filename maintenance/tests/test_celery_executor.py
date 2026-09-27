@@ -137,10 +137,13 @@ class TestRunJob:
         job.refresh_from_db()
         assert job.state == "failed" and job.reason == "command_failed"
 
-    def test_completion_notifies_and_records_it(self, echo, no_push, make_superuser):
+    def test_completion_notifies_and_records_it(
+        self, echo, no_push, make_superuser, django_capture_on_commit_callbacks
+    ):
         root = make_superuser()
         job = _job()
-        run_job(job.pk)
+        with django_capture_on_commit_callbacks(execute=True):
+            run_job(job.pk)
         job.refresh_from_db()
         assert job.last_notified_state == "succeeded"
         assert [n["user_id"] for n in no_push] == [root.pk]
@@ -166,3 +169,125 @@ def test_the_audit_integrity_command_exists_and_reports():
     from django.core.management import get_commands
 
     assert get_commands()["verify_audit_integrity"] == "activity"
+
+
+class ExitingCommand(BaseCommand):
+    """A stub that exits the way ``validate_originals`` does."""
+
+    def add_arguments(self, parser):
+        parser.add_argument("--count", type=int, default=1)
+        parser.add_argument("--fail", action="store_true")
+
+    def handle(self, *args, **options):
+        import sys
+
+        self.stdout.write("checked")
+        sys.exit(1 if options["fail"] else 0)
+
+
+@pytest.fixture
+def exiting(echo, monkeypatch):
+    from django.core import management
+
+    monkeypatch.setattr(management, "load_command_class", lambda app, name: ExitingCommand())
+    return echo
+
+
+@pytest.mark.django_db
+class TestEveryOutcomeIsRecorded:
+    def test_a_non_zero_exit_fails_the_job_instead_of_leaving_it_running(self, exiting):
+        job = _job(args={"fail": True})
+        run_job(job.pk)
+        job.refresh_from_db()
+        assert job.state == "failed" and job.reason == "command_failed" and not job.in_flight
+        assert "exited with status 1" in job.output
+
+    def test_a_zero_exit_is_a_success(self, exiting):
+        job = _job()
+        run_job(job.pk)
+        job.refresh_from_db()
+        assert job.state == "succeeded" and "checked" in job.output
+
+    def test_an_interrupt_is_recorded_and_re_raised(self, echo, monkeypatch):
+        from maintenance import tasks
+
+        def interrupted(*args, **kwargs):
+            raise KeyboardInterrupt
+
+        monkeypatch.setattr(tasks, "call_command", interrupted)
+        job = _job()
+        with pytest.raises(KeyboardInterrupt):
+            run_job(job.pk)
+        job.refresh_from_db()
+        assert job.state == "failed" and job.reason == "interrupted"
+
+    def test_nothing_starts_while_the_maintenance_flag_is_up(self, echo, write_flag):
+        write_flag("verifying")
+        job = _job()
+        assert run_job(job.pk) == {"ran": False}
+        job.refresh_from_db()
+        assert job.state == "failed" and job.reason == "maintenance_lock"
+        assert "line 0" not in job.output
+
+
+@pytest.mark.django_db
+class TestReaper:
+    def _aged(self, state, *, minutes):
+        from datetime import timedelta
+
+        from django.utils import timezone
+
+        then = timezone.now() - timedelta(minutes=minutes)
+        return _job(state=state, in_flight=True, created_at=then, started_at=then if state == "running" else None)
+
+    def test_a_job_past_its_limit_is_failed_as_stale(self, echo, caplog):
+        from maintenance.tasks import reap_stale_jobs
+
+        job = self._aged("running", minutes=60 + 20)
+        assert reap_stale_jobs() == 1
+        job.refresh_from_db()
+        assert job.state == "failed" and job.reason == "stale" and not job.in_flight
+        assert Activity.objects.filter(verb="maintenance.job.reap").exists()
+
+    def test_a_request_no_worker_picked_up_is_reaped_too(self, echo):
+        from maintenance.tasks import reap_stale_jobs
+
+        job = self._aged("requested", minutes=60 + 20)
+        assert reap_stale_jobs() == 1
+        job.refresh_from_db()
+        assert job.reason == "stale"
+
+    def test_a_job_within_its_limit_is_left_alone(self, echo):
+        from maintenance.tasks import reap_stale_jobs
+
+        job = self._aged("running", minutes=30)
+        assert reap_stale_jobs() == 0
+        job.refresh_from_db()
+        assert job.state == "running"
+
+    def test_host_jobs_are_never_reaped_here(self, echo):
+        from datetime import timedelta
+
+        from django.utils import timezone
+
+        from maintenance.tasks import reap_stale_jobs
+
+        MaintenanceJob.objects.create(
+            operation="platform.update",
+            executor="host",
+            state="running",
+            in_flight=True,
+            created_at=timezone.now() - timedelta(days=1),
+        )
+        assert reap_stale_jobs() == 0
+
+    def test_the_beat_task_reaps_and_does_nothing_while_updating(self, echo, spool_dir, write_flag):
+        from maintenance.tasks import sync_spool
+
+        job = self._aged("running", minutes=60 + 20)
+        write_flag("updating")
+        assert sync_spool() == {"skipped": "locked"}
+        job.refresh_from_db()
+        assert job.state == "running"
+        write_flag("verifying")
+        assert sync_spool()["stale"] == 1

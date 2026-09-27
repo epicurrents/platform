@@ -32,6 +32,43 @@ def _no_args(args) -> list[str]:
     return []
 
 
+def _schema_property_names(node) -> set[str]:
+    """Every property name anywhere in a JSON schema: nested objects, array items, combinators and ``$defs``."""
+    names: set[str] = set()
+    if isinstance(node, dict):
+        properties = node.get("properties")
+        if isinstance(properties, dict):
+            names.update(str(name) for name in properties)
+        for value in node.values():
+            names |= _schema_property_names(value)
+    elif isinstance(node, list):
+        for item in node:
+            names |= _schema_property_names(item)
+    return names
+
+
+def forbidden_arg_fields(args_schema) -> set[str]:
+    """The names in ``args_schema`` that match :data:`FORBIDDEN_ARG_FIELDS`, compared case-insensitively.
+
+    Looks past the top level: a field's alias, a nested schema's properties, an
+    array's items and every branch of ``anyOf`` / ``oneOf`` / ``allOf``, read off
+    the JSON schema by field name and by alias. A ``Command`` field or a
+    ``{"options": {"shell": ...}}`` object carries a command as surely as a
+    top-level ``command`` does.
+    """
+    names: set[str] = set()
+    for name, info in args_schema.model_fields.items():
+        names.add(name)
+        for alias in (info.alias, info.validation_alias, info.serialization_alias):
+            if isinstance(alias, str):
+                names.add(alias)
+    # A schema pydantic cannot render raises here, at registration, rather than
+    # later from the operations listing, which publishes the same JSON schema.
+    for by_alias in (True, False):
+        names |= _schema_property_names(args_schema.model_json_schema(by_alias=by_alias))
+    return {name for name in names if name.lower() in FORBIDDEN_ARG_FIELDS}
+
+
 @dataclass(frozen=True)
 class Operation:
     """One registered operation.
@@ -72,7 +109,7 @@ def register_operation(operation: Operation) -> None:
         )
     if not (isinstance(operation.args_schema, type) and issubclass(operation.args_schema, Schema)):
         raise TypeError(f"Operation {operation.key!r} must declare a ninja.Schema subclass as args_schema.")
-    forbidden = FORBIDDEN_ARG_FIELDS & set(operation.args_schema.model_fields)
+    forbidden = forbidden_arg_fields(operation.args_schema)
     if forbidden:
         raise ValueError(f"Operation {operation.key!r} argument schema carries forbidden field(s) {sorted(forbidden)}.")
     if operation.key in _REGISTRY:

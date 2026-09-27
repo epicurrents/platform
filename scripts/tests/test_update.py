@@ -188,7 +188,7 @@ def _nothing_touched(fakebin, root):
     """The assertions every refusal shares: no extraction, no overlay, no snapshot, no flag."""
     assert not _extracted_to_disk(fakebin), "the archive was extracted"
     assert not fakebin.has_call("rsync"), "the tree was overlaid"
-    assert not (root / "backups").exists(), "a snapshot was taken"
+    assert not list((root / "backups").glob("*-*-*")) if (root / "backups").exists() else True, "a snapshot was taken"
     assert not (root / "update" / "maintenance.json").exists(), "the maintenance flag went up"
     assert not fakebin.has_call("stop web"), "the stack was stopped"
 
@@ -535,7 +535,7 @@ class TestRollback:
         assert result.returncode == 0, result.stderr
         calls = fakebin.calls()
         stop_i = _index_of(calls, "stop web celery celery-beat")
-        restore_i = _index_of(calls, "psql --single-transaction")
+        restore_i = _index_of(calls, "psql -v ON_ERROR_STOP=1 -U")
         recreate_i = _index_of(calls, "--force-recreate web celery celery-beat")
         assert -1 < stop_i < restore_i < recreate_i, f"stop={stop_i} restore={restore_i} recreate={recreate_i}"
         # The restore must be atomic — ON_ERROR_STOP makes a failure roll back.
@@ -554,7 +554,7 @@ class TestRollback:
         assert result.returncode != 0
         assert "incomplete" in result.stderr
         # All-or-nothing: a refused rollback must not have restored or recreated.
-        assert not fakebin.has_call("psql --single-transaction")
+        assert not fakebin.has_call("psql -v ON_ERROR_STOP=1 -U")
         assert not fakebin.has_call("--force-recreate")
 
     def test_the_restore_replaces_the_schema_inside_the_same_transaction(self, fakebin, tmp_path):
@@ -580,7 +580,22 @@ class TestRollback:
         # One transaction for the preamble and the dump alike — a separate psql
         # call for the drop would commit an empty schema before the restore began.
         restores = [c for c in fakebin.calls() if "psql" in c]
-        assert len(restores) == 1 and "--single-transaction" in restores[0], restores
+        assert len(restores) == 1 and "ON_ERROR_STOP=1" in restores[0], restores
+        # An explicit transaction, committed only once the whole dump was read:
+        # psql --single-transaction commits at end of input, truncated or not.
+        assert stream.startswith("BEGIN;") and stream.rstrip().endswith("COMMIT;"), stream
+        assert "--single-transaction" not in restores[0]
+
+    def test_a_truncated_dump_is_refused_before_anything_is_touched(self, fakebin, tmp_path):
+        _deploy(fakebin, tmp_path)
+        snap = self._seed_snapshot(tmp_path)
+        data = (snap / "db.sql.gz").read_bytes()
+        (snap / "db.sql.gz").write_bytes(data[: len(data) // 2])
+        result = run_script("update.sh", fakebin, cwd=tmp_path, args=["--rollback", "--yes"])
+        assert result.returncode != 0
+        assert "truncated or corrupt" in result.stderr
+        assert not fakebin.has_call("psql -v ON_ERROR_STOP=1 -U")
+        assert not fakebin.has_call("stop web")
 
     def test_the_restore_waits_a_bounded_time_for_its_locks(self, fakebin, tmp_path):
         # Anything still holding a share lock — a backup dumping the database —
@@ -612,7 +627,7 @@ class TestRollback:
         result = run_script("update.sh", fakebin, cwd=tmp_path, args=["--rollback", "--yes"])
         assert result.returncode == 0, result.stderr
         calls = fakebin.calls()
-        restore_i = _index_of(calls, "psql --single-transaction")
+        restore_i = _index_of(calls, "psql -v ON_ERROR_STOP=1 -U")
         build_i = _index_of(calls, "--profile vendor build")
         static_i = _index_of(calls, "manage.py collectstatic")
         viewer_i = _index_of(calls, "vendor_viewer --check")
@@ -666,7 +681,7 @@ class TestBorgPause:
         assert result.returncode == 0, result.stderr
         calls = fakebin.calls()
         stop_i = _index_of(calls, "stop web celery celery-beat borg")
-        restore_i = _index_of(calls, "psql --single-transaction")
+        restore_i = _index_of(calls, "psql -v ON_ERROR_STOP=1 -U")
         start_i = _index_of(calls, "up -d borg")
         assert -1 < stop_i < restore_i < start_i, f"stop={stop_i} restore={restore_i} start={start_i}"
 
@@ -680,9 +695,14 @@ class TestBorgPause:
         fakebin.stub("docker", body=_docker_stub('*"manage.py migrate"*) exit 1 ;;'))
         result = run_script("update.sh", fakebin, cwd=tmp_path, args=["--from", "repo", "--no-pull"])
         assert result.returncode != 0
-        marker = tmp_path / "update" / ".borg-was-running"
+        marker = tmp_path / "backups" / ".borg-was-running"
         assert marker.is_file(), "the stop must record that borg was running"
 
+        # The failed run changed the tree, so it left the flag up and the
+        # update marked unfinished; the operator repairs the deployment and
+        # clears both before running again.
+        (tmp_path / "backups" / ".update-unfinished").unlink()
+        (tmp_path / "update" / "maintenance.json").unlink()
         fakebin.log.write_text("")
         fakebin.stub("docker", body=_docker_stub('*" ps borg") ;;'))
         result = run_script("update.sh", fakebin, cwd=tmp_path, args=["--from", "repo", "--no-pull"])
@@ -696,7 +716,7 @@ class TestBorgPause:
         result = run_script("update.sh", fakebin, cwd=tmp_path, args=["--from", "repo", "--no-pull"])
         assert result.returncode == 0, result.stderr
         assert "borg did not start" in result.stdout
-        assert (tmp_path / "update" / ".borg-was-running").is_file()
+        assert (tmp_path / "backups" / ".borg-was-running").is_file()
 
     def test_borg_is_not_started_on_a_deployment_that_did_not_run_it(self, fakebin, tmp_path):
         # A deployment with backups turned off has the service defined and never
@@ -884,25 +904,72 @@ class TestMaintenanceFlag:
         assert result.returncode == 0, result.stderr
         assert (tmp_path / "update" / "maintenance.json").read_text() == theirs
 
-    def test_a_stale_flag_is_replaced_without_keep_lock(self, fakebin, tmp_path):
+    def test_a_flag_this_run_did_not_raise_is_a_refusal_without_keep_lock(self, fakebin, tmp_path):
+        # It belongs to the host agent mid-job, or to a run that left the stack
+        # stopped; either way a manual run must not go ahead over it.
         _deploy(fakebin, tmp_path)
         (tmp_path / "update").mkdir()
-        (tmp_path / "update" / "maintenance.json").write_text('{"phase": "rolling_back", "job_id": "old"}\n')
+        flag = tmp_path / "update" / "maintenance.json"
+        flag.write_text('{"phase": "rolling_back", "job_id": "old"}\n')
+        result = run_script("update.sh", fakebin, cwd=tmp_path, args=["--from", "repo", "--no-pull"])
+        assert result.returncode != 0
+        assert "refused=locked" in _progress(result)
+        assert json.loads(flag.read_text())["job_id"] == "old"
+        assert not fakebin.has_call("stop -t 60 celery")
+
+    def test_a_link_at_the_flag_name_is_replaced_not_written_through(self, fakebin, tmp_path):
+        _deploy(fakebin, tmp_path)
+        (tmp_path / "update").mkdir()
+        victim = tmp_path / "victim"
+        victim.write_text("precious\n")
         seen = tmp_path / "flag-during-migrate.json"
         fakebin.stub("docker", body=_docker_stub(f'*"manage.py migrate"*) /bin/cp update/maintenance.json "{seen}" ;;'))
+        (tmp_path / "update" / "maintenance.json").symlink_to(victim)
+        result = run_script("update.sh", fakebin, cwd=tmp_path, args=["--from", "repo", "--no-pull", "--keep-lock"])
+        # --keep-lock leaves a present flag alone; without it the link is a
+        # foreign flag and refused. Either way the target is never written.
+        assert victim.read_text() == "precious\n"
         result = run_script("update.sh", fakebin, cwd=tmp_path, args=["--from", "repo", "--no-pull"])
-        assert result.returncode == 0, result.stderr
-        assert json.loads(seen.read_text())["phase"] == "updating"
+        assert result.returncode != 0
+        assert victim.read_text() == "precious\n"
 
-    def test_a_failure_before_the_stack_is_stopped_removes_the_flag(self, fakebin, tmp_path):
+    def test_a_failure_before_the_tree_changes_removes_the_flag(self, fakebin, tmp_path):
         # Nothing changed and the platform is still serving, so the flag would
-        # only lock everyone out of a working deployment.
+        # only lock everyone out of a working deployment; the workers stopped
+        # for the dump come back.
         _deploy(fakebin, tmp_path)
-        fakebin.stub("docker", body=_docker_stub('*"--profile vendor build"*) exit 1 ;;'))
+        fakebin.stub("docker", body=_docker_stub('*"pg_dump"*) exit 1 ;;'))
         result = run_script("update.sh", fakebin, cwd=tmp_path, args=["--from", "repo", "--no-pull"])
         assert result.returncode != 0
         assert not fakebin.has_call("stop web celery")
         assert not (tmp_path / "update" / "maintenance.json").exists()
+        assert fakebin.has_call("up -d celery celery-beat")
+        assert not (tmp_path / "backups" / ".update-unfinished").exists()
+
+    def test_a_rollback_takes_over_a_flag_a_failed_update_left(self, fakebin, tmp_path):
+        # The failed update's own message sends the operator to --rollback; a
+        # rollback refusing the flag that update left would strand them.
+        _deploy(fakebin, tmp_path)
+        TestRollback()._seed_snapshot(tmp_path)
+        (tmp_path / "update").mkdir()
+        (tmp_path / "update" / "maintenance.json").write_text('{"protocol": 1, "phase": "updating"}\n')
+        result = run_script("update.sh", fakebin, cwd=tmp_path, args=["--rollback", "--yes"])
+        assert result.returncode == 0, result.stderr
+        assert "takes it over" in result.stdout
+        assert not (tmp_path / "update" / "maintenance.json").exists()
+
+    def test_a_failure_after_the_tree_changed_keeps_the_flag_and_blocks_a_retry(self, fakebin, tmp_path):
+        _deploy(fakebin, tmp_path)
+        fakebin.stub("docker", body=_docker_stub('*"--profile vendor build"*) exit 1 ;;'))
+        result = run_script("update.sh", fakebin, cwd=tmp_path, args=["--from", "repo", "--no-pull"])
+        assert result.returncode != 0
+        assert (tmp_path / "update" / "maintenance.json").exists()
+        assert "--rollback --snapshot pre-update-" in result.stdout
+        unfinished = (tmp_path / "backups" / ".update-unfinished").read_text().strip()
+        assert unfinished.startswith("pre-update-")
+        (tmp_path / "update" / "maintenance.json").unlink()
+        result = run_script("update.sh", fakebin, cwd=tmp_path, args=["--from", "repo", "--no-pull"])
+        assert result.returncode != 0 and "refused=unfinished" in _progress(result)
 
     def test_a_failure_after_the_stack_is_stopped_leaves_the_flag_and_says_so(self, fakebin, tmp_path):
         # The stack is down and not coming back on its own; the flag is what
@@ -918,7 +985,7 @@ class TestMaintenanceFlag:
     def test_a_failed_restore_leaves_the_flag(self, fakebin, tmp_path):
         _deploy(fakebin, tmp_path)
         TestRollback()._seed_snapshot(tmp_path)
-        fakebin.stub("docker", body=_docker_stub('*"psql --single-transaction"*) cat >/dev/null; exit 1 ;;'))
+        fakebin.stub("docker", body=_docker_stub('*"psql -v ON_ERROR_STOP=1 -U"*) cat >/dev/null; exit 1 ;;'))
         result = run_script("update.sh", fakebin, cwd=tmp_path, args=["--rollback", "--yes"])
         assert result.returncode != 0
         assert "restore FAILED" in result.stderr
@@ -929,7 +996,7 @@ class TestMaintenanceFlag:
         # the code snapshot leaves it out, so neither direction can touch the flag.
         body = (SCRIPTS_DIR / "update.sh").read_text()
         assert body.count("--exclude='/update/'") == 1, "archive overlay no longer excludes update/"
-        assert body.count('--exclude="update/"') == 1, "rollback replace no longer excludes update/"
+        assert body.count('--exclude="/update/"') == 1, "rollback replace no longer excludes update/"
         assert body.count('--exclude="./update"') == 1, "code snapshot no longer excludes update/"
 
 
@@ -1241,18 +1308,20 @@ class TestArchiveVerification:
 
     def test_a_host_that_cannot_verify_says_so(self, fakebin, tmp_path):
         # LibreSSL cannot do Ed25519 and neither can a python3 without
-        # cryptography: the signature is reported as unverifiable, which
-        # --require-signature refuses.
+        # cryptography: the signature is reported as unverifiable. With a
+        # release key present that is a refusal; --allow-unsigned applies the
+        # package regardless, with the warning.
         self._signed(fakebin, tmp_path)
         fakebin.stub("openssl", body=OPENSSL_TOO_OLD)
         fakebin.stub("python3", exit_code=1)
         result = run_script("update.sh", fakebin, cwd=tmp_path)
+        assert result.returncode != 0
+        assert "nothing on this host can check" in result.stderr
+        assert "refused=signature" in _progress(result)
+        result = run_script("update.sh", fakebin, cwd=tmp_path, args=["--allow-unsigned"])
         assert result.returncode == 0, result.stderr
         assert "nothing on this host can check" in result.stdout
         assert "signature=unverifiable" in _progress(result)
-        result = run_script("update.sh", fakebin, cwd=tmp_path, args=["--require-signature"])
-        assert result.returncode != 0
-        assert "nothing on this host can check" in result.stderr
 
     def test_a_package_for_another_project_is_refused(self, fakebin, tmp_path):
         self._signed(fakebin, tmp_path, EPICURRENTS_PROJECT="edu", project="research")
@@ -1393,7 +1462,7 @@ class TestArchiveContents:
         fakebin.stub("rsync")
         result = run_script("update.sh", fakebin, cwd=tmp_path)
         assert result.returncode != 0
-        assert ".env, .git/ or backups/" in result.stderr
+        assert ".env, .git/, backups/, update/ or .epicurrents-files" in result.stderr
 
     def test_a_package_packed_with_a_dot_prefix_is_accepted(self, fakebin, tmp_path):
         # `tar -C dir .` writes ./epicurrents-test/…; the one-directory rule
@@ -1580,13 +1649,15 @@ class TestProgressLines:
         lines = _progress(result)
         steps = [line for line in lines if line.startswith("step=")]
         assert steps == [
-            "step=check", "step=snapshot", "step=acquire", "step=backup", "step=build", "step=stop",
+            "step=check", "step=snapshot", "step=backup", "step=acquire", "step=build", "step=stop",
             "step=migrate", "step=static", "step=vendor", "step=recreate", "step=health",
         ], steps
         snapshot = next(line for line in lines if line.startswith("snapshot="))
         assert snapshot.startswith("snapshot=./backups/pre-update-")
+        # The snapshot is complete before the tree is touched: a failure from
+        # step=acquire on always has one to roll back to.
         assert lines.index(snapshot) > lines.index("step=backup")
-        assert lines.index(snapshot) < lines.index("step=build")
+        assert lines.index(snapshot) < lines.index("step=acquire")
         assert "health=ok" in lines
         assert lines[-1] == "done"
 
@@ -1594,8 +1665,11 @@ class TestProgressLines:
         _deploy(fakebin, tmp_path)
         fakebin.stub("curl", exit_code=1)
         result = run_script("update.sh", fakebin, cwd=tmp_path, args=["--from", "repo", "--no-pull"])
-        assert result.returncode == 0, result.stderr
+        # A failed health check is a failed run: a caller that keys on the exit
+        # status must not read it as success.
+        assert result.returncode != 0
         assert "health=failed" in _progress(result)
+        assert "done" not in _progress(result)
 
     def test_a_failure_before_the_snapshot_completes_reports_no_snapshot(self, fakebin, tmp_path):
         _deploy(fakebin, tmp_path)
@@ -1736,7 +1810,7 @@ class TestCodeOnlyRollback:
         lines = _progress(result)
         assert "step=restore-code" in lines and "step=build" in lines and "restored=0.1.0" in lines
         assert "step=restore-db" not in lines and "step=restore-env" not in lines
-        assert not any("psql --single-transaction" in c for c in fakebin.calls())
+        assert not any("psql -v ON_ERROR_STOP=1 -U" in c for c in fakebin.calls())
         assert (tmp_path / ".env").read_text() == env_before
         assert "the database and .env were kept" in result.stdout
         assert lines[-1] == "done"
@@ -1899,7 +1973,7 @@ class TestSeveralReleaseKeys:
         result = run_script("update.sh", fakebin, cwd=tmp_path, args=["--require-signature"])
         assert result.returncode != 0
         assert "refused=signature" in _progress(result) and "does NOT verify against" in result.stderr
-        assert not (tmp_path / "backups").exists()
+        assert not list((tmp_path / "backups").glob("pre-update-*"))
 
     def test_a_missing_key_among_several_is_skipped(self, fakebin, tmp_path):
         _deploy(fakebin, tmp_path)
@@ -1984,7 +2058,9 @@ class TestPruningStaysInsideTheTree:
         (tmp_path / "RELEASE_KEY.pub").write_text("key")
         self._lists(tmp_path, "epicurrents/version.py", "RELEASE_KEY.pub")
         fakebin.stub("rsync")
-        result = run_script("update.sh", fakebin, cwd=tmp_path)
+        # Unsigned beside a present key is now a refusal; the operator's flag
+        # is what lets this package through.
+        result = run_script("update.sh", fakebin, cwd=tmp_path, args=["--allow-unsigned"])
         assert result.returncode == 0, result.stderr
         assert (tmp_path / "RELEASE_KEY.pub").exists()
 
@@ -2022,11 +2098,11 @@ class TestListingHardeningEdges:
         fakebin.stub("rsync")
         result = run_script("update.sh", fakebin, cwd=tmp_path)
         assert result.returncode != 0
-        assert ".env, .git/ or backups/" in result.stderr
+        assert ".env, .git/, backups/, update/ or .epicurrents-files" in result.stderr
         self._archive(tmp_path, [("top/docker-compose.yml", "file"), ("top//backups/x", "file")])
         result = run_script("update.sh", fakebin, cwd=tmp_path)
         assert result.returncode != 0
-        assert ".env, .git/ or backups/" in result.stderr
+        assert ".env, .git/, backups/, update/ or .epicurrents-files" in result.stderr
 
     def test_a_device_node_is_refused(self, fakebin, tmp_path):
         _deploy(fakebin, tmp_path)

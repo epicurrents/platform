@@ -28,6 +28,7 @@ from activity.audit import log_activity
 from epicurrents.auth import enforce_session_csrf
 from epicurrents.security_log import get_client_ip, log_security_event
 from user.models import TwoFactorCredential
+from user.stepup import check_stepup_lockout, record_password_recheck_failure
 from user.two_factor import (
     active_credential,
     build_provisioning_uri,
@@ -95,14 +96,19 @@ def _confirm_password(request, user, password: str) -> None:
     An account with no usable password — provisioned through OIDC, where the
     provider owns authentication — cannot satisfy this and cannot manage a local
     second factor. Refusing with 409 rather than 400 says the state of the
-    account is the problem, not the payload.
+    account is the problem, not the payload. A wrong password counts toward the
+    shared lockout in user/lockout.py, and a locked-out account answers 429.
     """
     if not user.has_usable_password():
         raise HttpError(
             409,
             "This account signs in through an external provider, which owns its second factor.",
         )
+    # Draws on the step-up budget: a re-check with no lockout of its own would be
+    # an unlimited password oracle for anyone holding the session.
+    check_stepup_lockout(request, user)
     if not user.check_password(password):
+        record_password_recheck_failure(user)
         log_security_event(
             "auth.2fa_reauth_failed",
             ip=get_client_ip(request),

@@ -136,3 +136,28 @@ class TestThrottleScope:
         assert _scope_for_path(f"{BASE}/jobs/{JOB_ID}/rollback") == "maintenance"
         assert _scope_for_path(f"{BASE}/packages") == "upload"
         assert _scope_for_path(f"{BASE}/status") == "default"
+
+
+@pytest.mark.django_db
+class TestRefusalsAreSecurityLogged:
+    def _denials(self, caplog):
+        return [r for r in caplog.records if getattr(r, "security_event_type", "") == "permission.denied"]
+
+    def test_an_anonymous_caller_is_logged(self, enabled, client, caplog):
+        import logging
+
+        caplog.set_level(logging.WARNING, logger="epicurrents.security")
+        assert client.get(f"{BASE}/status").status_code == 401
+        [event] = self._denials(caplog)
+        assert event.permission == "maintenance.authenticated" and event.actor_id is None
+
+    def test_a_plain_user_is_logged_with_the_tier_they_lacked(self, enabled, auth_client, caplog):
+        import logging
+
+        caplog.set_level(logging.WARNING, logger="epicurrents.security")
+        client, user = auth_client
+        assert client.get(f"{BASE}/status").status_code == 403
+        assert _post(client, f"{BASE}/jobs").status_code == 403
+        events = self._denials(caplog)
+        assert [e.permission for e in events] == ["maintenance.staff", "maintenance.superuser"]
+        assert {e.actor_id for e in events} == {user.pk} and events[0].path == f"{BASE}/status"

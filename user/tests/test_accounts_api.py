@@ -24,6 +24,10 @@ ACCOUNTS = "/api/v1/user/admin/accounts"
 GROUPS = "/api/v1/user/admin/groups"
 ROLES = "/api/v1/user/admin/roles"
 
+#: The superuser fixture's own password, sent as step-up confirmation on the
+#: writes that require it.
+STEP = {"password": "adminpass123"}
+
 
 def put_json(client, url, data):
     """PUT JSON data and return the response."""
@@ -106,7 +110,12 @@ class TestAccountCreation:
         response = post_json(
             su_client,
             ACCOUNTS,
-            {"username": "newbie", "password": "Str0ng-Passphrase-42", "email": "n@example.com"},
+            {
+                "username": "newbie",
+                "password": "Str0ng-Passphrase-42",
+                "email": "n@example.com",
+                "current_password": STEP["password"],
+            },
         )
         assert response.status_code == 201
         body = response.json()
@@ -150,7 +159,7 @@ class TestAccountCreation:
 @pytest.mark.django_db
 class TestAccountUpdate:
     def test_edits_fields_and_audits(self, su_client, user):
-        response = patch_json(su_client, f"{ACCOUNTS}/{user.pk}", {"first_name": "Ada", "is_staff": True})
+        response = patch_json(su_client, f"{ACCOUNTS}/{user.pk}", {"first_name": "Ada", "is_staff": True, **STEP})
         assert response.status_code == 200
         user.refresh_from_db()
         assert user.first_name == "Ada"
@@ -175,7 +184,7 @@ class TestLastSuperuserGuard:
     not have at the moment they need it."""
 
     def test_cannot_demote_the_last_superuser(self, su_client, superuser):
-        response = patch_json(su_client, f"{ACCOUNTS}/{superuser.pk}", {"is_superuser": False})
+        response = patch_json(su_client, f"{ACCOUNTS}/{superuser.pk}", {"is_superuser": False, **STEP})
         assert response.status_code == 409
         superuser.refresh_from_db()
         assert superuser.is_superuser is True
@@ -188,7 +197,7 @@ class TestLastSuperuserGuard:
 
     def test_can_demote_when_another_active_superuser_remains(self, su_client, superuser, make_superuser):
         make_superuser(username="second_root")
-        response = patch_json(su_client, f"{ACCOUNTS}/{superuser.pk}", {"is_superuser": False})
+        response = patch_json(su_client, f"{ACCOUNTS}/{superuser.pk}", {"is_superuser": False, **STEP})
         assert response.status_code == 200
 
     def test_an_inactive_second_superuser_does_not_count(self, su_client, superuser, make_superuser):
@@ -196,7 +205,7 @@ class TestLastSuperuserGuard:
         spare = make_superuser(username="dormant_root")
         spare.is_active = False
         spare.save(update_fields=["is_active"])
-        response = patch_json(su_client, f"{ACCOUNTS}/{superuser.pk}", {"is_superuser": False})
+        response = patch_json(su_client, f"{ACCOUNTS}/{superuser.pk}", {"is_superuser": False, **STEP})
         assert response.status_code == 409
 
     def test_editing_an_ordinary_account_is_unaffected(self, su_client, user):
@@ -206,7 +215,9 @@ class TestLastSuperuserGuard:
 @pytest.mark.django_db
 class TestSetPassword:
     def test_sets_and_audits(self, su_client, user):
-        response = post_json(su_client, f"{ACCOUNTS}/{user.pk}/password", {"new_password": "An0ther-Str0ng-Pass"})
+        response = post_json(
+            su_client, f"{ACCOUNTS}/{user.pk}/password", {"new_password": "An0ther-Str0ng-Pass", **STEP}
+        )
         assert response.status_code == 200
         user.refresh_from_db()
         assert user.check_password("An0ther-Str0ng-Pass")
@@ -218,7 +229,7 @@ class TestSetPassword:
     def test_the_hash_never_reaches_the_audit_payload(self, su_client, user):
         """user/apps.py masks `password`; this asserts the masking survives a
         write through this endpoint rather than trusting the registration."""
-        post_json(su_client, f"{ACCOUNTS}/{user.pk}/password", {"new_password": "An0ther-Str0ng-Pass"})
+        post_json(su_client, f"{ACCOUNTS}/{user.pk}/password", {"new_password": "An0ther-Str0ng-Pass", **STEP})
         user.refresh_from_db()
         for change in _changes_for(user):
             assert user.password not in json.dumps(change.before_state)
@@ -234,13 +245,13 @@ class TestGroupMembershipIsAudited:
     def test_setting_groups_writes_a_change_row(self, su_client, user):
         group = Group.objects.create(name="Reviewers")
         before = _changes_for(user).count()
-        response = put_json(su_client, f"{ACCOUNTS}/{user.pk}/groups", {"group_ids": [group.pk]})
+        response = put_json(su_client, f"{ACCOUNTS}/{user.pk}/groups", {"group_ids": [group.pk], **STEP})
         assert response.status_code == 200
         assert _changes_for(user).count() == before + 1
 
     def test_the_row_carries_a_verifiable_membership_digest(self, su_client, user):
         group = Group.objects.create(name="Reviewers")
-        put_json(su_client, f"{ACCOUNTS}/{user.pk}/groups", {"group_ids": [group.pk]})
+        put_json(su_client, f"{ACCOUNTS}/{user.pk}/groups", {"group_ids": [group.pk], **STEP})
         change = _changes_for(user).latest("created_at")
         result = verify_derived_state(change)
         assert result.ok, result.digests
@@ -250,7 +261,7 @@ class TestGroupMembershipIsAudited:
         stored digest describing a membership that no longer exists."""
         group = Group.objects.create(name="Reviewers")
         other = Group.objects.create(name="Smuggled")
-        put_json(su_client, f"{ACCOUNTS}/{user.pk}/groups", {"group_ids": [group.pk]})
+        put_json(su_client, f"{ACCOUNTS}/{user.pk}/groups", {"group_ids": [group.pk], **STEP})
         change = _changes_for(user).latest("created_at")
 
         user.groups.add(other)  # straight to the M2M table, no audit row
@@ -262,7 +273,7 @@ class TestGroupMembershipIsAudited:
         """The digest is over primary keys precisely so a rename — which this
         surface offers — cannot invalidate every historical membership row."""
         group = Group.objects.create(name="Reviewers")
-        put_json(su_client, f"{ACCOUNTS}/{user.pk}/groups", {"group_ids": [group.pk]})
+        put_json(su_client, f"{ACCOUNTS}/{user.pk}/groups", {"group_ids": [group.pk], **STEP})
         change = _changes_for(user).latest("created_at")
 
         patch_json(su_client, f"{GROUPS}/{group.pk}", {"name": "Renamed"})
@@ -271,8 +282,8 @@ class TestGroupMembershipIsAudited:
     def test_membership_is_replaced_not_merged(self, su_client, user):
         first = Group.objects.create(name="First")
         second = Group.objects.create(name="Second")
-        put_json(su_client, f"{ACCOUNTS}/{user.pk}/groups", {"group_ids": [first.pk]})
-        put_json(su_client, f"{ACCOUNTS}/{user.pk}/groups", {"group_ids": [second.pk]})
+        put_json(su_client, f"{ACCOUNTS}/{user.pk}/groups", {"group_ids": [first.pk], **STEP})
+        put_json(su_client, f"{ACCOUNTS}/{user.pk}/groups", {"group_ids": [second.pk], **STEP})
         assert sorted(user.groups.values_list("name", flat=True)) == ["Second"]
 
     def test_unknown_group_is_404_and_changes_nothing(self, su_client, user):
@@ -289,7 +300,7 @@ class TestGroupMembershipIsAudited:
         first = make_user(username="member_a", password="pw")
         second = make_user(username="member_b", password="pw")
 
-        response = put_json(su_client, f"{GROUPS}/{group.pk}/members", {"user_ids": [first.pk, second.pk]})
+        response = put_json(su_client, f"{GROUPS}/{group.pk}/members", {"user_ids": [first.pk, second.pk], **STEP})
         assert response.status_code == 200
         assert response.json()["member_count"] == 2
         assert _changes_for(first).filter(action=ObjectChangeLog.ACTION_MODIFY).exists()
@@ -302,7 +313,7 @@ class TestGroupMembershipIsAudited:
         staying.groups.add(group)
         baseline = _changes_for(staying).count()
 
-        put_json(su_client, f"{GROUPS}/{group.pk}/members", {"user_ids": [staying.pk, joining.pk]})
+        put_json(su_client, f"{GROUPS}/{group.pk}/members", {"user_ids": [staying.pk, joining.pk], **STEP})
         assert _changes_for(staying).count() == baseline
         assert _changes_for(joining).filter(action=ObjectChangeLog.ACTION_MODIFY).exists()
 
@@ -314,7 +325,7 @@ class TestGroups:
         assert created.status_code == 201
         group_id = created.json()["id"]
 
-        put_json(su_client, f"{ACCOUNTS}/{user.pk}/groups", {"group_ids": [group_id]})
+        put_json(su_client, f"{ACCOUNTS}/{user.pk}/groups", {"group_ids": [group_id], **STEP})
         listing = su_client.get(GROUPS).json()
         entry = next(item for item in listing if item["id"] == group_id)
         assert entry["member_count"] == 1
@@ -444,7 +455,7 @@ class TestRoleHook:
         store = {}
         self._register(store)
         group = self._group()
-        response = patch_json(su_client, f"{GROUPS}/{group.pk}", {"roles": {"test_role": "captain"}})
+        response = patch_json(su_client, f"{GROUPS}/{group.pk}", {"roles": {"test_role": "captain"}, **STEP})
         assert response.status_code == 200
         assert store[group.pk] == "captain"
         assert response.json()["roles"]["test_role"] == "captain"
@@ -532,11 +543,11 @@ class TestResponseFreshness:
 
     def test_the_group_response_reflects_the_new_membership(self, su_client, user):
         group = Group.objects.create(name="Reviewers")
-        response = put_json(su_client, f"{ACCOUNTS}/{user.pk}/groups", {"group_ids": [group.pk]})
+        response = put_json(su_client, f"{ACCOUNTS}/{user.pk}/groups", {"group_ids": [group.pk], **STEP})
         assert [g["name"] for g in response.json()["groups"]] == ["Reviewers"]
 
     def test_clearing_membership_is_reflected_too(self, su_client, user):
         group = Group.objects.create(name="Reviewers")
-        put_json(su_client, f"{ACCOUNTS}/{user.pk}/groups", {"group_ids": [group.pk]})
+        put_json(su_client, f"{ACCOUNTS}/{user.pk}/groups", {"group_ids": [group.pk], **STEP})
         response = put_json(su_client, f"{ACCOUNTS}/{user.pk}/groups", {"group_ids": []})
         assert response.json()["groups"] == []

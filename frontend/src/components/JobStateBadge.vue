@@ -5,27 +5,12 @@
  * @package    epicurrents-platform
  */
 import { computed } from 'vue'
-import { t } from '#i18n'
 import type { JobState } from '#api/maintenance'
-
-const SCOPE = 'JobStateBadge'
+import { jobStateLabel } from '#lib/maintenanceLabels'
 
 const props = defineProps<{
     state: JobState
 }>()
-
-const LABELS: Record<JobState, string> = {
-    requested: 'Requested',
-    accepted: 'Accepted',
-    running: 'Running',
-    awaiting_verification: 'Awaiting confirmation',
-    succeeded: 'Succeeded',
-    failed: 'Failed',
-    cancelled: 'Cancelled',
-    rolling_back: 'Rolling back',
-    rolled_back: 'Rolled back',
-    rollback_failed: 'Rollback failed',
-}
 
 const variant = computed(() => {
     switch (props.state) {
@@ -45,7 +30,7 @@ const variant = computed(() => {
     }
 })
 
-const label = computed(() => t(LABELS[props.state] ?? props.state, SCOPE))
+const label = computed(() => jobStateLabel(props.state))
 </script>
 
 <template>

@@ -1,5 +1,5 @@
 import axios from 'axios'
-import { isMaintenanceNotice, recordMaintenanceNotice } from '#lib/maintenanceLock'
+import { isMaintenanceNotice, parseRetryAfter, recordMaintenanceNotice } from '#lib/maintenanceLock'
 
 /**
  * API base URL for all frontend HTTP calls.
@@ -31,9 +31,10 @@ export const http = axios.create({
 http.interceptors.response.use(
     (response) => response,
     (error: unknown) => {
-        const response = (error as { response?: { status?: number, data?: unknown } })?.response
+        type Rejected = { response?: { status?: number, data?: unknown, headers?: Record<string, unknown> } }
+        const response = (error as Rejected)?.response
         if (response?.status === 503 && isMaintenanceNotice(response.data)) {
-            recordMaintenanceNotice(response.data)
+            recordMaintenanceNotice(response.data, parseRetryAfter(response.headers?.['retry-after']))
         }
         return Promise.reject(error)
     },
@@ -46,12 +47,18 @@ http.interceptors.response.use(
  * the last-active-superuser guard, the grant count blocking a group deletion,
  * the password validators' joined messages — and each refusal arrives as a
  * `detail` string that is already the right thing to show. Falls back to
- * `fallback` for a network error, which has no response to read.
+ * `fallback` for a network error, which has no response to read. A
+ * maintenance refusal's `detail` is the token `"maintenance"`, so its
+ * `message` is shown instead.
  *
  * @param error - the rejected value from an `http` call, of whatever shape axios produced.
  * @param fallback - message to use when the failure carries no `detail` string.
  */
 export function errorDetail(error: unknown, fallback: string): string {
-    const detail = (error as { response?: { data?: { detail?: string } } })?.response?.data?.detail
+    const data = (error as { response?: { data?: unknown } })?.response?.data
+    if (isMaintenanceNotice(data)) {
+        return typeof data.message === 'string' && data.message.length > 0 ? data.message : fallback
+    }
+    const detail = (data as { detail?: unknown } | undefined)?.detail
     return typeof detail === 'string' && detail.length > 0 ? detail : fallback
 }

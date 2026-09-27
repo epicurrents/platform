@@ -327,6 +327,7 @@ def export_user_data(user) -> dict[str, Any]:
             "is_staff",
             "is_superuser",
             "is_active",
+            "email_self_asserted",
         ),
     )
 

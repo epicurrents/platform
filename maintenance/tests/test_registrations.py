@@ -90,4 +90,7 @@ class TestDeploymentPairing:
     def test_update_sh_keeps_the_spool_out_of_every_sync_and_snapshot(self):
         script = (REPO_ROOT / "scripts" / "update.sh").read_text()
         assert script.count("--exclude") >= 3
-        assert '--exclude="./update"' in script and '--exclude="update/"' in script and "--exclude='/update/'" in script
+        # The code snapshot, the rollback's replace and the update's overlay,
+        # each anchored at the root so an app directory of the same name is
+        # still code.
+        assert '--exclude="./update"' in script and '--exclude="/update/"' in script and "--exclude='/update/'" in script

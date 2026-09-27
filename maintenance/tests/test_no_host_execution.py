@@ -100,10 +100,30 @@ class TestNoHostExecution:
 
 @pytest.mark.django_db
 class TestEveryEndpointIsGated:
+    # The lock probe is public and ungated by design: update.sh raises the flag
+    # on deployments without the feature, and the SPA polls it signed out.
+    PUBLIC_VIEWS = {"get_lock"}
+
     def _maintenance_operations(self):
-        found = [(path, methods, view) for path, methods, view in _iter_operations() if "api/v1/maintenance/" in path]
+        found = [
+            (path, methods, view)
+            for path, methods, view in _iter_operations()
+            if "api/v1/maintenance/" in path and view.__name__ not in self.PUBLIC_VIEWS
+        ]
         assert len(found) >= 9, "the maintenance API must be mounted for this scan to mean anything"
         return found
+
+    def test_the_only_public_view_is_the_lock_probe_and_it_writes_nothing(self):
+        public = [
+            (path, methods, view)
+            for path, methods, view in _iter_operations()
+            if "api/v1/maintenance/" in path and view.__name__ in self.PUBLIC_VIEWS
+        ]
+        assert [(path.rstrip("/").rsplit("/", 1)[-1], list(methods)) for path, methods, _ in public] == [
+            ("lock", ["GET"])
+        ]
+        source = inspect.getsource(public[0][2])
+        assert "sync(" not in source and "log_activity" not in source and ".save(" not in source
 
     def test_every_operation_calls_the_gate_and_a_tier_guard(self):
         for path, methods, view in self._maintenance_operations():

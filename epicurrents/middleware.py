@@ -320,8 +320,18 @@ class ApiThrottleMiddleware:
 
 _SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 # API paths that answer while the platform is locked, whatever the phase: the
-# probes an orchestrator and the host agent gate on.
-_LOCK_EXEMPT_PATHS = frozenset({"/api/v1/health", "/api/v1/ready", "/api/v1/health/", "/api/v1/ready/"})
+# probes an orchestrator and the host agent gate on, and the lock probe the SPA
+# polls to see the phase change and the flag come down.
+_LOCK_EXEMPT_PATHS = frozenset(
+    {
+        "/api/v1/health",
+        "/api/v1/ready",
+        "/api/v1/health/",
+        "/api/v1/ready/",
+        "/api/v1/maintenance/lock",
+        "/api/v1/maintenance/lock/",
+    }
+)
 # Unsafe API paths allowed during the verification window for everyone, so a
 # superuser can sign in to confirm and anyone can sign out.
 _LOCK_LOGIN_PREFIXES = ("/api/v1/user/login", "/api/v1/user/logout")

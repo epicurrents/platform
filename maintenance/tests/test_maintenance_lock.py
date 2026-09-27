@@ -16,6 +16,7 @@ ME = "/api/v1/user/me"
 LOGIN = "/api/v1/user/login"
 LOGOUT = "/api/v1/user/logout"
 STATUS = "/api/v1/maintenance/status"
+PROBE = "/api/v1/maintenance/lock"
 WRITE = "/api/v1/notifications/subscribe"
 WELL_KNOWN = "/.well-known/epicurrents-federation.json"
 
@@ -130,6 +131,15 @@ class TestLockMiddlewarePolicy:
         assert client.get(READY).json().get("detail") != "maintenance"
 
     @pytest.mark.parametrize("phase", ["updating", "verifying", "rolling_back"])
+    @pytest.mark.parametrize("path", [PROBE, PROBE + "/"])
+    def test_the_lock_probe_answers_in_every_phase(self, write_flag, client, phase, path):
+        """The SPA polls the probe to see the phase change and the flag come down; refusing it hides the release."""
+        write_flag(phase)
+        response = client.get(path)
+        assert response.status_code != 503
+        assert response.json().get("detail") != "maintenance"
+
+    @pytest.mark.parametrize("phase", ["updating", "verifying", "rolling_back"])
     def test_documents_and_assets_pass_in_every_phase(self, write_flag, client, phase):
         write_flag(phase)
         assert client.get("/").status_code != 503, "the SPA document must render the message"
@@ -234,3 +244,51 @@ def test_a_spool_the_process_cannot_enter_is_not_a_lock(spool_dir, client):
         assert client.get(ME).status_code == 200
     finally:
         spool_dir.chmod(0o755)
+
+
+@pytest.mark.django_db
+class TestLockProbe:
+    """``GET /api/v1/maintenance/lock``: public, ungated, exempt, no Activity row, the same shape always."""
+
+    def test_no_flag(self, spool_dir, client):
+        response = client.get(PROBE)
+        assert response.status_code == 200
+        assert response.json() == {
+            "locked": False,
+            "phase": None,
+            "since": None,
+            "expected_until": None,
+            "message": None,
+        }
+        assert "no-store" in response["Cache-Control"]
+
+    @pytest.mark.parametrize("phase", ["updating", "verifying", "rolling_back"])
+    def test_each_phase(self, write_flag, client, phase):
+        write_flag(phase, expected_until="2026-09-20T10:30:00Z")
+        assert client.get(PROBE).json() == {
+            "locked": True,
+            "phase": phase,
+            "since": "2026-09-20T10:00:00Z",
+            "expected_until": "2026-09-20T10:30:00Z",
+            "message": "The platform is being updated.",
+        }
+
+    def test_a_malformed_flag_reads_as_updating(self, spool_dir, client):
+        lock.lock_path().write_text("{")
+        lock.invalidate_cache()
+        body = client.get(PROBE).json()
+        assert body["locked"] is True and body["phase"] == "updating" and body["message"] == lock.DEFAULT_MESSAGE
+
+    def test_answers_with_the_feature_off(self, write_flag, client):
+        with override_settings(REMOTE_MAINTENANCE_ENABLED=False):
+            write_flag("updating")
+            assert client.get(PROBE).json()["locked"] is True
+
+    def test_writes_no_activity_row(self, write_flag, superuser_client):
+        client, _ = superuser_client
+        write_flag("verifying")
+        before = Activity.objects.count()
+        assert client.get(PROBE).status_code == 200
+        assert client.get(PROBE + "/").status_code in (200, 404)
+        assert Activity.objects.count() == before
+        assert PROBE in settings.ACTIVITY_PATH_SKIP_LIST and PROBE + "/" in settings.ACTIVITY_PATH_SKIP_LIST

@@ -13,3 +13,13 @@ TimeoutStartSec=0
 Nice=5
 IOSchedulingClass=best-effort
 IOSchedulingPriority=6
+# Whatever the agent creates is root's alone unless it sets a mode itself; the
+# files it publishes into the spool do.
+UMask=0077
+# No ProtectSystem, ProtectHome, PrivateTmp or ReadWritePaths, deliberately.
+# Each of them puts the service in a mount namespace of its own, and rootful
+# Podman sets up a container's mounts in the namespace of the process that
+# starts it: containers started from here would carry mounts the host cannot
+# see. NoNewPrivileges is left out for the same runtime: it forbids the SELinux
+# domain transition a container process makes on a Red Hat host. The agent's
+# own defence is that it trusts nothing in the spool (see the script's header).

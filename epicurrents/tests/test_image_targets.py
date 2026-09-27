@@ -189,6 +189,20 @@ class TestStageLayout:
             "the re-include must come after the exclusion it carves out of"
         )
 
+    def test_deployment_state_never_reaches_the_build_context(self):
+        """`COPY . .` takes whatever the context holds, and a deployment root
+        holds snapshots (a database dump and a copy of .env each), the spool
+        (uploaded packages, job logs) and nested .env files. Baked into an
+        image, a dump outlives every erasure the platform performs.
+        """
+        patterns = [
+            line.strip() for line in (REPO / ".dockerignore").read_text().splitlines()
+            if line.strip() and not line.startswith("#")
+        ]
+        for pattern in ("backups/", "update/", ".epicurrents-files", ".env", ".env.*", "**/.env", "**/.env.*"):
+            assert pattern in patterns, f"{pattern} is not excluded from the build context"
+        assert "!**/.env.example" not in patterns, "a nested .env.example re-include reaches into excluded trees"
+
 
 class TestDependencyLock:
     """Version pins alone let two builds of one commit install different

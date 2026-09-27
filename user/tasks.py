@@ -6,6 +6,21 @@ persists to an append-only file, so its arguments outlive the send, and a task
 signature that accepts a recipient address invites exactly the payload the
 inventory in docs/gdpr-compliance.md says the store does not hold. A new mail
 flow adds a task that takes a primary key, as the one below does.
+
+Nothing is sent while the deployment has no mail backend outside development.
+Django's default is the console backend, which writes each message — the reset
+or invitation link with its live token, and the recipient address — to the
+worker's standard output, and a container's standard output is a log that is
+shipped, retained and read by people who were never meant to hold either. The
+tasks log that they declined, naming neither, and the account endpoints say in
+their response that no invitation went out.
+
+Links carry ``uid`` and ``token`` in the URL fragment rather than the query
+string. A fragment never leaves the browser: it is not sent to the server that
+serves the page, so it stays out of access logs and proxy logs, and it is not
+repeated in the ``Referer`` header of anything the page loads. The page reads
+it, removes it from the address bar, and posts both values to
+``/reset-password/confirm``.
 """
 
 import logging
@@ -13,6 +28,29 @@ import logging
 from celery import shared_task
 
 logger = logging.getLogger(__name__)
+
+
+def mail_deliverable() -> bool:
+    """Whether a user mail task would send anything at all.
+
+    True when a real backend is configured, and in development (``DEBUG``),
+    where the console backend is how a developer reads the link. The
+    configured-backend test is the maintenance notifier's, reused so the two
+    senders cannot disagree about what counts as configured.
+    """
+    from django.conf import settings
+
+    from maintenance.notify import mail_configured
+
+    return mail_configured() or bool(settings.DEBUG)
+
+
+def _refuse_undeliverable(task) -> bool:
+    """Log and return True when ``task`` must not send; the line names neither recipient nor link."""
+    if mail_deliverable():
+        return False
+    logger.warning("%s: outgoing mail is not configured (EMAIL_BACKEND is the console backend); not sent", task.name)
+    return True
 
 
 def _deliver(task, subject: str, message: str, from_email: str, recipient_list: list[str]):
@@ -72,6 +110,8 @@ def send_password_reset_email(self, user_id: int):
     from django.utils.encoding import force_bytes
     from django.utils.http import urlsafe_base64_encode
 
+    if _refuse_undeliverable(self):
+        return
     try:
         user = get_user_model().objects.get(pk=user_id, is_active=True)
     except get_user_model().DoesNotExist:
@@ -81,8 +121,9 @@ def send_password_reset_email(self, user_id: int):
     token = default_token_generator.make_token(user)
     # rstrip because a trailing slash in FRONTEND_URL is expected enough that the
     # boot guard in epicurrents/apps.py strips one too; without it every link is
-    # minted with a doubled slash.
-    reset_url = f"{settings.FRONTEND_URL.rstrip('/')}/reset-password?uid={uid}&token={token}"
+    # minted with a doubled slash. The fragment, not the query string: see the
+    # module docstring.
+    reset_url = f"{settings.FRONTEND_URL.rstrip('/')}/reset-password#uid={uid}&token={token}"
 
     _deliver(
         self,
@@ -121,6 +162,8 @@ def send_welcome_email(self, user_id: int):
 
     from user.identity import is_externally_authenticated
 
+    if _refuse_undeliverable(self):
+        return
     try:
         user = get_user_model().objects.get(pk=user_id, is_active=True)
     except get_user_model().DoesNotExist:
@@ -132,8 +175,9 @@ def send_welcome_email(self, user_id: int):
     token = default_token_generator.make_token(user)
     # welcome=1 only changes what the page says. An invited person told their
     # link expired and to "request a new one" has nowhere to request it from,
-    # since they cannot sign in to ask.
-    invite_url = f"{settings.FRONTEND_URL.rstrip('/')}/reset-password?uid={uid}&token={token}&welcome=1"
+    # since they cannot sign in to ask. In the fragment with the token, which is
+    # what the page reads.
+    invite_url = f"{settings.FRONTEND_URL.rstrip('/')}/reset-password#uid={uid}&token={token}&welcome=1"
 
     _deliver(
         self,

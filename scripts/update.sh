@@ -48,6 +48,11 @@
 #                                        RELEASE_KEY.next.pub beside it when present)
 #   ./update.sh --require-newer          refuse a package whose version is not
 #                                        greater than the installed one
+#   ./update.sh --allow-unsigned         apply a package without a verifying signature
+#                                        although a release key is present (refused
+#                                        otherwise)
+#   ./update.sh --allow-downgrade        apply a package older than the installed
+#                                        release (refused otherwise)
 #   ./update.sh --from repo              repo mode, git pull + frontend build
 #   ./update.sh --from repo --no-pull    repo mode, rebuild the current checkout
 #   ./update.sh --no-backup              skip the pre-update snapshot (not advised —
@@ -71,8 +76,11 @@ set -euo pipefail
 
 # Bumped whenever a package starts relying on something an older copy of this
 # script does not do; a package's manifest names the minimum it needs. 3 added
-# --code-only, repeatable --release-key and the migrations record in snapshots.
-UPDATER_SCRIPT_VERSION=3
+# --code-only, repeatable --release-key and the migrations record in snapshots;
+# 4 made a present release key require a signature, refused downgrades, took
+# the database dump before the tree changes, and exits non-zero on a failed
+# health check.
+UPDATER_SCRIPT_VERSION=4
 
 info() { printf '\n\033[1;34m==> %s\033[0m\n' "$*"; }
 ok()   { printf '    \033[32m✓\033[0m  %s\n'  "$*"; }
@@ -90,8 +98,9 @@ die()  {
 # A refusal with a reason a caller can key on: the host agent turns the token
 # into the job's failure reason, where the free text of the message would not
 # survive as a stable identifier. The vocabulary is the one the agent knows —
-# signature, hash, manifest, updater_too_old, incompatible, version_not_newer,
-# code_only — and is pinned in scripts/tests/test_update_targets.py.
+# signature, hash, manifest, contents, updater_too_old, incompatible,
+# version_not_newer, code_only, disk, locked, unfinished — and is pinned in
+# scripts/tests/test_update_targets.py.
 refuse() {
     emit "refused=$1"
     shift
@@ -128,6 +137,8 @@ SKIP_BEAT=false
 KEEP_LOCK=false
 REQUIRE_SIGNATURE=false
 REQUIRE_NEWER=false
+ALLOW_UNSIGNED=false
+ALLOW_DOWNGRADE=false
 RELEASE_KEYS=()
 CODE_ONLY=false
 SNAPSHOT=""
@@ -158,6 +169,8 @@ while [ $# -gt 0 ]; do
         --keep-lock) KEEP_LOCK=true; shift ;;
         --require-signature) REQUIRE_SIGNATURE=true; shift ;;
         --require-newer)     REQUIRE_NEWER=true; shift ;;
+        --allow-unsigned)    ALLOW_UNSIGNED=true; shift ;;
+        --allow-downgrade)   ALLOW_DOWNGRADE=true; shift ;;
         --yes|-y)    ASSUME_YES=true; shift ;;
         -h|--help)   usage; exit 0 ;;
         *)           die "Unknown argument: $1 (try --help)" ;;
@@ -256,6 +269,13 @@ UPDATE_DIR="./update"
 BACKUP_DIR="./backups"
 KEEP_BACKUPS=3
 MAINTENANCE_FLAG="$UPDATE_DIR/maintenance.json"
+# An update that began changing the tree and has neither completed nor been
+# rolled back names its pre-update snapshot here. While it does, a new update
+# is refused and that snapshot is never pruned: retrying a failed update would
+# otherwise snapshot the half-updated tree each time and rotate the real
+# pre-update snapshot out.
+UNFINISHED_MARKER="$BACKUP_DIR/.update-unfinished"
+UNFINISHED_SNAPSHOT=""
 # The installed release's file list, kept so the next update can prune what it
 # shipped and the new package does not. A root file, so the code snapshot
 # carries it and a rollback restores it with the code it describes.
@@ -324,10 +344,23 @@ applied_migrations() {
     # sorted. Read from the table rather than through showmigrations, which
     # lists only the migration files the current code carries. Empty when the
     # table does not exist yet, which is a database nothing has migrated.
+    # Non-zero when the database could not be asked: an empty answer then
+    # would read as "nothing changed" and license a code-only rollback.
+    local rows err rc=0
+    err="$(mktemp)"
     # SC2016: $POSTGRES_* must expand inside the db container's shell, not here.
     # shellcheck disable=SC2016
-    "${COMPOSE[@]}" exec -T db sh -c 'psql -At -F . -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "SELECT app, name FROM django_migrations ORDER BY 1, 2"' 2>/dev/null \
-        | LC_ALL=C sort || true
+    rows="$("${COMPOSE[@]}" exec -T db sh -c 'psql -v ON_ERROR_STOP=1 -At -F . -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "SELECT app, name FROM django_migrations ORDER BY 1, 2"' 2>"$err")" \
+        || rc=$?
+    if [ "$rc" -ne 0 ]; then
+        if grep -q 'relation "django_migrations" does not exist' "$err"; then
+            rc=0
+            rows=""
+        fi
+    fi
+    rm -f "$err"
+    [ "$rc" -eq 0 ] || return 1
+    [ -z "$rows" ] || printf '%s\n' "$rows" | LC_ALL=C sort
 }
 
 version_gt() {
@@ -362,6 +395,38 @@ require_sha256_tool() {
         || die "Neither sha256sum nor shasum is available; the package hash cannot be checked."
 }
 
+# ── Private working space and mutual exclusion ────────────────────────────────
+# update/ is bind-mounted read-write into the web containers, so whatever sits
+# there may have been put there by a compromised web tier — and this script
+# may run as root. Nothing is written through a name in update/: files are
+# built in a private directory and renamed into place, and an archive picked
+# up from there is copied out before it is verified. The private directory
+# lives under backups/, which no container mounts, so it shares the
+# deployment's filesystem (a rename stays a rename) and its disk check.
+
+PRIVATE=""
+
+private_dir() {
+    # Created on first use, root's (or the runner's) alone, removed at exit.
+    if [ -z "$PRIVATE" ]; then
+        mkdir -p "$BACKUP_DIR"
+        PRIVATE="$(mktemp -d "$BACKUP_DIR/.update-private.XXXXXX")"
+        chmod 0700 "$PRIVATE"
+    fi
+    printf '%s' "$PRIVATE"
+}
+
+take_run_lock() {
+    # One mutating run at a time. Two runs would prune each other's snapshots
+    # and interleave their overlays; the lock file is under backups/, out of
+    # the web tier's reach. Held until exit. Without flock (not a deployment
+    # host) the runs are the operator's to keep apart.
+    command -v flock >/dev/null 2>&1 || return 0
+    mkdir -p "$BACKUP_DIR"
+    exec 8>"$BACKUP_DIR/.update.lock"
+    flock -n 8 || refuse locked "Another update.sh is running against $ROOT. Wait for it to finish."
+}
+
 # ── The maintenance flag ──────────────────────────────────────────────────────
 # A file rather than a database row, because the rollback restores the database
 # and would erase a row mid-way through the very operation the flag announces.
@@ -370,14 +435,28 @@ require_sha256_tool() {
 # changes and removed by the exit trap below; a caller that manages the flag's
 # lifecycle itself passes --keep-lock, and a pre-existing flag is then left as
 # it is rather than overwritten, since it carries that caller's own fields.
+# Without --keep-lock a flag this run did not write is a refusal: it belongs to
+# the host agent mid-job, or to a run that left the stack stopped.
 
 FLAG_WRITTEN=false
 SERVICES_STOPPED=false
+WORKERS_STOPPED=false
+TREE_CHANGED=false
 tmp=""
+
+flag_present() {
+    [ -e "$MAINTENANCE_FLAG" ] || [ -L "$MAINTENANCE_FLAG" ]
+}
+
+refuse_foreign_flag() {
+    if [ "$KEEP_LOCK" = false ] && flag_present; then
+        refuse locked "A maintenance flag is already up ($MAINTENANCE_FLAG): the host agent is carrying out a job, or an earlier run left the stack stopped. Wait for the job, or remove the file once the deployment is known to be in order, then re-run."
+    fi
+}
 
 write_maintenance_flag() {
     # $1 = phase, $2 = message for the people locked out.
-    if [ "$KEEP_LOCK" = true ] && [ -f "$MAINTENANCE_FLAG" ]; then
+    if [ "$KEEP_LOCK" = true ] && flag_present; then
         return 0
     fi
     if [ ! -d "$UPDATE_DIR" ]; then
@@ -388,24 +467,53 @@ write_maintenance_flag() {
         mkdir "$UPDATE_DIR"
         chown "$(stat -c %u:%g . 2>/dev/null)" "$UPDATE_DIR" 2>/dev/null || true
     fi
-    local now
+    local now staged
     now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    staged="$(private_dir)/maintenance.json"
     printf '{"protocol": 1, "phase": "%s", "job_id": null, "since": "%s", "expected_until": null, "message": "%s"}\n' \
-        "$1" "$now" "$2" > "$MAINTENANCE_FLAG.tmp"
-    mv -f "$MAINTENANCE_FLAG.tmp" "$MAINTENANCE_FLAG"
+        "$1" "$now" "$2" > "$staged"
+    chmod 0644 "$staged"
+    # A rename replaces whatever stands at the name — a link included — and
+    # never writes through it. -T keeps a directory at the name from turning
+    # the rename into a move into it; where mv has no -T, such a name is
+    # refused instead.
+    if mv -T "$staged" "$MAINTENANCE_FLAG" 2>/dev/null; then
+        :
+    elif [ -d "$MAINTENANCE_FLAG" ] || [ -L "$MAINTENANCE_FLAG" ]; then
+        die "$MAINTENANCE_FLAG is a directory or a link; remove it and re-run."
+    else
+        mv -f "$staged" "$MAINTENANCE_FLAG"
+    fi
     FLAG_WRITTEN=true
 }
 
 cleanup() {
     local rc=$?
     [ -n "$tmp" ] && rm -rf "$tmp"
+    [ -n "$PRIVATE" ] && rm -rf "$PRIVATE"
+    if [ "$rc" -ne 0 ] && [ "$TREE_CHANGED" = false ] && [ "$WORKERS_STOPPED" = true ] && [ "$SERVICES_STOPPED" = false ]; then
+        # Stopped for the dump, and the run ended before it changed anything:
+        # bring the workers back as they were.
+        warn "Restarting the workers stopped for the snapshot"
+        if [ "$SKIP_BEAT" = true ]; then
+            "${COMPOSE[@]}" up -d celery || true
+        else
+            "${COMPOSE[@]}" up -d celery celery-beat || true
+        fi
+    fi
+    if [ "$rc" -ne 0 ] && [ "$TREE_CHANGED" = true ] && [ "$ROLLBACK" = false ]; then
+        warn "The run failed after it began changing the deployment. The pre-update snapshot is complete:"
+        warn "  ./update.sh --rollback${UNFINISHED_SNAPSHOT:+ --snapshot $UNFINISHED_SNAPSHOT}"
+        warn "restores the code, the database and .env as they were before this run."
+    fi
     if [ "$FLAG_WRITTEN" = true ] && [ "$KEEP_LOCK" = false ]; then
-        if [ "$rc" -ne 0 ] && [ "$SERVICES_STOPPED" = true ]; then
-            # The stack was taken down and not brought back, so the platform is
-            # not serving anyway; the flag is what tells anyone who reaches it
-            # why. Removing it would replace a maintenance page with an error.
-            warn "Leaving the maintenance flag in place ($MAINTENANCE_FLAG) — the stack was stopped"
-            warn "and not restarted. Remove the file once the deployment is repaired."
+        if [ "$rc" -ne 0 ] && { [ "$SERVICES_STOPPED" = true ] || [ "$TREE_CHANGED" = true ]; }; then
+            # The stack was taken down and not brought back, or the tree is
+            # half-updated, so the platform is not serving what it should; the
+            # flag is what tells anyone who reaches it why. Removing it would
+            # let writes onto a deployment that is about to be rolled back.
+            warn "Leaving the maintenance flag in place ($MAINTENANCE_FLAG). Remove the file once the"
+            warn "deployment is repaired or rolled back."
         else
             rm -f "$MAINTENANCE_FLAG"
         fi
@@ -423,6 +531,7 @@ trap cleanup EXIT
 
 ARCHIVE_TOP=""
 ARCHIVE_PREFIX=""
+ARCHIVE_UNPACKED_BYTES=0
 PKG_MANIFEST=""
 PKG_VERSION=""
 PKG_SHA256=""
@@ -526,13 +635,13 @@ inspect_archive_listing() {
     # listing longer than one stdio buffer then reads as "no match" — which
     # refused a valid package on a real host while the same check, run a
     # minute earlier, had passed.
-    names="$(tar -tzf "$ARCHIVE" 2>/dev/null)" || die "Cannot read the archive: $ARCHIVE is not a gzipped tar file, or is truncated."
-    [ -n "$names" ] || die "The archive is empty: $ARCHIVE"
+    names="$(tar -tzf "$ARCHIVE" 2>/dev/null)" || refuse contents "Cannot read the archive: $ARCHIVE is not a gzipped tar file, or is truncated."
+    [ -n "$names" ] || refuse contents "The archive is empty: $ARCHIVE"
     # Member names as tar will extract them: `a/./b` and `a//b` both land at
     # `a/b`, so the checks below look at the same spelling tar acts on.
     names="$(printf '%s\n' "$names" | sed 's|/\./|/|g; s|//*|/|g; s|/\./|/|g; s|/\.$||')"
     if grep -qE '^/|(^|/)\.\.(/|$)' <<< "$names"; then
-        die "Refusing the archive: it carries an absolute path or a '..' component, which would extract outside the deployment."
+        refuse contents "Refusing the archive: it carries an absolute path or a '..' component, which would extract outside the deployment."
     fi
     case "$names" in
         ./*) ARCHIVE_PREFIX="./" ;;
@@ -542,9 +651,9 @@ inspect_archive_listing() {
     count="$(printf '%s\n' "$tops" | sed '/^$/d' | wc -l | tr -d ' ')"
     if [ "$count" != 1 ]; then
         if grep -q '^\._' <<< "$tops"; then
-            die "Refusing the archive: it carries macOS extended-attribute members (._*). Rebuild it with COPYFILE_DISABLE=1, which the packager's --tarball does."
+            refuse contents "Refusing the archive: it carries macOS extended-attribute members (._*). Rebuild it with COPYFILE_DISABLE=1, which the packager's --tarball does."
         fi
-        die "Refusing the archive: expected exactly one top-level directory, found $count ($(printf '%s' "$tops" | tr '\n' ' ')). A distribution wraps its files in one versioned directory."
+        refuse contents "Refusing the archive: expected exactly one top-level directory, found $count ($(printf '%s' "$tops" | tr '\n' ' ')). A distribution wraps its files in one versioned directory."
     fi
     top="$tops"
     # The paths inside the wrapper. Every member starts with the wrapper by
@@ -552,27 +661,30 @@ inspect_archive_listing() {
     # data, and data built into a regular expression is a regular expression.
     inner="$(printf '%s\n' "$names" | sed 's|^\./||' | cut -s -d/ -f2- | sed '/^$/d')"
     if [ -z "$inner" ]; then
-        die "Refusing the archive: its only top-level entry ($top) is not a directory."
+        refuse contents "Refusing the archive: its only top-level entry ($top) is not a directory."
     fi
-    if grep -qE '^(\.env|\.git|backups)(/|$)' <<< "$inner"; then
-        die "Refusing the archive: it carries .env, .git/ or backups/, which belong to the deployment and never to a package."
+    if grep -qE '^(\.env|\.git|backups|update|\.epicurrents-files)(/|$)' <<< "$inner"; then
+        refuse contents "Refusing the archive: it carries .env, .git/, backups/, update/ or .epicurrents-files, which belong to the deployment and never to a package."
     fi
     if grep -qE '(^|/)\.git(/|$)' <<< "$names"; then
-        die "Refusing the archive: it carries a .git directory."
+        refuse contents "Refusing the archive: it carries a .git directory."
     fi
-    verbose="$(tar -tzvf "$ARCHIVE" 2>/dev/null)" || die "Cannot list the archive: $ARCHIVE"
+    verbose="$(tar -tzvf "$ARCHIVE" 2>/dev/null)" || refuse contents "Cannot list the archive: $ARCHIVE"
     if grep -qE '^[lh]' <<< "$verbose"; then
-        die "Refusing the archive: it carries symbolic or hard links. An overlay that follows a link can write outside the tree; the packager refuses to build one."
+        refuse contents "Refusing the archive: it carries symbolic or hard links. An overlay that follows a link can write outside the tree; the packager refuses to build one."
     fi
     # Device nodes and pipes have no place in a code tree, and an extraction run
     # as root would create them; setuid or setgid bits survive rsync -a the
     # same way and turn a file in a uid-1000 tree into something else.
     if grep -qE '^[bcp]' <<< "$verbose"; then
-        die "Refusing the archive: it carries a device node or a named pipe."
+        refuse contents "Refusing the archive: it carries a device node or a named pipe."
     fi
     if grep -qE '^.{3}[sS]|^.{6}[sS]' <<< "$verbose"; then
-        die "Refusing the archive: it carries a setuid or setgid file."
+        refuse contents "Refusing the archive: it carries a setuid or setgid file."
     fi
+    # What the archive unpacks to, for the disk check before the overlay: the
+    # size column of the verbose listing, summed.
+    ARCHIVE_UNPACKED_BYTES="$(awk '{ total += $3 } END { printf "%d", total }' <<< "$verbose")"
     ARCHIVE_TOP="$top"
 }
 
@@ -600,6 +712,12 @@ check_archive() {
     for key in "${keys[@]}"; do
         [ -f "$key" ] && present="$present${present:+, }$key"
     done
+    # A deployment that holds a release key has said which packages it
+    # trusts: one that does not verify against it is refused unless the
+    # operator says otherwise, by flag, on this run.
+    if [ -n "$present" ] && [ "$ALLOW_UNSIGNED" = false ]; then
+        REQUIRE_SIGNATURE=true
+    fi
 
     if [ -f "$manifest" ]; then
         PKG_MANIFEST="$manifest"
@@ -628,7 +746,7 @@ check_archive() {
                 esac
             fi
         else
-            [ "$REQUIRE_SIGNATURE" = false ] || refuse signature "The package is not signed (no $sig), and --require-signature is set."
+            [ "$REQUIRE_SIGNATURE" = false ] || refuse signature "The package is not signed (no $sig), and a release key is present (or --require-signature is set). Pass --allow-unsigned to apply it anyway."
             warn "The package is not signed; its manifest is checked for consistency only."
         fi
 
@@ -667,7 +785,7 @@ check_archive() {
         fi
         ok "Package is for project '${pkg_project:-<none>}', plugins '${pkg_plugins:-<none>}' — matches this deployment"
     else
-        [ "$REQUIRE_SIGNATURE" = false ] || refuse signature "No manifest beside the archive ($manifest), and --require-signature is set. A signed package ships as three files: the tarball, .manifest.json and .manifest.sig."
+        [ "$REQUIRE_SIGNATURE" = false ] || refuse signature "No manifest beside the archive ($manifest), and a release key is present (or --require-signature is set). A signed package ships as three files: the tarball, .manifest.json and .manifest.sig."
         warn "No manifest beside the archive ($manifest); the package cannot be verified. Its contents are still checked."
     fi
 
@@ -679,10 +797,10 @@ check_archive() {
     fi
     INSTALLED_VERSION="$(installed_version)"
     if [ -n "$PKG_VERSION" ]; then
-        is_version "$PKG_VERSION" || die "The package version '$PKG_VERSION' is not a plain MAJOR.MINOR.PATCH version."
+        is_version "$PKG_VERSION" || refuse manifest "The package version '$PKG_VERSION' is not a plain MAJOR.MINOR.PATCH version."
     fi
     if [ -n "$PKG_VERSION" ] && [ -n "$INSTALLED_VERSION" ]; then
-        is_version "$INSTALLED_VERSION" || die "The installed version '$INSTALLED_VERSION' is not a plain MAJOR.MINOR.PATCH version."
+        is_version "$INSTALLED_VERSION" || refuse incompatible "The installed version '$INSTALLED_VERSION' is not a plain MAJOR.MINOR.PATCH version."
         if version_gt "$PKG_VERSION" "$INSTALLED_VERSION"; then
             ok "Package version $PKG_VERSION is newer than the installed $INSTALLED_VERSION"
         elif [ "$PKG_VERSION" = "$INSTALLED_VERSION" ]; then
@@ -692,7 +810,8 @@ check_archive() {
         else
             msg="The package is version $PKG_VERSION, OLDER than the installed $INSTALLED_VERSION."
             [ "$REQUIRE_NEWER" = false ] || refuse version_not_newer "$msg --require-newer refuses a downgrade."
-            warn "$msg Applying it is a downgrade; the database will not be migrated backwards."
+            [ "$ALLOW_DOWNGRADE" = true ] || refuse version_not_newer "$msg A downgrade does not migrate the database backwards; roll back to a snapshot instead, or pass --allow-downgrade."
+            warn "$msg Applying it is a downgrade (--allow-downgrade); the database will not be migrated backwards."
         fi
     elif [ "$REQUIRE_NEWER" = true ]; then
         refuse version_not_newer "--require-newer: cannot compare versions (package: '${PKG_VERSION:-unknown}', installed: '${INSTALLED_VERSION:-unknown}')."
@@ -861,10 +980,11 @@ fi
 BORG_WAS_RUNNING=false
 # Survives a run that stops borg and then dies: the next run finds borg stopped
 # and cannot tell "never ran here" from "the last update stopped it", and the
-# difference is whether a deployment silently loses its backups. Under update/
-# for the same reason as the flag — nothing this script syncs or snapshots
-# touches it.
-BORG_MARKER="$UPDATE_DIR/.borg-was-running"
+# difference is whether a deployment silently loses its backups. Under backups/,
+# which nothing this script syncs or snapshots touches and no container mounts:
+# written by a script that may run as root, it must not sit where the web tier
+# could have left a link at its name.
+BORG_MARKER="$BACKUP_DIR/.borg-was-running"
 
 stop_app_services() {
     # borg as well as the application services. Its scheduler runs inside the
@@ -876,7 +996,7 @@ stop_app_services() {
     # ran.
     if service_running borg || [ -f "$BORG_MARKER" ]; then
         BORG_WAS_RUNNING=true
-        mkdir -p "$UPDATE_DIR"
+        mkdir -p "$BACKUP_DIR"
         : > "$BORG_MARKER"
     fi
     emit "step=stop"
@@ -1003,14 +1123,16 @@ recreate_stack() {
     emit "step=recreate"
     info "Recreating containers"
     "${COMPOSE[@]}" up -d --force-recreate "${services[@]}"
+    SERVICES_STOPPED=false
+    WORKERS_STOPPED=false
     # Caddy serves /assets/, /viewer/ and /static/ straight off bind mounts, so
     # it has to be recreated after the tree underneath it changes — a running
     # container holds the mount it was started with. Left out, an archive update
     # takes the SPA offline while Django reports healthy.
     if [ "$PROXY_ENABLED" = true ]; then
-        "${COMPOSE[@]}" up -d --force-recreate caddy
+        "${COMPOSE[@]}" up -d --force-recreate caddy \
+            || die "The application is up but caddy could not be recreated, so the SPA is not being served. Check '${COMPOSE[*]} logs caddy'."
     fi
-    SERVICES_STOPPED=false
     if [ "$BORG_WAS_RUNNING" = true ]; then
         # `up` rather than `start`, so a .env the rollback restored is re-read.
         # A backup service that fails to come back is not a failed update: the
@@ -1046,8 +1168,8 @@ wait_for_health() {
         ok "Health check passed"
         emit "health=ok"
     else
-        warn "Health check did not pass within the timeout; check '${COMPOSE[*]} logs web'."
         emit "health=failed"
+        die "Health check did not pass within the timeout; check '${COMPOSE[*]} logs web'."
     fi
 
     # The health endpoint says Django is answering. It says nothing about whether
@@ -1108,6 +1230,12 @@ snapshot_complete() {
         warn "Skipping snapshot $(basename "$1") — its code archive is unreadable" >&2
         return 1
     fi
+    # A truncated dump decompresses to a prefix of the database, and restored
+    # it would be a prefix of the database; the gzip trailer is what tells.
+    if ! gzip -t "$1/db.sql.gz" 2>/dev/null; then
+        warn "Skipping snapshot $(basename "$1") — its database dump is truncated or corrupt" >&2
+        return 1
+    fi
     return 0
 }
 
@@ -1140,9 +1268,13 @@ prune_backups() {
     # Keep the newest $KEEP_BACKUPS pre-update snapshots; drop the rest. ls -t
     # over our own timestamped dir names is fine — no untrusted filenames here.
     # Named snapshots (--snapshot LABEL) are not touched: whoever took one
-    # removes it.
+    # removes it, and neither is the snapshot an unfinished update is waiting
+    # to be rolled back to.
+    local keep_name=""
+    [ ! -f "$UNFINISHED_MARKER" ] || keep_name="$(cat "$UNFINISHED_MARKER" 2>/dev/null || true)"
     # shellcheck disable=SC2012
     ls -1dt "$BACKUP_DIR"/pre-update-* 2>/dev/null | tail -n +$((KEEP_BACKUPS + 1)) | while read -r old; do
+        [ "$(basename "$old")" != "$keep_name" ] || continue
         rm -rf "$old"
     done || true
     # Drop snapshots left half-written by a run that died before the dump. They
@@ -1216,14 +1348,37 @@ snapshot_database() {
         rm -rf "$1"
         die "Database dump failed; aborting before any change. (Pass --no-backup to override.)"
     fi
+    if ! gzip -t "$1/db.sql.gz" 2>/dev/null; then
+        rm -rf "$1"
+        die "The database dump does not read back; aborting before any change."
+    fi
     cp .env "$1/.env"
     # Which migrations the dump has applied, so a later rollback can tell
-    # whether the database still matches the snapshot's code and keep it.
-    applied_migrations > "$1/migrations.txt"
+    # whether the database still matches the snapshot's code and keep it. A
+    # snapshot whose record could not be taken has none, which is what makes
+    # --code-only refuse it rather than guess.
+    if ! applied_migrations > "$1/migrations.txt"; then
+        rm -f "$1/migrations.txt"
+        warn "Could not read the applied migrations; a rollback to this snapshot will restore the database too."
+    fi
     printf '%s\n' "$2" > "$1/MANIFEST"
     hand_to_tree_owner "$1"
     ok ".env + manifest saved"
     emit "snapshot=$1"
+}
+
+restore_stream() {
+    # $1 = the dump. The whole restore as one explicit transaction: BEGIN, the
+    # preamble, the dump, and COMMIT only once gunzip has read the dump to its
+    # end. psql --single-transaction commits at end of input, so a stream cut
+    # short by a truncated or corrupt dump would commit whatever part of it
+    # arrived; here a short stream ends without COMMIT, the server rolls the
+    # transaction back when psql disconnects, and the non-zero status of this
+    # function fails the pipeline.
+    printf 'BEGIN;\n'
+    restore_sql_preamble
+    gunzip -c "$1" || return 1
+    printf '\nCOMMIT;\n'
 }
 
 restore_sql_preamble() {
@@ -1258,6 +1413,7 @@ if [ "$SNAPSHOT_ONLY" = true ]; then
     stamp="$(date -u +%Y%m%d-%H%M%S)"
     snap="$BACKUP_DIR/$SNAPSHOT-$stamp"
     [ ! -e "$snap" ] || die "Snapshot $snap already exists."
+    take_run_lock
     emit "step=snapshot"
     snapshot_code "$snap"
     snapshot_database "$snap" "timestamp_utc=$stamp
@@ -1298,10 +1454,12 @@ if [ "$ROLLBACK" = true ]; then
         # against: the set of applied migrations must not have moved since the
         # snapshot recorded it. Checked before anything is touched, so a
         # refusal changes nothing, and named so a caller can key on it.
-        [ -f "$latest/code.tar.gz" ] || die "--code-only needs a snapshot with a code archive, and $(basename "$latest") has none."
+        [ -f "$latest/code.tar.gz" ] || refuse code_only "--code-only needs a snapshot with a code archive, and $(basename "$latest") has none."
         [ -f "$latest/migrations.txt" ] || refuse code_only "Snapshot $(basename "$latest") predates migration records, so whether the database still matches its code cannot be told. Roll back without --code-only, which restores the database too."
         ensure_db_up
-        if [ "$(applied_migrations)" != "$(LC_ALL=C sort "$latest/migrations.txt")" ]; then
+        current_migrations="$(applied_migrations)" \
+            || refuse code_only "The applied migrations could not be read from the database, so whether it still matches the snapshot's code cannot be told. Roll back without --code-only, which restores the database too."
+        if [ "$current_migrations" != "$(LC_ALL=C sed '/^$/d' "$latest/migrations.txt" | LC_ALL=C sort)" ]; then
             refuse code_only "Migrations were applied since snapshot $(basename "$latest") was taken, so its code cannot run against the current database. Roll back without --code-only, which restores the database too."
         fi
         ok "No migration was applied since the snapshot; the database and .env are kept"
@@ -1311,25 +1469,41 @@ if [ "$ROLLBACK" = true ]; then
         confirm "Restore database + .env from this snapshot? Current data will be overwritten." \
             || die "Rollback aborted."
     fi
+    take_run_lock
+    # A rollback is the repair a failed update asks for, so a flag left up by
+    # that update, or by the agent, is taken over rather than refused.
+    if [ "$KEEP_LOCK" = false ] && flag_present; then
+        warn "A maintenance flag is already up ($MAINTENANCE_FLAG); the rollback takes it over."
+        rm -f "$MAINTENANCE_FLAG"
+    fi
     write_maintenance_flag rolling_back "The platform is being rolled back to the previous release."
     ensure_db_up
     stop_app_services
     if [ "$CODE_ONLY" = false ]; then
         emit "step=restore-db"
         info "Restoring database (single transaction — all or nothing)"
-        # --single-transaction + ON_ERROR_STOP: the schema drop and the restore
-        # commit or roll back as one unit, so a failure leaves the database
-        # exactly as it was rather than half-restored. On failure we stop here —
-        # .env is untouched and the stack is not recreated — so the operator
-        # never lands in a partially-recovered state.
+        # One explicit transaction + ON_ERROR_STOP: the schema drop and the
+        # restore commit or roll back as one unit, and COMMIT is sent only
+        # after the whole dump was read (restore_stream), so a failure leaves
+        # the database exactly as it was rather than half-restored. On failure
+        # we stop here — .env is untouched and the stack is not recreated — so
+        # the operator never lands in a partially-recovered state.
         # SC2016: $POSTGRES_* must expand inside the db container's shell, not here.
         # shellcheck disable=SC2016
-        if ! { restore_sql_preamble; gunzip -c "$latest/db.sql.gz"; } \
-                | "${COMPOSE[@]}" exec -T db sh -c 'psql --single-transaction -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB"' \
+        if ! restore_stream "$latest/db.sql.gz" \
+                | "${COMPOSE[@]}" exec -T db sh -c 'psql -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB"' \
                     >/dev/null; then
             die "Database restore FAILED and was rolled back — the database is unchanged, .env was not touched, and the stack was not recreated. If the error above is a lock timeout, something is still connected to the database (a backup in progress, a shell); see pg_stat_activity. Investigate before retrying."
         fi
         ok "Database restored"
+        # Tasks queued before the restore name rows the restored database may
+        # not hold, or hold differently; the queue is dropped rather than run
+        # against them. The broker is redis, which the restore does not touch.
+        if "${COMPOSE[@]}" run --rm --no-deps -T celery celery -A epicurrents purge -f >/dev/null 2>&1; then
+            ok "Task queue purged"
+        else
+            warn "Could not purge the task queue; tasks queued before the restore may run against the restored database."
+        fi
         emit "step=restore-env"
         cp "$latest/.env" ./.env
         ok ".env restored"
@@ -1356,21 +1530,34 @@ if [ "$ROLLBACK" = true ]; then
         #
         # -m on extraction: do not restore mtimes, so a root-owned path in a
         # future snapshot cannot fail an entire recovery on "Cannot utime".
-        rtmp="$(mktemp -d)"
+        #
+        # Anchored at the root, so a directory of the same name deeper in the
+        # code (a static/ inside an app) is restored like the rest. .git/ is
+        # the one left unanchored on purpose: a project checked out under
+        # projects/ is the operator's, and so is its history. The release keys
+        # stay as they are — restoring an older one would undo a rotation and
+        # refuse the next package.
+        rtmp="$(private_dir)/restore"
+        mkdir -p "$rtmp"
         if tar -xzmf "$latest/code.tar.gz" -C "$rtmp" \
             && rsync -a --delete \
-                --exclude=".env" \
-                --exclude="backups/" \
-                --exclude="update/" \
-                --exclude="static/" \
-                --exclude="frontend/vendor/" \
-                --exclude="frontend/node_modules/" \
+                --exclude="/.env" \
+                --exclude="/backups/" \
+                --exclude="/update/" \
+                --exclude="/static/" \
+                --exclude="/frontend/vendor/" \
+                --exclude="/frontend/node_modules/" \
+                --exclude="/RELEASE_KEY.pub" \
+                --exclude="/RELEASE_KEY.next.pub" \
                 --exclude=".git/" \
                 "$rtmp"/ ./; then
             rm -rf "$rtmp"
             ok "Code restored"
         else
             rm -rf "$rtmp"
+            if [ "$CODE_ONLY" = true ]; then
+                die "Code restore FAILED. The database and .env were kept as they were; the tree is in an unknown state. Re-apply a known archive before starting the stack."
+            fi
             die "Code restore FAILED. The database and .env are already rolled back; the tree is in an unknown state. Re-apply a known archive before starting the stack."
         fi
         # The images carry the code (Dockerfile: COPY . .), so restoring the
@@ -1407,6 +1594,8 @@ if [ "$ROLLBACK" = true ]; then
     recreate_stack
     wait_for_health
     report_vendor_failures
+    # Rolled back: whatever update was left unfinished is settled.
+    rm -f "$UNFINISHED_MARKER"
     echo
     if [ "$CODE_ONLY" = true ]; then
         ok "Rollback complete — code restored; the database and .env were kept."
@@ -1475,58 +1664,121 @@ fi
 # before the snapshot: a refused package leaves no trace. The extraction itself
 # is step 1, after the snapshot, because the snapshot must capture the tree the
 # package is about to overwrite.
+#
+# The archive and its sidecars are copied into the private directory first, and
+# the copy is what is verified and extracted. update/ is writable by the web
+# tier: a file verified where it lies could be exchanged between the check and
+# the extraction.
 
+take_run_lock
+refuse_foreign_flag
+if [ -f "$UNFINISHED_MARKER" ]; then
+    refuse unfinished "An earlier update did not finish; its pre-update snapshot is $(cat "$UNFINISHED_MARKER" 2>/dev/null || echo unknown). Roll it back first (./update.sh --rollback --snapshot <that name>), or remove $UNFINISHED_MARKER once the deployment is known to be in order."
+fi
+
+ARCHIVE_SOURCE=""
 if [ "$MODE" = archive ]; then
     if [ -z "$ARCHIVE" ]; then
         # shellcheck disable=SC2012  # newest-by-mtime over a controlled glob.
         ARCHIVE="$(ls -1t "$UPDATE_DIR"/epicurrents*.tar.gz 2>/dev/null | head -1 || true)"
         [ -n "$ARCHIVE" ] || die "No archive in $UPDATE_DIR/ (looked for epicurrents*.tar.gz). Drop the distribution there or pass --archive FILE."
     fi
-    [ -f "$ARCHIVE" ] || die "Archive not found: $ARCHIVE"
+    { [ -f "$ARCHIVE" ] && [ ! -L "$ARCHIVE" ]; } || die "Archive not found, or not a plain file: $ARCHIVE"
     command -v rsync >/dev/null 2>&1 || die "rsync is required for archive mode (apt-get install rsync)."
+    ARCHIVE_SOURCE="$ARCHIVE"
+    staged_pkg="$(private_dir)/package"
+    mkdir "$staged_pkg"
+    cp -- "$ARCHIVE" "$staged_pkg/package.tar.gz"
+    for sidecar in manifest.json manifest.sig; do
+        if [ -e "$ARCHIVE.$sidecar" ] || [ -L "$ARCHIVE.$sidecar" ]; then
+            { [ -f "$ARCHIVE.$sidecar" ] && [ ! -L "$ARCHIVE.$sidecar" ]; } || die "$ARCHIVE.$sidecar is not a plain file."
+            cp -- "$ARCHIVE.$sidecar" "$staged_pkg/package.tar.gz.$sidecar"
+        fi
+    done
+    ARCHIVE="$staged_pkg/package.tar.gz"
     emit "step=check"
     check_archive
+    # Room for the extraction, which lives beside the snapshots, and for the
+    # overlay's copy of it in the tree: the unpacked size twice, plus a margin.
+    need=$((ARCHIVE_UNPACKED_BYTES * 2 + 268435456))
+    free="$(df -Pk "$BACKUP_DIR" 2>/dev/null | awk 'NR==2{print $4 * 1024}' || true)"
+    if [ -n "$free" ] && [ "$free" -lt "$need" ]; then
+        refuse disk "$free bytes free under $BACKUP_DIR; the package unpacks to $ARCHIVE_UNPACKED_BYTES bytes and the update needs $need."
+    fi
 fi
 
-# ── 0. Snapshot the current code, BEFORE anything overwrites it ───────────────
-# The maintenance flag goes up first. The database dump is taken in step 2 and
-# the services keep running until step 4, with the image build in between —
-# minutes on a small host — so every write in that gap is one a rollback loses.
-# With the flag up, the platform declines them instead.
-write_maintenance_flag updating "The platform is being updated."
-
-# Placement is the whole point. Step 1 rsyncs the new tree over the deployment,
-# so a code snapshot taken with the database in step 2 captures the *new* code
-# and is worthless for rollback — the restore puts the failing version back and
-# the recreate re-applies the migrations being rolled back. The database dump
-# can wait for step 2 because migrations do not run until step 5; the code
-# cannot.
+# ── 0. Snapshot code and database, BEFORE anything changes ────────────────────
+# The maintenance flag goes up first, so the platform declines writes from here
+# on; the workers, which the flag does not reach, are stopped next — a warm
+# shutdown, so a task in flight finishes — and brought back by the recreate.
+# Then the code and the database are snapshotted together, and ::snapshot= is
+# reported, before a single file of the tree is touched. A failure from there on
+# always has a complete snapshot to roll back to; a failure before it has
+# changed nothing.
 #
 # Retaining "the previous archive" instead would be cheaper and does not work:
 # this script never moves, copies or records the archive it applied, so after a
 # few updates nothing identifies the deployed lineage.
+write_maintenance_flag updating "The platform is being updated."
 stamp="$(date -u +%Y%m%d-%H%M%S)"
 snap="$BACKUP_DIR/pre-update-$stamp"
 # The version the tree carries now, before the overlay replaces it: what the
 # snapshot's code is, recorded in its MANIFEST the way a named snapshot does.
 PRE_VERSION="$(installed_version)"
 if [ "$BACKUP" = true ]; then
+    info "Stopping the workers for the snapshot"
+    WORKERS_STOPPED=true
+    "${COMPOSE[@]}" stop -t 60 celery celery-beat || warn "The workers did not stop cleanly; continuing."
     emit "step=snapshot"
     snapshot_code "$snap"
+    emit "step=backup"
+    if [ "$MODE" = archive ]; then
+        source_line="archive=$ARCHIVE_SOURCE
+archive_sha256=${PKG_SHA256:-unknown}
+package_version=${PKG_VERSION:-unknown}"
+    else
+        source_line="git_ref=$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
+    fi
+    snapshot_database "$snap" "timestamp_utc=$stamp
+mode=$MODE
+code_snapshot=yes
+version=${PRE_VERSION:-unknown}
+$source_line"
+
+    # If borgmatic is wired up and running, take a full backup too (data volumes).
+    if [ -x ./scripts/backup.sh ] && service_running borg; then
+        info "Borg is enabled — taking a full backup"
+        ./scripts/backup.sh || warn "Borg backup reported an error; the local snapshot is still in place."
+    fi
+
+    prune_backups
+    UNFINISHED_SNAPSHOT="$(basename "$snap")"
+    printf '%s\n' "$UNFINISHED_SNAPSHOT" > "$UNFINISHED_MARKER"
+    hand_to_tree_owner "$UNFINISHED_MARKER"
+else
+    warn "Skipping backup (--no-backup)."
 fi
 
 # ── 1. Acquire source ─────────────────────────────────────────────────────────
 
+TREE_CHANGED=true
 emit "step=acquire"
 if [ "$MODE" = archive ]; then
-    info "Applying archive: $ARCHIVE"
-    tmp="$(mktemp -d)"   # removed by the exit trap
-    tar -xzf "$ARCHIVE" -C "$tmp"
+    info "Applying archive: $ARCHIVE_SOURCE"
+    tmp="$(private_dir)/extract"   # removed by the exit trap
+    mkdir "$tmp"
+    # --no-same-owner: extracted as root, a member would otherwise keep the
+    # builder's uid, which the overlay below would carry into the tree.
+    tar -xzf "$ARCHIVE" --no-same-owner -C "$tmp"
     # Distribution tars wrap their contents in a single versioned top-level dir,
     # which the listing check established; descend into it so the sync targets
     # the deployment files, not the wrapper.
     src="$tmp/$ARCHIVE_TOP"
     [ -f "$src/docker-compose.yml" ] || die "Archive does not look like an Epicurrents distribution (no docker-compose.yml under $ARCHIVE_TOP/)."
+    OWNER_ARGS=()
+    if [ "$(id -u)" = 0 ] && tree_owner="$(stat -c %u:%g . 2>/dev/null)"; then
+        OWNER_ARGS=(--chown="$tree_owner")
+    fi
 
     # Refresh the platform-owned, regenerable bundle dirs so stale content-hashed
     # chunks from prior releases don't pile up. These are the only trees we
@@ -1558,11 +1810,15 @@ if [ "$MODE" = archive ]; then
     # original inode. The excludes keep operator state from being overwritten
     # even if a future archive happens to carry one of these paths.
     info "Updating files (preserving .env, data, backups, update)"
-    rsync -a \
+    # Handed to the tree's owner on the way in when this runs as root: tar
+    # records the builder's uid, and a tree owned by it is one the containers
+    # cannot write.
+    rsync -a ${OWNER_ARGS[@]+"${OWNER_ARGS[@]}"} \
         --exclude='/.env' \
         --exclude='/backups/' \
         --exclude='/update/' \
         --exclude='/static/' \
+        --exclude='/.epicurrents-files' \
         "$src"/ "$ROOT"/
     ok "Files updated"
     prune_orphans "$src/FILELIST"
@@ -1619,34 +1875,6 @@ else
     ok "Frontend bundles built"
 fi
 
-# ── 2. Back up before mutating the database ───────────────────────────────────
-
-if [ "$BACKUP" = true ]; then
-    emit "step=backup"
-    # $snap already exists and holds code.tar.gz from step 0.
-    if [ "$MODE" = archive ]; then
-        source_line="archive=$ARCHIVE
-archive_sha256=${PKG_SHA256:-unknown}
-package_version=${PKG_VERSION:-unknown}"
-    else
-        source_line="git_ref=$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
-    fi
-    snapshot_database "$snap" "timestamp_utc=$stamp
-mode=$MODE
-code_snapshot=yes
-version=${PRE_VERSION:-unknown}
-$source_line"
-
-    # If borgmatic is wired up and running, take a full backup too (data volumes).
-    if [ -x ./scripts/backup.sh ] && service_running borg; then
-        info "Borg is enabled — taking a full backup"
-        ./scripts/backup.sh || warn "Borg backup reported an error; the local snapshot is still in place."
-    fi
-
-    prune_backups
-else
-    warn "Skipping backup (--no-backup)."
-fi
 
 # ── 3. Build the image ────────────────────────────────────────────────────────
 
@@ -1671,14 +1899,22 @@ info "Applying database migrations"
 # What the database had applied before, so the run can say whether this release
 # changed the schema: a release that applied nothing can be rolled back with
 # --code-only, which keeps the database and everything written since.
-before_migrate="$(applied_migrations)"
+# A record that could not be read on either side is "unknown", which no caller
+# treats as licence to keep the database.
+before_ok=true
+before_migrate="$(applied_migrations)" || before_ok=false
 "${COMPOSE[@]}" run --rm --no-deps web python manage.py migrate
 ok "Migrations applied"
-if [ "$before_migrate" = "$(applied_migrations)" ]; then
-    MIGRATIONS=none
-    ok "No migration was applied; this release can be rolled back with --code-only"
+if [ "$before_ok" = true ] && after_migrate="$(applied_migrations)"; then
+    if [ "$before_migrate" = "$after_migrate" ]; then
+        MIGRATIONS=none
+        ok "No migration was applied; this release can be rolled back with --code-only"
+    else
+        MIGRATIONS=applied
+    fi
 else
-    MIGRATIONS=applied
+    MIGRATIONS=unknown
+    warn "Could not read the applied migrations; a rollback of this release will restore the database too."
 fi
 emit "migrations=$MIGRATIONS"
 if [ "$BACKUP" = true ] && [ -f "$snap/MANIFEST" ]; then
@@ -1699,6 +1935,8 @@ recreate_stack
 
 wait_for_health
 report_vendor_failures
+rm -f "$UNFINISHED_MARKER"
+TREE_CHANGED=false
 
 echo
 "${COMPOSE[@]}" ps

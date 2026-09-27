@@ -160,3 +160,60 @@ class TestChecks:
         assert {"check_operation_registry", "check_maintenance_settings"} <= names
         apps_source = Path(__file__).resolve().parent.parent.joinpath("apps.py").read_text()
         assert "from . import checks" in apps_source
+
+
+class Nested(Schema):
+    """An object argument whose own field would carry a command."""
+
+    shell: str = ""
+
+
+class TestForbiddenFieldsAnyDepth:
+    """A command field is refused wherever it hides: alias, nesting, array items, combinators, any case."""
+
+    def _refuses(self, registry, schema):
+        with pytest.raises(ValueError, match="forbidden"):
+            register_operation(
+                Operation(
+                    key="tests.bad", executor="celery", label="x", description="x", args_schema=schema, command="c"
+                )
+            )
+
+    def test_an_alias(self, registry):
+        from pydantic import Field
+
+        class Aliased(Schema):
+            harmless: str = Field("", alias="command")
+
+        self._refuses(registry, Aliased)
+
+    def test_a_different_case(self, registry):
+        class Shouting(Schema):
+            Command: str = ""
+
+        self._refuses(registry, Shouting)
+
+    def test_a_nested_object(self, registry):
+        class Outer(Schema):
+            options: Nested = Nested()
+
+        self._refuses(registry, Outer)
+
+    def test_array_items_and_unions(self, registry):
+        class Listed(Schema):
+            steps: list[Nested] = []
+
+        class Either(Schema):
+            choice: Nested | int = 0
+
+        self._refuses(registry, Listed)
+        self._refuses(registry, Either)
+
+    def test_the_check_finds_the_same(self, registry):
+        class Outer(Schema):
+            options: Nested = Nested()
+
+        registry["tests.bad"] = Operation(
+            key="tests.bad", executor="celery", label="x", description="x", args_schema=Outer, command="check"
+        )
+        assert any(issue.id == "maintenance.E002" for issue in check_operation_registry(None))

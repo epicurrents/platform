@@ -338,6 +338,8 @@ class TestCancel:
     def test_a_job_the_agent_picked_up_cannot_be_cancelled(self, host_enabled, superuser_client, write_status):
         client, user = superuser_client
         job = _host_job(user, state="requested")
+        spool.write_request(job)
+        spool.request_path(job.job_id).rename(spool.claimed_path(job.job_id))
         write_status(job.job_id, "accepted")
         assert _post(client, f"{BASE}/jobs/{job.job_id}/cancel").status_code == 409
         job.refresh_from_db()
@@ -431,3 +433,387 @@ class TestVerifyAndRollback:
         client, user = superuser_client
         job = _host_job(user)
         assert _post(client, f"{BASE}/jobs/{job.job_id}/verify", {"password": PASSWORD}).status_code == 200
+
+
+@pytest.mark.django_db
+class TestCancelRace:
+    """The agent claims by renaming the request; the cancel unlinks it. Exactly one of the two wins."""
+
+    def test_cancel_wins_and_a_stray_status_later_is_ignored(self, host_enabled, superuser_client, write_status):
+        client, user = superuser_client
+        job = _host_job(user, state="requested")
+        spool.write_request(job)
+        assert _post(client, f"{BASE}/jobs/{job.job_id}/cancel").status_code == 200
+        assert not spool.request_path(job.job_id).exists()
+        write_status(job.job_id, "accepted", updated_at="2026-09-20T10:05:00Z")
+        write_status(job.job_id, "failed", updated_at="2026-09-20T10:06:00Z")
+        spool.sync(force=True)
+        job.refresh_from_db()
+        assert job.state == "cancelled" and not job.in_flight
+
+    def test_agent_wins_once_it_has_claimed_the_request(self, host_enabled, superuser_client):
+        client, user = superuser_client
+        job = _host_job(user, state="requested")
+        spool.write_request(job)
+        spool.request_path(job.job_id).rename(spool.claimed_path(job.job_id))
+        response = _post(client, f"{BASE}/jobs/{job.job_id}/cancel")
+        assert response.status_code == 409
+        assert response.json()["detail"] == "The host agent has already picked this request up."
+        job.refresh_from_db()
+        assert job.state == "requested" and job.in_flight, "the row is left to the agent"
+        assert spool.claimed_path(job.job_id).exists()
+
+    def test_the_claim_status_applies_and_keeps_the_job_uncancellable(
+        self, host_enabled, superuser_client, write_status
+    ):
+        client, user = superuser_client
+        job = _host_job(user, state="requested")
+        spool.write_request(job)
+        spool.request_path(job.job_id).rename(spool.claimed_path(job.job_id))
+        write_status(job.job_id, "requested", step="check")
+        assert _post(client, f"{BASE}/jobs/{job.job_id}/cancel").status_code == 409
+        job.refresh_from_db()
+        assert job.state == "requested" and job.step == "check"
+
+    def test_the_row_turns_cancelled_only_after_the_unlink(self, host_enabled, superuser_client, monkeypatch):
+        client, user = superuser_client
+        job = _host_job(user, state="requested")
+        spool.write_request(job)
+        monkeypatch.setattr(spool, "remove_request", lambda job: False)
+        assert _post(client, f"{BASE}/jobs/{job.job_id}/cancel").status_code == 409
+        job.refresh_from_db()
+        assert job.state == "requested"
+
+
+def _succeeded_update(user, **fields):
+    fields.setdefault("snapshot", "pre-update-20260920-120000")
+    return _host_job(user, state=MaintenanceJob.State.SUCCEEDED, verify_requested_at="2026-09-20T12:30:00Z", **fields)
+
+
+@pytest.mark.django_db
+class TestLateRollbackRefusals:
+    def test_an_older_update_cannot_be_rolled_back_once_a_newer_one_succeeded(self, host_enabled, superuser_client):
+        from datetime import timedelta
+
+        from django.utils import timezone
+
+        client, user = superuser_client
+        old = _succeeded_update(user, created_at=timezone.now() - timedelta(days=2))
+        _succeeded_update(user, created_at=timezone.now() - timedelta(days=1))
+        response = _post(client, f"{BASE}/jobs/{old.job_id}/rollback", {"password": PASSWORD})
+        assert response.status_code == 409 and "newest update" in response.json()["detail"]
+        assert not spool.marker_path(old.job_id, "rollback").exists()
+
+    def test_a_later_restore_counts_as_newer(self, host_enabled, superuser_client):
+        from datetime import timedelta
+
+        from django.utils import timezone
+
+        client, user = superuser_client
+        old = _succeeded_update(user, created_at=timezone.now() - timedelta(days=2))
+        MaintenanceJob.objects.create(
+            operation="platform.rollback", executor="host", state="succeeded", in_flight=False
+        )
+        assert _post(client, f"{BASE}/jobs/{old.job_id}/rollback", {"password": PASSWORD}).status_code == 409
+
+    def test_a_late_rollback_while_another_job_is_in_flight_is_409(self, host_enabled, superuser_client):
+        client, user = superuser_client
+        job = _succeeded_update(user)
+        MaintenanceJob.objects.create(operation="platform.backup", executor="host", state="running", in_flight=True)
+        response = _post(client, f"{BASE}/jobs/{job.job_id}/rollback", {"password": PASSWORD})
+        assert response.status_code == 409 and "in flight" in response.json()["detail"]
+
+    def test_the_newest_succeeded_update_can_be_rolled_back(self, host_enabled, superuser_client):
+        client, user = superuser_client
+        job = _succeeded_update(user)
+        assert _post(client, f"{BASE}/jobs/{job.job_id}/rollback", {"password": PASSWORD}).status_code == 200
+
+
+@pytest.mark.django_db
+class TestVerifyRollbackExclusion:
+    def test_verify_after_the_deadline_is_409(self, host_enabled, superuser_client):
+        from datetime import timedelta
+
+        from django.utils import timezone
+
+        client, user = superuser_client
+        job = _host_job(user, verify_deadline=timezone.now() - timedelta(seconds=1))
+        response = _post(client, f"{BASE}/jobs/{job.job_id}/verify", {"password": PASSWORD})
+        assert response.status_code == 409 and "closed" in response.json()["detail"]
+        assert not spool.marker_path(job.job_id, "verify").exists()
+
+    def test_a_second_verify_is_409(self, host_enabled, superuser_client):
+        client, user = superuser_client
+        job = _host_job(user)
+        assert _post(client, f"{BASE}/jobs/{job.job_id}/verify", {"password": PASSWORD}).status_code == 200
+        assert _post(client, f"{BASE}/jobs/{job.job_id}/verify", {"password": PASSWORD}).status_code == 409
+
+    def test_rollback_after_verify_in_the_window_is_409(self, host_enabled, superuser_client):
+        client, user = superuser_client
+        job = _host_job(user)
+        assert _post(client, f"{BASE}/jobs/{job.job_id}/verify", {"password": PASSWORD}).status_code == 200
+        assert _post(client, f"{BASE}/jobs/{job.job_id}/rollback", {"password": PASSWORD}).status_code == 409
+        assert not spool.marker_path(job.job_id, "rollback").exists()
+
+    def test_verify_after_rollback_is_409(self, host_enabled, superuser_client):
+        client, user = superuser_client
+        job = _host_job(user)
+        assert _post(client, f"{BASE}/jobs/{job.job_id}/rollback", {"password": PASSWORD}).status_code == 200
+        assert _post(client, f"{BASE}/jobs/{job.job_id}/verify", {"password": PASSWORD}).status_code == 409
+        assert _post(client, f"{BASE}/jobs/{job.job_id}/rollback", {"password": PASSWORD}).status_code == 409
+
+    def test_the_compare_and_set_refuses_a_stamp_set_after_the_row_was_read(self, superuser):
+        from django.utils import timezone
+
+        job = _host_job(superuser)
+        MaintenanceJob.objects.filter(pk=job.pk).update(rollback_requested_at=timezone.now())
+        assert not job.transition(
+            expect=["awaiting_verification"],
+            unset=("verify_requested_at", "rollback_requested_at"),
+            verify_requested_at=timezone.now(),
+        )
+
+    def test_an_unwritable_marker_withdraws_the_stamp(self, host_enabled, superuser_client, monkeypatch):
+        client, user = superuser_client
+        job = _host_job(user)
+
+        def refuse(*args, **kwargs):
+            raise PermissionError("read-only")
+
+        monkeypatch.setattr(spool, "write_marker", refuse)
+        assert _post(client, f"{BASE}/jobs/{job.job_id}/verify", {"password": PASSWORD}).status_code == 503
+        job.refresh_from_db()
+        assert job.verify_requested_at is None
+
+
+@pytest.mark.django_db
+class TestStepUpComesLast:
+    def test_a_request_refused_for_another_reason_never_checks_the_credential(
+        self, host_enabled, superuser_client, monkeypatch
+    ):
+        from maintenance.api.v1 import ninja
+
+        calls = []
+        monkeypatch.setattr(ninja, "confirm_step_up", lambda *args, **kwargs: calls.append(args))
+        client, user = superuser_client
+        package = _package()
+        _host_job(user, state="running")
+        response = _post(
+            client,
+            f"{BASE}/jobs",
+            {"operation": "platform.update", "args": {"package_sha256": package.sha256}, "password": PASSWORD},
+        )
+        assert response.status_code == 409
+        assert calls == [], "no one-time code is spent on a request that was going to be refused"
+
+    def test_a_rollback_refused_for_another_reason_never_checks_the_credential(
+        self, host_enabled, superuser_client, monkeypatch
+    ):
+        from maintenance.api.v1 import ninja
+
+        calls = []
+        monkeypatch.setattr(ninja, "confirm_step_up", lambda *args, **kwargs: calls.append(args))
+        client, user = superuser_client
+        job = _succeeded_update(user)
+        MaintenanceJob.objects.create(operation="platform.backup", executor="host", state="running", in_flight=True)
+        assert _post(client, f"{BASE}/jobs/{job.job_id}/rollback", {"password": "x"}).status_code == 409
+        assert calls == []
+
+
+@pytest.mark.django_db
+class TestLockedWindow:
+    @pytest.mark.parametrize("phase", ["verifying"])
+    def test_no_job_may_be_requested_while_the_flag_is_up(self, enabled, superuser_client, write_flag, phase):
+        write_flag(phase)
+        client, _ = superuser_client
+        response = _post(client, f"{BASE}/jobs", {"operation": "activity.verify_audit_integrity"})
+        assert response.status_code == 409 and phase in response.json()["detail"]
+        assert not MaintenanceJob.objects.exists()
+
+    def test_verify_and_rollback_still_work_while_verifying(self, host_enabled, superuser_client, write_flag):
+        write_flag("verifying")
+        client, user = superuser_client
+        job = _host_job(user)
+        assert _post(client, f"{BASE}/jobs/{job.job_id}/verify", {"password": PASSWORD}).status_code == 200
+
+    @pytest.mark.parametrize("phase", ["updating", "rolling_back"])
+    def test_reads_write_nothing_and_answer_from_the_spool(
+        self, host_enabled, superuser_client, write_flag, write_status, phase
+    ):
+        client, user = superuser_client
+        job = _host_job(user, state="running")
+        write_status(job.job_id, "rolling_back", step="restore")
+        write_flag(phase)
+        body = client.get(f"{BASE}/jobs/{job.job_id}").json()
+        assert body["state"] == "rolling_back" and body["step"] == "restore", "the spool's view, overlaid"
+        assert client.get(f"{BASE}/jobs").json()[0]["state"] == "rolling_back"
+        job.refresh_from_db()
+        assert job.state == "running", "and nothing written to the database"
+        assert not Activity.objects.filter(verb="maintenance.job.sync").exists()
+
+
+@pytest.mark.django_db
+class TestEngagingTheExecutor:
+    def test_an_unwritable_spool_refuses_a_host_job_before_creating_it(
+        self, host_enabled, superuser_client, monkeypatch
+    ):
+        client, _ = superuser_client
+        package = _package()
+        monkeypatch.setattr(spool, "is_writable", lambda: False)
+        response = _post(
+            client,
+            f"{BASE}/jobs",
+            {"operation": "platform.update", "args": {"package_sha256": package.sha256}, "password": PASSWORD},
+        )
+        assert response.status_code == 409 and "not writable" in response.json()["detail"]
+        assert not MaintenanceJob.objects.exists()
+
+    def test_a_request_file_that_cannot_be_written_fails_the_job(self, host_enabled, superuser_client, monkeypatch):
+        client, _ = superuser_client
+        package = _package()
+
+        def refuse(job):
+            raise PermissionError("read-only")
+
+        monkeypatch.setattr(spool, "write_request", refuse)
+        response = _post(
+            client,
+            f"{BASE}/jobs",
+            {"operation": "platform.update", "args": {"package_sha256": package.sha256}, "password": PASSWORD},
+        )
+        assert response.status_code == 503
+        job = MaintenanceJob.objects.get()
+        assert job.state == "failed" and job.reason == "spool_write_failed" and not job.in_flight
+
+    def test_a_dispatch_that_fails_fails_the_job(self, enabled, superuser_client, monkeypatch):
+        from maintenance.tasks import run_job
+
+        def refuse(*args, **kwargs):
+            raise ConnectionError("broker down")
+
+        monkeypatch.setattr(run_job, "apply_async", refuse)
+        client, _ = superuser_client
+        response = _post(client, f"{BASE}/jobs", {"operation": "activity.verify_audit_integrity"})
+        assert response.status_code == 503
+        job = MaintenanceJob.objects.get()
+        assert job.state == "failed" and job.reason == "dispatch_failed" and not job.in_flight
+
+
+def _stale_agent(spool_dir, *, stale=True):
+    from datetime import timedelta
+
+    from django.utils import timezone
+
+    seen = timezone.now() - timedelta(seconds=600 if stale else 5)
+    spool.write_json_atomic(
+        spool_dir / "agent.json",
+        {"protocol": 1, "version": "1", "enabled": True, "last_run": seen.isoformat().replace("+00:00", "Z")},
+    )
+
+
+@pytest.mark.django_db
+class TestAbandon:
+    def test_a_celery_job_can_be_abandoned_and_the_slot_freed(self, enabled, superuser_client, caplog):
+        import logging
+
+        caplog.set_level(logging.WARNING, logger="epicurrents.security")
+        client, _ = superuser_client
+        job = MaintenanceJob.objects.create(operation="tests.x", executor="celery", state="running", in_flight=True)
+        response = _post(client, f"{BASE}/jobs/{job.job_id}/abandon", {"password": PASSWORD})
+        assert response.status_code == 200, response.content
+        job.refresh_from_db()
+        assert job.state == "failed" and job.reason == "abandoned" and not job.in_flight
+        assert Activity.objects.filter(verb="maintenance.job.abandon").exists()
+        events = [r for r in caplog.records if getattr(r, "security_event_type", "") == "maintenance.job_abandoned"]
+        assert len(events) == 1 and events[0].state_before == "running"
+
+    def test_needs_the_step_up(self, enabled, superuser_client):
+        client, _ = superuser_client
+        job = MaintenanceJob.objects.create(operation="tests.x", executor="celery", state="running", in_flight=True)
+        assert _post(client, f"{BASE}/jobs/{job.job_id}/abandon", {"password": "wrong"}).status_code == 400
+        job.refresh_from_db()
+        assert job.in_flight
+
+    def test_a_host_job_is_refused_while_the_agent_is_alive(self, host_enabled, superuser_client):
+        client, user = superuser_client
+        _stale_agent(host_enabled, stale=False)
+        job = _host_job(user, state="running")
+        assert _post(client, f"{BASE}/jobs/{job.job_id}/abandon", {"password": PASSWORD}).status_code == 409
+
+    def test_a_host_job_can_be_abandoned_once_the_agent_is_gone(self, host_enabled, superuser_client, write_status):
+        client, user = superuser_client
+        _stale_agent(host_enabled)
+        job = _host_job(user, state="requested")
+        spool.write_request(job)
+        assert _post(client, f"{BASE}/jobs/{job.job_id}/abandon", {"password": PASSWORD}).status_code == 200
+        assert not spool.request_path(job.job_id).exists(), "a returning agent finds nothing to pick up"
+        write_status(job.job_id, "running")
+        spool.sync(force=True)
+        job.refresh_from_db()
+        assert job.state == "failed" and not job.in_flight, "a late status never puts it back in flight"
+
+    def test_a_settled_job_is_409(self, enabled, superuser_client):
+        client, _ = superuser_client
+        job = MaintenanceJob.objects.create(operation="tests.x", executor="celery", state="succeeded", in_flight=False)
+        assert _post(client, f"{BASE}/jobs/{job.job_id}/abandon", {"password": PASSWORD}).status_code == 409
+
+
+@pytest.mark.django_db
+class TestErasureAcknowledgement:
+    def _record(self, when):
+        from maintenance.erasures import record_erasure
+
+        assert record_erasure(4242, when, at=when)
+
+    def test_a_rollback_undoing_erasures_is_409_until_acknowledged(self, host_enabled, superuser_client):
+        from datetime import UTC, datetime
+
+        client, user = superuser_client
+        job = _host_job(user, snapshot="pre-update-20260920-120000")
+        self._record(datetime(2026, 9, 20, 12, 30, tzinfo=UTC))
+        response = _post(client, f"{BASE}/jobs/{job.job_id}/rollback", {"password": PASSWORD})
+        assert response.status_code == 409
+        assert response.json()["reason"] == "erasures_since_snapshot" and response.json()["erasures"] == 1
+        assert not spool.marker_path(job.job_id, "rollback").exists()
+        response = _post(
+            client, f"{BASE}/jobs/{job.job_id}/rollback", {"password": PASSWORD, "acknowledge_erasures": True}
+        )
+        assert response.status_code == 200
+        # The audit row keeps what was acknowledged, which the row cannot say
+        # once the rollback has settled.
+        from activity.models import Activity
+
+        row = Activity.objects.filter(verb="maintenance.job.rollback").get()
+        assert row.metadata == {"restores_database": True, "erasures_acknowledged": 1}
+
+    def test_erasures_before_the_snapshot_do_not_count(self, host_enabled, superuser_client):
+        from datetime import UTC, datetime
+
+        client, user = superuser_client
+        job = _host_job(user, snapshot="pre-update-20260920-120000")
+        self._record(datetime(2026, 9, 20, 11, 0, tzinfo=UTC))
+        assert _post(client, f"{BASE}/jobs/{job.job_id}/rollback", {"password": PASSWORD}).status_code == 200
+
+    def test_a_rollback_keeping_the_database_is_not_asked(self, host_enabled, superuser_client):
+        from datetime import UTC, datetime
+
+        client, user = superuser_client
+        job = _host_job(user, snapshot="pre-update-20260920-120000", migrations_applied=False)
+        self._record(datetime(2026, 9, 20, 12, 30, tzinfo=UTC))
+        assert _post(client, f"{BASE}/jobs/{job.job_id}/rollback", {"password": PASSWORD}).status_code == 200
+
+    def test_a_restore_operation_is_asked_too(self, host_enabled, superuser_client, django_capture_on_commit_callbacks):
+        from datetime import UTC, datetime
+
+        client, _ = superuser_client
+        self._record(datetime(2026, 9, 21, 9, 0, tzinfo=UTC))
+        body = {"operation": "platform.rollback", "args": {"snapshot": "pre-update-20260920-120000"}}
+        response = _post(client, f"{BASE}/jobs", {**body, "password": PASSWORD})
+        assert response.status_code == 409 and response.json()["erasures"] == 1
+        assert not MaintenanceJob.objects.exists()
+        body["args"]["restore_database"] = False
+        assert _post(client, f"{BASE}/jobs", {**body, "password": PASSWORD}).status_code == 202
+        MaintenanceJob.objects.all().delete()
+        body["args"]["restore_database"] = True
+        response = _post(client, f"{BASE}/jobs", {**body, "password": PASSWORD, "acknowledge_erasures": True})
+        assert response.status_code == 202

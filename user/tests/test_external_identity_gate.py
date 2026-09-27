@@ -3,8 +3,8 @@
 An OIDC account's access is controlled entirely by the provider gates in
 user/oidc.py — the tenant (``tid``) claim and the email-domain allowlist. A
 local password on such an account answers to neither, so every surface that can
-put one there has to refuse: the reset link, the change-password form, and the
-invitation.
+put one there has to refuse: the reset link, the change-password form, the
+invitation, and the operator's set-password action.
 
 The whole of this is inert while ``OIDC_ENABLED`` is off, which is what makes
 it worth pinning. Nothing here can be noticed by using the platform as it is
@@ -115,7 +115,8 @@ class TestPasswordReset:
             r for r in caplog.records if getattr(r, "security_event_type", "") == "auth.password_reset_refused_external"
         ]
         assert len(events) == 1
-        assert events[0].actor_id == account.pk
+        assert events[0].target_id == account.pk
+        assert not hasattr(events[0], "actor_id")
 
     def test_the_address_is_not_in_the_refusal_event(self, client, make_user, caplog):
         account = _provisioned(make_user, username="ext_hygiene", email="ext_hygiene@example.com")
@@ -274,6 +275,38 @@ class TestInvitations:
         body = su_client.get(f"{ACCOUNTS}/{account.pk}").json()
         assert body["external_provider"] == "Microsoft"
         assert body["is_invite_pending"] is False
+
+
+@pytest.mark.django_db
+class TestOperatorSetPassword:
+    """The fourth surface. An operator setting a password on a provider account
+    mints the same local credential the reset link would, so it is refused the
+    same way — and before step-up, so the refusal costs no confirmation."""
+
+    def test_an_external_account_is_refused(self, superuser_client, make_user):
+        su_client = superuser_client[0]
+        account = _provisioned(make_user, username="ext_setpw", email="ext_setpw@example.com")
+        response = post_json(
+            su_client,
+            f"{ACCOUNTS}/{account.pk}/password",
+            {"new_password": "Str0ng-Passphrase-42", "password": "adminpass123"},
+        )
+        assert response.status_code == 409
+        assert "Microsoft" in response.json()["detail"]
+        account.refresh_from_db()
+        assert not account.has_usable_password()
+
+    def test_an_invited_local_account_can_still_be_given_one(self, superuser_client, make_user):
+        su_client = superuser_client[0]
+        invited = make_user(username="invited_setpw", email="isp@example.com")
+        invited.set_unusable_password()
+        invited.save(update_fields=["password"])
+        response = post_json(
+            su_client,
+            f"{ACCOUNTS}/{invited.pk}/password",
+            {"new_password": "Str0ng-Passphrase-42", "password": "adminpass123"},
+        )
+        assert response.status_code == 200
 
 
 @pytest.mark.django_db

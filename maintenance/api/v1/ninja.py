@@ -1,10 +1,12 @@
 """Maintenance API v1 — status, the operation registry, and jobs.
 
-Mounted at ``/api/v1/maintenance/``. Every operation calls ``_gate_enabled``
-first, which answers 404 while ``REMOTE_MAINTENANCE_ENABLED`` is off so the
-surface does not exist on a deployment that has not opted in, and then one of
-the tier guards. Host-tier writes additionally answer 403 while
-``REMOTE_UPDATE_ENABLED`` is off.
+Mounted at ``/api/v1/maintenance/``. Every operation but the lock probe calls
+``_gate_enabled`` first, which answers 404 while ``REMOTE_MAINTENANCE_ENABLED``
+is off so the surface does not exist on a deployment that has not opted in, and
+then one of the tier guards. Host-tier writes additionally answer 403 while
+``REMOTE_UPDATE_ENABLED`` is off. The lock probe is public and ungated because
+``update.sh``'s manual path raises the flag on deployments without the feature,
+and the SPA needs to see it come down.
 
 Nothing here executes anything. A request becomes a ``MaintenanceJob`` row and,
 on commit, either a Celery dispatch or a request file in the spool; the
@@ -13,6 +15,7 @@ keeps it that way.
 
 Endpoints
 ---------
+GET  /lock                   the maintenance flag, for the SPA to poll              (public, ungated)
 GET  /status                 flags, versions, spool and agent state, step-up method   (staff)
 GET  /operations             the registry with a JSON schema per operation           (staff)
 GET  /jobs                   recent jobs                                              (staff)
@@ -22,17 +25,21 @@ GET  /jobs/{job_id}/log      the host agent's log tail, or the command output   
 POST /jobs/{job_id}/cancel   withdraw a request the executor has not picked up        (superuser)
 POST /jobs/{job_id}/verify   confirm an update                                        (superuser, password)
 POST /jobs/{job_id}/rollback ask for a rollback                                       (superuser, step-up)
+POST /jobs/{job_id}/abandon  fail a job whose executor is gone                         (superuser, step-up)
 GET  /packages               uploaded update packages                                 (staff)
 POST /packages               upload a package: tarball, manifest, signature           (superuser)
 DELETE /packages/{sha256}    remove an uploaded package                               (superuser)
 """
 
+import logging
+import re
 import uuid
+from datetime import UTC, datetime
 
 from django.conf import settings
 from django.db import IntegrityError, transaction
 from django.utils import timezone
-from ninja import File, NinjaAPI, Schema, UploadedFile
+from ninja import NinjaAPI, Schema
 from ninja.errors import HttpError
 from pydantic import ValidationError
 
@@ -40,8 +47,8 @@ from activity.audit import log_activity
 from epicurrents.auth import enforce_session_csrf
 from epicurrents.security_log import get_client_ip, log_security_event
 from epicurrents.version import VERSION_INFO, __version__
-from maintenance import packaging, spool
-from maintenance.lock import current_lock
+from maintenance import erasures, packaging, spool
+from maintenance.lock import PHASE_VERIFYING, current_lock, read_lock
 from maintenance.models import MaintenanceJob, MaintenancePackage
 from maintenance.operations import HOST, get_operation, registered_operations
 from user.stepup import confirm_step_up, step_up_method
@@ -54,10 +61,15 @@ api = NinjaAPI(
     openapi_url=settings.API_OPENAPI_URL,
 )
 
+logger = logging.getLogger(__name__)
+
 JOB_LIST_LIMIT = 50
 # The one operation with a verification window, and so the one the verify and
 # rollback endpoints act on.
 UPDATE_OPERATION = "platform.update"
+RESTORE_OPERATION = "platform.rollback"
+# The date and time update.sh stamps on a snapshot name, in UTC.
+_SNAPSHOT_STAMP_RE = re.compile(r"-([0-9]{8})-([0-9]{6})$")
 
 
 # ── Schemas ──────────────────────────────────────────────────────────────────
@@ -98,6 +110,24 @@ class LockOut(Schema):
     expected_until: str | None
     message: str
     job_id: str | None
+
+
+class LockProbeOut(Schema):
+    """The maintenance flag as the SPA polls it: ``locked`` and, while it is, what the flag says."""
+
+    locked: bool
+    phase: str | None
+    since: str | None
+    expected_until: str | None
+    message: str | None
+
+
+class ConflictOut(Schema):
+    """A 409 with a reason the client acts on; ``erasures`` counts the accounts a restore would bring back."""
+
+    detail: str
+    reason: str | None = None
+    erasures: int | None = None
 
 
 class StepUpOut(Schema):
@@ -176,13 +206,15 @@ class JobCreateIn(Schema):
     args: dict = {}
     password: str | None = None
     totp_code: str | None = None
+    acknowledge_erasures: bool = False
 
 
 class ConfirmIn(Schema):
-    """Credentials for a step-up confirmation."""
+    """Credentials for a step-up confirmation, and for a rollback the acknowledgement of erasures it undoes."""
 
     password: str | None = None
     totp_code: str | None = None
+    acknowledge_erasures: bool = False
 
 
 class LogOut(Schema):
@@ -228,32 +260,60 @@ def _gate_enabled(request) -> None:
         raise HttpError(404, "Not found")
 
 
+def _deny(request, permission: str, user=None) -> None:
+    """Record a refused caller in the security log; the guards raise the response."""
+    log_security_event(
+        "permission.denied",
+        permission=permission,
+        actor_id=getattr(user, "pk", None),
+        ip=get_client_ip(request),
+        path=request.path,
+        method=request.method,
+    )
+
+
+def _authenticated(request):
+    """The authenticated user, or a logged 401. No CSRF check: the callers make it once the role is known."""
+    user = getattr(request, "user", None)
+    if not user or not user.is_authenticated:
+        _deny(request, "maintenance.authenticated")
+        raise HttpError(401, "Not authenticated")
+    return user
+
+
 def _require_auth(request):
     """Return the authenticated user or raise 401.
 
     Routes the request through the session-CSRF chokepoint; see AGENTS.md →
     *Session-authenticated write CSRF*.
     """
-    user = getattr(request, "user", None)
-    if not user or not user.is_authenticated:
-        raise HttpError(401, "Not authenticated")
+    user = _authenticated(request)
     enforce_session_csrf(request)
     return user
 
 
 def _require_staff(request):
-    """Return an authenticated staff (or superuser) user or raise 403."""
-    user = _require_auth(request)
+    """Return an authenticated staff (or superuser) user or raise 403, logging a refusal.
+
+    The role is checked before the CSRF chokepoint, which on a multipart POST
+    parses the body: a caller without the role must not get an upload spooled
+    to disk by asking.
+    """
+    user = _authenticated(request)
     if not (user.is_staff or user.is_superuser):
+        _deny(request, "maintenance.staff", user)
         raise HttpError(403, "Staff access required.")
+    enforce_session_csrf(request)
     return user
 
 
 def _require_superuser(request):
-    """Return an authenticated superuser or raise 403."""
-    user = _require_auth(request)
+    """Return an authenticated superuser or raise 403, logging a refusal; CSRF after the role, as above."""
+    user = _authenticated(request)
     if not user.is_superuser:
+        _deny(request, "maintenance.superuser", user)
         raise HttpError(403, "Superuser access required.")
+    enforce_session_csrf(request)
     return user
 
 
@@ -265,6 +325,71 @@ def _require_host_tier(operation) -> None:
     """403 for a host-tier operation while the host tier is switched off."""
     if operation.executor == HOST and not _host_tier_enabled():
         raise HttpError(403, "Remote updates are disabled on this deployment (REMOTE_UPDATE_ENABLED).")
+
+
+def _refuse_while_locked() -> None:
+    """409 while the maintenance flag is up in any phase, read fresh rather than through the cache.
+
+    Starting a job, uploading or removing a package in the verification window
+    changes the deployment under an update nobody has confirmed yet, and a
+    superuser is exempt from the lock's own refusal in that phase.
+    """
+    flag = read_lock()
+    if flag is not None:
+        raise HttpError(409, f"The platform is under maintenance ({flag.phase}); try again once it is over.")
+
+
+def _sync_for_read() -> bool:
+    """Run the spool sync unless the lock phase is ``updating`` or ``rolling_back``; returns whether it ran.
+
+    In those phases the database is between the pre-update dump and the
+    recreate, so a read writes nothing and answers from the spool through
+    ``spool.overlay`` instead.
+    """
+    flag = current_lock()
+    if flag is not None and flag.phase != PHASE_VERIFYING:
+        return False
+    spool.sync()
+    return True
+
+
+def _snapshot_taken_at(name: str | None) -> datetime | None:
+    """When a snapshot was taken: from the heartbeat when it lists the snapshot, else from the name's stamp."""
+    if not name:
+        return None
+    for row in spool.agent_summary()["snapshots"]:
+        if row["name"] == name and row["taken_at"]:
+            taken = spool.parse_timestamp(row["taken_at"])
+            if taken is not None:
+                return taken
+    match = _SNAPSHOT_STAMP_RE.search(name)
+    if match is None:
+        return None
+    try:
+        return datetime.strptime("".join(match.groups()), "%Y%m%d%H%M%S").replace(tzinfo=UTC)
+    except ValueError:
+        return None
+
+
+def _erasure_conflict(taken_at: datetime | None, *, acknowledged: bool) -> dict | None:
+    """The 409 body when restoring a database taken at ``taken_at`` would undo erasures made since, or ``None``.
+
+    An unknown time counts every recorded erasure, which errs towards asking.
+    """
+    if acknowledged:
+        return None
+    count = erasures.erasures_since(taken_at)
+    if not count:
+        return None
+    return {
+        "detail": (
+            f"{count} account(s) were erased after the snapshot was taken. Restoring the database brings them back "
+            "until they are erased again once the rollback has settled. Repeat the request with "
+            "acknowledge_erasures to go ahead."
+        ),
+        "reason": "erasures_since_snapshot",
+        "erasures": count,
+    }
 
 
 # ── Serialisation ────────────────────────────────────────────────────────────
@@ -369,12 +494,34 @@ def _step_up_status(user) -> dict:
 # ── Endpoints ────────────────────────────────────────────────────────────────
 
 
+@api.get("/lock", response=LockProbeOut)
+def get_lock(request):
+    """The maintenance flag, for the SPA to detect a phase change and the release.
+
+    Public and not gated by ``REMOTE_MAINTENANCE_ENABLED``: ``update.sh``'s
+    manual path raises the flag without the feature. Exempt from the lock
+    itself and from the Activity trail (``ACTIVITY_PATH_SKIP_LIST``), since a
+    browser polls it. A flag that cannot be read reports ``updating``, which is
+    how the middleware treats it.
+    """
+    flag = current_lock()
+    if flag is None:
+        return {"locked": False, "phase": None, "since": None, "expected_until": None, "message": None}
+    return {
+        "locked": True,
+        "phase": flag.phase,
+        "since": flag.since,
+        "expected_until": flag.expected_until,
+        "message": flag.message,
+    }
+
+
 @api.get("/status", response=StatusOut)
 def get_status(request):
     """The deployment's maintenance state, for the tab header."""
     _gate_enabled(request)
     user = _require_staff(request)
-    spool.sync()
+    _sync_for_read()
     lock = current_lock()
     in_flight = MaintenanceJob.objects.filter(in_flight=True).only("job_id").first()
     keys = packaging.load_release_keys()
@@ -440,8 +587,10 @@ def list_jobs(request):
     """The most recent jobs, newest first."""
     _gate_enabled(request)
     user = _require_staff(request)
-    spool.sync()
-    jobs = MaintenanceJob.objects.select_related("requested_by", "package")[:JOB_LIST_LIMIT]
+    synced = _sync_for_read()
+    jobs = list(MaintenanceJob.objects.select_related("requested_by", "package")[:JOB_LIST_LIMIT])
+    if not synced:
+        spool.overlay(jobs)
     log_activity(verb="maintenance.job.list")
     return [_serialize_job(job, for_superuser=user.is_superuser) for job in jobs]
 
@@ -451,8 +600,10 @@ def get_job(request, job_id: str):
     """One job by its id."""
     _gate_enabled(request)
     user = _require_staff(request)
-    spool.sync()
+    synced = _sync_for_read()
     job = _get_job(job_id)
+    if not synced:
+        spool.overlay([job])
     log_activity(verb="maintenance.job.read", target=job)
     return _serialize_job(job, for_superuser=user.is_superuser)
 
@@ -471,20 +622,72 @@ def get_job_log(request, job_id: str):
     return {"job_id": str(job.job_id), "log": text, "truncated": truncated, "bytes": total}
 
 
-@api.post("/jobs", response={202: JobOut})
+def _log_state(job) -> None:
+    log_security_event(
+        "maintenance.job_state",
+        job_id=str(job.job_id),
+        operation=job.operation,
+        state=job.state,
+        reason=job.reason or None,
+    )
+
+
+def _engage(job, operation) -> None:
+    """Hand a committed job to its executor; a hand-off that fails marks the job failed and answers 503.
+
+    Runs after the commit rather than in ``on_commit``, so a failure reaches the
+    caller instead of a 500 with the row committed in flight: the request file
+    for the host tier (``spool_write_failed``), the Celery dispatch for the
+    celery tier (``dispatch_failed``).
+    """
+    if operation.executor == HOST:
+        try:
+            spool.write_request(job)
+        except OSError as exc:
+            logger.warning("Request file of job %s could not be written: %s", job.job_id, exc.strerror or exc)
+            reason, detail = "spool_write_failed", "The request could not be written into the maintenance spool."
+        else:
+            return
+    else:
+        from maintenance.tasks import run_job
+
+        try:
+            run_job.apply_async(args=[job.pk], soft_time_limit=operation.soft_time_limit)
+        except Exception:
+            logger.exception("Job %s could not be dispatched to a worker", job.job_id)
+            reason, detail = (
+                "dispatch_failed",
+                "The job could not be handed to a worker; the task queue is unreachable.",
+            )
+        else:
+            return
+    if job.mark_finished(state=MaintenanceJob.State.FAILED, reason=reason, expect=["requested"]):
+        _log_state(job)
+    raise HttpError(503, f"{detail} The job was marked failed.")
+
+
+@api.post("/jobs", response={202: JobOut, 409: ConflictOut})
 def create_job(request, payload: JobCreateIn):
     """Request an operation.
 
     The registry decides what the key means; the request supplies only its
     typed arguments and, when the operation asks for it, a step-up
     confirmation. One job may be in flight at a time, across both tiers, so a
-    request while another runs answers 409. The row is created first and the
-    executor engaged on commit — a Celery dispatch for the celery tier, a
-    request file in the spool for the host tier — so an executor never sees a
-    job the database does not have.
+    request while another runs answers 409, and so does any request while the
+    maintenance flag is up. A ``platform.rollback`` that restores the database
+    answers 409 with ``reason: erasures_since_snapshot`` while accounts were
+    erased after its snapshot, until the body carries ``acknowledge_erasures``.
+    Step-up comes last, after every check that could refuse, so a refused
+    request spends no one-time code.
+
+    The row is committed first and the executor engaged afterwards — a Celery
+    dispatch for the celery tier, a request file in the spool for the host
+    tier — so an executor never sees a job the database does not have, and a
+    hand-off that fails marks the row failed rather than leaving it in flight.
     """
     _gate_enabled(request)
     user = _require_superuser(request)
+    _refuse_while_locked()
     spool.sync()
     operation = get_operation(payload.operation)
     if operation is None:
@@ -495,18 +698,17 @@ def create_job(request, payload: JobCreateIn):
     except ValidationError as exc:
         errors = "; ".join(f"{'.'.join(str(p) for p in e['loc']) or 'args'}: {e['msg']}" for e in exc.errors())
         raise HttpError(400, f"Invalid arguments: {errors}") from None
-    if operation.requires_step_up:
-        confirm_step_up(request, user, password=payload.password, totp_code=payload.totp_code)
 
     package = None
     target_version = ""
     request_args = args.model_dump(exclude_none=True)
+    conflict = None
     if operation.executor == HOST:
         sha256 = getattr(args, "package_sha256", None)
         if sha256:
             package = MaintenancePackage.objects.filter(sha256=sha256, state=MaintenancePackage.State.AVAILABLE).first()
             if package is None:
-                raise HttpError(400, "No uploaded package has that hash.")
+                raise HttpError(400, "No uploaded package has that hash, or it has not been verified.")
             if not _package_applicable(package):
                 raise HttpError(400, f"Package {package.version} is not newer than the installed {__version__}.")
             target_version = package.version
@@ -519,12 +721,20 @@ def create_job(request, payload: JobCreateIn):
             if agent["installed"] and snapshot not in known:
                 raise HttpError(400, "The host agent reports no snapshot by that name.")
             target_version = (known.get(snapshot) or {}).get("version") or ""
+            if operation.key == RESTORE_OPERATION and request_args.get("restore_database", True):
+                conflict = _erasure_conflict(_snapshot_taken_at(snapshot), acknowledged=payload.acknowledge_erasures)
         # The agent reads the window from the request, and a request that
         # leaves it out means the deployment's default, not the agent's.
         if "verify_window_minutes" in type(args).model_fields and request_args.get("verify_window_minutes") is None:
             request_args["verify_window_minutes"] = int(getattr(settings, "REMOTE_UPDATE_VERIFY_WINDOW_MINUTES", 30))
     if MaintenanceJob.objects.filter(in_flight=True).exists():
         raise HttpError(409, "Another maintenance job is in flight.")
+    if operation.executor == HOST and not spool.is_writable():
+        raise HttpError(409, "The maintenance spool is not writable by the platform; an operator needs to fix it.")
+    if conflict is not None:
+        return 409, conflict
+    if operation.requires_step_up:
+        confirm_step_up(request, user, password=payload.password, totp_code=payload.totp_code)
 
     job = MaintenanceJob(
         operation=operation.key,
@@ -536,6 +746,13 @@ def create_job(request, payload: JobCreateIn):
     )
     try:
         with transaction.atomic():
+            if package is not None:
+                # Held until the commit, so a removal of the same package
+                # waits and then sees this job in flight, or wins first and
+                # this request sees the package gone.
+                locked = MaintenancePackage.objects.select_for_update().filter(pk=package.pk).first()
+                if locked is None or locked.state != MaintenancePackage.State.AVAILABLE:
+                    raise HttpError(409, "The package was removed while the request was being made.")
             job.save()
             # The row carries the operation, executor and target version; only
             # the cross-model reference is worth repeating.
@@ -544,14 +761,6 @@ def create_job(request, payload: JobCreateIn):
                 target=job,
                 metadata={"package_sha256": package.sha256} if package is not None else None,
             )
-            if operation.executor == HOST:
-                transaction.on_commit(lambda: spool.write_request(job))
-            else:
-                from maintenance.tasks import run_job
-
-                transaction.on_commit(
-                    lambda: run_job.apply_async(args=[job.pk], soft_time_limit=operation.soft_time_limit)
-                )
     except IntegrityError:
         raise HttpError(409, "Another maintenance job is in flight.") from None
     log_security_event(
@@ -562,6 +771,8 @@ def create_job(request, payload: JobCreateIn):
         operation=job.operation,
         executor=job.executor,
     )
+    _engage(job, operation)
+    job.refresh_from_db()
     return 202, _serialize_job(job, for_superuser=True)
 
 
@@ -570,7 +781,10 @@ def cancel_job(request, job_id: str):
     """Withdraw a request the executor has not yet picked up.
 
     A celery-tier job past ``requested`` is already running and cannot be
-    stopped from here; a host-tier job past it belongs to the agent.
+    stopped from here. A host-tier request is withdrawn by unlinking its file,
+    which the agent claims by renaming: the unlink succeeding is what makes the
+    cancel win, and the row turns ``cancelled`` only then. A request the agent
+    has claimed answers 409.
     """
     _gate_enabled(request)
     user = _require_superuser(request)
@@ -578,19 +792,26 @@ def cancel_job(request, job_id: str):
     job = _get_job(job_id)
     if job.state != MaintenanceJob.State.REQUESTED:
         raise HttpError(409, f"A job in state {job.state!r} cannot be cancelled.")
-    if job.executor == MaintenanceJob.Executor.HOST and spool.read_status(job.job_id) is not None:
-        raise HttpError(409, "The agent has already picked this job up.")
+    if job.executor == MaintenanceJob.Executor.HOST and not spool.remove_request(job):
+        raise HttpError(409, "The host agent has already picked this request up.")
     if not job.mark_finished(state=MaintenanceJob.State.CANCELLED, actor=user, expect=["requested"]):
         raise HttpError(409, "The job changed state while cancelling.")
-    if job.executor == MaintenanceJob.Executor.HOST:
-        spool.remove_request(job)
     log_activity(verb="maintenance.job.cancel", target=job)
     return _serialize_job(job, for_superuser=True)
 
 
+def _withdraw_stamp(job, user, field: str) -> None:
+    """Undo a verify or rollback stamp whose marker could not be written, so the request can be repeated."""
+    job.transition(expect=[job.state], actor=user, **{field: None})
+
+
 @api.post("/jobs/{job_id}/verify", response=JobOut)
 def verify_job(request, job_id: str, payload: ConfirmIn):
-    """Confirm an update: the agent marks it succeeded and lifts the lock."""
+    """Confirm an update: the agent marks it succeeded and lifts the lock.
+
+    Once per job, before the window closes, and not after a rollback was asked
+    for: the stamp is set only while both it and the rollback stamp are null.
+    """
     _gate_enabled(request)
     user = _require_superuser(request)
     spool.sync()
@@ -599,23 +820,50 @@ def verify_job(request, job_id: str, payload: ConfirmIn):
         raise HttpError(409, "Only an update has a verification window.")
     if job.state != MaintenanceJob.State.AWAITING_VERIFICATION:
         raise HttpError(409, f"A job in state {job.state!r} is not awaiting verification.")
+    if job.verify_deadline is not None and timezone.now() >= job.verify_deadline:
+        raise HttpError(409, "The verification window has closed; the update is being rolled back.")
+    if job.verify_requested_at is not None:
+        raise HttpError(409, "This update has already been confirmed.")
+    if job.rollback_requested_at is not None:
+        raise HttpError(409, "A rollback of this update has already been asked for.")
     confirm_step_up(request, user, password=payload.password, totp_code=payload.totp_code, second_factor=False)
     now = timezone.now()
-    if not job.transition(expect=["awaiting_verification"], actor=user, verify_requested_at=now):
-        raise HttpError(409, "The job changed state while confirming.")
-    spool.write_marker(job, spool.MARKER_VERIFY, by_user_id=user.pk)
+    if not job.transition(
+        expect=["awaiting_verification"],
+        actor=user,
+        unset=("verify_requested_at", "rollback_requested_at"),
+        verify_requested_at=now,
+    ):
+        raise HttpError(409, "The job changed while confirming.")
+    try:
+        spool.write_marker(job, spool.MARKER_VERIFY, by_user_id=user.pk)
+    except OSError:
+        _withdraw_stamp(job, user, "verify_requested_at")
+        raise HttpError(503, "The confirmation could not be written into the maintenance spool.") from None
     log_activity(verb="maintenance.job.verify", target=job)
     return _serialize_job(job, for_superuser=True)
 
 
-@api.post("/jobs/{job_id}/rollback", response=JobOut)
+def _rollback_restores_database(job) -> bool:
+    """Whether rolling ``job`` back restores the database: unless it applied no migration, which lets the agent keep it."""
+    return job.migrations_applied is not False
+
+
+@api.post("/jobs/{job_id}/rollback", response={200: JobOut, 409: ConflictOut})
 def rollback_job(request, job_id: str, payload: ConfirmIn):
     """Ask the agent to roll an update back.
 
     Allowed while the job awaits verification, and after it succeeded for as
-    long as its pre-update snapshot exists; the agent makes the second check.
+    long as its pre-update snapshot exists, nothing is in flight and no later
+    update or restore has succeeded: rolling back an older update would put its
+    snapshot over everything since. The agent makes the same checks. Once per
+    job, and not after the update was confirmed while it awaited verification.
+
     Everything written since the update's snapshot is lost from the database,
-    which the UI says before the click and the notification repeats.
+    which the UI says before the click and the notification repeats; accounts
+    erased since then come back until the re-erasure that follows the rollback,
+    so while there are any the request answers 409 with ``reason:
+    erasures_since_snapshot`` until the body carries ``acknowledge_erasures``.
     """
     _gate_enabled(request)
     user = _require_superuser(request)
@@ -628,20 +876,108 @@ def rollback_job(request, job_id: str, payload: ConfirmIn):
     allowed = (MaintenanceJob.State.AWAITING_VERIFICATION, MaintenanceJob.State.SUCCEEDED)
     if job.state not in allowed:
         raise HttpError(409, f"A job in state {job.state!r} cannot be rolled back.")
-    if job.state == MaintenanceJob.State.SUCCEEDED and not job.snapshot:
-        raise HttpError(409, "This job left no snapshot to roll back to.")
+    if job.rollback_requested_at is not None:
+        raise HttpError(409, "A rollback of this update has already been asked for.")
+    unset = ["rollback_requested_at"]
+    if job.state == MaintenanceJob.State.AWAITING_VERIFICATION:
+        if job.verify_requested_at is not None:
+            raise HttpError(409, "This update has already been confirmed.")
+        unset.append("verify_requested_at")
+    else:
+        if not job.snapshot:
+            raise HttpError(409, "This job left no snapshot to roll back to.")
+        if MaintenanceJob.objects.filter(in_flight=True).exists():
+            raise HttpError(409, "Another maintenance job is in flight.")
+        later = MaintenanceJob.objects.filter(
+            operation__in=[UPDATE_OPERATION, RESTORE_OPERATION],
+            state=MaintenanceJob.State.SUCCEEDED,
+            created_at__gt=job.created_at,
+        )
+        if later.exists():
+            raise HttpError(409, "A later update or restore has succeeded; only the newest update can be rolled back.")
+    restores_database = _rollback_restores_database(job)
+    erasures_undone = 0
+    if restores_database:
+        taken_at = _snapshot_taken_at(job.snapshot) or job.started_at or job.created_at
+        conflict = _erasure_conflict(taken_at, acknowledged=payload.acknowledge_erasures)
+        if conflict is not None:
+            return 409, conflict
+        erasures_undone = erasures.erasures_since(taken_at)
     confirm_step_up(request, user, password=payload.password, totp_code=payload.totp_code)
     now = timezone.now()
-    if not job.transition(expect=list(allowed), actor=user, rollback_requested_at=now):
-        raise HttpError(409, "The job changed state while requesting the rollback.")
-    spool.write_marker(job, spool.MARKER_ROLLBACK, by_user_id=user.pk)
-    log_activity(verb="maintenance.job.rollback", target=job)
+    if not job.transition(expect=[job.state], actor=user, unset=unset, rollback_requested_at=now):
+        raise HttpError(409, "The job changed while requesting the rollback.")
+    try:
+        spool.write_marker(job, spool.MARKER_ROLLBACK, by_user_id=user.pk)
+    except OSError:
+        _withdraw_stamp(job, user, "rollback_requested_at")
+        raise HttpError(503, "The rollback request could not be written into the maintenance spool.") from None
+    # Whether the database goes back, and how many erasures the superuser
+    # acknowledged it would undo until the re-erasure: neither is recoverable
+    # from the row once the rollback has settled.
+    log_activity(
+        verb="maintenance.job.rollback",
+        target=job,
+        metadata={"restores_database": restores_database, "erasures_acknowledged": erasures_undone},
+    )
     log_security_event(
         "maintenance.rollback_requested",
         ip=get_client_ip(request),
         actor_id=user.pk,
         job_id=str(job.job_id),
         reason=job.state,
+    )
+    return 200, _serialize_job(job, for_superuser=True)
+
+
+@api.post("/jobs/{job_id}/abandon", response=JobOut)
+def abandon_job(request, job_id: str, payload: ConfirmIn):
+    """Fail a job in flight whose executor is gone, as ``abandoned``, to free the one-in-flight slot.
+
+    A celery-tier job may be abandoned at any time: the worker that ran it may
+    have died without a trace, and the reaper otherwise waits out the time
+    limit. A host-tier job only while the agent's heartbeat is stale or absent —
+    a running agent reports its own outcome, and abandoning under it would let
+    a second job start beside one that is still changing the host. An
+    unclaimed request file is withdrawn; a status the agent publishes later
+    may still record the outcome, but never puts the job back in flight.
+    """
+    _gate_enabled(request)
+    user = _require_superuser(request)
+    spool.sync()
+    job = _get_job(job_id)
+    if not job.in_flight:
+        raise HttpError(409, f"A job in state {job.state!r} is not in flight.")
+    if job.executor == MaintenanceJob.Executor.HOST:
+        agent = spool.agent_summary()
+        if agent["installed"] and not agent["stale"]:
+            raise HttpError(409, "The host agent is running and will report this job's outcome itself.")
+    confirm_step_up(request, user, password=payload.password, totp_code=payload.totp_code)
+    before = job.state
+    from maintenance.notify import dispatch_notice, needs_notice
+
+    announce = needs_notice(job, MaintenanceJob.State.FAILED)
+    if not job.mark_finished(
+        state=MaintenanceJob.State.FAILED,
+        reason="abandoned",
+        actor=user,
+        expect=[before],
+        last_notified_state=MaintenanceJob.State.FAILED if announce else job.last_notified_state,
+    ):
+        raise HttpError(409, "The job changed state while abandoning it.")
+    if job.executor == MaintenanceJob.Executor.HOST:
+        spool.remove_request(job)
+    if announce:
+        dispatch_notice(job, MaintenanceJob.State.FAILED)
+    log_activity(verb="maintenance.job.abandon", target=job)
+    log_security_event(
+        "maintenance.job_abandoned",
+        ip=get_client_ip(request),
+        actor_id=user.pk,
+        job_id=str(job.job_id),
+        operation=job.operation,
+        executor=job.executor,
+        state_before=before,
     )
     return _serialize_job(job, for_superuser=True)
 
@@ -654,7 +990,7 @@ def list_packages(request):
     """The uploaded packages, newest first, pruned ones included so the history reads whole."""
     _gate_enabled(request)
     _require_staff(request)
-    spool.sync()
+    _sync_for_read()
     packages = MaintenancePackage.objects.select_related("uploaded_by")[:JOB_LIST_LIMIT]
     log_activity(verb="maintenance.package.list")
     return [_serialize_package(package) for package in packages]
@@ -672,27 +1008,32 @@ def _reject_package(request, user, exc: packaging.PackageRejected, *, declared_v
 
 
 @api.post("/packages", response={201: PackageOut, 400: RejectionOut, 409: RejectionOut, 413: RejectionOut})
-def upload_package(
-    request,
-    package: UploadedFile = File(...),
-    manifest: UploadedFile = File(...),
-    signature: UploadedFile = File(...),
-):
+def upload_package(request):
     """Upload a release: the tarball, its manifest and the signature over the manifest, as three parts.
 
-    The signature is checked against ``REMOTE_UPDATE_RELEASE_KEY_PATH``, or
-    the successor key a release announced beside it, and the manifest against
-    what this deployment is — newer than the installed
-    version, the same project and plugins, within every installed pin — before
-    the tarball is copied into the spool and hashed against the manifest. A
-    refusal names its reason, leaves nothing in the packages directory and is
-    written to the security log. The host agent repeats the checks on its own
-    copy before anything runs; this is the immediate answer, not the boundary.
+    The parts are read from ``request.FILES`` only after the gate, the role,
+    the host-tier flag and the lock have been checked: a ``File`` parameter
+    would have the multipart body parsed, and spooled to disk, before any of
+    them ran. The signature is checked against
+    ``REMOTE_UPDATE_RELEASE_KEY_PATH``, or the successor key a release announced
+    beside it, and the manifest against what this deployment is — newer than
+    the installed version, the same project and plugins, within every
+    installed pin — before the tarball is copied into the spool and hashed
+    against the manifest. A refusal names its reason, leaves nothing in the
+    packages directory and is written to the security log. The host agent
+    repeats the checks on its own copy before anything runs; this is the
+    immediate answer, not the boundary.
     """
     _gate_enabled(request)
     user = _require_superuser(request)
     if not _host_tier_enabled():
         raise HttpError(403, "Remote updates are disabled on this deployment (REMOTE_UPDATE_ENABLED).")
+    _refuse_while_locked()
+    parts = {name: request.FILES.get(name) for name in ("package", "manifest", "signature")}
+    missing = sorted(name for name, part in parts.items() if part is None)
+    if missing:
+        raise HttpError(422, f"Missing multipart part(s): {', '.join(missing)}.")
+    package, manifest, signature = parts["package"], parts["manifest"], parts["signature"]
     spool.sync()
     declared = ""
     try:
@@ -709,12 +1050,14 @@ def upload_package(
                 "This deployment has no release key to verify packages against (REMOTE_UPDATE_RELEASE_KEY_PATH).",
                 status=409,
             )
-        packaging.verify_signature(manifest_bytes, signature_bytes, keys)
+        key = packaging.verify_signature(manifest_bytes, signature_bytes, keys)
         parsed = packaging.read_manifest(manifest_bytes)
         declared = parsed.version
         packaging.check_manifest(parsed)
         with transaction.atomic():
-            row = packaging.store(package, manifest_bytes, signature_bytes, parsed, uploaded_by=user)
+            row = packaging.store(
+                package, manifest_bytes, signature_bytes, parsed, uploaded_by=user, key_id=packaging.key_id(key)
+            )
             # The target row carries the hash and the version; nothing to repeat.
             log_activity(verb="maintenance.package.create", target=row)
             pruned = packaging.prune()
@@ -733,20 +1076,27 @@ def upload_package(
 
 @api.delete("/packages/{sha256}", response=PackageOut)
 def delete_package(request, sha256: str):
-    """Remove an uploaded package's files. The row stays as ``pruned``, since jobs refer to it."""
+    """Remove an uploaded package's files. The row stays as ``pruned``, since jobs refer to it.
+
+    The row is locked for the check and the removal, the same lock a job
+    request naming the package takes, so a removal cannot slip between that
+    request's check and its commit.
+    """
     _gate_enabled(request)
     user = _require_superuser(request)
+    _refuse_while_locked()
     spool.sync()
     package = _get_package(sha256)
-    if MaintenanceJob.objects.filter(in_flight=True, package=package).exists():
-        raise HttpError(409, "A job in flight refers to this package.")
-    if package.state == MaintenancePackage.State.PRUNED:
-        raise HttpError(409, "This package has already been removed.")
-    try:
-        packaging.remove_files(package.sha256)
-    except OSError as exc:
-        raise HttpError(409, f"The package files could not be removed: {exc.strerror or exc}") from None
     with transaction.atomic():
+        package = MaintenancePackage.objects.select_for_update().select_related("uploaded_by").get(pk=package.pk)
+        if MaintenanceJob.objects.filter(in_flight=True, package=package).exists():
+            raise HttpError(409, "A job in flight refers to this package.")
+        if package.state == MaintenancePackage.State.PRUNED:
+            raise HttpError(409, "This package has already been removed.")
+        try:
+            packaging.remove_files(package.sha256)
+        except OSError as exc:
+            raise HttpError(409, f"The package files could not be removed: {exc.strerror or exc}") from None
         package.state = MaintenancePackage.State.PRUNED
         package.save(update_fields=["state"])
         log_activity(verb="maintenance.package.delete", target=package)

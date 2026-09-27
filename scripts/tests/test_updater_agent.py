@@ -14,6 +14,7 @@ import hashlib
 import json
 import os
 import shutil
+import stat
 import subprocess
 import uuid
 from dataclasses import dataclass
@@ -196,7 +197,12 @@ class Staged:
         return self.spool / "packages"
 
     def status(self, job_id: str) -> dict:
+        """The status as the platform sees it: the copy published into the spool."""
         return json.loads((self.jobs / f"{job_id}.status.json").read_text())
+
+    def state_status(self, job_id: str) -> dict:
+        """The agent's status of record."""
+        return json.loads((self.state_dir / "jobs" / f"{job_id}.status.json").read_text())
 
     def log(self, job_id: str) -> str:
         path = self.jobs / f"{job_id}.log"
@@ -209,6 +215,29 @@ class Staged:
     def heartbeat(self) -> dict | None:
         path = self.spool / "agent.json"
         return json.loads(path.read_text()) if path.exists() else None
+
+    @property
+    def state_jobs(self) -> Path:
+        return self.state_dir / "jobs"
+
+    @property
+    def active_lock(self) -> Path:
+        return self.state_dir / "active.lock"
+
+    def put_status(self, job_id: str, status: dict, *, log: str | None = None) -> None:
+        """Stand in for an earlier tick: the status of record, as the agent keeps it, and its claim of the request."""
+        self.state_jobs.mkdir(parents=True, exist_ok=True)
+        (self.state_jobs / f"{job_id}.status.json").write_text(json.dumps(status))
+        request = self.jobs / f"{job_id}.json"
+        if request.exists():
+            (self.state_jobs / f"{job_id}.request.json").write_text(request.read_text())
+            request.rename(self.jobs / f"{job_id}.claimed.json")
+        if log is not None:
+            (self.state_jobs / f"{job_id}.log").write_text(log)
+
+    def put_lock(self, job_id: str, *, pid: int = 4000000, boot: str = "boot-gone") -> None:
+        self.state_dir.mkdir(parents=True, exist_ok=True)
+        self.active_lock.write_text(json.dumps({"protocol": 1, "pid": pid, "boot_id": boot, "job_id": job_id}))
 
     def update_sh_calls(self) -> list[str]:
         path = self.fake_dir / "calls"
@@ -379,7 +408,7 @@ class TestHeartbeatAndConfig:
         result = _run(staged)
         assert result.returncode == 0, result.stderr
         beat = staged.heartbeat()
-        assert beat["protocol"] == 1 and beat["enabled"] is False and beat["version"] == "2"
+        assert beat["protocol"] == 1 and beat["enabled"] is False and beat["version"] == "3"
         assert beat["runtime"] == "docker" and beat["last_run"].endswith("Z")
         assert beat["capabilities"] == ["platform.update", "platform.backup", "platform.rollback"]
         assert beat["self_update"] is False and beat["snapshots"] == []
@@ -437,7 +466,7 @@ class TestAcceptance:
         assert status["running_version"] == "0.2.0"
         assert status["snapshot"] == "pre-update-20260920-100000"
         assert status["started_at"].endswith("Z") and status["finished_at"] is None
-        assert status["verify_deadline"].endswith("Z") and status["agent_version"] == "2"
+        assert status["verify_deadline"].endswith("Z") and status["agent_version"] == "3"
         assert status["operation"] == "platform.update" and status["migrations_applied"] is True
 
         calls = staged.update_sh_calls()
@@ -453,7 +482,7 @@ class TestAcceptance:
         flag = staged.flag()
         assert flag["phase"] == "verifying" and flag["job_id"] == job_id
         assert flag["expected_until"] == status["verify_deadline"] and flag["protocol"] == 1
-        assert not (staged.spool / "lock").exists(), "the active-run lock outlives the run"
+        assert not staged.active_lock.exists(), "the active-run lock outlives the run"
         log = staged.log(job_id)
         assert "::snapshot=" in log and "awaiting verification" in log
 
@@ -485,14 +514,20 @@ class TestAcceptance:
         job_id = _to_window(staged)
         assert "still busy" in staged.log(job_id)
 
-    def test_status_files_are_handed_to_the_tree_owner_before_they_land(self, fakebin, tmp_path):
+    def test_published_files_are_plain_readable_copies_of_the_state_of_record(self, fakebin, tmp_path):
         staged = _stage(tmp_path, fakebin)
         job_id = _to_window(staged)
-        chowns = [c for c in fakebin.calls() if c.startswith("chown")]
-        assert any(f"{job_id}.status.json.tmp" in c for c in chowns), chowns
-        assert any("agent.json.tmp" in c for c in chowns)
-        assert any("maintenance.json.tmp" in c for c in chowns)
-        assert not (staged.jobs / f"{job_id}.status.json.tmp").exists()
+        for path in (
+            staged.jobs / f"{job_id}.status.json",
+            staged.spool / "agent.json",
+            staged.spool / "maintenance.json",
+        ):
+            info = path.lstat()
+            assert stat.S_ISREG(info.st_mode) and info.st_mode & 0o777 == 0o644, path
+        assert staged.status(job_id) == json.loads((staged.state_jobs / f"{job_id}.status.json").read_text())
+        assert not [p.name for p in staged.jobs.iterdir() if p.name.endswith(".tmp")]
+        assert not [p.name for p in staged.spool.iterdir() if p.name.endswith(".tmp")]
+        assert (staged.jobs / f"{job_id}.claimed.json").exists() and not (staged.jobs / f"{job_id}.json").exists()
 
     def test_the_agents_update_sh_is_refreshed_from_a_package_that_applied(self, fakebin, tmp_path):
         import tarfile
@@ -527,7 +562,7 @@ class TestAcceptance:
         assert staged.status(first)["state"] == "awaiting_verification"
         assert len(staged.update_sh_calls()) == 2
 
-    def test_a_request_whose_body_names_another_job_is_ignored(self, fakebin, tmp_path):
+    def test_a_request_whose_body_names_another_job_is_refused(self, fakebin, tmp_path):
         staged = _stage(tmp_path, fakebin)
         sha = _package(staged)
         job_id = _request(staged, sha)
@@ -535,7 +570,8 @@ class TestAcceptance:
         body["job_id"] = str(uuid.uuid4())
         (staged.jobs / f"{job_id}.json").write_text(json.dumps(body))
         _run(staged)
-        assert not (staged.jobs / f"{job_id}.status.json").exists()
+        assert staged.status(job_id)["reason"] == "refused_request"
+        assert staged.update_sh_calls() == []
 
 
 class TestRefusals:
@@ -547,7 +583,7 @@ class TestRefusals:
         assert status["reason"] == f"refused_{reason}"
         assert status["finished_at"] is not None and status["started_at"] is None
         assert staged.flag() is None
-        assert not (staged.spool / "lock").exists()
+        assert not staged.active_lock.exists()
         assert not any("--archive" in c for c in staged.update_sh_calls()), "the update ran"
         assert not (staged.state_dir / "work" / job_id).exists(), "the work copy was left behind"
         assert not staged.fakebin.has_call("stop celery-beat")
@@ -674,7 +710,7 @@ class TestTheWindow:
         job_id = _to_window(staged)
         status = staged.status(job_id)
         status["verify_deadline"] = "2020-01-01T00:00:00Z"
-        (staged.jobs / f"{job_id}.status.json").write_text(json.dumps(status))
+        staged.put_status(job_id, status)
         _run(staged)
         assert staged.status(job_id)["state"] == "rolled_back"
         assert staged.status(job_id)["reason"] == "deadline"
@@ -754,7 +790,7 @@ class TestFailedUpdates:
         assert status["snapshot"] == "" and status["step"] == "acquire"
         assert staged.flag() is None
         assert fakebin.has_call("up -d celery-beat")
-        assert not (staged.spool / "lock").exists()
+        assert not staged.active_lock.exists()
         assert not any("--rollback" in c for c in staged.update_sh_calls())
 
     def test_a_failure_after_the_snapshot_rolls_back_without_a_post_snapshot_requirement(self, fakebin, tmp_path):
@@ -801,7 +837,7 @@ class TestFailedUpdates:
         status = staged.status(job_id)
         assert status["state"] == "rollback_failed" and status["reason"] == "update_failed"
         assert staged.flag()["phase"] == "rolling_back"
-        assert not (staged.spool / "lock").exists()
+        assert not staged.active_lock.exists()
         assert not fakebin.has_call("up -d celery-beat")
         assert "needs a shell" in staged.log(job_id)
 
@@ -818,11 +854,7 @@ class TestFailedUpdates:
 
 class TestStaleLock:
     def _stale(self, staged: Staged, job_id: str, *, boot="boot-gone") -> None:
-        (staged.spool / "lock").write_text(
-            json.dumps(
-                {"protocol": 1, "pid": 4000000, "boot_id": boot, "job_id": job_id, "since": "2026-09-20T10:00:00Z"}
-            )
-        )
+        staged.put_lock(job_id, boot=boot)
 
     def _in_state(self, staged: Staged, state: str, *, snapshot: str = "", log: str = "") -> str:
         job_id = str(uuid.uuid4())
@@ -845,22 +877,19 @@ class TestStaleLock:
             "running_version": "",
             "retries": 0,
         }
-        (staged.jobs / f"{job_id}.status.json").write_text(json.dumps(status))
-        (staged.jobs / f"{job_id}.log").write_text(log)
+        staged.put_status(job_id, status, log=log)
         return job_id
 
     def test_a_running_job_with_a_snapshot_is_rolled_back(self, fakebin, tmp_path):
         staged = _stage(tmp_path, fakebin)
         (staged.root / "backups" / "pre-update-20260920-100000").mkdir(parents=True)
-        job_id = self._in_state(
-            staged, "running", log="::step=backup\n::snapshot=./backups/pre-update-20260920-100000\n"
-        )
+        job_id = self._in_state(staged, "running", snapshot="pre-update-20260920-100000")
         self._stale(staged, job_id)
         _run(staged)
         status = staged.status(job_id)
         assert status["state"] == "rolled_back" and status["reason"] == "stale"
         assert status["snapshot"] == "pre-update-20260920-100000"
-        assert not (staged.spool / "lock").exists()
+        assert not staged.active_lock.exists()
 
     def test_a_running_job_without_a_snapshot_is_failed(self, fakebin, tmp_path):
         staged = _stage(tmp_path, fakebin)
@@ -870,15 +899,15 @@ class TestStaleLock:
         status = staged.status(job_id)
         assert status["state"] == "failed" and status["reason"] == "stale"
         assert not any("--rollback" in c for c in staged.update_sh_calls())
-        assert staged.flag() is None and not (staged.spool / "lock").exists()
+        assert staged.flag() is None and not staged.active_lock.exists()
 
     def test_an_interrupted_rollback_is_retried_once(self, fakebin, tmp_path):
         staged = _stage(tmp_path, fakebin)
         (staged.root / "backups" / "pre-update-20260920-100000").mkdir(parents=True)
         job_id = self._in_state(staged, "rolling_back", snapshot="pre-update-20260920-100000")
-        status = staged.status(job_id)
+        status = staged.state_status(job_id)
         status["reason"] = "deadline"
-        (staged.jobs / f"{job_id}.status.json").write_text(json.dumps(status))
+        staged.put_status(job_id, status)
         self._stale(staged, job_id)
         _run(staged)
         after = staged.status(job_id)
@@ -887,9 +916,9 @@ class TestStaleLock:
     def test_a_twice_interrupted_rollback_needs_a_shell(self, fakebin, tmp_path):
         staged = _stage(tmp_path, fakebin)
         job_id = self._in_state(staged, "rolling_back", snapshot="pre-update-20260920-100000")
-        status = staged.status(job_id)
+        status = staged.state_status(job_id)
         status["retries"] = 1
-        (staged.jobs / f"{job_id}.status.json").write_text(json.dumps(status))
+        staged.put_status(job_id, status)
         self._stale(staged, job_id)
         _run(staged)
         assert staged.status(job_id)["state"] == "rollback_failed"
@@ -898,21 +927,31 @@ class TestStaleLock:
     def test_a_live_lock_from_this_boot_is_respected(self, fakebin, tmp_path):
         staged = _stage(tmp_path, fakebin)
         job_id = self._in_state(staged, "running")
-        (staged.spool / "lock").write_text(
-            json.dumps({"protocol": 1, "pid": os.getpid(), "boot_id": "boot-one", "job_id": job_id})
-        )
+        staged.put_lock(job_id, pid=os.getpid(), boot="boot-one")
         result = _run(staged)
         assert result.returncode == 0
-        assert staged.status(job_id)["state"] == "running"
-        assert (staged.spool / "lock").exists()
+        assert staged.state_status(job_id)["state"] == "running"
+        assert staged.active_lock.exists()
 
     def test_a_lock_naming_no_job_is_removed(self, fakebin, tmp_path):
         staged = _stage(tmp_path, fakebin)
-        (staged.spool / "lock").write_text(
-            json.dumps({"protocol": 1, "pid": 4000000, "boot_id": "x", "job_id": "nope"})
-        )
+        staged.put_lock("nope")
         _run(staged)
-        assert not (staged.spool / "lock").exists()
+        assert not staged.active_lock.exists()
+
+    def test_a_run_that_died_right_after_its_claim_fails_the_job(self, fakebin, tmp_path):
+        # The lock is taken before the claim, so the next tick finds a lock for
+        # a job with no status of record and settles it rather than leaving a
+        # claimed request nobody owns.
+        staged = _stage(tmp_path, fakebin)
+        job_id = _request(staged, _package(staged))
+        (staged.jobs / f"{job_id}.json").rename(staged.jobs / f"{job_id}.claimed.json")
+        staged.put_lock(job_id)
+        _run(staged)
+        status = staged.status(job_id)
+        assert status["state"] == "failed" and status["reason"] == "stale"
+        assert not staged.active_lock.exists()
+        assert staged.update_sh_calls() == []
 
 
 def _tarball(tmp_path, files: dict[str, str], *, top="epicurrents-0.2.0") -> bytes:
@@ -1026,7 +1065,7 @@ class TestBackups:
         assert staged.update_sh_calls() == [f"--root {staged.root} --snapshot backup"]
         assert staged.flag() is None
         assert not fakebin.has_call("stop celery-beat") and not fakebin.has_call("inspect active")
-        assert not (staged.spool / "lock").exists()
+        assert not staged.active_lock.exists()
         assert (staged.root / "backups" / "backup-20260920-140000").is_dir()
 
     def test_a_failed_snapshot_fails_the_job(self, fakebin, tmp_path):
@@ -1036,7 +1075,7 @@ class TestBackups:
         _run(staged)
         status = staged.status(job_id)
         assert status["state"] == "failed" and status["reason"] == "snapshot_failed"
-        assert not (staged.spool / "lock").exists()
+        assert not staged.active_lock.exists()
 
     def test_backups_are_pruned_to_the_newest_three(self, fakebin, tmp_path):
         staged = _stage(tmp_path, fakebin)
@@ -1074,14 +1113,12 @@ class TestBackups:
             "updated_at": "2026-09-20T10:05:00Z",
             "retries": 0,
         }
-        (staged.jobs / f"{job_id}.status.json").write_text(json.dumps(status))
-        (staged.spool / "lock").write_text(
-            json.dumps({"protocol": 1, "pid": 4000000, "boot_id": "gone", "job_id": job_id})
-        )
+        staged.put_status(job_id, status)
+        staged.put_lock(job_id)
         _run(staged)
         after = staged.status(job_id)
         assert after["state"] == "failed" and after["reason"] == "stale"
-        assert not (staged.spool / "lock").exists()
+        assert not staged.active_lock.exists()
 
 
 class TestStandaloneRollback:
@@ -1123,7 +1160,7 @@ class TestStandaloneRollback:
         assert "--code-only" not in calls[1]
         assert staged.flag() is None
         assert fakebin.has_call("stop celery-beat") and fakebin.has_call("up -d celery-beat")
-        assert not (staged.spool / "lock").exists()
+        assert not staged.active_lock.exists()
 
     def test_keeps_the_database_when_asked(self, fakebin, tmp_path):
         staged = _stage(tmp_path, fakebin)
@@ -1146,7 +1183,7 @@ class TestStandaloneRollback:
         restore = [c for c in staged.update_sh_calls() if "--rollback" in c]
         assert len(restore) == 1, "no second, database-restoring attempt without being asked"
         assert staged.flag() is None and fakebin.has_call("up -d celery-beat")
-        assert not (staged.spool / "lock").exists()
+        assert not staged.active_lock.exists()
 
     def test_a_snapshot_without_code_cannot_keep_the_database(self, fakebin, tmp_path):
         staged = _stage(tmp_path, fakebin)
@@ -1203,20 +1240,16 @@ class TestStandaloneRollback:
             "retries": 0,
         }
         (staged.root / "backups" / "pre-rollback-20260920-130000").mkdir(parents=True)
-        (staged.jobs / f"{job_id}.status.json").write_text(json.dumps(status))
-        (staged.spool / "lock").write_text(
-            json.dumps({"protocol": 1, "pid": 4000000, "boot_id": "gone", "job_id": job_id})
-        )
+        staged.put_status(job_id, status)
+        staged.put_lock(job_id)
         _run(staged)
         after = staged.status(job_id)
         assert after["state"] == "succeeded" and after["retries"] == 1
         calls = staged.update_sh_calls()
         assert len(calls) == 1 and "--rollback" in calls[0] and "--code-only" in calls[0], calls
         assert "keeping the safety snapshot already taken" in staged.log(job_id)
-        (staged.jobs / f"{job_id}.status.json").write_text(json.dumps({**status, "retries": 1}))
-        (staged.spool / "lock").write_text(
-            json.dumps({"protocol": 1, "pid": 4000000, "boot_id": "gone", "job_id": job_id})
-        )
+        staged.put_status(job_id, {**status, "retries": 1})
+        staged.put_lock(job_id)
         _run(staged)
         assert staged.status(job_id)["state"] == "rollback_failed"
 
@@ -1339,11 +1372,11 @@ class TestSelfUpdate:
     def test_an_older_or_equal_agent_is_kept(self, fakebin, tmp_path):
         staged = _stage(tmp_path, fakebin, SELF_UPDATE=1)
         before = (staged.lib_dir / "epicurrents-updater.sh").read_text()
-        sha = _package(staged, _tarball(tmp_path, {"updater/epicurrents-updater.sh": self._agent("2")}))
+        sha = _package(staged, _tarball(tmp_path, {"updater/epicurrents-updater.sh": self._agent("3")}))
         job_id = _request(staged, sha)
         _run(staged)
         assert (staged.lib_dir / "epicurrents-updater.sh").read_text() == before
-        assert "this is 2; this one stays" in staged.log(job_id)
+        assert "this is 3; this one stays" in staged.log(job_id)
 
     def test_an_agent_that_does_not_parse_is_kept(self, fakebin, tmp_path):
         staged = _stage(tmp_path, fakebin, SELF_UPDATE=1)
@@ -1520,10 +1553,191 @@ exec /usr/bin/install "$@"
         assert result.returncode != 0 and "no systemd" in result.stderr
 
 
+class TestOneWaySpool:
+    """The web tier can write anything under update/, and the agent is root.
+    Nothing it finds there may be followed, written through, or acted on as
+    the agent's own record.
+    """
+
+    def test_a_symlink_at_a_published_name_is_replaced_not_followed(self, fakebin, tmp_path):
+        staged = _stage(tmp_path, fakebin)
+        victim = tmp_path / "victim"
+        victim.write_text("precious\n")
+        sha = _package(staged)
+        job_id = _request(staged, sha)
+        for name in (f"jobs/{job_id}.status.json", f"jobs/{job_id}.log", "agent.json", "maintenance.json"):
+            (staged.spool / name).symlink_to(victim)
+        _run(staged)
+        assert victim.read_text() == "precious\n"
+        assert not (staged.jobs / f"{job_id}.status.json").is_symlink()
+        assert staged.status(job_id)["state"] == "awaiting_verification"
+
+    def test_a_symlinked_temporary_name_cannot_be_guessed_into(self, fakebin, tmp_path):
+        # The old writer used <target>.tmp; a link planted there was followed.
+        staged = _stage(tmp_path, fakebin, enabled=False)
+        victim = tmp_path / "victim"
+        victim.write_text("precious\n")
+        (staged.spool / "agent.json.tmp").symlink_to(victim)
+        _run(staged)
+        assert victim.read_text() == "precious\n"
+        assert staged.heartbeat()["enabled"] is False
+
+    def test_a_jobs_directory_replaced_by_a_link_stops_the_tick(self, fakebin, tmp_path):
+        staged = _stage(tmp_path, fakebin)
+        elsewhere = tmp_path / "elsewhere"
+        elsewhere.mkdir()
+        shutil.rmtree(staged.jobs)
+        staged.jobs.symlink_to(elsewhere)
+        result = _run(staged)
+        assert result.returncode != 0 and "cannot be used safely" in result.stderr
+        assert list(elsewhere.iterdir()) == []
+
+    def test_a_request_that_is_a_link_is_refused_unread(self, fakebin, tmp_path):
+        staged = _stage(tmp_path, fakebin)
+        secret = tmp_path / "secret.json"
+        body = {"protocol": 1, "job_id": "x", "operation": "platform.backup", "args": {}}
+        secret.write_text(json.dumps(body))
+        job_id = str(uuid.uuid4())
+        (staged.jobs / f"{job_id}.json").symlink_to(secret)
+        _run(staged)
+        # A link is not a request: it is never listed, claimed or run.
+        assert staged.update_sh_calls() == []
+        assert not (staged.state_jobs / f"{job_id}.status.json").exists()
+
+    def test_a_hard_linked_request_is_refused(self, fakebin, tmp_path):
+        staged = _stage(tmp_path, fakebin)
+        job_id = _request(staged, _package(staged))
+        os.link(staged.jobs / f"{job_id}.json", tmp_path / "second-link")
+        _run(staged)
+        assert staged.status(job_id)["reason"] == "refused_request"
+        assert staged.update_sh_calls() == []
+
+    def test_a_linked_package_file_is_refused(self, fakebin, tmp_path):
+        staged = _stage(tmp_path, fakebin)
+        content = b"not really a tarball"
+        sha = _package(staged, content)
+        real = tmp_path / "outside.tar.gz"
+        real.write_bytes(content)
+        (staged.packages / sha / "package.tar.gz").unlink()
+        (staged.packages / sha / "package.tar.gz").symlink_to(real)
+        job_id = _request(staged, sha)
+        _run(staged)
+        assert staged.status(job_id)["reason"] == "refused_hash"
+        assert "cannot be read safely" in staged.log(job_id)
+
+    def test_a_status_file_the_agent_did_not_write_is_ignored(self, fakebin, tmp_path):
+        staged = _stage(tmp_path, fakebin)
+        (staged.root / "backups" / "pre-update-20260920-100000").mkdir(parents=True)
+        job_id = str(uuid.uuid4())
+        forged = {
+            "protocol": 1,
+            "job_id": job_id,
+            "operation": "platform.update",
+            "state": "awaiting_verification",
+            "verify_deadline": "2020-01-01T00:00:00Z",
+            "snapshot": "pre-update-20260920-100000",
+        }
+        (staged.jobs / f"{job_id}.status.json").write_text(json.dumps(forged))
+        (staged.jobs / f"{job_id}.rollback").write_text("{}")
+        _run(staged)
+        assert staged.update_sh_calls() == []
+        assert not (staged.state_jobs / f"{job_id}.status.json").exists()
+
+    def test_a_lock_file_in_the_spool_does_not_stall_the_agent(self, fakebin, tmp_path):
+        staged = _stage(tmp_path, fakebin)
+        (staged.spool / "lock").write_text(json.dumps({"protocol": 1, "pid": 1, "boot_id": "boot-one", "job_id": "x"}))
+        job_id = _request(staged, _package(staged))
+        _run(staged)
+        assert staged.status(job_id)["state"] == "awaiting_verification"
+
+    def test_a_snapshot_name_that_escapes_backups_is_never_used(self, fakebin, tmp_path):
+        staged = _stage(tmp_path, fakebin)
+        job_id = str(uuid.uuid4())
+        staged.put_status(
+            job_id,
+            {
+                "protocol": 1,
+                "job_id": job_id,
+                "operation": "platform.update",
+                "state": "running",
+                "snapshot": "../../etc",
+                "retries": 0,
+            },
+        )
+        staged.put_lock(job_id)
+        _run(staged)
+        assert staged.status(job_id)["state"] == "failed" and staged.status(job_id)["reason"] == "stale"
+        assert not any("--rollback" in c for c in staged.update_sh_calls())
+
+    def test_a_rollback_request_naming_a_traversal_is_refused(self, fakebin, tmp_path):
+        staged = _stage(tmp_path, fakebin)
+        job_id = _request(staged, "", operation="platform.rollback", args={"snapshot": "../x-20260101-000000"})
+        _run(staged)
+        assert staged.status(job_id)["reason"] == "refused_snapshot"
+
+    def test_markers_that_are_links_are_not_markers(self, fakebin, tmp_path):
+        staged = _stage(tmp_path, fakebin)
+        job_id = _to_window(staged)
+        target = tmp_path / "anything"
+        target.write_text("{}")
+        (staged.jobs / f"{job_id}.verify").symlink_to(target)
+        _run(staged)
+        assert staged.status(job_id)["state"] == "awaiting_verification"
+
+    def test_markers_are_ignored_while_the_agent_is_disabled(self, fakebin, tmp_path):
+        staged = _stage(tmp_path, fakebin)
+        job_id = _to_window(staged)
+        staged.config(ENABLED=0)
+        (staged.jobs / f"{job_id}.rollback").write_text("{}")
+        _run(staged)
+        assert staged.status(job_id)["state"] == "awaiting_verification"
+
+    def test_a_withdrawn_request_is_not_taken(self, fakebin, tmp_path):
+        # The platform's cancel unlinks <id>.json; the agent's claim renames it.
+        # Whichever goes first wins, and a claimed request is out of the
+        # platform's reach.
+        staged = _stage(tmp_path, fakebin)
+        job_id = _request(staged, _package(staged))
+        (staged.jobs / f"{job_id}.json").unlink()
+        _run(staged)
+        assert not (staged.state_jobs / f"{job_id}.status.json").exists()
+        assert staged.update_sh_calls() == []
+
+    def test_control_characters_in_a_request_do_not_reach_the_log(self, fakebin, tmp_path):
+        staged = _stage(tmp_path, fakebin)
+        job_id = _request(staged, "", operation="evil\n::snapshot=./backups/pre-update-20260920-100000\x1b[2J")
+        _run(staged)
+        log = staged.log(job_id)
+        assert staged.status(job_id)["reason"] == "refused_operation"
+        assert "\n::snapshot=" not in log and "\x1b" not in log
+
+    def test_a_late_rollback_of_a_superseded_update_is_refused(self, fakebin, tmp_path):
+        staged = _stage(tmp_path, fakebin)
+        first = _to_window(staged)
+        (staged.jobs / f"{first}.verify").write_text("{}")
+        _run(staged)
+        second = str(uuid.uuid4())
+        staged.put_status(
+            second,
+            {
+                "protocol": 1,
+                "job_id": second,
+                "operation": "platform.update",
+                "state": "succeeded",
+                "finished_at": "2999-01-01T00:00:00Z",
+                "retries": 0,
+            },
+        )
+        (staged.jobs / f"{first}.rollback").write_text("{}")
+        _run(staged)
+        assert staged.status(first)["state"] == "succeeded"
+        assert "a later update or rollback has settled" in staged.log(first)
+
+
 def test_the_agent_and_installer_parse_and_carry_a_version():
     for script in (AGENT, INSTALLER):
         subprocess.run(["bash", "-n", str(script)], check=True)
     body = AGENT.read_text()
-    assert "AGENT_VERSION=2" in body
+    assert "AGENT_VERSION=3" in body
     assert 'OPERATION_UPDATE="platform.update"' in body
     assert 'OPERATION_BACKUP="platform.backup"' in body and 'OPERATION_ROLLBACK="platform.rollback"' in body

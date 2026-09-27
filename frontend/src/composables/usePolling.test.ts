@@ -87,4 +87,58 @@ describe('usePolling', () => {
         expect(read).not.toHaveBeenCalled()
         expect(handle.active.value).toBe(false)
     })
+
+    it('holds a read that falls due while the tab is hidden until it is shown', async () => {
+        const read = vi.fn<() => Promise<boolean>>().mockResolvedValue(false)
+        const setHidden = (hidden: boolean) => {
+            Object.defineProperty(document, 'visibilityState', {
+                configurable: true,
+                get: () => hidden ? 'hidden' : 'visible',
+            })
+            document.dispatchEvent(new Event('visibilitychange'))
+        }
+        const { app } = mountPolling(read, { initial: 1000 })
+        setHidden(true)
+        await vi.advanceTimersByTimeAsync(5000)
+        expect(read).not.toHaveBeenCalled()
+        setHidden(false)
+        await vi.advanceTimersByTimeAsync(0)
+        expect(read).toHaveBeenCalledTimes(1)
+        app.unmount()
+    })
+
+    it('waits out the Retry-After of a failure, bounded', async () => {
+        const read = vi.fn<() => Promise<boolean>>()
+        read.mockRejectedValueOnce(Object.assign(new Error('503'), { response: { headers: { 'retry-after': '20' } } }))
+        read.mockResolvedValue(false)
+        const { app } = mountPolling(read, { initial: 1000, max: 4000, retryAfterMax: 15000 })
+        await vi.advanceTimersByTimeAsync(1000)
+        expect(read).toHaveBeenCalledTimes(1)
+        await vi.advanceTimersByTimeAsync(14000)
+        expect(read).toHaveBeenCalledTimes(1)
+        await vi.advanceTimersByTimeAsync(1000)
+        expect(read).toHaveBeenCalledTimes(2)
+        app.unmount()
+    })
+
+    it('never overlaps a refresh with a scheduled read', async () => {
+        let running = 0
+        let overlapped = false
+        const read = vi.fn<() => Promise<boolean>>(async () => {
+            running += 1
+            if (running > 1) {
+                overlapped = true
+            }
+            await new Promise(resolve => setTimeout(resolve, 500))
+            running -= 1
+            return false
+        })
+        const { app, handle } = mountPolling(read, { initial: 1000 })
+        await vi.advanceTimersByTimeAsync(1100)
+        void handle.refresh()
+        await vi.advanceTimersByTimeAsync(1500)
+        expect(read).toHaveBeenCalledTimes(2)
+        expect(overlapped).toBe(false)
+        app.unmount()
+    })
 })

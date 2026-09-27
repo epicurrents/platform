@@ -23,6 +23,9 @@ from conftest import delete_json, post_json
 from user import two_factor as tf
 from user.models import TwoFactorCredential
 
+#: The superuser fixture's password, as step-up confirmation for the operator reset.
+SU_STEP = {"password": "adminpass123"}
+
 LOGIN_URL = "/api/v1/user/login"
 LOGIN_2FA_URL = "/api/v1/user/login/2fa"
 ME_URL = "/api/v1/user/me"
@@ -609,38 +612,38 @@ class TestOperatorReset:
 
     def test_a_superuser_can_reset(self, superuser_client, enrolled_user):
         su_client, _ = superuser_client
-        assert su_client.delete(self._url(enrolled_user)).status_code == 200
+        assert delete_json(su_client, self._url(enrolled_user), SU_STEP).status_code == 200
         assert not TwoFactorCredential.objects.filter(user=enrolled_user).exists()
 
     def test_the_account_can_then_sign_in_with_the_password_alone(self, superuser_client, enrolled_user, client):
         su_client, _ = superuser_client
-        su_client.delete(self._url(enrolled_user))
+        delete_json(su_client, self._url(enrolled_user), SU_STEP)
         body = post_json(client, LOGIN_URL, {"username": enrolled_user.username, "password": PASSWORD}).json()
         assert body["authenticated"] is True
 
     def test_staff_without_superuser_cannot_reset(self, make_user, enrolled_user, client):
         staff = make_user(password=PASSWORD, is_staff=True)
         client.force_login(staff)
-        assert client.delete(self._url(enrolled_user)).status_code == 403
+        assert delete_json(client, self._url(enrolled_user), {"password": PASSWORD}).status_code == 403
         assert TwoFactorCredential.objects.filter(user=enrolled_user).exists()
 
     def test_an_ordinary_user_cannot_reset_another_account(self, make_user, enrolled_user, client):
         client.force_login(make_user(password=PASSWORD))
-        assert client.delete(self._url(enrolled_user)).status_code == 403
+        assert delete_json(client, self._url(enrolled_user), {"password": PASSWORD}).status_code == 403
 
     def test_resetting_an_account_without_a_factor_is_refused(self, superuser_client, make_user):
         su_client, _ = superuser_client
-        assert su_client.delete(self._url(make_user())).status_code == 409
+        assert delete_json(su_client, self._url(make_user()), SU_STEP).status_code == 409
 
     def test_resetting_an_unknown_account_is_404(self, superuser_client):
         su_client, _ = superuser_client
-        assert su_client.delete("/api/v1/user/admin/accounts/999999/2fa").status_code == 404
+        assert delete_json(su_client, "/api/v1/user/admin/accounts/999999/2fa", SU_STEP).status_code == 404
 
     def test_the_reset_is_audited(self, superuser_client, enrolled_user):
         from activity.models import Activity
 
         su_client, _ = superuser_client
-        su_client.delete(self._url(enrolled_user))
+        delete_json(su_client, self._url(enrolled_user), SU_STEP)
         assert Activity.objects.filter(verb="user.account.2fa.reset").exists()
 
     def test_the_roster_reports_who_has_a_factor(self, superuser_client, enrolled_user):

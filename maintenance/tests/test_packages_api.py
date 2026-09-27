@@ -447,17 +447,19 @@ class TestPruning:
 
 @pytest.mark.django_db
 class TestReconciliation:
-    def test_rows_erased_by_a_restore_come_back_from_the_directories(self, ready):
+    def test_rows_erased_by_a_restore_come_back_from_the_directories(self, ready, django_capture_on_commit_callbacks):
         data = tarball()
         upload(ready, data)
         MaintenancePackage.objects.all().delete()
         # The list runs the sync, but under its five-second lock the upload just took; force it as beat would.
-        assert spool.sync(force=True)["packages"] == {"created": 1, "pruned": 0, "swept": 0}
+        with django_capture_on_commit_callbacks(execute=True):
+            assert spool.sync(force=True)["packages"] == {"created": 1, "pruned": 0, "swept": 0}
         rows = ready.client.get(f"{BASE}/packages").json()
         assert [row["sha256"] for row in rows] == [sha_of(data)]
         assert rows[0]["uploaded_by"] == ready.user.username and rows[0]["version"] == NEWER
         row = MaintenancePackage.objects.get()
-        assert row.manifest["sha256"] == sha_of(data) and row.state == "available"
+        assert row.manifest["sha256"] == sha_of(data) and row.state == "available", "hashed by the dispatched task"
+        assert row.key_id == packaging.key_id(packaging.load_release_key()), "the key that verified, not a claim"
         assert Activity.objects.filter(verb="maintenance.package.sync").exists()
 
     def test_a_directory_removed_by_hand_marks_the_row_pruned(self, ready):
@@ -685,3 +687,183 @@ class TestProxyBodyGuard:
             pytest.raises(ImproperlyConfigured, match="RECORDINGS_MAX_UPLOAD_SIZE"),
         ):
             self._run(monkeypatch, "50MiB")
+
+
+def _place(ready, data: bytes, manifest: bytes | None = None, signature: bytes | None = None, *, sha: str = ""):
+    """A package directory as a restore leaves it or an operator drops it, with no row."""
+    manifest = manifest if manifest is not None else manifest_for(data)
+    directory = packaging.package_dir(sha or sha_of(data))
+    directory.mkdir(parents=True)
+    (directory / packaging.TARBALL_NAME).write_bytes(data)
+    (directory / packaging.MANIFEST_NAME).write_bytes(manifest)
+    if signature is None:
+        signature = ready.key.sign(manifest)
+    (directory / packaging.SIGNATURE_NAME).write_bytes(signature)
+    return directory
+
+
+@pytest.mark.django_db
+class TestReconciliationVerifies:
+    def test_a_found_directory_is_unverified_until_hashed_and_cannot_be_named(self, ready):
+        data = tarball()
+        _place(ready, data)
+        spool.sync(force=True)
+        row = MaintenancePackage.objects.get()
+        assert row.state == "unverified" and row.key_id == packaging.key_id(packaging.load_release_key())
+        assert ready.client.get(f"{BASE}/packages").json()[0]["applicable"] is False
+        response = _post_json(
+            ready.client,
+            f"{BASE}/jobs",
+            {"operation": "platform.update", "args": {"package_sha256": row.sha256}, "password": PASSWORD},
+        )
+        assert response.status_code == 400
+        assert packaging.verify_pending() == {"available": 1, "invalid": 0}
+        row.refresh_from_db()
+        assert row.state == "available"
+
+    def test_a_signature_that_does_not_verify_makes_the_row_invalid_and_shows_no_claimed_key(self, ready):
+        data = tarball()
+        manifest = manifest_for(data)
+        _place(ready, data, manifest, signature=base64.b64encode(b"\0" * 64))
+        spool.sync(force=True)
+        row = MaintenancePackage.objects.get()
+        assert row.state == "invalid" and row.key_id == "", "never the key id the manifest claims"
+        assert packaging.verify_pending() == {"available": 0, "invalid": 0}, "nothing to hash"
+
+    def test_a_tarball_whose_hash_disagrees_is_invalid(self, ready):
+        data = tarball()
+        manifest = manifest_for(data)
+        directory = _place(ready, data, manifest)
+        (directory / packaging.TARBALL_NAME).write_bytes(bytes(reversed(data)))
+        spool.sync(force=True)
+        assert MaintenancePackage.objects.get().state == "unverified"
+        assert packaging.verify_pending()["invalid"] == 1
+        assert MaintenancePackage.objects.get().state == "invalid"
+
+    def test_a_package_for_another_deployment_is_invalid(self, ready):
+        data = tarball()
+        _place(ready, data, manifest_for(data, project="elsewhere"))
+        spool.sync(force=True)
+        assert MaintenancePackage.objects.get().state == "invalid"
+
+    def test_without_a_release_key_the_row_waits_rather_than_being_condemned(self, ready, tmp_path):
+        data = tarball()
+        _place(ready, data)
+        with override_settings(REMOTE_UPDATE_RELEASE_KEY_PATH=str(tmp_path / "gone.pub")):
+            spool.sync(force=True)
+            assert packaging.verify_pending() == {"available": 0, "invalid": 0}
+        assert MaintenancePackage.objects.get().state == "unverified"
+        packaging.verify_pending()
+        assert MaintenancePackage.objects.get().state == "available"
+
+    def test_an_overlong_manifest_field_is_skipped_and_never_fails_the_sync(self, ready):
+        data = tarball()
+        _place(ready, data, manifest_for(data, version="1.2.3" + "0" * 40))
+        assert spool.sync(force=True)["packages"]["created"] == 0
+        assert ready.client.get(f"{BASE}/packages").status_code == 200
+        assert not MaintenancePackage.objects.exists()
+
+
+@pytest.mark.django_db
+class TestManifestBounds:
+    @pytest.mark.parametrize(
+        "overrides",
+        [
+            {"version": "1." + "9" * 40 + ".0"},
+            {"key_id": "abcdef01234567890"},
+            {"key_id": "not-hex"},
+            {"project": "p" * 65},
+            {"platform_compatible": ">=" + "0" * 70},
+            {"built_at": "yesterday"},
+            {"plugins": [f"plugin{i}" for i in range(70)]},
+        ],
+    )
+    def test_a_field_the_row_cannot_hold_is_refused_at_upload(self, ready, overrides):
+        data = tarball()
+        response = upload(ready, data, manifest=manifest_for(data, **overrides))
+        assert response.status_code == 400 and response.json()["reason"] == "manifest"
+        assert not MaintenancePackage.objects.exists() and not packaging.package_dir(sha_of(data)).exists()
+
+
+@pytest.mark.django_db
+class TestPackagesWhileLocked:
+    def test_no_upload_while_the_flag_is_up(self, ready, write_flag):
+        write_flag("verifying")
+        response = upload(ready)
+        assert response.status_code == 409 and "verifying" in response.json()["detail"]
+        assert not MaintenancePackage.objects.exists()
+
+    def test_no_removal_while_the_flag_is_up(self, ready, write_flag):
+        data = tarball()
+        upload(ready, data)
+        write_flag("verifying")
+        assert ready.client.delete(f"{BASE}/packages/{sha_of(data)}").status_code == 409
+        assert packaging.package_dir(sha_of(data)).is_dir()
+
+
+@pytest.mark.django_db
+class TestUploadBodyIsNotParsedEarly:
+    """A File parameter would have the multipart body spooled to disk before the gate or the role ran."""
+
+    @pytest.fixture
+    def parse_calls(self, monkeypatch):
+        from django.http import multipartparser
+
+        calls = []
+        original = multipartparser.MultiPartParser.parse
+
+        def spy(self):
+            calls.append(True)
+            return original(self)
+
+        monkeypatch.setattr(multipartparser.MultiPartParser, "parse", spy)
+        return calls
+
+    def test_the_feature_off_parses_nothing(self, spool_dir, client, parse_calls):
+        response = post_package(client, b"x" * 1024, b"{}", b"")
+        assert response.status_code == 404 and parse_calls == []
+
+    def test_an_anonymous_caller_parses_nothing(self, host_enabled, client, parse_calls):
+        response = post_package(client, b"x" * 1024, b"{}", b"")
+        assert response.status_code == 401 and parse_calls == []
+
+    def test_a_non_superuser_parses_nothing(self, host_enabled, staff_client, parse_calls):
+        client, _ = staff_client
+        response = post_package(client, b"x" * 1024, b"{}", b"")
+        assert response.status_code == 403 and parse_calls == []
+
+    def test_the_host_tier_off_parses_nothing(self, enabled, superuser_client, parse_calls):
+        client, _ = superuser_client
+        response = post_package(client, b"x" * 1024, b"{}", b"")
+        assert response.status_code == 403 and parse_calls == []
+
+
+@pytest.mark.django_db
+class TestRemovalRace:
+    def test_removal_locks_the_row_the_request_locks(self, ready):
+        import inspect
+
+        from maintenance.api.v1 import ninja
+
+        for view in (ninja.create_job, ninja.delete_package):
+            assert "select_for_update()" in inspect.getsource(view), view.__name__
+
+    def test_a_request_whose_package_went_while_it_was_checked_is_409(self, ready, monkeypatch):
+        data = tarball()
+        upload(ready, data)
+        from maintenance.api.v1 import ninja
+
+        original = ninja.confirm_step_up
+
+        def remove_meanwhile(*args, **kwargs):
+            original(*args, **kwargs)
+            MaintenancePackage.objects.update(state="pruned")
+
+        monkeypatch.setattr(ninja, "confirm_step_up", remove_meanwhile)
+        response = _post_json(
+            ready.client,
+            f"{BASE}/jobs",
+            {"operation": "platform.update", "args": {"package_sha256": sha_of(data)}, "password": PASSWORD},
+        )
+        assert response.status_code == 409 and "removed" in response.json()["detail"]
+        assert not MaintenanceJob.objects.exists()

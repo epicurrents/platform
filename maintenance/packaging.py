@@ -24,6 +24,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import secrets
 import shutil
 from dataclasses import dataclass
@@ -31,6 +32,7 @@ from pathlib import Path
 
 from django.apps import apps as django_apps
 from django.conf import settings
+from django.db import DatabaseError, transaction
 from django.utils import timezone
 
 from epicurrents.plugin_loader import get_active_plugins
@@ -68,6 +70,14 @@ REJECTION_REASONS = (
 DISK_HEADROOM_FACTOR = 2
 #: Age past which a ``.incoming-`` directory is a crashed upload's leftover and swept.
 INCOMING_MAX_AGE_SECONDS = 24 * 3600
+#: Bounds on the manifest's text fields: the columns they land in, so a manifest that passes here can be stored.
+VERSION_MAX_LENGTH = 32
+PROJECT_MAX_LENGTH = 64
+PLATFORM_COMPATIBLE_MAX_LENGTH = 64
+BUILT_AT_MAX_LENGTH = 64
+PLUGINS_MAX = 64
+PLUGIN_NAME_MAX_LENGTH = 64
+_KEY_ID_RE = re.compile(r"^[0-9a-f]{1,16}$")
 
 
 class PackageRejected(Exception):
@@ -193,8 +203,12 @@ def key_id(key) -> str:
     return hashlib.sha256(raw).hexdigest()[:16]
 
 
-def verify_signature(manifest_bytes: bytes, signature_bytes: bytes, keys) -> None:
-    """Check the base64 detached signature over the manifest's exact bytes against ``keys``, one key or a list."""
+def verify_signature(manifest_bytes: bytes, signature_bytes: bytes, keys):
+    """Check the base64 detached signature over the manifest's exact bytes against ``keys``; returns the key that verified.
+
+    ``keys`` is one key or a list. The key returned is what a row's ``key_id``
+    shows, rather than the id the manifest claims for itself.
+    """
     from cryptography.exceptions import InvalidSignature
 
     if not isinstance(keys, list | tuple):
@@ -209,7 +223,7 @@ def verify_signature(manifest_bytes: bytes, signature_bytes: bytes, keys) -> Non
                 key.verify(signature, manifest_bytes)
             except InvalidSignature:
                 continue
-            return
+            return key
     raise PackageRejected(
         "signature",
         "The package signature does not verify against this deployment's release key: the manifest or the "
@@ -244,16 +258,36 @@ def read_manifest(raw: bytes) -> Manifest:
         raise PackageRejected(
             "manifest", f"The manifest's version {version!r} is not a MAJOR.MINOR.PATCH version."
         ) from None
+    if len(version) > VERSION_MAX_LENGTH:
+        raise PackageRejected("manifest", f"The manifest's version is longer than {VERSION_MAX_LENGTH} characters.")
+    project = str(data.get("project") or "")
+    platform_compatible = str(data.get("platform_compatible") or "")
+    built_at = str(data.get("built_at") or "")
+    key_id_claimed = str(data.get("key_id") or "")
+    plugins = normalise_plugins(data.get("plugins"))
+    if len(project) > PROJECT_MAX_LENGTH:
+        raise PackageRejected("manifest", f"The manifest's project is longer than {PROJECT_MAX_LENGTH} characters.")
+    if len(platform_compatible) > PLATFORM_COMPATIBLE_MAX_LENGTH:
+        raise PackageRejected(
+            "manifest",
+            f"The manifest's platform_compatible is longer than {PLATFORM_COMPATIBLE_MAX_LENGTH} characters.",
+        )
+    if len(built_at) > BUILT_AT_MAX_LENGTH or (built_at and spool.parse_timestamp(built_at) is None):
+        raise PackageRejected("manifest", "The manifest's built_at is not an ISO-8601 timestamp.")
+    if key_id_claimed and not _KEY_ID_RE.match(key_id_claimed):
+        raise PackageRejected("manifest", "The manifest's key_id is not a key id of up to 16 hex digits.")
+    if len(plugins) > PLUGINS_MAX or any(len(name) > PLUGIN_NAME_MAX_LENGTH for name in plugins):
+        raise PackageRejected("manifest", "The manifest's plugin list is longer than any deployment runs.")
     agent_version = data.get("agent_version")
     return Manifest(
         version=version,
         sha256=sha256,
         size=size,
-        project=str(data.get("project") or ""),
-        plugins=normalise_plugins(data.get("plugins")),
-        platform_compatible=str(data.get("platform_compatible") or ""),
-        built_at=str(data.get("built_at") or ""),
-        key_id=str(data.get("key_id") or ""),
+        project=project,
+        plugins=plugins,
+        platform_compatible=platform_compatible,
+        built_at=built_at,
+        key_id=key_id_claimed,
         agent_version=agent_version if isinstance(agent_version, int) and not isinstance(agent_version, bool) else 0,
         raw=data,
     )
@@ -315,7 +349,7 @@ def _write_bytes(path: Path, data: bytes) -> None:
         handle.write(data)
 
 
-def store(package_file, manifest_bytes: bytes, signature_bytes: bytes, manifest: Manifest, *, uploaded_by):
+def store(package_file, manifest_bytes: bytes, signature_bytes: bytes, manifest: Manifest, *, uploaded_by, key_id=""):
     """Stream the tarball into the spool beside its manifest and signature, then create or revive the row.
 
     ``package_file`` is anything with ``chunks()``. The copy is hashed as it is
@@ -324,6 +358,7 @@ def store(package_file, manifest_bytes: bytes, signature_bytes: bytes, manifest:
     ``upload.json`` are in it. Any failure removes the incoming directory. A
     package with the same hash already present answers ``duplicate``; a row
     left ``pruned`` by an earlier removal is revived rather than duplicated.
+    ``key_id`` is the id of the key the signature verified against.
     """
     from maintenance.models import MaintenancePackage
 
@@ -401,12 +436,14 @@ def store(package_file, manifest_bytes: bytes, signature_bytes: bytes, manifest:
         ) from None
 
     row, _ = MaintenancePackage.objects.update_or_create(
-        sha256=manifest.sha256, defaults=_row_fields(manifest, uploaded_by=uploaded_by, uploaded_at=timezone.now())
+        sha256=manifest.sha256,
+        defaults=_row_fields(manifest, uploaded_by=uploaded_by, uploaded_at=timezone.now(), key_id=key_id),
     )
     return row
 
 
-def _row_fields(manifest: Manifest, *, uploaded_by, uploaded_at) -> dict:
+def _row_fields(manifest: Manifest, *, uploaded_by, uploaded_at, key_id: str, state=None) -> dict:
+    """The row of a package; ``key_id`` is the key that verified, blank when none did, never the manifest's claim."""
     from maintenance.models import MaintenancePackage
 
     built_at = spool.parse_timestamp(manifest.built_at) if manifest.built_at else None
@@ -417,11 +454,11 @@ def _row_fields(manifest: Manifest, *, uploaded_by, uploaded_at) -> dict:
         "platform_compatible": manifest.platform_compatible,
         "built_at": built_at,
         "size": manifest.size,
-        "key_id": manifest.key_id,
+        "key_id": key_id,
         "manifest": manifest.raw,
         "uploaded_by": uploaded_by,
         "uploaded_at": uploaded_at,
-        "state": MaintenancePackage.State.AVAILABLE,
+        "state": state or MaintenancePackage.State.AVAILABLE,
     }
 
 
@@ -519,14 +556,161 @@ def _scan_package_dirs() -> dict[str, Path]:
     return found
 
 
+def _read_capped(path: Path, limit: int) -> bytes | None:
+    """The bytes of ``path`` when it is a regular file no larger than ``limit``; ``None`` otherwise."""
+    try:
+        if not path.is_file() or path.stat().st_size > limit:
+            return None
+        return path.read_bytes()
+    except OSError:
+        return None
+
+
+def _examine(path: Path, sha256: str):
+    """Check a package directory the way an upload is checked, short of hashing the tarball.
+
+    Returns ``(manifest, state, key_id)``, or ``None`` when the manifest cannot
+    even be read, which leaves nothing to describe a row with. ``state`` is
+    ``invalid`` when the signature does not verify, the tarball's size disagrees
+    with the manifest, or the package is for another deployment; ``unverified``
+    otherwise, which :func:`verify_pending` settles by hashing. A deployment
+    without a release key cannot verify anything yet and keeps the row
+    ``unverified`` rather than condemning it.
+    """
+    from maintenance.models import MaintenancePackage
+
+    manifest_bytes = _read_capped(path / MANIFEST_NAME, MANIFEST_LIMIT)
+    if manifest_bytes is None:
+        logger.warning("Package directory %s carries no readable manifest; ignored", sha256[:12])
+        return None
+    try:
+        manifest = read_manifest(manifest_bytes)
+    except PackageRejected as exc:
+        logger.warning("Package directory %s carries an unusable manifest: %s", sha256[:12], exc)
+        return None
+    if manifest.sha256 != sha256:
+        logger.warning("Package directory %s carries a manifest for %s; ignored", sha256[:12], manifest.sha256[:12])
+        return None
+    invalid = MaintenancePackage.State.INVALID
+    try:
+        check_manifest(manifest)
+    except PackageRejected as exc:
+        # Newer-than-installed is decided when a request names the package,
+        # since a rollback makes an applied package newer again.
+        if exc.reason != "version_not_newer":
+            logger.warning("Package directory %s is not applicable here (%s)", sha256[:12], exc.reason)
+            return manifest, invalid, ""
+    try:
+        size = (path / TARBALL_NAME).stat().st_size
+    except OSError:
+        size = -1
+    if size != manifest.size:
+        logger.warning("Package directory %s holds a tarball whose size disagrees with its manifest", sha256[:12])
+        return manifest, invalid, ""
+    keys = load_release_keys()
+    if not keys:
+        return manifest, MaintenancePackage.State.UNVERIFIED, ""
+    signature_bytes = _read_capped(path / SIGNATURE_NAME, SIGNATURE_LIMIT) or b""
+    try:
+        key = verify_signature(manifest_bytes, signature_bytes, keys)
+    except PackageRejected:
+        logger.warning("Package directory %s carries a signature that does not verify", sha256[:12])
+        return manifest, invalid, ""
+    return manifest, MaintenancePackage.State.UNVERIFIED, key_id(key)
+
+
+def _hash_file(path: Path) -> str | None:
+    hasher = hashlib.sha256()
+    try:
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                hasher.update(chunk)
+    except OSError as exc:
+        logger.warning("Could not hash the tarball of %s: %s", path.parent.name[:12], exc)
+        return None
+    return hasher.hexdigest()
+
+
+def verify_pending() -> dict:
+    """Settle every ``unverified`` package: the upload's checks again, then the tarball's hash against the manifest.
+
+    Runs in the worker, from the task the reconciliation dispatches and from
+    the beat sync, because hashing a package is seconds of I/O that has no place
+    in a request. A match makes the row ``available``; a mismatch or a failed
+    check makes it ``invalid``, which no request may name. A row whose
+    signature cannot be checked yet, for want of a release key, stays
+    ``unverified``.
+    """
+    from activity.audit import record_modify_change, serialize_instance
+    from activity.models import Activity
+    from activity.system_activity import with_system_activity
+    from maintenance.models import MaintenancePackage
+
+    counts = {"available": 0, "invalid": 0}
+    outcomes = []
+    for row in MaintenancePackage.objects.filter(state=MaintenancePackage.State.UNVERIFIED):
+        path = package_dir(row.sha256)
+        examined = _examine(path, row.sha256) if path.is_dir() else None
+        if examined is None:
+            continue
+        _, state, verified_key = examined
+        if state == MaintenancePackage.State.UNVERIFIED:
+            if not verified_key:
+                continue
+            digest = _hash_file(path / TARBALL_NAME)
+            if digest is None:
+                continue
+            if digest == row.sha256:
+                state = MaintenancePackage.State.AVAILABLE
+            else:
+                state = MaintenancePackage.State.INVALID
+                logger.warning("Package directory %s holds a tarball whose hash disagrees with it", row.sha256[:12])
+        outcomes.append((row, state, verified_key))
+    if not outcomes:
+        return counts
+    with with_system_activity(
+        "maintenance.package.sync", interface=Activity.Interface.CELERY, metadata={"verified": len(outcomes)}
+    ):
+        for row, state, verified_key in outcomes:
+            before = serialize_instance(row)
+            updated = MaintenancePackage.objects.filter(pk=row.pk, state=MaintenancePackage.State.UNVERIFIED).update(
+                state=state, key_id=verified_key
+            )
+            if not updated:
+                continue
+            row.state, row.key_id = state, verified_key
+            record_modify_change(actor=None, obj=row, before_state=before)
+            counts[str(state)] += 1
+    return counts
+
+
+def _dispatch_verify() -> None:
+    """Queue ``verify_packages`` for after the commit; a broker that is down leaves it to the beat sync."""
+
+    def _dispatch():
+        try:
+            from maintenance.tasks import verify_packages
+
+            verify_packages.delay()
+        except Exception:
+            logger.exception("Verifying reconciled packages could not be dispatched; the beat sync will")
+
+    transaction.on_commit(_dispatch)
+
+
 def reconcile() -> dict:
     """Bring the rows in line with the directories, both ways.
 
     A directory with no row — the rows a rollback's database restore erased,
     or a package an operator dropped into the spool by hand — gets a row from
-    its manifest and ``upload.json``. An available row whose directory is
-    gone is marked ``pruned``. Writes happen under an audited scope only when
-    there is something to write.
+    its manifest and ``upload.json`` after the checks an upload makes, short of
+    the hash: ``invalid`` when one fails, ``unverified`` otherwise until
+    :func:`verify_pending` has hashed the tarball in the worker. Nothing a
+    directory claims is trusted before that, its key id included. An available
+    row whose directory is gone is marked ``pruned``. Writes happen under an
+    audited scope only when there is something to write, and a row that cannot
+    be written is logged and skipped: this runs at the top of every maintenance
+    request, and one directory must not be able to fail them all.
     """
     from django.contrib.auth import get_user_model
 
@@ -541,35 +725,43 @@ def reconcile() -> dict:
     for sha256, path in dirs.items():
         if sha256 in rows and rows[sha256].state != MaintenancePackage.State.PRUNED:
             continue
-        try:
-            manifest = read_manifest((path / MANIFEST_NAME).read_bytes())
-        except (OSError, PackageRejected) as exc:
-            logger.warning("Package directory %s carries an unusable manifest: %s", sha256[:12], exc)
+        examined = _examine(path, sha256)
+        if examined is None:
             continue
-        if manifest.sha256 != sha256:
-            logger.warning("Package directory %s carries a manifest for %s; ignored", sha256[:12], manifest.sha256[:12])
-            continue
+        manifest, state, verified_key = examined
         upload = spool.read_json(path / UPLOAD_NAME) or {}
         uploaded_by = None
         if isinstance(upload.get("uploaded_by_id"), int):
             uploaded_by = get_user_model().objects.filter(pk=upload["uploaded_by_id"]).first()
         uploaded_at = spool.parse_timestamp(upload.get("uploaded_at")) or timezone.now()
-        to_create.append((sha256, _row_fields(manifest, uploaded_by=uploaded_by, uploaded_at=uploaded_at)))
+        fields = _row_fields(
+            manifest, uploaded_by=uploaded_by, uploaded_at=uploaded_at, key_id=verified_key, state=state
+        )
+        to_create.append((sha256, fields))
     to_prune = [
         row for sha256, row in rows.items() if row.state != MaintenancePackage.State.PRUNED and sha256 not in dirs
     ]
     if not (to_create or to_prune):
         return counts
+    pending = False
     with with_system_activity(
         "maintenance.package.sync",
         interface=Activity.Interface.CELERY,
         metadata={"created": len(to_create), "pruned": len(to_prune)},
     ):
         for sha256, fields in to_create:
-            MaintenancePackage.objects.update_or_create(sha256=sha256, defaults=fields)
+            try:
+                with transaction.atomic():
+                    MaintenancePackage.objects.update_or_create(sha256=sha256, defaults=fields)
+            except DatabaseError:
+                logger.exception("Package directory %s could not be recorded; skipped", sha256[:12])
+                continue
             counts["created"] += 1
+            pending = pending or fields["state"] == MaintenancePackage.State.UNVERIFIED
         for row in to_prune:
             row.state = MaintenancePackage.State.PRUNED
             row.save(update_fields=["state"])
             counts["pruned"] += 1
+    if pending:
+        _dispatch_verify()
     return counts

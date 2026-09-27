@@ -7,7 +7,8 @@
 #   /etc/epicurrents-updater/config        DEPLOY_ROOT, ENABLED=0, timeouts (kept on re-run)
 #   /etc/epicurrents-updater/release.pub   the release public key, root-owned
 #   /usr/local/lib/epicurrents-updater/    the agent and its own copy of update.sh
-#   /var/lib/epicurrents-updater/          verified package copies while a job runs
+#   /var/lib/epicurrents-updater/          the agent's state of record (job statuses, logs,
+#                                          the active-run lock), verified package copies
 #   /etc/systemd/system/                   epicurrents-updater.service + .timer (one-minute timer)
 #   <root>/update/{packages,jobs}          the spool, owned by the deployment account
 #
@@ -167,7 +168,7 @@ install -m 0755 -o 0 -g 0 "$UPDATE_SH_SOURCE" "$LIB_DIR/update.sh"
 if [ -f "$HERE/README.md" ]; then
     install -m 0644 -o 0 -g 0 "$HERE/README.md" "$LIB_DIR/README.md"
 fi
-install -d -m 0700 -o 0 -g 0 "$STATE_DIR" "$STATE_DIR/work"
+install -d -m 0700 -o 0 -g 0 "$STATE_DIR" "$STATE_DIR/work" "$STATE_DIR/jobs"
 echo "    epicurrents-updater.sh, update.sh (from $UPDATE_SH_SOURCE)"
 
 echo "==> Spool under $DEPLOY_ROOT/update"

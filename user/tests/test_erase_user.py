@@ -143,3 +143,31 @@ class TestEraseUserCommand:
         user = make_user(username=USERNAME)
         with pytest.raises(CommandError, match="does not match"):
             call_command("erase_user", USERNAME, "--user-id", str(user.pk + 1), "--yes")
+
+
+@pytest.mark.django_db
+class TestErasureRecord:
+    """The erasure is recorded where a database restore cannot reach it (maintenance/erasures.py)."""
+
+    def test_the_erasure_is_recorded_with_identifiers_only(self, make_user, tmp_path, settings):
+        spool = tmp_path / "update"
+        spool.mkdir()
+        settings.MAINTENANCE_SPOOL_PATH = str(spool)
+        user = make_user(username=USERNAME, email=EMAIL)
+        user_pk, joined = user.pk, user.date_joined
+        call_command("erase_user", USERNAME, "--yes", stdout=StringIO())
+        [line] = (spool / "erasures.jsonl").read_text().splitlines()
+        record = json.loads(line)
+        assert set(record) == {"at", "user_id", "date_joined"} and record["user_id"] == user_pk
+        assert USERNAME not in line and EMAIL not in line
+        from maintenance.erasures import read_records
+
+        assert read_records()[0]["date_joined"] == joined
+
+    def test_an_unwritable_spool_still_erases_and_warns(self, make_user, tmp_path, settings):
+        settings.MAINTENANCE_SPOOL_PATH = str(tmp_path / "absent")
+        user = make_user(username=USERNAME, email=EMAIL)
+        out, err = StringIO(), StringIO()
+        call_command("erase_user", USERNAME, "--yes", stdout=out, stderr=err)
+        assert not get_user_model().objects.filter(pk=user.pk).exists()
+        assert "could not be recorded" in err.getvalue()

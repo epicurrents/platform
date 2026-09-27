@@ -24,12 +24,16 @@ class MaintenancePackage(models.Model):
 
     ``sha256`` is the identifier: the package directory under the spool is named
     after it and the path is derived, never stored. Rows are written by the
-    upload endpoint, which lands with the host tier; the model exists now so the
-    job row can reference the package it applied.
+    upload endpoint, which has verified the package, and by the reconciliation,
+    which finds a directory with no row and verifies it before a request may
+    name it: ``unverified`` until the tarball has been hashed against the
+    manifest, ``invalid`` when the signature or the hash does not hold.
     """
 
     class State(models.TextChoices):
         AVAILABLE = "available", "Available"
+        UNVERIFIED = "unverified", "Unverified"
+        INVALID = "invalid", "Invalid"
         APPLIED = "applied", "Applied"
         PRUNED = "pruned", "Pruned"
 
@@ -160,14 +164,17 @@ class MaintenanceJob(models.Model):
         """Whether no executor will write to this job again."""
         return self.state not in self.IN_FLIGHT_STATES
 
-    def transition(self, *, expect, actor=None, **fields) -> bool:
+    def transition(self, *, expect, actor=None, unset=(), **fields) -> bool:
         """Move to a new state only if the row is still in one of ``expect``.
 
         A compare-and-set ``update`` keyed on the current state, so two writers
         racing for the same row cannot both win, and ``in_flight`` is derived
-        from the new state rather than trusted from the caller. Returns whether
-        this call made the change. The bulk update fires no signal, so the audit
-        row is recorded explicitly, with ``actor`` when a request made the change.
+        from the new state rather than trusted from the caller. ``unset`` names
+        fields that must still be null for the update to apply, which is how the
+        verify and rollback stamps exclude each other and themselves. Returns
+        whether this call made the change. The bulk update fires no signal, so
+        the audit row is recorded explicitly, with ``actor`` when a request made
+        the change.
         """
         from activity.audit import record_modify_change, serialize_instance
 
@@ -175,7 +182,8 @@ class MaintenanceJob(models.Model):
         if "state" in fields:
             fields["in_flight"] = fields["state"] in self.IN_FLIGHT_STATES
         before = serialize_instance(self)
-        updated = type(self).objects.filter(pk=self.pk, state__in=expect).update(**fields)
+        guards = {f"{name}__isnull": True for name in unset}
+        updated = type(self).objects.filter(pk=self.pk, state__in=expect, **guards).update(**fields)
         if not updated:
             return False
         for name, value in fields.items():

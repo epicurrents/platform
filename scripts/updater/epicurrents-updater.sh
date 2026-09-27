@@ -11,12 +11,23 @@
 # allowlists, the package is copied out of the spool and verified as a copy,
 # and update.sh is run from this agent's own root-owned copy.
 #
+# The spool is one-way. The web tier can write anything there, so the agent
+# never follows a link in it, never writes into a file it finds there, and
+# never acts on anything it did not put there itself. What it acts on — the
+# status of record of each job, the active-run lock, the job logs — lives in a
+# root-only state directory; the spool receives published copies, each written
+# as a fresh file with O_EXCL|O_NOFOLLOW and renamed over whatever stood at the
+# name. A request is claimed by renaming it before a byte of it is read, which
+# is what makes a cancel from the platform and a claim from here exclusive.
+# The markers the platform writes to confirm or roll back an update are read
+# for their presence only.
+#
 # One job at a time. A tick either refuses or accepts a request, runs the
 # update to its verification window, acts on a confirmation or a rollback
 # marker, or rolls a job back whose window closed. Every state it reaches is
-# written to jobs/<id>.status.json in the spool, where the platform projects
-# it onto the job row, and to the system journal, which survives the database
-# restore a rollback performs.
+# written to the state directory, published into the spool where the platform
+# projects it onto the job row, and logged to the system journal, which
+# survives the database restore a rollback performs.
 #
 # Three operations. platform.update applies a package as above; a release
 # that applied no migration is rolled back with --code-only, which keeps the
@@ -32,8 +43,11 @@
 # The full protocol is in docs/engineering-notes/remote-maintenance-design.md.
 #
 set -euo pipefail
+# Everything this process creates is root's alone unless it says otherwise:
+# the files it publishes into the spool set their own mode.
+umask 077
 
-AGENT_VERSION=2
+AGENT_VERSION=3
 PROTOCOL=1
 OPERATION_UPDATE="platform.update"
 OPERATION_BACKUP="platform.backup"
@@ -52,6 +66,8 @@ LOG_CAP="${EPICURRENTS_UPDATER_LOG_CAP:-8388608}"
 # Seconds between polls of the readiness probe and the worker drain. Tests set
 # it to 0.
 POLL_SECONDS="${EPICURRENTS_UPDATER_POLL_SECONDS:-5}"
+# How many lines of update.sh output go by between two publications of the log.
+LOG_PUBLISH_LINES=100
 
 UPDATE_SH="$LIB_DIR/update.sh"
 AGENT_SELF="$LIB_DIR/epicurrents-updater.sh"
@@ -59,8 +75,14 @@ RELEASE_KEY="$CONFIG_DIR/release.pub"
 # The successor a release announced, trusted beside the current key until a
 # package signed with it verifies, at which point it becomes the current key.
 RELEASE_KEY_NEXT="$CONFIG_DIR/release.pub.next"
+# The state of record, root's own. The spool holds copies of some of it.
+STATE_JOBS="$STATE_DIR/jobs"
+ACTIVE_LOCK="$STATE_DIR/active.lock"
+STATE_FLAG="$STATE_DIR/maintenance.json"
+STATE_HEARTBEAT="$STATE_DIR/agent.json"
 # A snapshot name as update.sh writes them: a label, a UTC date and a time.
 SNAPSHOT_NAME_RE='^[A-Za-z0-9][A-Za-z0-9_-]*-[0-9]{8}-[0-9]{6}$'
+UUID_RE='^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
 
 # Defaults the config file may override.
 DEPLOY_ROOT=""
@@ -74,13 +96,24 @@ VERIFY_WINDOW_MINUTES=30
 
 # ── Output ────────────────────────────────────────────────────────────────────
 
+clean() {
+    # $1 = text that may carry a value from the spool. Control characters
+    # dropped and the length bounded, so a request cannot forge a line in the
+    # journal or the job log, or paint the operator's terminal.
+    local value
+    value="$(printf '%s' "$1" | LC_ALL=C tr -d '\000-\037\177')"
+    printf '%s' "${value:0:1000}"
+}
+
 log() {
     # To the journal when running under systemd, to stderr otherwise; a
     # `logger` line as well so the timeline exists somewhere the database
     # restore cannot reach.
-    printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" >&2
+    local line
+    line="$(clean "$*")"
+    printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$line" >&2
     if command -v logger >/dev/null 2>&1; then
-        logger -t epicurrents-updater -- "$*" 2>/dev/null || true
+        logger -t epicurrents-updater -- "$line" 2>/dev/null || true
     fi
 }
 
@@ -108,36 +141,404 @@ load_config() {
     # shellcheck source=/dev/null
     . "$config"
     [ -n "$DEPLOY_ROOT" ] || die "$config names no DEPLOY_ROOT."
+    case "$DEPLOY_ROOT" in
+        /*) ;;
+        *) die "DEPLOY_ROOT $DEPLOY_ROOT is not an absolute path." ;;
+    esac
     [ -d "$DEPLOY_ROOT" ] || die "DEPLOY_ROOT $DEPLOY_ROOT does not exist."
     [ -f "$DEPLOY_ROOT/docker-compose.yml" ] || die "DEPLOY_ROOT $DEPLOY_ROOT is not a deployment (no docker-compose.yml)."
-    DEPLOY_ROOT="$(cd "$DEPLOY_ROOT" && pwd)"
+    DEPLOY_ROOT="$(cd "$DEPLOY_ROOT" && pwd -P)"
     return 0
 }
 
 SPOOL=""
-JOBS=""
-PACKAGES=""
-FLAG=""
-ACTIVE_LOCK=""
 TREE_OWNER="1000:1000"
 
 locate_spool() {
     SPOOL="$DEPLOY_ROOT/update"
-    JOBS="$SPOOL/jobs"
-    PACKAGES="$SPOOL/packages"
-    FLAG="$SPOOL/maintenance.json"
-    ACTIVE_LOCK="$SPOOL/lock"
     # Whoever owns the deployment tree is who the containers run as; every file
-    # this root process writes into the spool is handed to them, or the web
+    # this root process publishes into the spool is handed to them, or the web
     # tier could never read its own job's status.
     TREE_OWNER="$(stat -c %u:%g "$DEPLOY_ROOT" 2>/dev/null || echo 1000:1000)"
-    local dir
-    for dir in "$SPOOL" "$JOBS" "$PACKAGES"; do
-        if [ ! -d "$dir" ]; then
-            mkdir -p "$dir"
-            chown "$TREE_OWNER" "$dir" 2>/dev/null || true
-        fi
-    done
+    [[ "$TREE_OWNER" =~ ^[0-9]+:[0-9]+$ ]] || TREE_OWNER="1000:1000"
+    mkdir -p "$STATE_JOBS" "$STATE_DIR/work"
+    chmod 0700 "$STATE_DIR"
+    spoolfs init || die "the spool at $SPOOL cannot be used safely; nothing was done"
+}
+
+# ── The spool, touched only through this ──────────────────────────────────────
+# Every operation on a path under ./update/ goes through spoolfs, which opens
+# each directory with O_NOFOLLOW relative to the one above it and never
+# resolves a path by name. A symlink, a hard link, a FIFO or a directory the
+# web tier left where a file belongs is refused, never followed.
+#   init                 ensure update/, jobs/ and packages/ are real directories
+#   publish REL SRC ...  publish each root-owned file SRC at its REL (agent.json,
+#                        maintenance.json, jobs/<id>.status.json, jobs/<id>.log)
+#   remove REL           unlink maintenance.json or a marker
+#   present REL          0 when a marker is a regular file
+#   requests             unclaimed request ids, oldest first
+#   claim ID DEST        rename jobs/ID.json to jobs/ID.claimed.json, then copy
+#                        it to DEST; 4 when there was nothing to claim
+#   package-size SHA     the size of packages/SHA/package.tar.gz; 4 when absent
+#   fetch-package SHA DIR SIZE   copy the package's three files into DIR
+# Exit status: 0 done, 1 no, 3 a spool directory is unusable, 4 absent,
+# 5 present but unusable; a message on stderr for anything but 0 and 1.
+
+read -r -d '' SPOOLFS_PY <<'PY' || true
+import os, re, secrets, stat, sys
+
+UUID = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+PUBLISHED = re.compile(rf"(agent\.json|maintenance\.json|jobs/{UUID}\.(status\.json|log))")
+REMOVABLE = re.compile(rf"(maintenance\.json|jobs/{UUID}\.(verify|rollback))")
+MARKER = re.compile(rf"jobs/{UUID}\.(verify|rollback)")
+SHA256 = re.compile(r"[0-9a-f]{64}")
+TEMP = re.compile(r"\.agent-[0-9a-f]{16}\.tmp")
+CLOEXEC = getattr(os, "O_CLOEXEC", 0)
+DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | CLOEXEC
+READ_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | CLOEXEC
+NEW_FLAGS = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | CLOEXEC
+REQUEST_CAP = 64 * 1024
+PACKAGE_SIDECARS = (("manifest.json", ".manifest.json", 64 * 1024), ("manifest.sig", ".manifest.sig", 4 * 1024))
+
+
+class Refused(Exception):
+    def __init__(self, code, message):
+        super().__init__(message)
+        self.code = code
+
+
+def owner():
+    uid, _, gid = os.environ["SPOOL_OWNER"].partition(":")
+    return int(uid), int(gid)
+
+
+def open_dir(name, parent):
+    try:
+        return os.open(name, DIR_FLAGS, dir_fd=parent)
+    except FileNotFoundError:
+        raise Refused(4, f"{name} does not exist")
+    except OSError as exc:
+        raise Refused(3, f"{name} is not a directory ({exc.strerror})")
+
+
+def open_spool():
+    root = os.open(os.environ["DEPLOY_ROOT"], os.O_RDONLY | os.O_DIRECTORY | CLOEXEC)
+    try:
+        return open_dir("update", root)
+    finally:
+        os.close(root)
+
+
+def parent_of(rel):
+    spool = open_spool()
+    if "/" not in rel:
+        return spool, rel
+    sub, _, name = rel.partition("/")
+    try:
+        return open_dir(sub, spool), name
+    finally:
+        os.close(spool)
+
+
+def ensure_dir(name, parent):
+    created = False
+    try:
+        os.mkdir(name, 0o755, dir_fd=parent)
+        created = True
+    except FileExistsError:
+        pass
+    fd = open_dir(name, parent)
+    if created and os.geteuid() == 0:
+        os.fchown(fd, *owner())
+        os.fchmod(fd, 0o755)
+    return fd
+
+
+def sweep_temps(fd):
+    for name in os.listdir(fd):
+        if TEMP.fullmatch(name):
+            try:
+                os.unlink(name, dir_fd=fd)
+            except OSError:
+                pass
+
+
+def safe_read(parent, name, cap):
+    try:
+        fd = os.open(name, READ_FLAGS, dir_fd=parent)
+    except FileNotFoundError:
+        raise Refused(4, f"{name} does not exist")
+    except OSError as exc:
+        raise Refused(5, f"{name} cannot be opened as a plain file ({exc.strerror})")
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            raise Refused(5, f"{name} is not a regular file")
+        if info.st_nlink != 1:
+            raise Refused(5, f"{name} has {info.st_nlink} links")
+        if info.st_size > cap:
+            raise Refused(5, f"{name} is larger than {cap} bytes")
+        chunks, total = [], 0
+        while True:
+            chunk = os.read(fd, 1024 * 1024)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > cap:
+                raise Refused(5, f"{name} grew past {cap} bytes while being read")
+            chunks.append(chunk)
+        return b"".join(chunks)
+    finally:
+        os.close(fd)
+
+
+def write_private(path, data):
+    fd = os.open(path, NEW_FLAGS, 0o600)
+    with os.fdopen(fd, "wb") as out:
+        out.write(data)
+
+
+def cmd_init():
+    root = os.open(os.environ["DEPLOY_ROOT"], os.O_RDONLY | os.O_DIRECTORY | CLOEXEC)
+    try:
+        spool = ensure_dir("update", root)
+    finally:
+        os.close(root)
+    sweep_temps(spool)
+    for name in ("jobs", "packages"):
+        fd = ensure_dir(name, spool)
+        if name == "jobs":
+            sweep_temps(fd)
+        os.close(fd)
+    os.close(spool)
+
+
+def cmd_publish(*pairs):
+    if not pairs or len(pairs) % 2:
+        raise Refused(5, "publish takes pairs of a name and a source")
+    for index in range(0, len(pairs), 2):
+        publish_one(pairs[index], pairs[index + 1])
+
+
+def publish_one(rel, source):
+    if not PUBLISHED.fullmatch(rel):
+        raise Refused(5, f"{rel} is not a name the agent publishes")
+    with open(source, "rb") as handle:
+        data = handle.read()
+    parent, name = parent_of(rel)
+    temp = f".agent-{secrets.token_hex(8)}.tmp"
+    try:
+        fd = os.open(temp, NEW_FLAGS, 0o600, dir_fd=parent)
+        try:
+            view = memoryview(data)
+            while view:
+                view = view[os.write(fd, view):]
+            if os.geteuid() == 0:
+                os.fchown(fd, *owner())
+            os.fchmod(fd, 0o644)
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        try:
+            os.rename(temp, name, src_dir_fd=parent, dst_dir_fd=parent)
+        except OSError as exc:
+            raise Refused(5, f"{rel} cannot be replaced ({exc.strerror})")
+    except BaseException:
+        try:
+            os.unlink(temp, dir_fd=parent)
+        except OSError:
+            pass
+        raise
+    finally:
+        os.close(parent)
+
+
+def cmd_remove(rel):
+    if not REMOVABLE.fullmatch(rel):
+        raise Refused(5, f"{rel} is not a name the agent removes")
+    parent, name = parent_of(rel)
+    try:
+        os.unlink(name, dir_fd=parent)
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        raise Refused(5, f"{rel} cannot be removed ({exc.strerror})")
+    finally:
+        os.close(parent)
+
+
+def cmd_present(rel):
+    if not MARKER.fullmatch(rel):
+        raise Refused(5, f"{rel} is not a marker")
+    parent, name = parent_of(rel)
+    try:
+        info = os.stat(name, dir_fd=parent, follow_symlinks=False)
+    except FileNotFoundError:
+        return 1
+    finally:
+        os.close(parent)
+    return 0 if stat.S_ISREG(info.st_mode) else 1
+
+
+def cmd_requests():
+    parent, _ = parent_of("jobs/x")
+    found = []
+    try:
+        for name in os.listdir(parent):
+            match = re.fullmatch(rf"({UUID})\.json", name)
+            if not match:
+                continue
+            try:
+                info = os.stat(name, dir_fd=parent, follow_symlinks=False)
+            except OSError:
+                continue
+            if stat.S_ISREG(info.st_mode):
+                found.append((info.st_mtime_ns, match.group(1)))
+    finally:
+        os.close(parent)
+    for _, job_id in sorted(found):
+        print(job_id)
+
+
+def cmd_claim(job_id, dest):
+    if not re.fullmatch(UUID, job_id):
+        raise Refused(5, f"{job_id} is not a job id")
+    parent, _ = parent_of("jobs/x")
+    try:
+        try:
+            os.rename(f"{job_id}.json", f"{job_id}.claimed.json", src_dir_fd=parent, dst_dir_fd=parent)
+        except FileNotFoundError:
+            raise Refused(4, "the request was withdrawn")
+        write_private(dest, safe_read(parent, f"{job_id}.claimed.json", REQUEST_CAP))
+    finally:
+        os.close(parent)
+
+
+def open_package(sha):
+    if not SHA256.fullmatch(sha):
+        raise Refused(5, f"{sha} is not a package hash")
+    packages, _ = parent_of("packages/x")
+    try:
+        return open_dir(sha, packages)
+    finally:
+        os.close(packages)
+
+
+def package_fd(pkgdir):
+    try:
+        fd = os.open("package.tar.gz", READ_FLAGS, dir_fd=pkgdir)
+    except FileNotFoundError:
+        raise Refused(4, "package.tar.gz does not exist")
+    except OSError as exc:
+        raise Refused(5, f"package.tar.gz cannot be opened as a plain file ({exc.strerror})")
+    info = os.fstat(fd)
+    if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+        os.close(fd)
+        raise Refused(5, "package.tar.gz is not a plain file with one link")
+    return fd, info.st_size
+
+
+def cmd_package_size(sha):
+    pkgdir = open_package(sha)
+    try:
+        for name, _, _ in PACKAGE_SIDECARS:
+            try:
+                info = os.stat(name, dir_fd=pkgdir, follow_symlinks=False)
+            except FileNotFoundError:
+                raise Refused(4, f"{name} does not exist")
+            if not stat.S_ISREG(info.st_mode):
+                raise Refused(5, f"{name} is not a regular file")
+        fd, size = package_fd(pkgdir)
+        os.close(fd)
+        print(size)
+    finally:
+        os.close(pkgdir)
+
+
+def cmd_fetch_package(sha, dest, size):
+    size = int(size)
+    pkgdir = open_package(sha)
+    try:
+        for name, suffix, cap in PACKAGE_SIDECARS:
+            write_private(os.path.join(dest, "package.tar.gz" + suffix), safe_read(pkgdir, name, cap))
+        fd, have = package_fd(pkgdir)
+        try:
+            if have != size:
+                raise Refused(5, f"package.tar.gz is {have} bytes, not the {size} it was a moment ago")
+            out = os.open(os.path.join(dest, "package.tar.gz"), NEW_FLAGS, 0o600)
+            try:
+                copied = 0
+                while True:
+                    chunk = os.read(fd, 1024 * 1024)
+                    if not chunk:
+                        break
+                    copied += len(chunk)
+                    if copied > size:
+                        raise Refused(5, "package.tar.gz grew while being copied")
+                    view = memoryview(chunk)
+                    while view:
+                        view = view[os.write(out, view):]
+            finally:
+                os.close(out)
+        finally:
+            os.close(fd)
+    finally:
+        os.close(pkgdir)
+
+
+COMMANDS = {
+    "init": cmd_init,
+    "publish": cmd_publish,
+    "remove": cmd_remove,
+    "present": cmd_present,
+    "requests": cmd_requests,
+    "claim": cmd_claim,
+    "package-size": cmd_package_size,
+    "fetch-package": cmd_fetch_package,
+}
+
+try:
+    sys.exit(COMMANDS[sys.argv[1]](*sys.argv[2:]) or 0)
+except Refused as refusal:
+    print(refusal, file=sys.stderr)
+    sys.exit(refusal.code)
+except OSError as exc:
+    print(f"{exc.strerror or exc}", file=sys.stderr)
+    sys.exit(3)
+PY
+
+spoolfs() {
+    DEPLOY_ROOT="$DEPLOY_ROOT" SPOOL_OWNER="$TREE_OWNER" python3 -c "$SPOOLFS_PY" "$@"
+}
+
+publish() {
+    # Pairs of a name under the spool and the root-owned file it copies. A
+    # failure is logged and survived: the state of record is unaffected, and
+    # the next write publishes again.
+    local err
+    if ! err="$(spoolfs publish "$@" 2>&1)"; then
+        log "could not publish $1 into the spool: $err"
+        return 1
+    fi
+    return 0
+}
+
+marker_present() {
+    # $1 = verify or rollback. Only whether the platform left one; what it
+    # says is never read.
+    spoolfs present "jobs/$JOB_ID.$1" 2>/dev/null
+}
+
+remove_marker() {
+    spoolfs remove "jobs/$JOB_ID.$1" 2>/dev/null || log "could not remove the $1 marker of job $JOB_ID"
+}
+
+decline_marker() {
+    # $1 = the marker, $2 = why it is not acted on. Said in the job's log,
+    # which is published, since no status write follows to carry it.
+    job_note "$2"
+    remove_marker "$1"
+    publish_log
 }
 
 # ── Runtime detection, as update.sh settles it ────────────────────────────────
@@ -172,7 +573,8 @@ env_value() {
 
 # ── JSON, through python3 ─────────────────────────────────────────────────────
 # A minimal host ships python3 and not jq. Values pass as arguments, never
-# through a shell string, and nothing read from a file is evaluated.
+# through a shell string, and nothing read from a file is evaluated. Both
+# helpers work on root's own files only; the spool is reached through spoolfs.
 
 json_get() {
     # $1 = file, $2 = key, $3 = optional sub-key of an object value. Prints the
@@ -202,12 +604,11 @@ PY
 json_write() {
     # $1 = target file, then key=value pairs. A value of @null, @true, @false,
     # @int:N, @list:a,b or @json:<document> is typed; everything else is a
-    # string. Written to a temporary file beside the target, handed to the
-    # tree owner, then renamed into place, so a reader never sees a partial
-    # file and the deployment account can always read what root wrote.
+    # string. Written to a fresh temporary file beside the target and renamed
+    # into place, so a reader never sees a partial file.
     local target="$1" tmp
     shift
-    tmp="$target.tmp"
+    tmp="$(mktemp "$(dirname "$target")/.$(basename "$target").XXXXXX")"
     python3 - "$tmp" "$@" <<'PY'
 import json, sys
 out = sys.argv[1]
@@ -236,7 +637,6 @@ with open(out, "w", encoding="utf-8") as fh:
     json.dump(data, fh, sort_keys=True, indent=2)
     fh.write("\n")
 PY
-    chown "$TREE_OWNER" "$tmp" 2>/dev/null || true
     mv -f "$tmp" "$target"
 }
 
@@ -307,6 +707,10 @@ set_key_args() {
     [ ! -f "$RELEASE_KEY_NEXT" ] || KEY_ARGS+=(--release-key "$RELEASE_KEY_NEXT")
 }
 
+valid_snapshot() {
+    [[ "$1" =~ $SNAPSHOT_NAME_RE ]]
+}
+
 snapshots_json() {
     # The snapshots under the deployment's backups/, newest first, as a JSON
     # list for the heartbeat: name, when it was taken, the version its code
@@ -359,7 +763,7 @@ write_heartbeat() {
     [ "$SELF_UPDATE" = 1 ] && self_update=@true
     key_id="$(key_id_of "$RELEASE_KEY")"
     next_key_id="$(key_id_of "$RELEASE_KEY_NEXT")"
-    json_write "$SPOOL/agent.json" \
+    json_write "$STATE_HEARTBEAT" \
         "protocol=@int:$PROTOCOL" \
         "version=$AGENT_VERSION" \
         "enabled=$enabled" \
@@ -371,12 +775,14 @@ write_heartbeat() {
         "key_id=$(opt "$key_id")" \
         "next_key_id=$(opt "$next_key_id")" \
         "snapshots=@json:$(snapshots_json)"
+    publish agent.json "$STATE_HEARTBEAT" || true
 }
 
 # ── Job state ─────────────────────────────────────────────────────────────────
 # One job's fields live in these globals while it is being worked on; every
 # status write carries the full set, because the platform blanks a field the
-# file does not carry.
+# file does not carry. The file of record is STATE_JOBS/<id>.status.json;
+# what the spool holds is a copy of it.
 
 JOB_ID=""
 JOB_OPERATION=""
@@ -397,28 +803,32 @@ JOB_WINDOW=""
 JOB_MIGRATIONS=""
 
 job_log() {
-    printf '%s\n' "$JOBS/$JOB_ID.log"
+    printf '%s\n' "$STATE_JOBS/$JOB_ID.log"
 }
 
 job_status() {
-    printf '%s\n' "$JOBS/$JOB_ID.status.json"
+    printf '%s\n' "$STATE_JOBS/$JOB_ID.status.json"
+}
+
+job_request() {
+    # The agent's copy of the request, taken when it was claimed.
+    printf '%s\n' "$STATE_JOBS/$JOB_ID.request.json"
+}
+
+publish_log() {
+    [ ! -f "$(job_log)" ] || publish "jobs/$JOB_ID.log" "$(job_log)" || true
 }
 
 job_note() {
     # A line of the agent's own into the job's log, and into the journal.
-    local line="[updater] $*"
+    local line
+    line="[updater] $(clean "$*")"
     append_log "$line"
     log "job $JOB_ID: $*"
 }
 
 append_log() {
-    local path
-    path="$(job_log)"
-    if [ ! -f "$path" ]; then
-        : > "$path"
-        chown "$TREE_OWNER" "$path" 2>/dev/null || true
-    fi
-    printf '%s\n' "$*" >> "$path"
+    printf '%s\n' "$*" >> "$(job_log)"
 }
 
 opt() {
@@ -465,17 +875,21 @@ write_status() {
         "target_version=$JOB_TARGET" \
         "running_version=$JOB_RUNNING" \
         "retries=@int:$JOB_RETRIES"
+    if [ -f "$(job_log)" ]; then
+        publish "jobs/$JOB_ID.status.json" "$(job_status)" "jobs/$JOB_ID.log" "$(job_log)" || true
+    else
+        publish "jobs/$JOB_ID.status.json" "$(job_status)" || true
+    fi
     log "job $JOB_ID: $JOB_STATE${JOB_REASON:+ ($JOB_REASON)}${JOB_STEP:+ step=$JOB_STEP}"
 }
 
 load_status() {
-    # Read a job's own status file back into the globals, for a job that a
-    # previous tick left in flight.
+    # Read a job's status of record back into the globals, for a job that a
+    # previous tick left in flight. The snapshot names are checked again on
+    # the way in, since every path the rollback builds starts from them.
     local path
     path="$(job_status)"
     JOB_OPERATION="$(json_get "$path" operation)"
-    # A status file from before operations were recorded is an update's.
-    [ -n "$JOB_OPERATION" ] || JOB_OPERATION="$OPERATION_UPDATE"
     JOB_STATE="$(json_get "$path" state)"
     JOB_REASON="$(json_get "$path" reason)"
     JOB_STEP="$(json_get "$path" step)"
@@ -494,6 +908,8 @@ load_status() {
         true) JOB_MIGRATIONS=applied ;;
         *) JOB_MIGRATIONS="" ;;
     esac
+    [ -z "$JOB_SNAPSHOT" ] || valid_snapshot "$JOB_SNAPSHOT" || JOB_SNAPSHOT=""
+    [ -z "$JOB_POST_SNAPSHOT" ] || valid_snapshot "$JOB_POST_SNAPSHOT" || JOB_POST_SNAPSHOT=""
 }
 
 reset_job() {
@@ -512,21 +928,25 @@ finish() {
 # ── The flag and the active-run lock ──────────────────────────────────────────
 
 write_flag() {
-    # $1 = phase, $2 = message, $3 = expected_until (may be empty).
+    # $1 = phase, $2 = message, $3 = expected_until (may be empty). Non-zero
+    # when the flag could not be published, which leaves the platform
+    # accepting writes: an update does not start without it.
     local since
-    since="$(json_get "$FLAG" since)"
+    since="$(json_get "$STATE_FLAG" since)"
     [ -n "$since" ] || since="$(now_iso)"
-    json_write "$FLAG" \
+    json_write "$STATE_FLAG" \
         "protocol=@int:$PROTOCOL" \
         "phase=$1" \
         "job_id=$JOB_ID" \
         "since=$since" \
         "expected_until=$(opt "${3:-}")" \
         "message=$2"
+    publish maintenance.json "$STATE_FLAG"
 }
 
 remove_flag() {
-    rm -f "$FLAG"
+    rm -f "$STATE_FLAG"
+    spoolfs remove maintenance.json 2>/dev/null || log "could not remove the maintenance flag from the spool"
 }
 
 boot_id() {
@@ -534,9 +954,10 @@ boot_id() {
 }
 
 write_active_lock() {
-    # Who is executing which job. Present only while this process is inside an
-    # update or a rollback; a lock whose process is gone, or from another boot,
-    # is what tells the next tick the previous one died mid-way.
+    # Who is executing which job. Present from the claim until the job no
+    # longer needs this process; a lock whose process is gone, or from another
+    # boot, is what tells the next tick the previous one died mid-way. Root's
+    # own: nothing in the spool can hold or forge it.
     json_write "$ACTIVE_LOCK" \
         "protocol=@int:$PROTOCOL" \
         "pid=@int:$$" \
@@ -616,7 +1037,7 @@ gate() {
     # and the running version is the expected one.
     local port waited=0 code version
     port="$(env_value HOST_PORT)"
-    port="${port:-8000}"
+    [[ "$port" =~ ^[0-9]+$ ]] || port=8000
     job_note "waiting for the platform to become ready (up to ${HEALTH_TIMEOUT}s)"
     while true; do
         code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "http://localhost:${port}/api/v1/ready" 2>/dev/null || true)"
@@ -632,8 +1053,8 @@ gate() {
         [ "$POLL_SECONDS" -gt 0 ] || waited=$HEALTH_TIMEOUT
     done
     job_note "readiness probe answered 200"
-    version="$(running_version)"
-    JOB_RUNNING="$version"
+    version="$(clean "$(running_version)")"
+    JOB_RUNNING="${version:0:32}"
     if [ -z "$version" ]; then
         job_note "could not read the running version from the web container"
         return 1
@@ -649,13 +1070,19 @@ gate() {
 # ── Running update.sh ─────────────────────────────────────────────────────────
 
 FACTS=""
+# Which field of the job a ::snapshot= line of the run being streamed fills:
+# snapshot for an update or a backup, post_snapshot for the safety snapshot
+# ahead of a rollback, nothing for a rollback. Written into the status of
+# record the moment the line arrives, so a run that dies after it leaves the
+# next tick a snapshot to roll back to.
+SNAPSHOT_INTO=""
 
 stream_log() {
     # Reads update.sh's output line by line into the job log (head-capped),
     # follows its :: lines, and records the facts the caller needs in $FACTS.
     # Runs in the pipe's subshell, so it writes the status itself on each step
     # and leaves the rest to the facts file.
-    local line size=0 capped=false key value
+    local line size=0 capped=false key value lines=0 name
     while IFS= read -r line; do
         if [ "$capped" = false ]; then
             size=$((size + ${#line} + 1))
@@ -666,6 +1093,10 @@ stream_log() {
                 append_log "$line"
             fi
         fi
+        lines=$((lines + 1))
+        if [ $((lines % LOG_PUBLISH_LINES)) = 0 ]; then
+            publish_log
+        fi
         case "$line" in
             ::*)
                 key="${line#::}"
@@ -673,19 +1104,30 @@ stream_log() {
                 key="${key%%=*}"
                 case "$key" in
                     step)
-                        JOB_STEP="$value"
-                        printf '%s=%s\n' "$key" "$value" >> "$FACTS"
+                        JOB_STEP="$(clean "$value")"
+                        printf '%s=%s\n' "$key" "$JOB_STEP" >> "$FACTS"
                         if [ -n "$JOB_STATE" ]; then
                             write_status "$JOB_STATE" "$JOB_REASON"
                         fi
                         ;;
-                    snapshot|health|failed|refused|done|installed|version|migrations|key|restored)
+                    snapshot)
                         printf '%s=%s\n' "$key" "$value" >> "$FACTS"
+                        name="${value##*/}"
+                        if valid_snapshot "$name"; then
+                            case "$SNAPSHOT_INTO" in
+                                snapshot) JOB_SNAPSHOT="$name"; write_status "$JOB_STATE" "$JOB_REASON" ;;
+                                post_snapshot) JOB_POST_SNAPSHOT="$name"; write_status "$JOB_STATE" "$JOB_REASON" ;;
+                            esac
+                        fi
+                        ;;
+                    health|failed|refused|done|installed|version|migrations|key|restored)
+                        printf '%s=%s\n' "$key" "$(clean "$value")" >> "$FACTS"
                         ;;
                 esac
                 ;;
         esac
     done
+    publish_log
 }
 
 fact() {
@@ -693,11 +1135,23 @@ fact() {
     sed -n "s/^$1=//p" "$FACTS" 2>/dev/null | tail -1
 }
 
+snapshot_fact() {
+    # The last ::snapshot= of the run, as a name, or nothing when it is not
+    # the shape update.sh writes.
+    local name
+    name="$(fact snapshot)"
+    name="${name##*/}"
+    if valid_snapshot "$name"; then
+        printf '%s' "$name"
+    fi
+}
+
 run_update_sh() {
     # $@ = arguments. Runs the agent's own copy against the deployment root,
     # streaming into the job log. Returns update.sh's exit status.
     local rc
-    FACTS="$(mktemp)"
+    rm -f "$FACTS"
+    FACTS="$(mktemp "$STATE_DIR/work/.facts.XXXXXX")"
     append_log "[updater] $(now_iso) update.sh $*"
     set +e
     "$UPDATE_SH" --root "$DEPLOY_ROOT" "$@" 2>&1 | stream_log
@@ -711,44 +1165,100 @@ run_update_sh() {
     return "$rc"
 }
 
-# ── Accepting a request ───────────────────────────────────────────────────────
+# ── Claiming and accepting a request ──────────────────────────────────────────
 
 refuse() {
     # $1 = reason token, $2 = message. A refused request changes nothing and
     # leaves no work copy.
     job_note "refused: $2"
     rm -rf "${STATE_DIR:?}/work/$JOB_ID"
+    remove_active_lock
     finish failed "refused_$1"
 }
 
 free_bytes() {
-    df -Pk "$DEPLOY_ROOT" | awk 'NR==2{print $4 * 1024}'
+    # $1 = a path. Free bytes on its filesystem.
+    df -Pk "$1" | awk 'NR==2{print $4 * 1024}'
+}
+
+device_of() {
+    stat -c %d "$1" 2>/dev/null || stat -f %d "$1" 2>/dev/null || echo "$1"
+}
+
+disk_ok() {
+    # $1 = bytes needed under DEPLOY_ROOT, $2 = bytes needed under STATE_DIR.
+    # One filesystem holding both has to hold the sum.
+    local deploy state
+    deploy="$(free_bytes "$DEPLOY_ROOT")"
+    state="$(free_bytes "$STATE_DIR")"
+    if [ "$(device_of "$DEPLOY_ROOT")" = "$(device_of "$STATE_DIR")" ]; then
+        [ "${deploy:-0}" -ge $(($1 + $2)) ]
+    else
+        [ "${deploy:-0}" -ge "$1" ] && [ "${state:-0}" -ge "$2" ]
+    fi
+}
+
+claim_request() {
+    # Takes the request out of the platform's reach before reading a byte of
+    # it: once renamed, a cancel finds nothing to withdraw. 0 when claimed; 1
+    # when there was nothing to claim, or the claimed file was unusable (then
+    # the job has been failed).
+    local err rc=0
+    # The lock first: a run that dies between the claim and its first status
+    # leaves the next tick a lock naming this job, which fails it as stale
+    # rather than leaving a claimed request nobody owns.
+    write_active_lock
+    err="$(spoolfs claim "$JOB_ID" "$(job_request)" 2>&1)" || rc=$?
+    case "$rc" in
+        0) ;;
+        4)
+            log "request $JOB_ID was withdrawn before it could be claimed"
+            remove_active_lock
+            return 1
+            ;;
+        *)
+            JOB_OPERATION=unknown
+            refuse request "the request file is not a plain readable file: $err"
+            return 1
+            ;;
+    esac
+    local operation
+    operation="$(json_get "$(job_request)" operation)"
+    case "$operation" in
+        "$OPERATION_UPDATE"|"$OPERATION_BACKUP"|"$OPERATION_ROLLBACK") JOB_OPERATION="$operation" ;;
+        *) JOB_OPERATION=unknown ;;
+    esac
+    if [ "$(json_get "$(job_request)" job_id)" != "$JOB_ID" ]; then
+        refuse request "the request names a different job id"
+        return 1
+    fi
+    # Picked up: the platform can see the request is no longer withdrawable.
+    JOB_STEP=check
+    write_status requested ""
+    return 0
 }
 
 accept_or_refuse() {
-    # $1 = the request file. Every check a request must pass before anything
-    # is touched, in the order that matters: the checks every operation
-    # shares, then the operation's own.
-    local request="$1" protocol operation
+    # Every check a request must pass before anything is touched, in the
+    # order that matters: the checks every operation shares, then the
+    # operation's own. The request read is the agent's own copy.
+    local request protocol operation
+    request="$(job_request)"
     protocol="$(json_get "$request" protocol)"
     operation="$(json_get "$request" operation)"
-    case "$operation" in
-        "$OPERATION_UPDATE"|"$OPERATION_BACKUP"|"$OPERATION_ROLLBACK") JOB_OPERATION="$operation" ;;
-        *) JOB_OPERATION="${operation:-unknown}" ;;
-    esac
 
     if [ "$ENABLED" != 1 ]; then
         refuse disabled "the agent is installed but not enabled (ENABLED=1 in $CONFIG_DIR/config)"
         return
     fi
     if [ "$protocol" != "$PROTOCOL" ]; then
-        refuse protocol "the request carries protocol '${protocol:-none}'; this agent speaks $PROTOCOL"
+        refuse protocol "the request carries protocol '$(clean "${protocol:-none}")'; this agent speaks $PROTOCOL"
         return
     fi
     case "$operation" in
         "$OPERATION_UPDATE"|"$OPERATION_BACKUP"|"$OPERATION_ROLLBACK") ;;
         *)
-            refuse operation "operation '${operation:-none}' is not one this agent carries out"
+            refuse operation "operation '$(clean "${operation:-none}")' is not one this agent carries out"
             return
             ;;
     esac
@@ -756,6 +1266,7 @@ accept_or_refuse() {
         refuse checkout "$DEPLOY_ROOT is a git checkout; remote operations are for distribution deployments (ALLOW_CHECKOUT=1 overrides)"
         return
     fi
+    JOB_STEP=""
     case "$operation" in
         "$OPERATION_BACKUP") accept_backup ;;
         "$OPERATION_ROLLBACK") accept_rollback "$request" ;;
@@ -764,10 +1275,8 @@ accept_or_refuse() {
 }
 
 accept_backup() {
-    local free
-    free="$(free_bytes)"
-    if [ "${free:-0}" -lt "$MIN_FREE_BYTES" ]; then
-        refuse disk "$free bytes free under $DEPLOY_ROOT; a snapshot needs at least $MIN_FREE_BYTES"
+    if ! disk_ok "$MIN_FREE_BYTES" 0; then
+        refuse disk "$(free_bytes "$DEPLOY_ROOT") bytes free under $DEPLOY_ROOT; a snapshot needs at least $MIN_FREE_BYTES"
         return
     fi
     JOB_INSTALLED_BEFORE="$(installed_tree_version)"
@@ -776,13 +1285,13 @@ accept_backup() {
 }
 
 accept_rollback() {
-    # $1 = the request file. The snapshot is named by a shape this agent
+    # $1 = the request copy. The snapshot is named by a shape this agent
     # checks and must exist as a restorable directory; whether the database
     # is restored with the code is the request's choice, restore by default.
-    local request="$1" snapshot restore_db free
+    local request="$1" snapshot restore_db
     snapshot="$(json_get "$request" args snapshot)"
     restore_db="$(json_get "$request" args restore_database)"
-    if ! [[ "$snapshot" =~ $SNAPSHOT_NAME_RE ]]; then
+    if ! valid_snapshot "$snapshot"; then
         refuse snapshot "the request names no snapshot"
         return
     fi
@@ -798,9 +1307,8 @@ accept_rollback() {
         refuse code_only "the agent's update.sh (version $(updater_script_version)) cannot keep the database on a rollback; apply a release carrying update.sh $UPDATER_SCRIPT_CODE_ONLY or newer first"
         return
     fi
-    free="$(free_bytes)"
-    if [ "${free:-0}" -lt "$MIN_FREE_BYTES" ]; then
-        refuse disk "$free bytes free under $DEPLOY_ROOT; a rollback needs at least $MIN_FREE_BYTES for its safety snapshot"
+    if ! disk_ok "$MIN_FREE_BYTES" 0; then
+        refuse disk "$(free_bytes "$DEPLOY_ROOT") bytes free under $DEPLOY_ROOT; a rollback needs at least $MIN_FREE_BYTES for its safety snapshot"
         return
     fi
     JOB_SNAPSHOT="$snapshot"
@@ -810,21 +1318,34 @@ accept_rollback() {
 }
 
 installed_tree_version() {
-    sed -n '/^__version__ = "/{s/^__version__ = "\([^"]*\)".*/\1/p;q;}' "$DEPLOY_ROOT/epicurrents/version.py" 2>/dev/null || true
+    local version
+    version="$(sed -n '/^__version__ = "/{s/^__version__ = "\([^"]*\)".*/\1/p;q;}' "$DEPLOY_ROOT/epicurrents/version.py" 2>/dev/null || true)"
+    clean "${version:0:32}"
 }
 
 accept_update() {
-    # $1 = the request file.
-    local request="$1" sha pkgdir work copy have free size need rc token key
+    # $1 = the request copy.
+    local request="$1" sha work copy have size rc token key err
     sha="$(json_get "$request" args package_sha256)"
     JOB_WINDOW="$(json_get "$request" args verify_window_minutes)"
     if ! [[ "$sha" =~ ^[0-9a-f]{64}$ ]]; then
         refuse hash "the request names no package hash"
         return
     fi
-    pkgdir="$PACKAGES/$sha"
-    if [ ! -f "$pkgdir/package.tar.gz" ] || [ ! -f "$pkgdir/manifest.json" ] || [ ! -f "$pkgdir/manifest.sig" ]; then
-        refuse hash "no uploaded package has hash $sha"
+    rc=0
+    size="$(spoolfs package-size "$sha" 2>"$STATE_DIR/work/.spoolfs.err")" || rc=$?
+    err="$(cat "$STATE_DIR/work/.spoolfs.err" 2>/dev/null || true)"
+    rm -f "$STATE_DIR/work/.spoolfs.err"
+    case "$rc" in
+        0) ;;
+        4) refuse hash "no uploaded package has hash $sha"; return ;;
+        *) refuse hash "the package with hash $sha cannot be read safely: $err"; return ;;
+    esac
+    # Twice the package plus the reserve under the deployment (update.sh
+    # extracts beside its snapshots, and checks the unpacked size itself),
+    # and the copy under the state directory.
+    if ! disk_ok $((size * 2 + MIN_FREE_BYTES)) "$size"; then
+        refuse disk "$(free_bytes "$DEPLOY_ROOT") bytes free under $DEPLOY_ROOT and $(free_bytes "$STATE_DIR") under $STATE_DIR; an update of a $size-byte package needs twice the package plus $MIN_FREE_BYTES, and the package once more for the agent's copy"
         return
     fi
 
@@ -834,20 +1355,13 @@ accept_update() {
     rm -rf "$work"
     mkdir -p "$work"
     copy="$work/package.tar.gz"
-    cp "$pkgdir/package.tar.gz" "$copy"
-    cp "$pkgdir/manifest.json" "$copy.manifest.json"
-    cp "$pkgdir/manifest.sig" "$copy.manifest.sig"
+    if ! err="$(spoolfs fetch-package "$sha" "$work" "$size" 2>&1)"; then
+        refuse hash "the package with hash $sha could not be copied safely: $err"
+        return
+    fi
     have="$(sha256_of "$copy")"
     if [ "$have" != "$sha" ]; then
         refuse hash "the package's sha256 is $have, the request names $sha"
-        return
-    fi
-
-    size="$(wc -c < "$copy" | tr -d ' ')"
-    free="$(free_bytes)"
-    need=$((size * 2 + MIN_FREE_BYTES))
-    if [ "${free:-0}" -lt "$need" ]; then
-        refuse disk "$free bytes free under $DEPLOY_ROOT; an update needs $need (twice the package plus $MIN_FREE_BYTES)"
         return
     fi
 
@@ -856,11 +1370,13 @@ accept_update() {
     run_update_sh --check-archive "$copy" --require-signature "${KEY_ARGS[@]}" --require-newer && rc=0 || rc=$?
     if [ "$rc" -ne 0 ]; then
         token="$(fact refused)"
-        refuse "${token:-check}" "update.sh refused the package: $(fact failed)"
+        [[ "$token" =~ ^[a-z_]{1,32}$ ]] || token=check
+        refuse "$token" "update.sh refused the package: $(fact failed)"
         return
     fi
     JOB_INSTALLED_BEFORE="$(fact installed)"
     JOB_TARGET="$(fact version)"
+    JOB_STEP=""
     # The package verified. A signature by the successor key is what settles
     # a rotation: from here on that key is the current one. And a manifest
     # may announce the next successor, which the signature just vouched for.
@@ -902,7 +1418,7 @@ install_successor_key() {
     have="$(key_id_of "$tmp")"
     if [ -n "$have" ] && [ -n "$id" ] && [ "$have" != "$id" ]; then
         rm -f "$tmp"
-        job_note "the manifest's successor key has id $have but claims $id; not installed"
+        job_note "the manifest's successor key has id $have but claims $(clean "$id"); not installed"
         return 0
     fi
     mv -f "$tmp" "$RELEASE_KEY_NEXT"
@@ -914,26 +1430,31 @@ install_successor_key() {
 
 window_minutes() {
     local minutes="$JOB_WINDOW"
-    [[ "$minutes" =~ ^[0-9]+$ ]] || minutes="$VERIFY_WINDOW_MINUTES"
-    [[ "$minutes" =~ ^[0-9]+$ ]] || minutes=30
+    [[ "$minutes" =~ ^[0-9]{1,5}$ ]] || minutes="$VERIFY_WINDOW_MINUTES"
+    [[ "$minutes" =~ ^[0-9]{1,5}$ ]] || minutes=30
     if [ "$minutes" -lt 5 ]; then minutes=5; fi
     if [ "$minutes" -gt 1440 ]; then minutes=1440; fi
     printf '%s' "$minutes"
 }
 
 run_update() {
-    local copy="$STATE_DIR/work/$JOB_ID/package.tar.gz" rc snapshot
+    local copy="$STATE_DIR/work/$JOB_ID/package.tar.gz" rc
     write_active_lock
-    write_flag updating "The platform is being updated." ""
+    if ! write_flag updating "The platform is being updated." ""; then
+        job_note "the maintenance flag could not be raised, so the platform would keep accepting writes; nothing was changed"
+        settle_failed spool_unwritable
+        return
+    fi
     stop_beat
     drain_worker
     JOB_STARTED_AT="$(now_iso)"
     write_status running ""
     set_key_args
+    SNAPSHOT_INTO=snapshot
     run_update_sh --archive "$copy" --require-signature "${KEY_ARGS[@]}" --require-newer \
         --skip-beat --keep-lock --yes && rc=0 || rc=$?
-    snapshot="$(fact snapshot)"
-    JOB_SNAPSHOT="${snapshot##*/}"
+    SNAPSHOT_INTO=""
+    JOB_SNAPSHOT="$(snapshot_fact)"
     JOB_MIGRATIONS="$(fact migrations)"
     if [ "$rc" -ne 0 ]; then
         if [ -n "$JOB_SNAPSHOT" ]; then
@@ -953,11 +1474,12 @@ run_update() {
     refresh_update_sh "$copy"
     refresh_agent "$copy"
     JOB_DEADLINE="$(deadline_iso "$(window_minutes)")"
-    write_flag verifying "The platform was updated and is waiting for a superuser to confirm it." "$JOB_DEADLINE"
+    write_flag verifying "The platform was updated and is waiting for a superuser to confirm it." "$JOB_DEADLINE" \
+        || job_note "the maintenance flag could not be moved to verifying"
     remove_active_lock
     JOB_STEP=""
-    write_status awaiting_verification ""
     job_note "awaiting verification until $JOB_DEADLINE"
+    write_status awaiting_verification ""
 }
 
 settle_failed() {
@@ -970,19 +1492,24 @@ settle_failed() {
     finish failed "$1"
 }
 
+package_top() {
+    # $1 = the verified package copy. Its wrapper directory, or nothing.
+    # `|| true` inside the substitution: a package that is not a tarball is a
+    # refusal update.sh already made, and here it must not end the run.
+    (tar -tzf "$1" 2>/dev/null || true) | awk -F/ 'NR==1{sub(/^\.\//, ""); top=$1} END{print top}'
+}
+
 refresh_update_sh() {
     # $1 = the verified package copy. The agent's update.sh is replaced with
     # the one the package ships, so the next package finds the script it was
     # built for; the package was verified, which is the trust the copy needs.
     local top tmp
-    # `|| true` inside the substitution: a package that is not a tarball is a
-    # refusal update.sh already made, and here it must not end the run.
-    top="$( (tar -tzf "$1" 2>/dev/null || true) | awk -F/ 'NR==1{sub(/^\.\//, ""); print $1}')"
+    top="$(package_top "$1")"
     if [ -z "$top" ]; then
         job_note "the package cannot be listed for an update.sh; the agent keeps its copy"
         return 0
     fi
-    tmp="$(mktemp)"
+    tmp="$(mktemp "$LIB_DIR/.update.sh.XXXXXX")"
     if tar -xzOf "$1" "$top/update.sh" > "$tmp" 2>/dev/null && [ -s "$tmp" ] && bash -n "$tmp" 2>/dev/null; then
         chmod 0755 "$tmp"
         mv -f "$tmp" "$UPDATE_SH"
@@ -1003,9 +1530,9 @@ refresh_agent() {
     # from the next tick.
     [ "$SELF_UPDATE" = 1 ] || return 0
     local top tmp version readme
-    top="$( (tar -tzf "$1" 2>/dev/null || true) | awk -F/ 'NR==1{sub(/^\.\//, ""); print $1}')"
+    top="$(package_top "$1")"
     [ -n "$top" ] || return 0
-    tmp="$(mktemp)"
+    tmp="$(mktemp "$LIB_DIR/.epicurrents-updater.sh.XXXXXX")"
     if ! tar -xzOf "$1" "$top/updater/epicurrents-updater.sh" > "$tmp" 2>/dev/null || [ ! -s "$tmp" ]; then
         rm -f "$tmp"
         job_note "the package carries no agent; this one stays"
@@ -1025,7 +1552,7 @@ refresh_agent() {
     cp -p "$AGENT_SELF" "$AGENT_SELF.previous" 2>/dev/null || true
     chmod 0755 "$tmp"
     mv -f "$tmp" "$AGENT_SELF"
-    readme="$(mktemp)"
+    readme="$(mktemp "$LIB_DIR/.README.md.XXXXXX")"
     if tar -xzOf "$1" "$top/updater/README.md" > "$readme" 2>/dev/null && [ -s "$readme" ]; then
         chmod 0644 "$readme"
         mv -f "$readme" "$LIB_DIR/README.md"
@@ -1041,13 +1568,13 @@ refresh_agent() {
 run_backup() {
     # code + database + .env under backups/backup-<stamp>, without a flag or
     # a stop: the dump is one transaction and the platform keeps serving.
-    local rc snapshot
-    write_active_lock
+    local rc
     JOB_STARTED_AT="$(now_iso)"
     write_status running ""
+    SNAPSHOT_INTO=snapshot
     run_update_sh --snapshot backup && rc=0 || rc=$?
-    snapshot="$(fact snapshot)"
-    JOB_SNAPSHOT="${snapshot##*/}"
+    SNAPSHOT_INTO=""
+    JOB_SNAPSHOT="$(snapshot_fact)"
     remove_active_lock
     JOB_STEP=""
     if [ "$rc" -ne 0 ] || [ -z "$JOB_SNAPSHOT" ]; then
@@ -1061,35 +1588,46 @@ run_backup() {
 
 # ── A rollback on request ─────────────────────────────────────────────────────
 
+take_safety_snapshot() {
+    # $1 = label. 0 with JOB_POST_SNAPSHOT set when one exists or was taken.
+    if [ -n "$JOB_POST_SNAPSHOT" ] && [ -d "$DEPLOY_ROOT/backups/$JOB_POST_SNAPSHOT" ]; then
+        job_note "keeping the safety snapshot already taken: $JOB_POST_SNAPSHOT"
+        return 0
+    fi
+    job_note "taking a $1 snapshot"
+    SNAPSHOT_INTO=post_snapshot
+    if run_update_sh --snapshot "$1" --keep-lock; then
+        SNAPSHOT_INTO=""
+        JOB_POST_SNAPSHOT="$(snapshot_fact)"
+        if [ -n "$JOB_POST_SNAPSHOT" ]; then
+            job_note "$1 snapshot: $JOB_POST_SNAPSHOT"
+            return 0
+        fi
+    fi
+    SNAPSHOT_INTO=""
+    return 1
+}
+
 run_standalone_rollback() {
     # $1 = whether to restore the database ("false" keeps it). A safety
     # snapshot first, so what the live database holds now is recoverable
     # from somewhere; then update.sh restores the named snapshot; then the
     # gate against whatever version the restored tree carries.
-    local restore_db="$1" rc post restored
+    local restore_db="$1" rc restored
     write_active_lock
-    write_flag rolling_back "The platform is being rolled back to an earlier snapshot." ""
+    write_flag rolling_back "The platform is being rolled back to an earlier snapshot." "" \
+        || job_note "the maintenance flag could not be raised; rolling back regardless"
     stop_beat
     drain_worker
-    JOB_STARTED_AT="$(now_iso)"
+    JOB_STARTED_AT="${JOB_STARTED_AT:-$(now_iso)}"
     write_status running ""
-    if [ -n "$JOB_POST_SNAPSHOT" ] && [ -d "$DEPLOY_ROOT/backups/$JOB_POST_SNAPSHOT" ]; then
-        job_note "keeping the safety snapshot already taken: $JOB_POST_SNAPSHOT"
-    elif job_note "taking a safety snapshot before the rollback" && run_update_sh --snapshot pre-rollback --keep-lock; then
-        post="$(fact snapshot)"
-        JOB_POST_SNAPSHOT="${post##*/}"
-        job_note "safety snapshot: $JOB_POST_SNAPSHOT"
-    else
+    if ! take_safety_snapshot pre-rollback; then
         job_note "the safety snapshot failed; nothing was changed"
         settle_failed snapshot_failed
         return
     fi
     if [ "$restore_db" = false ]; then
         job_note "restoring the code of $JOB_SNAPSHOT; the database is kept"
-    else
-        job_note "restoring $JOB_SNAPSHOT"
-    fi
-    if [ "$restore_db" = false ]; then
         run_update_sh --rollback --snapshot "$JOB_SNAPSHOT" --code-only --yes --skip-beat --keep-lock && rc=0 || rc=$?
         if [ "$rc" -ne 0 ] && [ "$(fact refused)" = code_only ]; then
             job_note "update.sh declined to keep the database: $(fact failed)"
@@ -1097,6 +1635,7 @@ run_standalone_rollback() {
             return
         fi
     else
+        job_note "restoring $JOB_SNAPSHOT"
         run_update_sh --rollback --snapshot "$JOB_SNAPSHOT" --yes --skip-beat --keep-lock && rc=0 || rc=$?
     fi
     if [ "$rc" -ne 0 ]; then
@@ -1121,11 +1660,14 @@ run_standalone_rollback() {
 # ── The verification window ───────────────────────────────────────────────────
 
 handle_awaiting() {
-    if [ -f "$JOBS/$JOB_ID.verify" ]; then
-        job_note "confirmed by user $(json_get "$JOBS/$JOB_ID.verify" by_user_id)"
+    # The markers count only while the agent is enabled; the deadline counts
+    # regardless, since a disabled agent must not leave the platform in its
+    # verification window for ever.
+    if [ "$ENABLED" = 1 ] && marker_present verify; then
+        job_note "confirmed from the platform"
         settle_succeeded
-    elif [ -f "$JOBS/$JOB_ID.rollback" ]; then
-        job_note "rollback requested by user $(json_get "$JOBS/$JOB_ID.rollback" by_user_id)"
+    elif [ "$ENABLED" = 1 ] && marker_present rollback; then
+        job_note "rollback requested from the platform"
         rollback requested true
     elif [ -n "$JOB_DEADLINE" ] && is_past "$JOB_DEADLINE"; then
         job_note "the verification window closed at $JOB_DEADLINE without a confirmation"
@@ -1141,16 +1683,48 @@ settle_succeeded() {
     finish succeeded ""
 }
 
+newest_settled() {
+    # $1 = job id. 0 when no update or rollback settled after it: a late
+    # rollback of an older update would restore a tree that a newer job has
+    # already replaced.
+    python3 - "$STATE_JOBS" "$1" <<'PY'
+import json, os, sys
+root, mine = sys.argv[1:3]
+newest, newest_id = "", None
+for name in os.listdir(root):
+    if not name.endswith(".status.json"):
+        continue
+    try:
+        with open(os.path.join(root, name), encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        continue
+    if data.get("operation") not in ("platform.update", "platform.rollback"):
+        continue
+    if data.get("state") not in ("succeeded", "rolled_back"):
+        continue
+    finished = data.get("finished_at") or ""
+    if finished > newest:
+        newest, newest_id = finished, data.get("job_id")
+sys.exit(0 if newest_id == mine else 1)
+PY
+}
+
 handle_succeeded() {
-    # A rollback may still be asked for after confirmation, for as long as the
-    # pre-update snapshot exists.
-    [ -f "$JOBS/$JOB_ID.rollback" ] || return 0
-    if [ -n "$JOB_SNAPSHOT" ] && [ -d "$DEPLOY_ROOT/backups/$JOB_SNAPSHOT" ]; then
-        job_note "late rollback requested by user $(json_get "$JOBS/$JOB_ID.rollback" by_user_id)"
+    # A rollback may still be asked for after confirmation, while the
+    # pre-update snapshot exists, nothing else is in flight, and no update or
+    # rollback has settled since.
+    [ "$ENABLED" = 1 ] || return 0
+    marker_present rollback || return 0
+    if in_flight_elsewhere "$JOB_ID"; then
+        decline_marker rollback "late rollback refused: another job is in flight"
+    elif ! newest_settled "$JOB_ID"; then
+        decline_marker rollback "late rollback refused: a later update or rollback has settled since this job"
+    elif [ -n "$JOB_SNAPSHOT" ] && [ -d "$DEPLOY_ROOT/backups/$JOB_SNAPSHOT" ]; then
+        job_note "late rollback requested from the platform"
         rollback late true
     else
-        job_note "rollback requested, but the snapshot '${JOB_SNAPSHOT:-none}' no longer exists; nothing to roll back to"
-        rm -f "$JOBS/$JOB_ID.rollback"
+        decline_marker rollback "rollback requested, but the snapshot '${JOB_SNAPSHOT:-none}' no longer exists; nothing to roll back to"
     fi
 }
 
@@ -1162,10 +1736,11 @@ rollback() {
     # what keeps that window's data recoverable, so when there was a window
     # its failure is a failed rollback; when there was none there is nothing
     # to preserve and the rollback goes ahead without it.
-    local reason="$1" had_window="$2" rc post
+    local reason="$1" had_window="$2" rc
     write_active_lock
-    write_flag rolling_back "The platform is being rolled back to the previous release." ""
-    rm -f "$JOBS/$JOB_ID.rollback"
+    write_flag rolling_back "The platform is being rolled back to the previous release." "" \
+        || job_note "the maintenance flag could not be raised; rolling back regardless"
+    remove_marker rollback
     JOB_STEP=""
     write_status rolling_back "$reason"
     if [ -z "$JOB_SNAPSHOT" ] || [ ! -d "$DEPLOY_ROOT/backups/$JOB_SNAPSHOT" ]; then
@@ -1173,18 +1748,14 @@ rollback() {
         settle_rollback_failed
         return
     fi
+    stop_beat
     drain_worker
-    if [ -n "$JOB_POST_SNAPSHOT" ] && [ -d "$DEPLOY_ROOT/backups/$JOB_POST_SNAPSHOT" ]; then
-        job_note "keeping the post-update snapshot already taken: $JOB_POST_SNAPSHOT"
-    elif job_note "taking a post-update snapshot" && run_update_sh --snapshot post-update --keep-lock; then
-        post="$(fact snapshot)"
-        JOB_POST_SNAPSHOT="${post##*/}"
-        job_note "post-update snapshot: $JOB_POST_SNAPSHOT"
-    elif [ "$had_window" = true ]; then
-        job_note "the post-update snapshot failed; refusing to roll back over data written since the update"
-        settle_rollback_failed
-        return
-    else
+    if ! take_safety_snapshot post-update; then
+        if [ "$had_window" = true ]; then
+            job_note "the post-update snapshot failed; refusing to roll back over data written since the update"
+            settle_rollback_failed
+            return
+        fi
         job_note "the post-update snapshot failed; nothing was served since the snapshot, so the rollback goes ahead"
     fi
     job_note "restoring $JOB_SNAPSHOT"
@@ -1236,6 +1807,8 @@ prune_labelled_snapshots() {
     dirs=("$DEPLOY_ROOT"/backups/"$label"-*)
     [ -d "${dirs[0]}" ] || return 0
     for ((i = 0; i < ${#dirs[@]} - keep; i++)); do
+        valid_snapshot "$(basename "${dirs[i]}")" || continue
+        [ ! -L "${dirs[i]}" ] || continue
         job_note "pruning old $label snapshot $(basename "${dirs[i]}")"
         rm -rf "${dirs[i]}"
     done
@@ -1263,9 +1836,20 @@ handle_stale_lock() {
         log "another run (pid $pid) is executing job $job; nothing to do"
         return 1
     fi
-    if ! [[ "$job" =~ ^[0-9a-f-]{36}$ ]] || [ ! -f "$JOBS/$job.status.json" ]; then
-        log "stale lock names no known job; removing it"
+    if ! [[ "$job" =~ $UUID_RE ]]; then
+        log "stale lock names no job; removing it"
         remove_active_lock
+        return 0
+    fi
+    if [ ! -f "$STATE_JOBS/$job.status.json" ]; then
+        # Died between taking the lock and the first status: at most the
+        # request was claimed, and nothing else happened.
+        reset_job "$job"
+        JOB_OPERATION="$(json_get "$(job_request)" operation)"
+        JOB_OPERATION="$(clean "${JOB_OPERATION:-unknown}")"
+        job_note "the run that claimed this job (pid ${pid:-?}) is gone before it checked anything; nothing was changed"
+        remove_active_lock
+        finish failed stale
         return 0
     fi
     reset_job "$job"
@@ -1281,10 +1865,14 @@ handle_stale_lock() {
             return 0
             ;;
         "$OPERATION_ROLLBACK")
-            if [ "$JOB_RETRIES" -lt 1 ]; then
+            if [ "$JOB_STATE" = requested ]; then
+                job_note "the request was interrupted while being checked; nothing was changed"
+                remove_active_lock
+                finish failed stale
+            elif [ "$JOB_RETRIES" -lt 1 ]; then
                 JOB_RETRIES=$((JOB_RETRIES + 1))
                 job_note "retrying the interrupted rollback"
-                run_standalone_rollback "$(json_get "$JOBS/$JOB_ID.json" args restore_database)"
+                run_standalone_rollback "$(json_get "$(job_request)" args restore_database)"
             else
                 job_note "the rollback was interrupted and already retried once; the deployment needs a shell"
                 settle_rollback_failed
@@ -1293,12 +1881,8 @@ handle_stale_lock() {
             ;;
     esac
     case "$JOB_STATE" in
-        accepted|running)
-            if [ -n "$JOB_SNAPSHOT" ] || grep -q '^::snapshot=' "$(job_log)" 2>/dev/null; then
-                if [ -z "$JOB_SNAPSHOT" ]; then
-                    JOB_SNAPSHOT="$(sed -n 's/^::snapshot=//p' "$(job_log)" | tail -1)"
-                    JOB_SNAPSHOT="${JOB_SNAPSHOT##*/}"
-                fi
+        requested|accepted|running)
+            if [ -n "$JOB_SNAPSHOT" ]; then
                 job_note "the update had taken its snapshot; rolling back to it"
                 rollback stale false
             else
@@ -1327,58 +1911,78 @@ handle_stale_lock() {
 # ── The tick ──────────────────────────────────────────────────────────────────
 
 in_flight_elsewhere() {
-    # Whether any job other than $1 is in a state this agent still owns.
+    # Whether any job other than $1 is in a state this agent still owns,
+    # according to the agent's own records.
     local path id state
-    for path in "$JOBS"/*.status.json; do
+    for path in "$STATE_JOBS"/*.status.json; do
         [ -f "$path" ] || continue
         id="$(basename "$path" .status.json)"
         [ "$id" != "$1" ] || continue
         state="$(json_get "$path" state)"
         case "$state" in
-            accepted|running|awaiting_verification|rolling_back) return 0 ;;
+            requested|accepted|running|awaiting_verification|rolling_back) return 0 ;;
         esac
     done
     return 1
 }
 
 tick() {
-    local path id request status
+    local path id state
     # Requests first, oldest first, so a queue drains in order; a request
-    # while another job is in flight waits for its turn.
-    # Names are UUIDs by the check below, so parsing ls is safe here; it is
-    # what gives oldest-first without a stat that differs between platforms.
-    # shellcheck disable=SC2010,SC2012
-    for id in $(cd "$JOBS" && ls -1tr -- *.json 2>/dev/null | grep -v '\.status\.json$' | sed 's/\.json$//' || true); do
-        [[ "$id" =~ ^[0-9a-f-]{36}$ ]] || continue
-        request="$JOBS/$id.json"
-        status="$JOBS/$id.status.json"
-        if [ -f "$status" ]; then
-            continue
-        fi
-        if [ "$(json_get "$request" job_id)" != "$id" ]; then
-            log "request $id names a different job id; ignored"
-            continue
-        fi
+    # while another job is in flight waits for its turn. One request per
+    # tick: the next is looked at once this one has reached a state that
+    # lets another start.
+    for id in $(spoolfs requests 2>/dev/null || true); do
+        [[ "$id" =~ $UUID_RE ]] || continue
+        # A request for a job the agent already knows is the platform's
+        # business, not a new job; it is never taken twice.
+        [ ! -f "$STATE_JOBS/$id.status.json" ] || continue
         if in_flight_elsewhere "$id"; then
-            continue
+            break
         fi
         reset_job "$id"
-        accept_or_refuse "$request"
-        # One request per tick: the next is looked at once this one has
-        # reached a state that lets another start.
+        if claim_request; then
+            accept_or_refuse
+        fi
         break
     done
-    # Jobs in their window, or confirmed and asked to roll back after all.
-    for path in "$JOBS"/*.status.json; do
+    # Jobs in their window, or confirmed and asked to roll back after all,
+    # from the agent's own records; the in-flight ones are published again
+    # in case their copy in the spool went missing.
+    for path in "$STATE_JOBS"/*.status.json; do
         [ -f "$path" ] || continue
         id="$(basename "$path" .status.json)"
-        [[ "$id" =~ ^[0-9a-f-]{36}$ ]] || continue
+        [[ "$id" =~ $UUID_RE ]] || continue
         reset_job "$id"
         load_status
+        state="$JOB_STATE"
+        case "$state" in
+            requested|accepted|running|awaiting_verification|rolling_back)
+                publish "jobs/$id.status.json" "$path" || true
+                ;;
+        esac
         [ "$JOB_OPERATION" = "$OPERATION_UPDATE" ] || continue
-        case "$JOB_STATE" in
+        case "$state" in
             awaiting_verification) handle_awaiting ;;
             succeeded) handle_succeeded ;;
+        esac
+    done
+    prune_state
+}
+
+prune_state() {
+    # The agent's copies of logs and requests of jobs finished more than 90
+    # days ago; the status files stay, since they are what a late rollback is
+    # checked against and they are small.
+    local path id state
+    for path in "$STATE_JOBS"/*.log "$STATE_JOBS"/*.request.json; do
+        [ -f "$path" ] || continue
+        [ -n "$(find "$path" -mtime +90 2>/dev/null)" ] || continue
+        id="$(basename "$path")"
+        id="${id%%.*}"
+        state="$(json_get "$STATE_JOBS/$id.status.json" state)"
+        case "$state" in
+            succeeded|failed|rolled_back|rollback_failed|cancelled) rm -f "$path" ;;
         esac
     done
 }
@@ -1406,7 +2010,6 @@ main() {
         die "no container runtime found (Docker Engine or Podman with Compose v2)."
     fi
     write_heartbeat
-    mkdir -p "$STATE_DIR/work"
     handle_stale_lock || exit 0
     tick
 }

@@ -1,8 +1,9 @@
 """Whether an account signs in through an external identity provider, and under which name.
 
-Three surfaces need the same answer and would otherwise each invent one: the
-password-reset request, the change-password endpoint, and the invite mail. All
-three offer a local password to an account, and an account provisioned through
+Four surfaces need the same answer and would otherwise each invent one: the
+password-reset request, the change-password endpoint, the operator's
+set-password action, and the invite mail. All four offer a local password to an
+account, and an account provisioned through
 OIDC is not supposed to have one — a local password bypasses the tenant (``tid``)
 and email-domain gates in :mod:`user.oidc`, which are the whole of the access
 control on who may sign in at all.
@@ -48,8 +49,8 @@ def external_identity(user):
 def is_externally_authenticated(user) -> bool:
     """Whether ``user`` signs in through a provider and has no local password of its own.
 
-    The one question the reset, change-password and invite paths ask before
-    offering to give the account a password.
+    The one question the reset, change-password, operator set-password and
+    invite paths ask before offering to give the account a password.
     """
     if user is None or user.has_usable_password():
         return False

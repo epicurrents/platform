@@ -229,24 +229,57 @@ class TestOrphans:
 @pytest.mark.django_db
 class TestNotifications:
     def test_each_attention_state_notifies_every_superuser_once(
-        self, spool_dir, make_superuser, make_user, write_status, no_push
+        self, spool_dir, make_superuser, make_user, write_status, no_push, django_capture_on_commit_callbacks
     ):
         first, second = make_superuser(), make_superuser()
         make_user()
         job = _host_job(first)
         write_status(job.job_id, "running")
-        spool.sync(force=True)
+        with django_capture_on_commit_callbacks(execute=True):
+            spool.sync(force=True)
         assert no_push == [], "running is not an attention state"
         write_status(job.job_id, "awaiting_verification", updated_at="2026-09-20T10:06:00Z", target_version="0.1.2")
-        spool.sync(force=True)
+        with django_capture_on_commit_callbacks(execute=True):
+            spool.sync(force=True)
         assert {n["user_id"] for n in no_push} == {first.pk, second.pk}
         assert all(n["data"] == {"type": "maintenance", "job_id": str(job.job_id)} for n in no_push)
         assert "0.1.2" in no_push[0]["title"]
         write_status(job.job_id, "awaiting_verification", updated_at="2026-09-20T10:07:00Z", step="health")
-        spool.sync(force=True)
+        with django_capture_on_commit_callbacks(execute=True):
+            spool.sync(force=True)
         assert len(no_push) == 2, "the same state again is not announced again"
 
-    def test_mail_goes_out_when_a_backend_is_configured(self, spool_dir, superuser, write_status, no_push, settings):
+    def test_a_status_that_cannot_be_saved_announces_nothing(
+        self, spool_dir, superuser, write_status, no_push, django_capture_on_commit_callbacks
+    ):
+        """Saved first, announced after: a status refused every tick must not notify every tick."""
+        _host_job(superuser, state="running")
+        other = _host_job(superuser, state="failed")
+        for minute in range(3):
+            write_status(other.job_id, "rolling_back", updated_at=f"2026-09-20T10:0{minute + 5}:00Z")
+            with django_capture_on_commit_callbacks(execute=True):
+                spool.sync(force=True)
+        assert no_push == []
+        other.refresh_from_db()
+        assert other.state == "failed" and other.last_notified_state == ""
+
+    def test_the_sending_happens_after_the_commit_not_inside_the_sync(
+        self, spool_dir, superuser, write_status, no_push, django_capture_on_commit_callbacks
+    ):
+        job = _host_job(superuser)
+        write_status(job.job_id, "failed", reason="refused_hash")
+        with django_capture_on_commit_callbacks(execute=False) as callbacks:
+            spool.sync(force=True)
+        assert no_push == [], "nothing sent while the sync ran"
+        job.refresh_from_db()
+        assert job.last_notified_state == "failed", "the bookkeeping is saved with the state"
+        for callback in callbacks:
+            callback()
+        assert [n["user_id"] for n in no_push] == [superuser.pk]
+
+    def test_mail_goes_out_when_a_backend_is_configured(
+        self, spool_dir, superuser, write_status, no_push, settings, django_capture_on_commit_callbacks
+    ):
         from django.core import mail
 
         settings.EMAIL_BACKEND = "django.core.mail.backends.locmem.EmailBackend"
@@ -254,7 +287,8 @@ class TestNotifications:
         superuser.save()
         job = _host_job(superuser)
         write_status(job.job_id, "rollback_failed")
-        spool.sync(force=True)
+        with django_capture_on_commit_callbacks(execute=True):
+            spool.sync(force=True)
         assert len(mail.outbox) == 1 and mail.outbox[0].to == ["root@example.org"]
         assert "shell" in mail.outbox[0].body
 
@@ -420,3 +454,151 @@ class TestCleanSlateFindings:
             spool.sync(force=True)
         sql = " ".join(q["sql"] for q in captured.captured_queries)
         assert '"in_flight"' in sql and "job_id" in sql
+
+
+@pytest.mark.django_db
+class TestClaimContract:
+    def test_a_claimed_request_is_a_request_for_re_creation(self, spool_dir, superuser, no_push):
+        job = _host_job(superuser)
+        spool.write_request(job)
+        spool.request_path(job.job_id).rename(spool.claimed_path(job.job_id))
+        job_id = job.job_id
+        MaintenanceJob.objects.all().delete()
+        assert spool.sync(force=True)["created"] == 1
+        assert MaintenanceJob.objects.get().job_id == job_id
+
+    def test_a_claimed_request_keeps_its_row_from_being_orphaned(self, spool_dir, superuser, no_push):
+        job = _host_job(superuser, created_at=timezone.now() - timedelta(minutes=5))
+        spool.write_request(job)
+        spool.request_path(job.job_id).rename(spool.claimed_path(job.job_id))
+        assert spool.sync(force=True)["orphaned"] == 0
+        job.refresh_from_db()
+        assert job.in_flight
+
+    def test_the_claimed_suffix_is_not_misread_as_a_request_id(self, spool_dir):
+        import uuid
+
+        job_id = uuid.uuid4()
+        assert spool._job_id_of(spool.claimed_path(job_id), ".claimed.json") == job_id
+        assert spool._job_id_of(spool.claimed_path(job_id), ".json") is None
+
+
+@pytest.mark.django_db
+class TestStatusMayNotResurrect:
+    @pytest.mark.parametrize("state", ["accepted", "running", "succeeded", "failed"])
+    def test_a_cancelled_row_is_final(self, spool_dir, superuser, write_status, no_push, state):
+        job = _host_job(superuser, state="cancelled")
+        write_status(job.job_id, state)
+        spool.sync(force=True)
+        job.refresh_from_db()
+        assert job.state == "cancelled" and not job.in_flight
+
+    @pytest.mark.parametrize("settled", ["failed", "rolled_back", "rollback_failed"])
+    def test_a_settled_row_never_goes_back_in_flight(self, spool_dir, superuser, write_status, no_push, settled):
+        job = _host_job(superuser, state=settled)
+        write_status(job.job_id, "running")
+        spool.sync(force=True)
+        job.refresh_from_db()
+        assert job.state == settled
+
+    def test_a_late_rollback_of_a_succeeded_update_is_the_one_exception(
+        self, spool_dir, superuser, write_status, no_push
+    ):
+        job = _host_job(superuser, state="succeeded")
+        write_status(job.job_id, "rolling_back")
+        spool.sync(force=True)
+        job.refresh_from_db()
+        assert job.state == "rolling_back" and job.in_flight
+
+    def test_a_row_settled_by_the_web_tier_may_learn_the_outcome(self, spool_dir, superuser, write_status, no_push):
+        job = _host_job(superuser, state="failed", reason="abandoned")
+        write_status(job.job_id, "rolled_back")
+        spool.sync(force=True)
+        job.refresh_from_db()
+        assert job.state == "rolled_back"
+
+
+@pytest.mark.django_db
+class TestStatusFieldBounds:
+    def test_an_overlong_field_is_clipped_rather_than_failing_every_sync(
+        self, spool_dir, superuser, write_status, no_push
+    ):
+        job = _host_job(superuser)
+        write_status(job.job_id, "running", step="s" * 500, reason="r" * 500, running_version="9" * 99)
+        spool.sync(force=True)
+        job.refresh_from_db()
+        assert job.state == "running" and len(job.step) == 64 and len(job.reason) == 64
+        assert len(job.running_version) == 32
+
+    def test_a_database_error_on_one_row_does_not_fail_the_sync(
+        self, spool_dir, superuser, write_status, no_push, monkeypatch
+    ):
+        from django.db import DataError
+
+        job = _host_job(superuser)
+        write_status(job.job_id, "running")
+
+        def refuse(self, *args, **kwargs):
+            raise DataError("value too long")
+
+        monkeypatch.setattr(MaintenanceJob, "save", refuse)
+        counts = spool.sync(force=True)
+        assert counts["applied"] == 0
+
+
+@pytest.mark.django_db
+class TestErasureReapplyAfterRestore:
+    def _capture(self, monkeypatch):
+        from maintenance import tasks
+
+        calls = []
+        monkeypatch.setattr(tasks.reapply_erasures, "delay", lambda: calls.append(True))
+        return calls
+
+    def test_a_rolled_back_update_re_applies_erasures(
+        self, spool_dir, superuser, write_status, no_push, monkeypatch, django_capture_on_commit_callbacks
+    ):
+        calls = self._capture(monkeypatch)
+        job = _host_job(superuser, state="rolling_back")
+        write_status(job.job_id, "rolled_back")
+        with django_capture_on_commit_callbacks(execute=True):
+            spool.sync(force=True)
+        assert calls == [True]
+        write_status(job.job_id, "rolled_back", updated_at="2026-09-20T10:09:00Z", step="done")
+        with django_capture_on_commit_callbacks(execute=True):
+            spool.sync(force=True)
+        assert calls == [True], "only on the transition, not on every status that repeats it"
+
+    def test_a_restore_that_kept_the_database_does_not(
+        self, spool_dir, superuser, write_status, no_push, monkeypatch, django_capture_on_commit_callbacks
+    ):
+        calls = self._capture(monkeypatch)
+        job = MaintenanceJob.objects.create(
+            operation="platform.rollback",
+            executor="host",
+            state="running",
+            in_flight=True,
+            args={"snapshot": "pre-update-20260920-120000", "restore_database": False},
+        )
+        write_status(job.job_id, "succeeded")
+        with django_capture_on_commit_callbacks(execute=True):
+            spool.sync(force=True)
+        assert calls == []
+
+    def test_a_restore_row_re_created_from_the_spool_re_applies_erasures(
+        self, spool_dir, superuser, write_status, no_push, monkeypatch, django_capture_on_commit_callbacks
+    ):
+        calls = self._capture(monkeypatch)
+        job = MaintenanceJob.objects.create(
+            operation="platform.rollback",
+            executor="host",
+            state="running",
+            in_flight=True,
+            args={"snapshot": "pre-update-20260920-120000", "restore_database": True},
+        )
+        spool.write_request(job)
+        write_status(job.job_id, "succeeded")
+        MaintenanceJob.objects.all().delete()
+        with django_capture_on_commit_callbacks(execute=True):
+            spool.sync(force=True)
+        assert calls == [True]

@@ -1,7 +1,9 @@
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref } from 'vue'
 import axios from 'axios'
+import { withStepUp } from '#composables/useStepUpPrompt'
 import { t } from '#i18n'
+import { profileNeedsStepUp } from '#lib/stepUp'
 import { useAuthStore } from '#stores/auth'
 import {
     updateProfile,
@@ -42,20 +44,47 @@ const passwordError = ref<string | null>(null)
 const passwordSuccess = ref(false)
 const passwordLoading = ref(false)
 
+/** Whether a password re-check on this page hit the shared step-up lockout, which answers 429. */
+function isLockedOut (err: unknown): boolean {
+    return axios.isAxiosError(err) && err.response?.status === 429
+}
+
+function lockedOutMessage () {
+    return t('Too many failed confirmations. Try again later.', SCOPE)
+}
+
+/**
+ * Save the profile. A new address is where a password reset would go, so changing it asks for confirmation
+ * through the shared step-up prompt; a name change saves in one click.
+ */
 async function submitProfile () {
+    if (profileLoading.value) {
+        return
+    }
     profileLoading.value = true
     profileError.value = null
     profileSuccess.value = false
+    const payload = {
+        email: input.email.trim(),
+        first_name: input.firstName,
+        last_name: input.lastName,
+    }
     try {
-        const updated = await updateProfile({
-            email: input.email,
-            first_name: input.firstName,
-            last_name: input.lastName,
-        })
-        authStore.user = updated
-        profileSuccess.value = true
-    } catch {
-        profileError.value = t('Failed to update profile. Please try again.', SCOPE)
+        const saved = await withStepUp(
+            profileNeedsStepUp(authStore.user?.email ?? '', payload.email),
+            {
+                title: t('Confirm the new address', SCOPE),
+                message: t('Password resets are sent to this address, so changing it asks for your credentials.', SCOPE),
+            },
+            async (stepUp) => {
+                authStore.user = await updateProfile({ ...payload, ...stepUp })
+            },
+        )
+        profileSuccess.value = saved
+    } catch (err) {
+        profileError.value = isLockedOut(err)
+            ? lockedOutMessage()
+            : t('Failed to update profile. Please try again.', SCOPE)
     } finally {
         profileLoading.value = false
     }
@@ -98,6 +127,9 @@ function clearTwoFactorInputs () {
  * wrong, since the account has no password to check.
  */
 function twoFactorErrorFrom (err: unknown, fallback: string): string {
+    if (isLockedOut(err)) {
+        return lockedOutMessage()
+    }
     if (axios.isAxiosError(err) && err.response?.status === 409) {
         const detail = (err.response.data as { detail?: unknown } | undefined)?.detail
         if (typeof detail === 'string' && detail) {
@@ -201,8 +233,10 @@ async function submitPassword () {
         input.newPassword = ''
         input.confirmPassword = ''
         passwordSuccess.value = true
-    } catch {
-        passwordError.value = t('Failed to change password. Check your current password and try again.', SCOPE)
+    } catch (err) {
+        passwordError.value = isLockedOut(err)
+            ? lockedOutMessage()
+            : t('Failed to change password. Check your current password and try again.', SCOPE)
     } finally {
         passwordLoading.value = false
     }

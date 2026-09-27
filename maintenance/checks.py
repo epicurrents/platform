@@ -13,7 +13,7 @@ from django.conf import settings
 from django.core.checks import Error, Tags, Warning, register
 from django.core.management import get_commands
 
-from maintenance.operations import CELERY, FORBIDDEN_ARG_FIELDS, registered_operations
+from maintenance.operations import CELERY, forbidden_arg_fields, registered_operations
 
 
 @register(Tags.compatibility)
@@ -32,7 +32,7 @@ def check_operation_registry(app_configs, **kwargs):
                     id="maintenance.E001",
                 )
             )
-        forbidden = FORBIDDEN_ARG_FIELDS & set(operation.args_schema.model_fields)
+        forbidden = forbidden_arg_fields(operation.args_schema)
         if forbidden:
             issues.append(
                 Error(

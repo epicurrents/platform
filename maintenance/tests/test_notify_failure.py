@@ -20,7 +20,7 @@ import pytest
 from django.core.mail.backends.base import BaseEmailBackend
 
 from maintenance.models import MaintenanceJob
-from maintenance.notify import notify_job_state
+from maintenance.notify import send_notice
 
 SUPERUSER_ADDRESS = "root@example.org"
 
@@ -44,22 +44,17 @@ class TestMailFailureIsContained:
     def _job(self):
         return MaintenanceJob.objects.create(operation="platform.update", executor="host", state="running")
 
-    def test_the_state_is_still_announced(self, addressed_superuser, no_push, settings, caplog):
-        """The return value is what the caller stores as ``last_notified_state``.
-
-        A failure that returned ``None`` here would leave the job announcing the
-        same state again on the next sync, once a minute, for as long as the
-        relay stays broken.
-        """
+    def test_a_refused_send_is_contained(self, addressed_superuser, no_push, settings, caplog):
+        """The state was saved before the notice was queued; the send failing must not raise into the worker."""
         settings.EMAIL_BACKEND = "maintenance.tests.test_notify_failure._RefusingBackend"
         with caplog.at_level(logging.WARNING):
-            announced = notify_job_state(self._job(), state="awaiting_verification")
-        assert announced == "awaiting_verification"
+            delivered = send_notice(self._job(), "awaiting_verification")
+        assert delivered == 0
 
     def test_the_address_never_reaches_the_log(self, addressed_superuser, no_push, settings, caplog):
         settings.EMAIL_BACKEND = "maintenance.tests.test_notify_failure._RefusingBackend"
         with caplog.at_level(logging.WARNING):
-            notify_job_state(self._job(), state="failed")
+            send_notice(self._job(), "failed")
         logged = "\n".join(record.getMessage() for record in caplog.records)
         assert SUPERUSER_ADDRESS not in logged
         assert "5.1.1" not in logged
@@ -67,7 +62,7 @@ class TestMailFailureIsContained:
     def test_no_traceback_is_attached(self, addressed_superuser, no_push, settings, caplog):
         settings.EMAIL_BACKEND = "maintenance.tests.test_notify_failure._RefusingBackend"
         with caplog.at_level(logging.WARNING):
-            notify_job_state(self._job(), state="failed")
+            send_notice(self._job(), "failed")
         assert [record for record in caplog.records if record.exc_info] == []
 
     def test_the_failure_is_recorded_at_all(self, addressed_superuser, no_push, settings, caplog):
@@ -75,7 +70,31 @@ class TestMailFailureIsContained:
         settings.EMAIL_BACKEND = "maintenance.tests.test_notify_failure._RefusingBackend"
         job = self._job()
         with caplog.at_level(logging.WARNING):
-            notify_job_state(job, state="failed")
+            send_notice(job, "failed")
         logged = "\n".join(record.getMessage() for record in caplog.records)
         assert str(job.job_id) in logged
         assert "SMTPRecipientsRefused" in logged
+
+
+class _RecordingBackend(BaseEmailBackend):
+    sent: list = []
+
+    def send_messages(self, email_messages):
+        type(self).sent.extend(email_messages)
+        return len(email_messages)
+
+
+@pytest.mark.django_db
+def test_every_superuser_gets_a_message_of_their_own(make_superuser, no_push, settings):
+    """A shared To line would hand every superuser's address to every other, and one refusal would fail them all."""
+    settings.EMAIL_BACKEND = "maintenance.tests.test_notify_failure._RecordingBackend"
+    _RecordingBackend.sent = []
+    for index in range(3):
+        make_superuser(email=f"root{index}@example.org")
+    job = MaintenanceJob.objects.create(operation="platform.update", executor="host", state="failed")
+    assert send_notice(job, "failed") == 3
+    assert sorted(tuple(message.to) for message in _RecordingBackend.sent) == [
+        ("root0@example.org",),
+        ("root1@example.org",),
+        ("root2@example.org",),
+    ]

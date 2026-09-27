@@ -8,6 +8,7 @@ import {
     submitTwoFactorCode as apiSubmitTwoFactorCode,
     type AuthUser,
 } from '#api/user'
+import { stepUpInfoFor } from '#lib/stepUp'
 import { isPushSupported, subscribeToPush, unsubscribeFromPush } from '#lib/webpush'
 
 /**
@@ -27,6 +28,8 @@ export const useAuthStore = defineStore('auth', () => {
     const isAuthenticated = computed(() => user.value !== null)
     const isStaff = computed(() => user.value?.is_staff === true || user.value?.is_superuser === true)
     const isSuperuser = computed(() => user.value?.is_superuser === true)
+    /** How the signed-in account confirms a sensitive request: which credentials the step-up prompt asks for. */
+    const stepUp = computed(() => stepUpInfoFor(user.value))
 
     /**
      * Re-fetch the current auth state from the server and report whether a user
@@ -139,6 +142,7 @@ export const useAuthStore = defineStore('auth', () => {
         isAuthenticated,
         isStaff,
         isSuperuser,
+        stepUp,
         init,
         refresh,
         login,

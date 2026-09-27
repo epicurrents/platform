@@ -10,6 +10,7 @@
  * @package    epicurrents-platform
  */
 
+import type { StepUpCredentials } from '#api/maintenance'
 import { http } from '#lib/http'
 
 /** A group as it appears inside an account payload. */
@@ -46,10 +47,16 @@ export interface Account {
     is_invite_pending: boolean
 }
 
-/** New-account payload. Only `username` is required; omitting `password` invites the holder to set their own, which needs `email`. */
+/**
+ * New-account payload. Only `username` is required; omitting `password` invites the holder to set their own, which
+ * needs `email`. `password` is the new account's; the caller's own step-up credentials are `current_password` and
+ * `totp_code`, required when a password is supplied or either staff tier is set.
+ */
 export interface AccountCreate {
     username: string
     password?: string
+    current_password?: string
+    totp_code?: string
     email?: string
     first_name?: string
     last_name?: string
@@ -58,8 +65,11 @@ export interface AccountCreate {
     is_superuser?: boolean
 }
 
-/** Partial account edit — omitted fields are left alone. Username is not editable. */
-export interface AccountUpdate {
+/**
+ * Partial account edit — omitted fields are left alone. Username is not editable. Step-up credentials are required
+ * when the edit changes either staff tier or the address, or activates the account.
+ */
+export interface AccountUpdate extends StepUpCredentials {
     email?: string
     first_name?: string
     last_name?: string
@@ -106,8 +116,13 @@ export async function fetchAccount(accountId: number): Promise<Account> {
     return response.data
 }
 
-export async function createAccount(payload: AccountCreate): Promise<Account> {
-    const response = await http.post<Account>('/api/v1/user/admin/accounts', payload)
+/** A created account, and whether its invitation was actually mailed — false when no mail backend is configured. */
+export interface AccountCreated extends Account {
+    invitation_sent: boolean
+}
+
+export async function createAccount(payload: AccountCreate): Promise<AccountCreated> {
+    const response = await http.post<AccountCreated>('/api/v1/user/admin/accounts', payload)
     return response.data
 }
 
@@ -121,10 +136,15 @@ export async function updateAccount(accountId: number, payload: AccountUpdate): 
  *
  * Deliberately does not end that account's open sessions — deactivation is the
  * control for a suspected compromise, and that does flush them. Copy around
- * this call must not imply otherwise.
+ * this call must not imply otherwise. Always needs the caller's step-up
+ * credentials, and is refused (409) on the caller's own account.
  */
-export async function setAccountPassword(accountId: number, newPassword: string): Promise<void> {
-    await http.post(`/api/v1/user/admin/accounts/${accountId}/password`, { new_password: newPassword })
+export async function setAccountPassword(
+    accountId: number,
+    newPassword: string,
+    credentials: StepUpCredentials,
+): Promise<void> {
+    await http.post(`/api/v1/user/admin/accounts/${accountId}/password`, { ...credentials, new_password: newPassword })
 }
 
 /**
@@ -132,14 +152,25 @@ export async function setAccountPassword(accountId: number, newPassword: string)
  *
  * Refused by the server for an account that already has a password or signs in
  * through a provider, so the control belongs behind `is_invite_pending`.
+ * `invitation_sent` is false on a deployment with no outgoing mail configured,
+ * where nothing reached the account holder.
  */
-export async function resendAccountInvitation (accountId: number): Promise<void> {
-    await http.post(`/api/v1/user/admin/accounts/${accountId}/invite`, {})
+export async function resendAccountInvitation (
+    accountId: number,
+): Promise<{ status: 'sent' | 'not_sent', invitation_sent: boolean }> {
+    const response = await http.post<{ status: 'sent' | 'not_sent', invitation_sent: boolean }>(
+        `/api/v1/user/admin/accounts/${accountId}/invite`,
+        {},
+    )
+    return response.data
 }
 
-/** Clear an account's second factor, so the holder can enrol again at next sign-in. */
-export async function resetAccountTwoFactor(accountId: number): Promise<void> {
-    await http.delete(`/api/v1/user/admin/accounts/${accountId}/2fa`)
+/**
+ * Clear an account's second factor, so the holder can enrol again at next sign-in. Always needs the caller's step-up
+ * credentials, sent as the DELETE body, and is refused (409) on the caller's own account.
+ */
+export async function resetAccountTwoFactor(accountId: number, credentials: StepUpCredentials): Promise<void> {
+    await http.delete(`/api/v1/user/admin/accounts/${accountId}/2fa`, { data: credentials })
 }
 
 /**
@@ -151,9 +182,15 @@ export async function resetAccountTwoFactor(accountId: number): Promise<void> {
  * user, and the account roster it would have to list is capped — so members
  * past the cap would be dropped by an operator who never saw them. Assigning
  * groups to a user is also the smaller list of the two in any real deployment.
+ * Adding the account to any group needs the caller's step-up credentials.
  */
-export async function setAccountGroups(accountId: number, groupIds: number[]): Promise<Account> {
+export async function setAccountGroups(
+    accountId: number,
+    groupIds: number[],
+    credentials: StepUpCredentials = {},
+): Promise<Account> {
     const response = await http.put<Account>(`/api/v1/user/admin/accounts/${accountId}/groups`, {
+        ...credentials,
         group_ids: groupIds,
     })
     return response.data
@@ -175,10 +212,11 @@ export async function createGroup(name: string): Promise<GroupDetail> {
  * `roles` is a partial map and the danger is padding it, not omitting from it:
  * the server leaves an absent key untouched and reads an explicit `null` as
  * "clear this role". Build the map with `rolesPayload` rather than by hand.
+ * Setting any role to a value needs the caller's step-up credentials.
  */
 export async function updateGroup(
     groupId: number,
-    payload: { name?: string, roles?: Record<string, string | null> },
+    payload: { name?: string, roles?: Record<string, string | null> } & StepUpCredentials,
 ): Promise<GroupDetail> {
     const response = await http.patch<GroupDetail>(`/api/v1/user/admin/groups/${groupId}`, payload)
     return response.data

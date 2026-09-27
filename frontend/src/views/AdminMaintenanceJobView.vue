@@ -2,20 +2,26 @@
 /**
  * One maintenance job: its timeline, its output or log, and the actions its state allows.
  *
- * Polls while the job is in flight, backing off as nothing changes. The
- * confirmation window counts down from the server's deadline against the
- * server's clock, so a browser whose clock is off still shows the right
- * remaining time. Confirm is the page's primary action; Roll back is a
- * danger action behind a dialog that says what is lost.
+ * Polls while the job is in flight, and while a confirmation or rollback it
+ * asked for waits for the agent to act on it, backing off as nothing
+ * changes. The confirmation window counts down from the server's deadline
+ * against the server's clock, so a browser whose clock is off still shows the
+ * right remaining time. Confirm is the page's primary action; Roll back is a
+ * danger action behind a dialog that says what is lost, and asks for an
+ * explicit acknowledgement when the restore brings back erased accounts.
+ * "Mark as failed" frees the one-job slot from a job whose executor is gone.
  *
  * @package    epicurrents-platform
  */
-import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
+import ErasureAcknowledgement from '#components/ErasureAcknowledgement.vue'
 import JobStateBadge from '#components/JobStateBadge.vue'
 import StepUpFields from '#components/StepUpFields.vue'
 import {
+    abandonJob,
     cancelJob,
+    erasureConflict,
     fetchJob,
     fetchJobLog,
     rollbackJob,
@@ -23,10 +29,13 @@ import {
     type JobLog,
     type MaintenanceJob,
 } from '#api/maintenance'
+import { useDialog } from '#composables/useDialog'
 import { usePolling } from '#composables/usePolling'
 import { t } from '#i18n'
 import { formatDateTime } from '#lib/datetime'
 import { errorDetail } from '#lib/http'
+import { jobReasonLabel } from '#lib/maintenanceLabels'
+import { stepUpBody } from '#lib/stepUp'
 import { showToast } from '#lib/toast'
 import { setPageTitle } from '#router'
 import { useAuthStore } from '#stores/auth'
@@ -39,7 +48,8 @@ const maintenanceStore = useMaintenanceStore()
 const route = useRoute()
 const router = useRouter()
 
-const jobId = String(route.params.id)
+/** Follows the route, so moving from one job to another reuses the page with the right id. */
+const jobId = computed(() => String(route.params.id))
 
 const job = ref<MaintenanceJob | null>(null)
 const log = ref<JobLog | null>(null)
@@ -47,31 +57,75 @@ const loading = ref(true)
 const loadError = ref('')
 
 const canWrite = computed(() => authStore.isSuperuser)
-const stepUp = computed(() => maintenanceStore.status?.step_up ?? { method: null, available: false, reason: null })
+/** The status says how this account confirms; before it has loaded, the account itself says the same. */
+const stepUp = computed(() => maintenanceStore.status?.step_up ?? authStore.stepUp)
 
-const showVerify = ref(false)
-const showRollback = ref(false)
-const showCancel = ref(false)
-const acting = ref(false)
-const actionError = ref('')
+const verifyDialog = useDialog()
+const rollbackDialog = useDialog()
+const cancelDialog = useDialog()
+const abandonDialog = useDialog()
 const credentials = reactive({ password: '', totp_code: '' })
+/** Set once a rollback came back asking for erasures to be acknowledged: how many accounts it brings back. */
+const erasures = ref<number | null>(null)
+const erasureAck = reactive({ acknowledged: false })
 
 /** Server clock minus browser clock, in milliseconds, from the last status read. */
 const clockOffset = ref(0)
 const now = ref(Date.now())
 let clockTimer: ReturnType<typeof setInterval> | undefined
+/** Sequence of the newest job read; an older answer landing later is dropped. */
+let loadSeq = 0
 
 /** The one operation with a verification window; the confirm and roll-back actions belong to it alone. */
 const UPDATE_OPERATION = 'platform.update'
 
-const canCancel = computed(() => job.value?.state === 'requested')
+/** A host request the agent has claimed publishes its first step; from then on it cannot be withdrawn. */
+const canCancel = computed(() => job.value?.state === 'requested' && !job.value.step)
 const isUpdate = computed(() => job.value?.operation === UPDATE_OPERATION)
-const canVerify = computed(() => isUpdate.value && job.value?.state === 'awaiting_verification')
-const canRollback = computed(() => {
-    if (!isUpdate.value || !job.value) {
+const verifyPending = computed(() => {
+    return job.value?.state === 'awaiting_verification' && job.value.verify_requested_at !== null
+})
+const rollbackPending = computed(() => {
+    const current = job.value
+    if (!current || current.rollback_requested_at === null) {
         return false
     }
-    return job.value.state === 'awaiting_verification' || (job.value.state === 'succeeded' && job.value.snapshot !== '')
+    return current.state === 'awaiting_verification' || current.state === 'succeeded'
+})
+const canVerify = computed(() => {
+    const current = job.value
+    if (!isUpdate.value || !current || current.state !== 'awaiting_verification') {
+        return false
+    }
+    if (current.verify_requested_at !== null || current.rollback_requested_at !== null) {
+        return false
+    }
+    return secondsLeft.value === null || secondsLeft.value > 0
+})
+const canRollback = computed(() => {
+    const current = job.value
+    if (!isUpdate.value || !current || current.rollback_requested_at !== null) {
+        return false
+    }
+    if (current.state === 'awaiting_verification') {
+        return current.verify_requested_at === null
+    }
+    return current.state === 'succeeded' && current.snapshot !== ''
+})
+/**
+ * Whether the executor of an in-flight job is gone, which is when the server lets it be abandoned: a worker job at
+ * any time, a host job only while the agent is absent or has stopped reporting.
+ */
+const canAbandon = computed(() => {
+    const current = job.value
+    if (!current?.in_flight) {
+        return false
+    }
+    if (current.executor !== 'host') {
+        return true
+    }
+    const agent = maintenanceStore.status?.agent
+    return agent !== undefined && (!agent.installed || agent.stale === true)
 })
 /** An update that applied no migration is rolled back with the database kept; the dialog says which it is. */
 const keepsDatabase = computed(() => job.value?.migrations_applied === false)
@@ -102,7 +156,10 @@ const facts = computed(() => {
     }
     const rows: { label: string, value: string }[] = [
         { label: t('Operation', SCOPE), value: current.operation },
-        { label: t('Executor', SCOPE), value: current.executor === 'host' ? t('Host agent', SCOPE) : t('Worker', SCOPE) },
+        {
+            label: t('Executor', SCOPE),
+            value: current.executor === 'host' ? t('Host agent', SCOPE) : t('Worker', SCOPE),
+        },
         { label: t('Requested by', SCOPE), value: current.requested_by ?? t('Unknown', SCOPE) },
         { label: t('Requested', SCOPE), value: formatDateTime(current.created_at) },
     ]
@@ -116,7 +173,7 @@ const facts = computed(() => {
         rows.push({ label: t('Step', SCOPE), value: current.step })
     }
     if (current.reason) {
-        rows.push({ label: t('Reason', SCOPE), value: current.reason })
+        rows.push({ label: t('Reason', SCOPE), value: jobReasonLabel(current.reason) })
     }
     if (current.target_version) {
         rows.push({ label: t('Target version', SCOPE), value: current.target_version })
@@ -158,29 +215,51 @@ const outputText = computed(() => {
 })
 
 function fingerprint (current: MaintenanceJob | null) {
-    return current ? `${current.state}:${current.step}:${current.finished_at ?? ''}:${current.verify_deadline ?? ''}` : ''
+    if (!current) {
+        return ''
+    }
+    const marks = `${current.verify_requested_at ?? ''}:${current.rollback_requested_at ?? ''}`
+    return `${current.state}:${current.step}:${current.finished_at ?? ''}:${current.verify_deadline ?? ''}:${marks}`
+}
+
+/** Whether the job still changes by itself: in flight, or holding a request the agent has yet to act on. */
+function stillMoving (current: MaintenanceJob) {
+    if (current.in_flight) {
+        return true
+    }
+    return current.rollback_requested_at !== null && current.state === 'succeeded'
 }
 
 async function loadJob (): Promise<boolean> {
-    const fresh = await fetchJob(jobId)
-    const changed = fingerprint(fresh) !== fingerprint(job.value)
-    job.value = fresh
-    setPageTitle(fresh.operation)
+    const seq = ++loadSeq
+    const id = jobId.value
+    const fresh = await fetchJob(id)
+    let freshLog: JobLog | null = null
     if (canWrite.value) {
         // The log grows while the job runs; a read per poll keeps it current.
         try {
-            log.value = await fetchJobLog(jobId)
+            freshLog = await fetchJobLog(id)
         } catch {
-            log.value = null
+            freshLog = null
         }
     }
+    if (seq !== loadSeq) {
+        return false
+    }
+    const changed = fingerprint(fresh) !== fingerprint(job.value)
+    job.value = fresh
+    log.value = freshLog
+    loadError.value = ''
+    setPageTitle(fresh.operation)
     if (changed) {
         const status = await maintenanceStore.refreshStatus()
         if (status) {
             clockOffset.value = Date.parse(status.server_now) - Date.now()
         }
     }
-    if (!fresh.in_flight) {
+    if (stillMoving(fresh)) {
+        poll.start()
+    } else {
         poll.stop()
     }
     return changed
@@ -189,15 +268,17 @@ async function loadJob (): Promise<boolean> {
 const poll = usePolling(loadJob, { immediate: false })
 
 async function load () {
+    poll.stop()
+    job.value = null
+    log.value = null
     loading.value = true
     loadError.value = ''
     try {
         await loadJob()
-        if (job.value?.in_flight) {
-            poll.start()
-        }
     } catch (err) {
         loadError.value = errorDetail(err, t('The job could not be loaded.', SCOPE))
+        // A maintenance window or a restart answers with errors for a while; keep asking.
+        poll.start()
     } finally {
         loading.value = false
     }
@@ -207,59 +288,99 @@ function goBack () {
     router.push({ name: 'admin-maintenance' })
 }
 
-function openDialog (which: 'verify' | 'rollback' | 'cancel') {
-    actionError.value = ''
+function resetForm () {
     credentials.password = ''
     credentials.totp_code = ''
-    showVerify.value = which === 'verify'
-    showRollback.value = which === 'rollback'
-    showCancel.value = which === 'cancel'
+    erasures.value = null
+    erasureAck.acknowledged = false
 }
 
-function closeDialogs () {
-    if (acting.value) {
+function openVerify () {
+    resetForm()
+    verifyDialog.show()
+}
+
+function openRollback () {
+    resetForm()
+    rollbackDialog.show()
+}
+
+function openCancel () {
+    cancelDialog.show()
+}
+
+function openAbandon () {
+    resetForm()
+    abandonDialog.show()
+}
+
+/** Adopt what the server answered, keep polling while it has more to report, and say so. */
+async function acted (fresh: MaintenanceJob | undefined, done: string) {
+    if (!fresh) {
         return
     }
-    showVerify.value = false
-    showRollback.value = false
-    showCancel.value = false
-}
-
-async function act (perform: () => Promise<MaintenanceJob>, done: string) {
-    actionError.value = ''
-    acting.value = true
-    try {
-        job.value = await perform()
-        closeDialogs()
-        showToast(done, 'neutral')
-        if (job.value.in_flight) {
-            poll.start()
-        }
-        await poll.refresh()
-    } catch (err) {
-        actionError.value = errorDetail(err, t('The request was refused.', SCOPE))
-    } finally {
-        acting.value = false
+    job.value = fresh
+    showToast(done, 'neutral')
+    if (stillMoving(fresh)) {
+        poll.start()
     }
+    await poll.refresh()
 }
 
-function confirmVerify () {
-    act(
-        () => verifyJob(jobId, { password: credentials.password || undefined }),
-        t('Confirmation sent. The agent completes the update on its next tick.', SCOPE),
+async function confirmVerify () {
+    const fresh = await verifyDialog.run(
+        () => verifyJob(jobId.value, stepUpBody(credentials)),
+        { fallback: t('The request was refused.', SCOPE) },
     )
+    await acted(fresh, t('Confirmation sent. The agent completes the update on its next tick.', SCOPE))
 }
 
-function confirmRollback () {
-    act(
-        () => rollbackJob(jobId, { password: credentials.password || undefined, totp_code: credentials.totp_code || undefined }),
-        t('Rollback requested. The agent restores the previous release on its next tick.', SCOPE),
+async function confirmRollback () {
+    const acknowledge = erasures.value !== null && erasureAck.acknowledged
+    const fresh = await rollbackDialog.run(
+        () => rollbackJob(jobId.value, {
+            ...stepUpBody(credentials),
+            ...(acknowledge ? { acknowledge_erasures: true } : {}),
+        }),
+        {
+            fallback: t('The request was refused.', SCOPE),
+            onError: (err) => {
+                const count = erasureConflict(err)
+                if (count === null) {
+                    return false
+                }
+                erasures.value = count
+                erasureAck.acknowledged = false
+                return true
+            },
+        },
     )
+    await acted(fresh, t('Rollback requested. The agent restores the previous release on its next tick.', SCOPE))
 }
 
-function confirmCancel () {
-    act(() => cancelJob(jobId), t('Job cancelled.', SCOPE))
+async function confirmCancel () {
+    const fresh = await cancelDialog.run(
+        () => cancelJob(jobId.value),
+        { fallback: t('The request was refused.', SCOPE) },
+    )
+    await acted(fresh, t('Job cancelled.', SCOPE))
 }
+
+async function confirmAbandon () {
+    const fresh = await abandonDialog.run(
+        () => abandonJob(jobId.value, stepUpBody(credentials)),
+        { fallback: t('The request was refused.', SCOPE) },
+    )
+    await acted(fresh, t('Job marked as failed.', SCOPE))
+}
+
+// Another job's id while this page stays mounted. Leaving for another route
+// clears the param too, and must not fetch a job called "undefined".
+watch(() => route.params.id, (id, previous) => {
+    if (typeof id === 'string' && id !== previous) {
+        load()
+    }
+})
 
 onMounted(() => {
     load()
@@ -286,8 +407,9 @@ onBeforeUnmount(() => {
 
         <wa-spinner v-if="loading" class="loading-center"></wa-spinner>
 
-        <wa-callout v-else-if="loadError" variant="danger">
+        <wa-callout v-else-if="loadError && !job" variant="danger">
             {{ loadError }}
+            <span class="callout-aside">{{ t('Trying again.', SCOPE) }}</span>
         </wa-callout>
 
         <template v-else-if="job">
@@ -297,16 +419,24 @@ onBeforeUnmount(() => {
                     <wa-button v-if="canWrite && canCancel"
                         appearance="plain"
                         size="s"
-                        @click="openDialog('cancel')"
+                        @click="openCancel"
                     >
                         <wa-icon name="ban" slot="start"></wa-icon>
                         {{ t('Cancel request', SCOPE) }}
+                    </wa-button>
+                    <wa-button v-if="canWrite && job.in_flight"
+                        appearance="plain"
+                        size="s"
+                        @click="openAbandon"
+                    >
+                        <wa-icon name="circle-exclamation" slot="start"></wa-icon>
+                        {{ t('Mark as failed', SCOPE) }}
                     </wa-button>
                     <wa-button v-if="canWrite && canRollback"
                         appearance="plain"
                         size="s"
                         variant="danger"
-                        @click="openDialog('rollback')"
+                        @click="openRollback"
                     >
                         <wa-icon name="rotate-left" slot="start"></wa-icon>
                         {{ t('Roll back', SCOPE) }}
@@ -315,7 +445,7 @@ onBeforeUnmount(() => {
                         appearance="filled-outlined"
                         size="s"
                         variant="brand"
-                        @click="openDialog('verify')"
+                        @click="openVerify"
                     >
                         <wa-icon name="check" slot="start"></wa-icon>
                         {{ t('Confirm update', SCOPE) }}
@@ -330,7 +460,15 @@ onBeforeUnmount(() => {
                 </wa-badge>
             </div>
 
-            <wa-callout v-if="job.state === 'awaiting_verification'" variant="warning">
+            <wa-callout v-if="rollbackPending" variant="warning">
+                {{ t('A rollback was requested. The agent restores the previous release on its next tick.', SCOPE) }}
+            </wa-callout>
+
+            <wa-callout v-else-if="verifyPending" variant="neutral">
+                {{ t('The update was confirmed. The agent completes it on its next tick.', SCOPE) }}
+            </wa-callout>
+
+            <wa-callout v-else-if="job.state === 'awaiting_verification'" variant="warning">
                 <strong>{{ t('The update is running and waits for your confirmation.', SCOPE) }}</strong>
                 {{ t('Check that the platform works, then confirm. Without a confirmation it is rolled back when the window closes.', SCOPE) }}
                 <span v-if="countdown"> {{ t('Time left: {countdown}', SCOPE, { countdown }) }}</span>
@@ -368,10 +506,10 @@ onBeforeUnmount(() => {
         </template>
     </main>
 
-    <wa-dialog :label="t('Confirm update', SCOPE)" :open="showVerify" @wa-hide.self="closeDialogs">
+    <wa-dialog :label="t('Confirm update', SCOPE)" :open="verifyDialog.open.value" @wa-hide.self="verifyDialog.onHide">
         <div class="job-form">
-            <wa-callout v-if="actionError" variant="danger">
-                {{ actionError }}
+            <wa-callout v-if="verifyDialog.error.value" variant="danger">
+                {{ verifyDialog.error.value }}
             </wa-callout>
             <p class="dialog-text">
                 {{ t('Confirming keeps the new release. The pre-update snapshot stays available for a later rollback for as long as snapshots are kept.', SCOPE) }}
@@ -381,15 +519,16 @@ onBeforeUnmount(() => {
         <div slot="footer" class="form-actions">
             <wa-button
                 appearance="filled-outlined"
-                :disabled="acting"
+                :disabled="verifyDialog.busy.value"
                 variant="neutral"
-                @click="closeDialogs"
+                @click="verifyDialog.close"
             >
                 {{ t('Cancel', SCOPE) }}
             </wa-button>
             <wa-button
                 appearance="filled-outlined"
-                :loading="acting"
+                :disabled="!stepUp.available"
+                :loading="verifyDialog.busy.value"
                 variant="brand"
                 @click="confirmVerify"
             >
@@ -398,10 +537,10 @@ onBeforeUnmount(() => {
         </div>
     </wa-dialog>
 
-    <wa-dialog :label="t('Roll back', SCOPE)" :open="showRollback" @wa-hide.self="closeDialogs">
+    <wa-dialog :label="t('Roll back', SCOPE)" :open="rollbackDialog.open.value" @wa-hide.self="rollbackDialog.onHide">
         <div class="job-form">
-            <wa-callout v-if="actionError" variant="danger">
-                {{ actionError }}
+            <wa-callout v-if="rollbackDialog.error.value" variant="danger">
+                {{ rollbackDialog.error.value }}
             </wa-callout>
             <wa-callout v-if="keepsDatabase" variant="warning">
                 {{ t('This update applied no migration, so rolling back restores the previous code and keeps the database; nothing written since the update is lost. The platform is unavailable while the previous release is rebuilt.', SCOPE) }}
@@ -409,20 +548,22 @@ onBeforeUnmount(() => {
             <wa-callout v-else variant="danger">
                 {{ t('Rolling back restores the database as it was before the update. Everything written since then is lost, including your own changes. The platform is unavailable while the previous release is rebuilt.', SCOPE) }}
             </wa-callout>
+            <ErasureAcknowledgement v-if="erasures !== null" :count="erasures" :state="erasureAck" />
             <StepUpFields :credentials="credentials" :step-up="stepUp" />
         </div>
         <div slot="footer" class="form-actions">
             <wa-button
                 appearance="filled-outlined"
-                :disabled="acting"
+                :disabled="rollbackDialog.busy.value"
                 variant="neutral"
-                @click="closeDialogs"
+                @click="rollbackDialog.close"
             >
                 {{ t('Cancel', SCOPE) }}
             </wa-button>
             <wa-button
                 appearance="filled-outlined"
-                :loading="acting"
+                :disabled="!stepUp.available || (erasures !== null && !erasureAck.acknowledged)"
+                :loading="rollbackDialog.busy.value"
                 variant="danger"
                 @click="confirmRollback"
             >
@@ -431,10 +572,10 @@ onBeforeUnmount(() => {
         </div>
     </wa-dialog>
 
-    <wa-dialog :label="t('Cancel request', SCOPE)" :open="showCancel" @wa-hide.self="closeDialogs">
+    <wa-dialog :label="t('Cancel request', SCOPE)" :open="cancelDialog.open.value" @wa-hide.self="cancelDialog.onHide">
         <div class="job-form">
-            <wa-callout v-if="actionError" variant="danger">
-                {{ actionError }}
+            <wa-callout v-if="cancelDialog.error.value" variant="danger">
+                {{ cancelDialog.error.value }}
             </wa-callout>
             <p class="dialog-text">
                 {{ t('Withdraw this request? It has not been picked up yet, so nothing has run.', SCOPE) }}
@@ -443,19 +584,62 @@ onBeforeUnmount(() => {
         <div slot="footer" class="form-actions">
             <wa-button
                 appearance="filled-outlined"
-                :disabled="acting"
+                :disabled="cancelDialog.busy.value"
                 variant="neutral"
-                @click="closeDialogs"
+                @click="cancelDialog.close"
             >
                 {{ t('Keep it', SCOPE) }}
             </wa-button>
             <wa-button
                 appearance="filled-outlined"
-                :loading="acting"
+                :loading="cancelDialog.busy.value"
                 variant="danger"
                 @click="confirmCancel"
             >
                 {{ t('Cancel request', SCOPE) }}
+            </wa-button>
+        </div>
+    </wa-dialog>
+
+    <wa-dialog
+        :label="t('Mark as failed', SCOPE)"
+        :open="abandonDialog.open.value"
+        @wa-hide.self="abandonDialog.onHide"
+    >
+        <div class="job-form">
+            <wa-callout v-if="abandonDialog.error.value" variant="danger">
+                {{ abandonDialog.error.value }}
+            </wa-callout>
+            <p class="dialog-text">
+                {{ t('Marking the job as failed frees the slot so another job can be requested. Use it for a job whose executor is gone: a worker job at any time, a host job only while the agent is not reporting. A running agent reports the outcome itself.', SCOPE) }}
+            </p>
+            <template v-if="canAbandon">
+                <wa-callout variant="warning">
+                    {{ t('Nothing is stopped or undone on the host. Check what the job left behind before starting another.', SCOPE) }}
+                </wa-callout>
+                <StepUpFields :credentials="credentials" :step-up="stepUp" />
+            </template>
+            <wa-callout v-else variant="neutral">
+                {{ t('The host agent is running and reports the outcome of this job itself.', SCOPE) }}
+            </wa-callout>
+        </div>
+        <div slot="footer" class="form-actions">
+            <wa-button
+                appearance="filled-outlined"
+                :disabled="abandonDialog.busy.value"
+                variant="neutral"
+                @click="abandonDialog.close"
+            >
+                {{ t('Cancel', SCOPE) }}
+            </wa-button>
+            <wa-button
+                appearance="filled-outlined"
+                :disabled="!canAbandon || !stepUp.available"
+                :loading="abandonDialog.busy.value"
+                variant="danger"
+                @click="confirmAbandon"
+            >
+                {{ t('Mark as failed', SCOPE) }}
             </wa-button>
         </div>
     </wa-dialog>
@@ -521,5 +705,10 @@ onBeforeUnmount(() => {
 
 .dialog-text {
     margin: 0;
+}
+
+.callout-aside {
+    color: var(--wa-color-text-quiet);
+    margin-left: var(--wa-space-2xs);
 }
 </style>

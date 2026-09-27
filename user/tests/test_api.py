@@ -87,7 +87,7 @@ class TestMeEndpoint:
 
     def test_patch_updates_profile(self, auth_client):
         c, _ = auth_client
-        resp = patch_json(c, ME_URL, {"email": "new@example.com", "first_name": "Alice"})
+        resp = patch_json(c, ME_URL, {"email": "new@example.com", "first_name": "Alice", "password": "testpass123"})
         assert resp.status_code == 200
         data = resp.json()
         assert data["email"] == "new@example.com"
@@ -306,6 +306,62 @@ class TestPasswordResetConfirm:
 
 
 @pytest.mark.django_db
+class TestResetConfirmRefusesInactiveAccounts:
+    """Deactivation answers a compromise; a link minted before it must not reopen the account."""
+
+    def test_a_deactivated_account_gets_the_invalid_link_answer(self, client, make_user):
+        user = make_user(username="deactivated_reset", password="Old-Passphrase-42", email="dr@example.com")
+        uid = urlsafe_base64_encode(force_bytes(user.pk))
+        token = default_token_generator.make_token(user)
+        user.is_active = False
+        user.save(update_fields=["is_active"])
+        resp = post_json(client, RESET_CONFIRM_URL, {"uid": uid, "token": token, "new_password": "N3w-Passphrase-42"})
+        assert resp.status_code == 400
+        assert resp.json()["detail"] == "Reset link is invalid or has expired"
+        user.refresh_from_db()
+        assert user.check_password("Old-Passphrase-42")
+
+
+@pytest.mark.django_db
+class TestProfileEmailNeedsStepUp:
+    """The address is where a reset link goes, so changing it from a session alone is a takeover."""
+
+    def test_an_email_change_without_the_password_is_refused(self, auth_client):
+        c, user = auth_client
+        resp = patch_json(c, ME_URL, {"email": "attacker@example.com"})
+        assert resp.status_code == 400
+        user.refresh_from_db()
+        assert user.email != "attacker@example.com"
+
+    def test_a_wrong_password_is_refused(self, auth_client):
+        c, user = auth_client
+        assert patch_json(c, ME_URL, {"email": "attacker@example.com", "password": "wrong"}).status_code == 400
+
+    def test_the_new_address_is_marked_self_asserted(self, auth_client):
+        c, user = auth_client
+        assert patch_json(c, ME_URL, {"email": "mine@example.com", "password": "testpass123"}).status_code == 200
+        user.refresh_from_db()
+        assert user.email_self_asserted is True
+
+    def test_names_and_an_unchanged_address_need_nothing(self, auth_client):
+        c, user = auth_client
+        user.email = "same@example.com"
+        user.save(update_fields=["email"])
+        resp = patch_json(c, ME_URL, {"email": user.email, "first_name": "Unconfirmed"})
+        assert resp.status_code == 200
+        user.refresh_from_db()
+        assert user.email_self_asserted is False
+
+    def test_the_change_is_a_security_event(self, auth_client, caplog):
+        c, user = auth_client
+        with caplog.at_level("WARNING", logger="epicurrents.security"):
+            patch_json(c, ME_URL, {"email": "logged@example.com", "password": "testpass123"})
+        events = [r for r in caplog.records if getattr(r, "security_event_type", "") == "auth.email_changed"]
+        assert [e.actor_id for e in events] == [user.pk]
+        assert "logged@example.com" not in caplog.text
+
+
+@pytest.mark.django_db
 class TestLoginRateLimiting:
     """Login endpoint must lock out after too many failed attempts."""
 
@@ -504,7 +560,7 @@ class TestUserAuditTrail:
         from activity.models import Activity
 
         c, user = auth_client
-        resp = patch_json(c, ME_URL, {"email": "new@example.com", "first_name": "Al"})
+        resp = patch_json(c, ME_URL, {"email": "new@example.com", "first_name": "Al", "password": "testpass123"})
         assert resp.status_code == 200
 
         activity = Activity.objects.filter(verb="user.profile.update").latest("created_at")

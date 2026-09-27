@@ -64,7 +64,12 @@ class TestCreationByInvitation:
             response = post_json(
                 su_client,
                 ACCOUNTS,
-                {"username": "self_served", "password": "Str0ng-Passphrase-42", "email": "s@example.com"},
+                {
+                    "username": "self_served",
+                    "password": "Str0ng-Passphrase-42",
+                    "email": "s@example.com",
+                    "current_password": "adminpass123",
+                },
             )
         assert response.status_code == 201
         assert response.json()["is_invite_pending"] is False
@@ -120,7 +125,7 @@ class TestBrokerPayload:
                 post_json(su_client, ACCOUNTS, {"username": "leak_invite", "email": "leak_invite@example.com"})
         serialized = repr(delay.call_args)
         assert "leak_invite@example.com" not in serialized
-        assert "reset-password?uid=" not in serialized
+        assert "uid=" not in serialized
 
 
 @pytest.mark.django_db
@@ -143,14 +148,14 @@ class TestTheTaskItself:
         account = self._invited(make_user, username="task_invite", email="task_invite@example.com")
         kwargs = self._send(account.pk).call_args.kwargs
         assert kwargs["recipient_list"] == ["task_invite@example.com"]
-        assert "https://eeg.example.com/reset-password?uid=" in kwargs["message"]
+        assert "https://eeg.example.com/reset-password#uid=" in kwargs["message"]
         assert "token=" in kwargs["message"]
         assert "welcome=1" in kwargs["message"]
 
     def test_a_trailing_slash_in_frontend_url_does_not_double(self, make_user, settings):
         settings.FRONTEND_URL = "https://eeg.example.com/"
         account = self._invited(make_user, username="slash_invite", email="slash_invite@example.com")
-        assert "https://eeg.example.com/reset-password?uid=" in self._send(account.pk).call_args.kwargs["message"]
+        assert "https://eeg.example.com/reset-password#uid=" in self._send(account.pk).call_args.kwargs["message"]
 
     def test_an_account_that_has_since_set_a_password_is_left_alone(self, make_user):
         """The person can follow a link and set a password in the seconds before

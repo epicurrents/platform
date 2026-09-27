@@ -6,12 +6,20 @@ Layout under ``MAINTENANCE_SPOOL_PATH`` (``./update`` in the deployment root,
 
     agent.json                 agent heartbeat: version, enabled, runtime, last_run
     maintenance.json           the lock flag (maintenance.lock)
+    erasures.jsonl             account erasures, appended by erase_user (maintenance.erasures)
     packages/<sha256>/         an uploaded package with its manifest and signature
     jobs/<id>.json             a request written by Django
+    jobs/<id>.claimed.json     the same request, renamed by the agent when it takes it
     jobs/<id>.verify           a marker: the superuser confirmed the update
     jobs/<id>.rollback         a marker: the superuser asked for a rollback
-    jobs/<id>.status.json      the agent's view of the job
-    jobs/<id>.log              the agent's tee of update.sh
+    jobs/<id>.status.json      the agent's published view of the job
+    jobs/<id>.log              the agent's published copy of the job log
+
+The agent publishes; everything the web tier writes is presence to it, never
+content it trusts. It claims a request by renaming ``<id>.json`` to
+``<id>.claimed.json`` before it reads anything, which is what makes a cancel
+decisive: :func:`remove_request` unlinks ``<id>.json`` and either succeeds, and
+the agent never sees the request, or finds it gone, and the agent has it.
 
 The spool, not the database, is the authoritative record of a host-tier job:
 the rollback restores the pre-update dump and erases every row written after
@@ -27,7 +35,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 from django.core.cache import cache
-from django.db import IntegrityError, models, transaction
+from django.db import DatabaseError, IntegrityError, models, transaction
 from django.utils import timezone
 
 from epicurrents.security_log import log_security_event
@@ -93,6 +101,11 @@ def packages_dir() -> Path:
 def request_path(job_id) -> Path:
     """The request file of ``job_id``."""
     return jobs_dir() / f"{job_id}.json"
+
+
+def claimed_path(job_id) -> Path:
+    """The request file of ``job_id`` once the agent has claimed it."""
+    return jobs_dir() / f"{job_id}.claimed.json"
 
 
 def status_path(job_id) -> Path:
@@ -169,7 +182,7 @@ def is_writable() -> bool:
 
 
 def write_request(job) -> Path:
-    """Write the request file the agent picks up. Called on commit of the job row."""
+    """Write the request file the agent picks up. Called once the job row has committed."""
     path = request_path(job.job_id)
     write_json_atomic(
         path,
@@ -186,7 +199,12 @@ def write_request(job) -> Path:
 
 
 def remove_request(job) -> bool:
-    """Delete the request file; ``True`` when there was one."""
+    """Withdraw the request before the agent claims it; ``False`` when it had already been claimed or was gone.
+
+    The unlink is the whole decision. The agent claims by renaming the same
+    file, so exactly one of the two succeeds; a caller that gets ``False`` must
+    leave the row to the agent.
+    """
     try:
         request_path(job.job_id).unlink()
     except FileNotFoundError:
@@ -202,8 +220,8 @@ def write_marker(job, kind: str, *, by_user_id) -> Path:
 
 
 def read_request(job_id) -> dict | None:
-    """The request file, parsed."""
-    return read_json(request_path(job_id))
+    """The request file, parsed, whether or not the agent has claimed it."""
+    return read_json(request_path(job_id)) or read_json(claimed_path(job_id))
 
 
 def read_status(job_id) -> dict | None:
@@ -319,6 +337,7 @@ def _log_state(job) -> None:
 
 
 def _job_id_of(path: Path, suffix: str):
+    """The job id a file in ``jobs/`` is named for, when it ends in ``suffix`` and the rest is a UUID."""
     name = path.name
     if not name.endswith(suffix):
         return None
@@ -338,18 +357,48 @@ def _scan_jobs() -> tuple[dict, dict]:
     for path in directory.iterdir():
         if not path.is_file():
             continue
+        # The longer suffixes first: "<id>.status.json" and "<id>.claimed.json"
+        # both end in ".json", and a claimed request is still a request.
         job_id = _job_id_of(path, ".status.json")
         if job_id is not None:
             data = read_json(path)
             if data is not None:
                 statuses[job_id] = data
             continue
-        job_id = _job_id_of(path, ".json")
+        job_id = _job_id_of(path, ".claimed.json")
+        if job_id is None:
+            job_id = _job_id_of(path, ".json")
         if job_id is not None:
             data = read_json(path)
             if data is not None:
-                requests[job_id] = data
+                requests.setdefault(job_id, data)
     return requests, statuses
+
+
+def _status_allowed(current: str, new: str) -> bool:
+    """Whether a status file may move a row from ``current`` to ``new``.
+
+    A cancelled row is final: the cancel won the race for the request file, so
+    any status naming the job is a stray. A settled row never goes back in
+    flight, with the one move the protocol has for it, a late rollback of a
+    succeeded update; a row settled by the web tier (abandoned, stale) may
+    still learn the outcome the agent reports.
+    """
+    from maintenance.models import MaintenanceJob
+
+    if current == MaintenanceJob.State.CANCELLED:
+        return False
+    if current in MaintenanceJob.IN_FLIGHT_STATES or new not in MaintenanceJob.IN_FLIGHT_STATES:
+        return True
+    return current == MaintenanceJob.State.SUCCEEDED and new == MaintenanceJob.State.ROLLING_BACK
+
+
+def _clip(name: str, value: str) -> str:
+    """``value`` cut to the column's length: an overlong field in a status file must not fail every sync."""
+    from maintenance.models import MaintenanceJob
+
+    limit = MaintenanceJob._meta.get_field(name).max_length
+    return value[:limit] if limit else value
 
 
 def _apply_status(job, status: dict) -> bool:
@@ -366,6 +415,9 @@ def _apply_status(job, status: dict) -> bool:
     if state not in MaintenanceJob.State.values:
         logger.warning("Status file of job %s names unknown state %r; ignored", job.job_id, state)
         return False
+    if job.pk is not None and not _status_allowed(job.state, state):
+        logger.warning("Status file of job %s would move it from %s to %s; ignored", job.job_id, job.state, state)
+        return False
     job.state = state
     job.in_flight = state in MaintenanceJob.IN_FLIGHT_STATES
     for name in _STATUS_TEXT_FIELDS:
@@ -374,7 +426,7 @@ def _apply_status(job, status: dict) -> bool:
             # A rollback's status file names no target; the row's, taken from
             # the snapshot when the request was made, stands.
             continue
-        setattr(job, name, str(value) if value is not None else "")
+        setattr(job, name, _clip(name, str(value)) if value is not None else "")
     for name in _STATUS_TIME_FIELDS:
         setattr(job, name, parse_timestamp(status.get(name)))
     applied = status.get("migrations_applied")
@@ -424,20 +476,96 @@ def _row_from_request(job_id, request: dict, status: dict | None):
     return job
 
 
+def overlay(jobs):
+    """Show each in-flight host-tier row with its newer status file applied, in memory only.
+
+    The read path while the lock phase is ``updating`` or ``rolling_back``: the
+    database is between the pre-update dump and the recreate, and a row written
+    now is lost to the restore or lands in a schema about to change, so the job
+    page answers from the spool without :func:`sync`. Returns ``jobs``.
+    """
+    from maintenance.models import MaintenanceJob
+
+    for job in jobs:
+        if job.executor == MaintenanceJob.Executor.HOST and job.in_flight:
+            status = read_status(job.job_id)
+            if status is not None:
+                _apply_status(job, status)
+    return jobs
+
+
+def restored_database(job) -> bool:
+    """Whether ``job`` settled in a state whose outcome put an older database in place.
+
+    A rolled-back update (conservatively: the agent keeps the database only when
+    no migration ran, and the re-erasure that follows is harmless when it did),
+    or a ``platform.rollback`` that did not ask to keep the database.
+    """
+    from maintenance.models import MaintenanceJob
+
+    if job.operation == "platform.update":
+        return job.state == MaintenanceJob.State.ROLLED_BACK
+    if job.operation == "platform.rollback":
+        return job.state == MaintenanceJob.State.SUCCEEDED and (job.args or {}).get("restore_database") is not False
+    return False
+
+
+def _dispatch_erasure_reapply() -> None:
+    """Queue ``reapply_erasures`` for after the commit; a broker that is down is logged, and the next restore retries."""
+
+    def _dispatch():
+        try:
+            from maintenance.tasks import reapply_erasures
+
+            reapply_erasures.delay()
+        except Exception:
+            logger.exception("Re-applying erasures after a database restore could not be dispatched")
+
+    transaction.on_commit(_dispatch)
+
+
+def _save(job, *, notify: bool, **kwargs) -> bool:
+    """Save ``job`` in its own savepoint, queueing its notice only if the save lands; ``False`` when it did not."""
+    from maintenance.notify import dispatch_notice
+
+    try:
+        with transaction.atomic():
+            job.save(**kwargs)
+            if notify:
+                dispatch_notice(job, job.state)
+    except IntegrityError:
+        # The spool reports this job in flight while another row is. Cannot
+        # both be true; the row keeps its state and the next tick tries again
+        # once the other job has settled.
+        logger.warning("Job %s from the spool would put a second job in flight; not saved this tick", job.job_id)
+        return False
+    except DatabaseError:
+        logger.exception("Job %s could not be saved from the spool; not saved this tick", job.job_id)
+        return False
+    return True
+
+
 def sync(*, force: bool = False) -> dict:
     """Project the spool onto the job rows.
 
     Applies each newer ``status.json`` to its row, re-creates rows whose request
-    file exists without one, and fails an in-flight host-tier row that has
-    neither file as ``orphaned``. Runs under a short cache lock so the callers —
-    every maintenance read, the top of every write, the beat task — do not
-    stampede; ``force`` skips the lock. Opens an audited scope only when there is
-    something to write, so the minute tick does not inflate the audit trail.
+    file (claimed or not) exists without one, and fails an in-flight host-tier
+    row that has neither file as ``orphaned``. Runs under a short cache lock so
+    the callers — every maintenance read, the top of every write, the beat task
+    — do not stampede; ``force`` skips the lock. Opens an audited scope only
+    when there is something to write, so the minute tick does not inflate the
+    audit trail.
+
+    Each row is saved before anything is announced: the notice is queued in the
+    save's own transaction and sent from a worker after the commit, so a status
+    that cannot be saved announces nothing and a slow relay never runs under the
+    lock. A job that settles having restored the database queues the re-erasure
+    of the accounts the restore brought back (``maintenance.erasures``).
     """
     from activity.models import Activity
     from activity.system_activity import with_system_activity
     from maintenance.models import MaintenanceJob
-    from maintenance.notify import notify_job_state
+    from maintenance.notify import needs_notice
 
     counts = {"applied": 0, "created": 0, "orphaned": 0, "notified": 0, "skipped": False}
     if not force and not cache.add(SYNC_LOCK_KEY, 1, timeout=SYNC_LOCK_SECONDS):
@@ -464,8 +592,11 @@ def sync(*, force: bool = False) -> dict:
     to_apply = []
     for job_id, status in statuses.items():
         job = rows.get(job_id)
-        if job is not None and _apply_status(job, status):
-            to_apply.append(job)
+        if job is None:
+            continue
+        previous = job.state
+        if _apply_status(job, status):
+            to_apply.append((job, previous))
     to_create = []
     for job_id, request in requests.items():
         if job_id not in rows:
@@ -479,55 +610,51 @@ def sync(*, force: bool = False) -> dict:
     if not (to_apply or to_create or to_orphan):
         return counts
 
+    reapply = False
     with with_system_activity(
         "maintenance.job.sync",
         interface=Activity.Interface.CELERY,
         metadata={"applied": len(to_apply), "created": len(to_create), "orphaned": len(to_orphan)},
     ):
-        for job in to_apply:
-            announced = notify_job_state(job)
-            if announced:
-                job.last_notified_state = announced
-            try:
-                with transaction.atomic():
-                    job.save(update_fields=_STATUS_ROW_FIELDS)
-            except IntegrityError:
-                # The agent reports this job in flight while another row is.
-                # Cannot both be true; the row keeps its state and the next
-                # tick tries again once the other job has settled.
-                logger.warning("Status of job %s puts a second job in flight; not applied this tick", job.job_id)
+        for job, previous in to_apply:
+            announce = needs_notice(job)
+            if announce:
+                job.last_notified_state = job.state
+            if not _save(job, notify=announce, update_fields=_STATUS_ROW_FIELDS):
                 continue
-            if announced:
-                counts["notified"] += 1
+            counts["notified"] += int(announce)
             _log_state(job)
             if job.state == MaintenanceJob.State.SUCCEEDED:
                 packaging.mark_applied(job.package)
+            if previous != job.state and restored_database(job):
+                reapply = True
             counts["applied"] += 1
         for job in to_orphan:
             job.state = MaintenanceJob.State.FAILED
             job.reason = "orphaned"
             job.in_flight = False
             job.finished_at = timezone.now()
-            announced = notify_job_state(job)
-            if announced:
-                job.last_notified_state = announced
-                counts["notified"] += 1
-            job.save(update_fields=["state", "reason", "in_flight", "finished_at", "last_notified_state"])
+            announce = needs_notice(job)
+            if announce:
+                job.last_notified_state = job.state
+            fields = ["state", "reason", "in_flight", "finished_at", "last_notified_state"]
+            if not _save(job, notify=announce, update_fields=fields):
+                continue
+            counts["notified"] += int(announce)
             _log_state(job)
             counts["orphaned"] += 1
         for job in to_create:
-            try:
-                with transaction.atomic():
-                    job.save()
-            except IntegrityError:
-                logger.warning("Job %s from the spool is in flight while another job is; not re-created", job.job_id)
+            announce = needs_notice(job)
+            if announce:
+                job.last_notified_state = job.state
+            if not _save(job, notify=announce):
                 continue
-            announced = notify_job_state(job)
-            if announced:
-                job.last_notified_state = announced
-                job.save(update_fields=["last_notified_state"])
-                counts["notified"] += 1
+            counts["notified"] += int(announce)
             if job.state == MaintenanceJob.State.SUCCEEDED:
                 packaging.mark_applied(job.package)
+            if restored_database(job):
+                reapply = True
             counts["created"] += 1
+    if reapply:
+        _dispatch_erasure_reapply()
     return counts

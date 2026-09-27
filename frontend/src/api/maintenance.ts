@@ -54,6 +54,18 @@ export interface MaintenanceLockInfo {
     job_id: string | null
 }
 
+/**
+ * The public lock probe at `GET /lock`: always 200, never refused by the lock, and not behind the feature gate.
+ * `locked` false carries nulls in every other field.
+ */
+export interface LockProbe {
+    locked: boolean
+    phase: 'updating' | 'verifying' | 'rolling_back' | string | null
+    since: string | null
+    expected_until: string | null
+    message: string | null
+}
+
 /** How the caller confirms a sensitive request, or why they cannot. */
 export interface StepUpInfo {
     method: 'password' | 'password+totp' | 'totp' | null
@@ -79,7 +91,8 @@ export interface MaintenanceStatus {
 /** One property of an operation's argument schema, as the server publishes it. */
 export interface ArgSchemaProperty {
     type?: string
-    anyOf?: { type: string }[]
+    /** A nullable field's branches; the non-null one carries the bounds and pattern. */
+    anyOf?: { type: string, minimum?: number, maximum?: number, pattern?: string }[]
     default?: unknown
     description?: string
     minimum?: number
@@ -158,12 +171,21 @@ export interface StepUpCredentials {
     totp_code?: string
 }
 
-export interface JobRequest extends StepUpCredentials {
+/** A confirmation that may restore the database: it acknowledges the erasures the restore brings back. */
+export interface ConfirmRequest extends StepUpCredentials {
+    acknowledge_erasures?: boolean
+}
+
+export interface JobRequest extends ConfirmRequest {
     operation: string
     args: Record<string, unknown>
 }
 
-export type PackageState = 'available' | 'applied' | 'pruned'
+/**
+ * `unverified` until the worker has hashed the tarball against the manifest, `invalid` when the signature or the
+ * hash does not hold; neither can be applied.
+ */
+export type PackageState = 'available' | 'unverified' | 'invalid' | 'applied' | 'pruned'
 
 /** An uploaded update package. The hash is the identifier; the server never returns a path. */
 export interface MaintenancePackage {
@@ -197,6 +219,18 @@ export interface PackageRejection {
 }
 
 const BASE = '/api/v1/maintenance'
+
+/** The 409 `reason` for a restore that would bring back accounts erased since its snapshot. */
+export const ERASURES_SINCE_SNAPSHOT = 'erasures_since_snapshot'
+
+/**
+ * The phase the lock is in, for anyone: the SPA polls this to notice a phase change and the release.
+ * Answers 200 even while the platform is locked and even with the feature off.
+ */
+export async function fetchLock(): Promise<LockProbe> {
+    const response = await http.get<LockProbe>(`${BASE}/lock`)
+    return response.data
+}
 
 export async function fetchMaintenanceStatus(): Promise<MaintenanceStatus> {
     const response = await http.get<MaintenanceStatus>(`${BASE}/status`)
@@ -234,15 +268,31 @@ export async function cancelJob(jobId: string): Promise<MaintenanceJob> {
     return response.data
 }
 
-/** Confirm an update. The server asks for the password only, never the second factor. */
+/**
+ * Confirm an update. The server waives the second factor for an account with a password, but an account whose
+ * factor is its only credential confirms with the code, so send whatever the form collected.
+ */
 export async function verifyJob(jobId: string, credentials: StepUpCredentials): Promise<MaintenanceJob> {
     const response = await http.post<MaintenanceJob>(`${BASE}/jobs/${encodeURIComponent(jobId)}/verify`, credentials)
     return response.data
 }
 
-/** Ask for a rollback. Full step-up: password plus the second factor when enrolled. */
-export async function rollbackJob(jobId: string, credentials: StepUpCredentials): Promise<MaintenanceJob> {
-    const response = await http.post<MaintenanceJob>(`${BASE}/jobs/${encodeURIComponent(jobId)}/rollback`, credentials)
+/**
+ * Ask for a rollback. Full step-up: password plus the second factor when enrolled. A rollback that restores the
+ * database answers 409 with `reason: erasures_since_snapshot` until `acknowledge_erasures` is set; see
+ * `erasureConflict`.
+ */
+export async function rollbackJob(jobId: string, request: ConfirmRequest): Promise<MaintenanceJob> {
+    const response = await http.post<MaintenanceJob>(`${BASE}/jobs/${encodeURIComponent(jobId)}/rollback`, request)
+    return response.data
+}
+
+/**
+ * Mark a job in flight as failed (`abandoned`) when its executor is gone, freeing the one-job slot. Refused with 409
+ * while the host agent is alive, or when the job is not in flight.
+ */
+export async function abandonJob(jobId: string, credentials: StepUpCredentials): Promise<MaintenanceJob> {
+    const response = await http.post<MaintenanceJob>(`${BASE}/jobs/${encodeURIComponent(jobId)}/abandon`, credentials)
     return response.data
 }
 
@@ -254,17 +304,20 @@ export async function listPackages(): Promise<MaintenancePackage[]> {
 /**
  * Upload a release as its three parts. The server verifies the signature and
  * the manifest before it keeps anything; a refusal is a 400, 409 or 413 whose
- * body is a `PackageRejection`. `onProgress` receives the upload fraction.
+ * body is a `PackageRejection`, and a missing part a 422. `onProgress` receives the upload fraction; `signal` aborts
+ * the transfer.
  */
 export async function uploadPackage(
     files: PackageFiles,
     onProgress?: (fraction: number) => void,
+    signal?: AbortSignal,
 ): Promise<MaintenancePackage> {
     const form = new FormData()
     form.append('package', files.package)
     form.append('manifest', files.manifest)
     form.append('signature', files.signature)
     const response = await http.post<MaintenancePackage>(`${BASE}/packages`, form, {
+        signal,
         onUploadProgress: (event) => {
             if (onProgress && event.total) {
                 onProgress(event.loaded / event.total)
@@ -310,4 +363,20 @@ export function classifyPackageFiles(files: Iterable<File>): Partial<PackageFile
 export function isFeatureDisabled(error: unknown): boolean {
     const status = (error as { response?: { status?: number } })?.response?.status
     return status === 404
+}
+
+/**
+ * The number of erased accounts a restore would bring back, when `error` is the 409 that asks for them to be
+ * acknowledged; `null` for any other failure.
+ */
+export function erasureConflict(error: unknown): number | null {
+    const response = (error as { response?: { status?: number, data?: unknown } })?.response
+    if (response?.status !== 409) {
+        return null
+    }
+    const data = response.data as { reason?: unknown, erasures?: unknown } | undefined
+    if (data?.reason !== ERASURES_SINCE_SNAPSHOT) {
+        return null
+    }
+    return typeof data.erasures === 'number' ? data.erasures : 0
 }

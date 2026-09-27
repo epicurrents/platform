@@ -14,21 +14,25 @@
  * account that cannot confirm is told so instead of failing at the submit.
  *
  * A package is uploaded as the three files the packager writes, picked
- * together from one file input and sorted by name; the server verifies the
- * signature and the manifest before it keeps anything, and its refusal is
- * shown as it was worded.
+ * together from one file input and sorted by name; the server checks the
+ * signature and the manifest before it keeps anything, the worker hashes the
+ * archive afterwards, and a refusal is shown as it was worded. A restore that
+ * would bring back erased accounts asks for that to be acknowledged first.
  *
  * @package    epicurrents-platform
  */
-import { computed, onMounted, reactive, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
 import { useRouter } from 'vue-router'
+import axios from 'axios'
 import AdminTabs from '#components/AdminTabs.vue'
+import ErasureAcknowledgement from '#components/ErasureAcknowledgement.vue'
 import JobStateBadge from '#components/JobStateBadge.vue'
 import StepUpFields from '#components/StepUpFields.vue'
 import {
     classifyPackageFiles,
     createJob,
     deletePackage,
+    erasureConflict,
     listJobs,
     listOperations,
     listPackages,
@@ -40,9 +44,12 @@ import {
     type MaintenancePackage,
     type PackageFiles,
 } from '#api/maintenance'
+import { useDialog } from '#composables/useDialog'
 import { usePolling } from '#composables/usePolling'
 import { t } from '#i18n'
 import { errorDetail } from '#lib/http'
+import { packageStateHint, packageStateLabel } from '#lib/maintenanceLabels'
+import { stepUpBody } from '#lib/stepUp'
 import { showToast } from '#lib/toast'
 import { useAuthStore } from '#stores/auth'
 import { useMaintenanceStore } from '#stores/maintenance'
@@ -67,29 +74,29 @@ const packages = ref<MaintenancePackage[]>([])
 const loading = ref(true)
 const loadError = ref('')
 
-const showRun = ref(false)
-const running = ref(false)
-const runError = ref('')
+const runDialog = useDialog()
 const selected = ref<MaintenanceOperation | null>(null)
 /** The form's values, keyed by argument name; strings until the submit converts them. */
 const argValues = reactive<Record<string, unknown>>({})
 const credentials = reactive({ password: '', totp_code: '' })
+/** Set once the request came back asking for erasures to be acknowledged: how many accounts it brings back. */
+const erasures = ref<number | null>(null)
+const erasureAck = reactive({ acknowledged: false })
 
-const showUpload = ref(false)
-const uploading = ref(false)
-const uploadError = ref('')
+const uploadDialog = useDialog()
 const uploadProgress = ref(0)
 /** The parts picked so far; the upload is enabled once all three are present. */
 const picked = reactive<Partial<PackageFiles>>({})
 const packageInputRef = ref<HTMLInputElement | null>(null)
+let uploadAbort: AbortController | null = null
 
+const removeDialog = useDialog()
 const removing = ref<MaintenancePackage | null>(null)
-const removeLoading = ref(false)
-const removeError = ref('')
 
 const canWrite = computed(() => authStore.isSuperuser)
 const status = computed(() => maintenanceStore.status)
-const stepUp = computed(() => status.value?.step_up ?? { method: null, available: false, reason: null })
+/** The status says how this account confirms; before it has loaded, the account itself says the same. */
+const stepUp = computed(() => status.value?.step_up ?? authStore.stepUp)
 const hostTier = computed(() => status.value?.remote_update_enabled === true)
 
 /** What the in-flight job is, when there is one, so the page can say why the run controls are off. */
@@ -97,7 +104,9 @@ const inFlight = computed(() => jobs.value.find(job => job.in_flight) ?? null)
 
 const updateOperation = computed(() => operations.value.find(operation => operation.key === UPDATE_OPERATION) ?? null)
 const backupOperation = computed(() => operations.value.find(operation => operation.key === BACKUP_OPERATION) ?? null)
-const rollbackOperation = computed(() => operations.value.find(operation => operation.key === ROLLBACK_OPERATION) ?? null)
+const rollbackOperation = computed(() => {
+    return operations.value.find(operation => operation.key === ROLLBACK_OPERATION) ?? null
+})
 const applicablePackages = computed(() => packages.value.filter(pkg => pkg.applicable))
 /** The section shows once the host tier is on, and stays for the history once anything was uploaded. */
 const showPackages = computed(() => hostTier.value || packages.value.length > 0)
@@ -124,7 +133,10 @@ const uploadReady = computed(() => Boolean(picked.package && picked.manifest && 
 const agentSummary = computed(() => {
     const agent = status.value?.agent
     if (!agent || !agent.installed) {
-        return { variant: 'neutral', text: t('The host agent is not installed. Updates from this page need it; the other operations do not.', SCOPE) }
+        return {
+            variant: 'neutral',
+            text: t('The host agent is not installed. Updates from this page need it; the other operations do not.', SCOPE),
+        }
     }
     if (!agent.enabled) {
         return { variant: 'warning', text: t('The host agent is installed but not enabled.', SCOPE) }
@@ -132,7 +144,38 @@ const agentSummary = computed(() => {
     if (agent.stale) {
         return { variant: 'warning', text: t('The host agent has not reported for more than two minutes.', SCOPE) }
     }
-    return { variant: 'success', text: t('The host agent is running (version {version}).', SCOPE, { version: agent.version ?? '?' }) }
+    return {
+        variant: 'success',
+        text: t('The host agent is running (version {version}).', SCOPE, { version: agent.version ?? '?' }),
+    }
+})
+
+/**
+ * Whether the run form can be sent: step-up possible when the operation needs it, and the package or snapshot the
+ * operation names actually chosen. A request missing either is refused by the server anyway.
+ */
+const runReady = computed(() => {
+    const operation = selected.value
+    if (!operation) {
+        return false
+    }
+    if (operation.requires_step_up && !stepUp.value.available) {
+        return false
+    }
+    const properties = operation.args_schema.properties ?? {}
+    for (const name of operation.args_schema.required ?? []) {
+        if (!(name in properties)) {
+            continue
+        }
+        const value = argValues[name]
+        if (value === '' || value === undefined || value === null) {
+            return false
+        }
+    }
+    if (erasures.value !== null && !erasureAck.acknowledged) {
+        return false
+    }
+    return true
 })
 
 /** A stable fingerprint of what the list shows, so the poll can tell a change from a repeat. */
@@ -144,30 +187,55 @@ async function loadPackages () {
     packages.value = await listPackages()
 }
 
+/** Refresh the job list; a change also refreshes the status and packages, since a settled job may have applied one. */
 async function loadJobs (): Promise<boolean> {
     const rows = await listJobs()
     const changed = fingerprint(rows) !== fingerprint(jobs.value)
     jobs.value = rows
+    const verifying = packages.value.some(pkg => pkg.state === 'unverified')
     if (changed) {
-        // A job that settled may have applied a package; the list says so.
         await Promise.all([maintenanceStore.refreshStatus(), loadPackages()])
+    } else if (verifying) {
+        // The worker settles an unverified package by itself; watch for it.
+        await loadPackages()
     }
     return changed
 }
 
-const poll = usePolling(loadJobs, { immediate: false })
+async function loadAll () {
+    const [ops, rows] = await Promise.all([
+        listOperations(),
+        listJobs(),
+        maintenanceStore.refreshStatus(),
+        loadPackages(),
+    ])
+    operations.value = ops
+    jobs.value = rows
+    loadError.value = ''
+}
+
+/** The poll's read: the job list once the page has loaded, the whole page while it has not. */
+async function pollRead (): Promise<boolean> {
+    if (loadError.value) {
+        await loadAll()
+        return true
+    }
+    return loadJobs()
+}
+
+const poll = usePolling(pollRead, { immediate: false })
 
 async function load () {
     loading.value = true
     loadError.value = ''
     try {
-        const [ops] = await Promise.all([listOperations(), maintenanceStore.refreshStatus(), loadJobs(), loadPackages()])
-        operations.value = ops
-        poll.start()
+        await loadAll()
     } catch (err) {
         loadError.value = errorDetail(err, t('The maintenance state could not be loaded.', SCOPE))
     } finally {
         loading.value = false
+        // Polled either way: a failed load retries until it answers.
+        poll.start()
     }
 }
 
@@ -185,6 +253,15 @@ function argType (property: ArgSchemaProperty): string {
     return first?.type ?? 'string'
 }
 
+/** A bound or pattern of a property, from the property itself or from the non-null branch of its `anyOf`. */
+function argConstraint (property: ArgSchemaProperty, key: 'minimum' | 'maximum' | 'pattern') {
+    if (property[key] !== undefined) {
+        return property[key]
+    }
+    const branch = property.anyOf?.find(option => option.type !== 'null')
+    return branch?.[key]
+}
+
 function argLabel (name: string, property: ArgSchemaProperty) {
     return property.title ?? name.replace(/_/g, ' ')
 }
@@ -198,7 +275,6 @@ function isSnapshotArg (name: string) {
 }
 
 function openRun (operation: MaintenanceOperation, preset: Record<string, unknown> = {}) {
-    runError.value = ''
     selected.value = operation
     for (const key of Object.keys(argValues)) {
         delete argValues[key]
@@ -217,14 +293,9 @@ function openRun (operation: MaintenanceOperation, preset: Record<string, unknow
     Object.assign(argValues, preset)
     credentials.password = ''
     credentials.totp_code = ''
-    showRun.value = true
-}
-
-function closeRun () {
-    if (running.value) {
-        return
-    }
-    showRun.value = false
+    erasures.value = null
+    erasureAck.acknowledged = false
+    runDialog.show()
 }
 
 /** Turn the form's values into the arguments the schema expects; blanks are omitted so the server default applies. */
@@ -237,7 +308,7 @@ function buildArgs (operation: MaintenanceOperation): Record<string, unknown> {
             args[name] = Boolean(raw)
             continue
         }
-        if (raw === '' || raw === undefined || raw === null) {
+        if (raw === '' || raw === undefined || raw === null || (typeof raw === 'number' && Number.isNaN(raw))) {
             continue
         }
         args[name] = type === 'integer' || type === 'number' ? Number(raw) : String(raw)
@@ -247,29 +318,37 @@ function buildArgs (operation: MaintenanceOperation): Record<string, unknown> {
 
 async function confirmRun () {
     const operation = selected.value
-    if (!operation) {
+    if (!operation || !runReady.value) {
         return
     }
-    runError.value = ''
-    running.value = true
-    try {
-        const job = await createJob({
+    const acknowledge = erasures.value !== null && erasureAck.acknowledged
+    const job = await runDialog.run(
+        () => createJob({
             operation: operation.key,
             args: buildArgs(operation),
-            ...(operation.requires_step_up
-                ? { password: credentials.password || undefined, totp_code: credentials.totp_code || undefined }
-                : {}),
-        })
-        showRun.value = false
-        showToast(t('{label} requested.', SCOPE, { label: operation.label }), 'neutral')
-        router.push({ name: 'admin-maintenance-job', params: { id: job.job_id } })
-    } catch (err) {
-        // The server owns every refusal: a job in flight, a wrong password, a
-        // host operation while the host tier is off. Show what it said.
-        runError.value = errorDetail(err, t('The operation could not be requested.', SCOPE))
-    } finally {
-        running.value = false
+            ...(operation.requires_step_up ? stepUpBody(credentials) : {}),
+            ...(acknowledge ? { acknowledge_erasures: true } : {}),
+        }),
+        {
+            // The server owns every refusal: a job in flight, a wrong password, a
+            // host operation while the host tier is off, the lock. Show what it said.
+            fallback: t('The operation could not be requested.', SCOPE),
+            onError: (err) => {
+                const count = erasureConflict(err)
+                if (count === null) {
+                    return false
+                }
+                erasures.value = count
+                erasureAck.acknowledged = false
+                return true
+            },
+        },
+    )
+    if (!job) {
+        return
     }
+    showToast(t('{label} requested.', SCOPE, { label: operation.label }), 'neutral')
+    router.push({ name: 'admin-maintenance-job', params: { id: job.job_id } })
 }
 
 /** Open the update form with this package chosen. */
@@ -286,8 +365,21 @@ function canRunHost (operation: MaintenanceOperation | null) {
     return operation !== null && operation.available && inFlight.value === null && stepUp.value.available
 }
 
+/** Whether an operation's Run button is live. */
+function canRun (operation: MaintenanceOperation) {
+    if (!operation.available || inFlight.value !== null) {
+        return false
+    }
+    return !operation.requires_step_up || stepUp.value.available
+}
+
 function canApply (pkg: MaintenancePackage) {
     return pkg.applicable && canRunHost(updateOperation.value)
+}
+
+/** An unverified or invalid package can never be applied, so it gets no Apply button at all. */
+function isApplicableState (pkg: MaintenancePackage) {
+    return pkg.state !== 'unverified' && pkg.state !== 'invalid'
 }
 
 const canTakeSnapshot = computed(() => canRunHost(backupOperation.value))
@@ -331,32 +423,31 @@ function canRemove (pkg: MaintenancePackage) {
     return pkg.state !== 'pruned' && inFlight.value?.package_sha256 !== pkg.sha256
 }
 
-function packageStateLabel (pkg: MaintenancePackage) {
+function packageStateVariant (pkg: MaintenancePackage) {
     switch (pkg.state) {
         case 'applied':
-            return t('Applied', SCOPE)
-        case 'pruned':
-            return t('Removed', SCOPE)
+            return 'success'
+        case 'invalid':
+            return 'danger'
+        case 'unverified':
+            return 'warning'
+        case 'available':
+            return pkg.applicable ? 'brand' : 'neutral'
         default:
-            return pkg.applicable ? t('Available', SCOPE) : t('Not newer than the installed version', SCOPE)
+            return 'neutral'
     }
 }
 
-function packageStateVariant (pkg: MaintenancePackage) {
-    if (pkg.state === 'applied') {
-        return 'success'
-    }
-    if (pkg.state === 'available' && pkg.applicable) {
-        return 'brand'
-    }
-    return 'neutral'
-}
-
+/** A byte count in binary units, one decimal throughout so a list of sizes lines up. */
 function formatSize (bytes: number) {
-    if (bytes < 1024 * 1024) {
-        return `${(bytes / 1024).toFixed(0)} KB`
+    const units = ['B', 'KB', 'MB', 'GB']
+    let value = bytes
+    let unit = 0
+    while (value >= 1024 && unit < units.length - 1) {
+        value /= 1024
+        unit += 1
     }
-    return `${(bytes / 1024 / 1024).toFixed(1)} MB`
+    return unit === 0 ? `${value} ${units[0]}` : `${value.toFixed(1)} ${units[unit]}`
 }
 
 function shortHash (sha256: string) {
@@ -364,19 +455,20 @@ function shortHash (sha256: string) {
 }
 
 function openUpload () {
-    uploadError.value = ''
     uploadProgress.value = 0
     delete picked.package
     delete picked.manifest
     delete picked.signature
-    showUpload.value = true
+    uploadDialog.show()
 }
 
-function closeUpload () {
-    if (uploading.value) {
+/** The upload dialog's Cancel: stops a transfer in progress, closes the dialog otherwise. */
+function cancelUpload () {
+    if (uploadDialog.busy.value) {
+        uploadAbort?.abort()
         return
     }
-    showUpload.value = false
+    uploadDialog.close()
 }
 
 function triggerPackageSelect () {
@@ -394,55 +486,63 @@ async function confirmUpload () {
     if (!uploadReady.value || !picked.package || !picked.manifest || !picked.signature) {
         return
     }
-    uploadError.value = ''
-    uploading.value = true
+    const files = { package: picked.package, manifest: picked.manifest, signature: picked.signature }
     uploadProgress.value = 0
-    try {
-        const pkg = await uploadPackage(
-            { package: picked.package, manifest: picked.manifest, signature: picked.signature },
-            fraction => { uploadProgress.value = Math.round(fraction * 100) },
-        )
-        showUpload.value = false
-        showToast(t('Package {version} uploaded and verified.', SCOPE, { version: pkg.version }), 'success')
-        await loadPackages()
-    } catch (err) {
-        // The server names the refusal: a signature that does not verify, a
-        // version that is not newer, a package for another deployment.
-        uploadError.value = errorDetail(err, t('The package could not be uploaded.', SCOPE))
-    } finally {
-        uploading.value = false
+    uploadAbort = new AbortController()
+    const signal = uploadAbort.signal
+    const pkg = await uploadDialog.run(
+        () => uploadPackage(files, fraction => {
+            uploadProgress.value = Math.round(fraction * 100)
+        }, signal),
+        {
+            // The server names the refusal: a signature that does not verify, a
+            // version that is not newer, a package for another deployment, the lock.
+            fallback: t('The package could not be uploaded.', SCOPE),
+            onError: (err) => {
+                if (!axios.isCancel(err)) {
+                    return false
+                }
+                uploadProgress.value = 0
+                showToast(t('Upload cancelled.', SCOPE), 'neutral')
+                return true
+            },
+        },
+    )
+    uploadAbort = null
+    if (!pkg) {
+        return
     }
+    showToast(
+        pkg.state === 'unverified'
+            ? t('Package {version} uploaded. The archive is being verified; it can be applied once that holds.', SCOPE, {
+                version: pkg.version,
+            })
+            : t('Package {version} uploaded and verified.', SCOPE, { version: pkg.version }),
+        'success',
+    )
+    await loadPackages()
 }
 
 function openRemove (pkg: MaintenancePackage) {
-    removeError.value = ''
     removing.value = pkg
-}
-
-function closeRemove () {
-    if (removeLoading.value) {
-        return
-    }
-    removing.value = null
+    removeDialog.show()
 }
 
 async function confirmRemove () {
-    if (!removing.value) {
+    const target = removing.value
+    if (!target) {
         return
     }
-    removeError.value = ''
-    removeLoading.value = true
-    try {
-        await deletePackage(removing.value.sha256)
-        removing.value = null
-        showToast(t('Package removed.', SCOPE), 'neutral')
-        await loadPackages()
-    } catch (err) {
-        // A job may have picked the package up between the list and the click.
-        removeError.value = errorDetail(err, t('The package could not be removed.', SCOPE))
-    } finally {
-        removeLoading.value = false
+    // A job may have picked the package up between the list and the click, or the lock may be up.
+    const removed = await removeDialog.run(
+        () => deletePackage(target.sha256),
+        { fallback: t('The package could not be removed.', SCOPE) },
+    )
+    if (!removed) {
+        return
     }
+    showToast(t('Package removed.', SCOPE), 'neutral')
+    await loadPackages()
 }
 
 function openJob (job: MaintenanceJob) {
@@ -450,6 +550,10 @@ function openJob (job: MaintenanceJob) {
 }
 
 onMounted(load)
+
+onBeforeUnmount(() => {
+    uploadAbort?.abort()
+})
 </script>
 
 <template>
@@ -468,6 +572,7 @@ onMounted(load)
 
         <wa-callout v-else-if="loadError" variant="danger">
             {{ loadError }}
+            <span class="callout-aside">{{ t('Trying again.', SCOPE) }}</span>
         </wa-callout>
 
         <template v-else>
@@ -496,8 +601,8 @@ onMounted(load)
                 {{ t('The platform is locked for maintenance ({phase}): {message}', SCOPE, { phase: status.lock.phase, message: status.lock.message }) }}
             </wa-callout>
 
-            <wa-callout v-if="canWrite && !stepUp.available" variant="warning">
-                {{ stepUp.reason }}
+            <wa-callout v-if="canWrite && status && !stepUp.available" variant="warning">
+                {{ stepUp.reason ?? t('This account cannot confirm sensitive actions.', SCOPE) }}
             </wa-callout>
 
             <section class="maintenance-section">
@@ -527,7 +632,7 @@ onMounted(load)
                             </div>
                             <wa-button v-if="canWrite"
                                 appearance="plain"
-                                :disabled="!operation.available || inFlight !== null || (operation.requires_step_up && !stepUp.available)"
+                                :disabled="!canRun(operation)"
                                 size="s"
                                 variant="brand"
                                 @click="openRun(operation)"
@@ -572,9 +677,12 @@ onMounted(load)
                                     <template v-if="pkg.project"> · {{ pkg.project }}</template>
                                     <template v-if="pkg.plugins.length"> · {{ pkg.plugins.join(', ') }}</template>
                                 </span>
+                                <span v-if="packageStateHint(pkg.state)" class="operation-description">
+                                    {{ packageStateHint(pkg.state) }}
+                                </span>
                                 <div class="row-badges">
                                     <wa-badge appearance="outlined" :variant="packageStateVariant(pkg)">
-                                        {{ packageStateLabel(pkg) }}
+                                        {{ packageStateLabel(pkg.state, pkg.applicable) }}
                                     </wa-badge>
                                     <span class="list-row-meta">
                                         <wa-relative-time :date="pkg.uploaded_at"></wa-relative-time>
@@ -583,7 +691,7 @@ onMounted(load)
                                 </div>
                             </div>
                             <div v-if="canWrite" class="package-actions">
-                                <wa-button
+                                <wa-button v-if="isApplicableState(pkg)"
                                     appearance="plain"
                                     :disabled="!canApply(pkg)"
                                     size="s"
@@ -694,10 +802,10 @@ onMounted(load)
         </template>
     </main>
 
-    <wa-dialog :label="selected?.label ?? ''" :open="showRun" @wa-hide.self="closeRun">
+    <wa-dialog :label="selected?.label ?? ''" :open="runDialog.open.value" @wa-hide.self="runDialog.onHide">
         <div v-if="selected" class="maintenance-form">
-            <wa-callout v-if="runError" variant="danger">
-                {{ runError }}
+            <wa-callout v-if="runDialog.error.value" variant="danger">
+                {{ runDialog.error.value }}
             </wa-callout>
             <p class="maintenance-hint">{{ selected.description }}</p>
             <template v-for="name in argNames(selected)" :key="name">
@@ -738,33 +846,35 @@ onMounted(load)
                 <wa-input v-else-if="['integer', 'number'].includes(argType(selected.args_schema.properties![name]!))"
                     :help-text="selected.args_schema.properties![name]!.description"
                     :label="argLabel(name, selected.args_schema.properties![name]!)"
-                    :max="selected.args_schema.properties![name]!.maximum"
-                    :min="selected.args_schema.properties![name]!.minimum"
+                    :max="argConstraint(selected.args_schema.properties![name]!, 'maximum')"
+                    :min="argConstraint(selected.args_schema.properties![name]!, 'minimum')"
                     type="number"
                     v-wa="[argValues, name]"
                 ></wa-input>
                 <wa-input v-else
                     :help-text="selected.args_schema.properties![name]!.description"
                     :label="argLabel(name, selected.args_schema.properties![name]!)"
-                    :pattern="selected.args_schema.properties![name]!.pattern"
+                    :pattern="argConstraint(selected.args_schema.properties![name]!, 'pattern')"
                     :required="selected.args_schema.required?.includes(name)"
                     v-wa="[argValues, name]"
                 ></wa-input>
             </template>
+            <ErasureAcknowledgement v-if="erasures !== null" :count="erasures" :state="erasureAck" />
             <StepUpFields v-if="selected.requires_step_up" :credentials="credentials" :step-up="stepUp" />
         </div>
         <div slot="footer" class="form-actions">
             <wa-button
                 appearance="filled-outlined"
-                :disabled="running"
+                :disabled="runDialog.busy.value"
                 variant="neutral"
-                @click="closeRun"
+                @click="runDialog.close"
             >
                 {{ t('Cancel', SCOPE) }}
             </wa-button>
             <wa-button
                 appearance="filled-outlined"
-                :loading="running"
+                :disabled="!runReady"
+                :loading="runDialog.busy.value"
                 variant="brand"
                 @click="confirmRun"
             >
@@ -773,15 +883,20 @@ onMounted(load)
         </div>
     </wa-dialog>
 
-    <wa-dialog :label="t('Upload package', SCOPE)" :open="showUpload" @wa-hide.self="closeUpload">
+    <wa-dialog :label="t('Upload package', SCOPE)" :open="uploadDialog.open.value" @wa-hide.self="uploadDialog.onHide">
         <div class="maintenance-form">
-            <wa-callout v-if="uploadError" variant="danger">
-                {{ uploadError }}
+            <wa-callout v-if="uploadDialog.error.value" variant="danger">
+                {{ uploadDialog.error.value }}
             </wa-callout>
             <p class="maintenance-hint">
                 {{ t('Select the three files of a release together: the archive (.tar.gz), its manifest (.manifest.json) and the signature (.manifest.sig). The package is verified before it is kept, and can be applied from this page afterwards.', SCOPE) }}
             </p>
-            <wa-button appearance="filled-outlined" :disabled="uploading" variant="neutral" @click="triggerPackageSelect">
+            <wa-button
+                appearance="filled-outlined"
+                :disabled="uploadDialog.busy.value"
+                variant="neutral"
+                @click="triggerPackageSelect"
+            >
                 <wa-icon name="folder-open" slot="start"></wa-icon>
                 {{ t('Select files', SCOPE) }}
             </wa-button>
@@ -810,21 +925,20 @@ onMounted(load)
                     <span v-if="picked.signature" class="package-part-name">{{ picked.signature.name }}</span>
                 </li>
             </ul>
-            <wa-progress-bar v-if="uploading" :value="uploadProgress"></wa-progress-bar>
+            <wa-progress-bar v-if="uploadDialog.busy.value" :value="uploadProgress"></wa-progress-bar>
         </div>
         <div slot="footer" class="form-actions">
             <wa-button
                 appearance="filled-outlined"
-                :disabled="uploading"
                 variant="neutral"
-                @click="closeUpload"
+                @click="cancelUpload"
             >
-                {{ t('Cancel', SCOPE) }}
+                {{ uploadDialog.busy.value ? t('Stop upload', SCOPE) : t('Cancel', SCOPE) }}
             </wa-button>
             <wa-button
                 appearance="filled-outlined"
                 :disabled="!uploadReady"
-                :loading="uploading"
+                :loading="uploadDialog.busy.value"
                 variant="brand"
                 @click="confirmUpload"
             >
@@ -833,9 +947,9 @@ onMounted(load)
         </div>
     </wa-dialog>
 
-    <wa-dialog :label="t('Remove package', SCOPE)" :open="!!removing" @wa-hide.self="closeRemove">
-        <wa-callout v-if="removeError" variant="danger">
-            {{ removeError }}
+    <wa-dialog :label="t('Remove package', SCOPE)" :open="removeDialog.open.value" @wa-hide.self="removeDialog.onHide">
+        <wa-callout v-if="removeDialog.error.value" variant="danger">
+            {{ removeDialog.error.value }}
         </wa-callout>
         <p class="dialog-text">
             {{ t('Remove the package for version {version}? Its files are deleted from the server; the record of jobs that used it stays.', SCOPE, { version: removing?.version ?? '' }) }}
@@ -843,15 +957,15 @@ onMounted(load)
         <div slot="footer" class="form-actions">
             <wa-button
                 appearance="filled-outlined"
-                :disabled="removeLoading"
+                :disabled="removeDialog.busy.value"
                 variant="neutral"
-                @click="closeRemove"
+                @click="removeDialog.close"
             >
                 {{ t('Cancel', SCOPE) }}
             </wa-button>
             <wa-button
                 appearance="filled-outlined"
-                :loading="removeLoading"
+                :loading="removeDialog.busy.value"
                 variant="danger"
                 @click="confirmRemove"
             >
@@ -960,5 +1074,10 @@ onMounted(load)
 
 .dialog-text {
     margin: 0;
+}
+
+.callout-aside {
+    color: var(--wa-color-text-quiet);
+    margin-left: var(--wa-space-2xs);
 }
 </style>

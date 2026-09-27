@@ -1,10 +1,12 @@
 """Telling every superuser when a job reaches a state that needs them.
 
 Push through the notifications app, mail through Django's backend when the
-deployment configured one. Each state notifies once: the caller persists
-``last_notified_state`` in the same write as the state itself, so a restore that
-rolls the row back also rolls the bookkeeping back and the state is announced
-again, which is the right direction.
+deployment configured one, one message per recipient. Each state notifies once:
+the caller decides with :func:`needs_notice`, persists ``last_notified_state``
+in the same write as the state itself, and only then :func:`dispatch_notice`
+queues the sending for after the commit. A restore that rolls the row back also
+rolls the bookkeeping back and the state is announced again, which is the right
+direction; a write that fails announces nothing.
 """
 
 import logging
@@ -63,18 +65,45 @@ def _message(job, state: str) -> tuple[str, str]:
     return f"{label}: {state}", f"The maintenance job {label} is now {state}."
 
 
-def notify_job_state(job, *, state: str | None = None) -> str | None:
-    """Notify superusers of ``job``'s state if it is one worth announcing and not yet announced.
-
-    ``state`` names the state being entered when the instance does not carry it
-    yet. Returns the state announced, which the caller stores as
-    ``last_notified_state`` in the same write as the state itself, or ``None``.
-    Nothing on the instance is changed here. Delivery failures are logged, never
-    raised: a job's state must not depend on a push service.
-    """
+def needs_notice(job, state: str | None = None) -> bool:
+    """Whether entering ``state`` (``job.state`` when omitted) is worth announcing and not yet announced."""
     state = state or job.state
-    if state not in ATTENTION_STATES or job.last_notified_state == state:
-        return None
+    return state in ATTENTION_STATES and job.last_notified_state != state
+
+
+def dispatch_notice(job, state: str) -> None:
+    """Send the notice for ``state`` from a worker once the current transaction commits.
+
+    The caller has already saved ``last_notified_state = state`` with the state
+    itself, so a notice goes out only for a state that was actually recorded:
+    a save that fails rolls the transaction back and discards the callback,
+    and the next attempt decides afresh. Sending from a task keeps a slow relay
+    out of the caller, which for the spool sync holds a five-second lock.
+    """
+    from django.db import transaction
+
+    job_pk = job.pk
+
+    def _dispatch():
+        try:
+            from maintenance.tasks import send_job_notice
+
+            send_job_notice.delay(job_pk, state)
+        except Exception:
+            logger.exception("Notice for maintenance job %s could not be dispatched", job.job_id)
+
+    transaction.on_commit(_dispatch)
+
+
+def send_notice(job, state: str) -> int:
+    """Push and mail every active superuser about ``job`` entering ``state``; returns the recipients reached.
+
+    One message per recipient, never one message addressed to all of them: a
+    shared ``To`` line hands every superuser's address to every other, and one
+    address the relay refuses fails the send for everyone. Delivery failures are
+    logged, never raised: a job's state must not depend on a push service or a
+    mail relay.
+    """
     title, body = _message(job, state)
     recipients = list(get_user_model().objects.filter(is_active=True, is_superuser=True))
     try:
@@ -84,19 +113,22 @@ def notify_job_state(job, *, state: str | None = None) -> str | None:
             send_push_to_user.delay(user.pk, title, body, data={"type": "maintenance", "job_id": str(job.job_id)})
     except Exception:
         logger.exception("Push notification for maintenance job %s could not be dispatched", job.job_id)
+    delivered = 0
     if mail_configured():
         from epicurrents.mail import send_mail
 
-        addresses = [user.email for user in recipients if user.email]
-        if addresses:
+        for user in recipients:
+            if not user.email:
+                continue
             try:
                 send_mail(
                     subject=title,
                     message=body,
                     from_email=None,
-                    recipient_list=addresses,
+                    recipient_list=[user.email],
                     context=f"maintenance.notify[{state}]",
                 )
+                delivered += 1
             except Exception:
                 # Caught here rather than silenced in the backend: the shared
                 # path has already logged what failed, hashed, and a job's state
@@ -106,4 +138,4 @@ def notify_job_state(job, *, state: str | None = None) -> str | None:
                 # decides an outcome, since an update nobody confirms is rolled
                 # back when the window closes.
                 logger.warning("Mail notification for maintenance job %s was not delivered", job.job_id)
-    return state
+    return delivered

@@ -94,8 +94,10 @@ function openCreate () {
     showCreate.value = true
 }
 
-function closeCreate () {
+/** Also the dialog's `wa-hide` handler, which is cancelled while the request is out so Escape cannot close it. */
+function closeCreate (event?: Event) {
     if (creating.value) {
+        event?.preventDefault()
         return
     }
     showCreate.value = false
@@ -121,8 +123,10 @@ function openDelete (group: GroupDetail) {
     deletingGroup.value = group
 }
 
-function closeDelete () {
+/** Also the dialog's `wa-hide` handler, which is cancelled while the request is out so Escape cannot close it. */
+function closeDelete (event?: Event) {
     if (deleteLoading.value) {
+        event?.preventDefault()
         return
     }
     deletingGroup.value = null
@@ -250,7 +254,7 @@ onMounted(load)
                 appearance="filled-outlined"
                 :disabled="creating"
                 variant="neutral"
-                @click="closeCreate"
+                @click="closeCreate()"
             >
                 {{ t('Cancel', SCOPE) }}
             </wa-button>
@@ -283,7 +287,7 @@ onMounted(load)
                 appearance="filled-outlined"
                 :disabled="deleteLoading"
                 variant="neutral"
-                @click="closeDelete"
+                @click="closeDelete()"
             >
                 {{ t('Cancel', SCOPE) }}
             </wa-button>

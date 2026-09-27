@@ -170,3 +170,107 @@ class TestConfirm:
             with pytest.raises(HttpError):
                 confirm_step_up(request_, user, password="nope")
         assert confirm_step_up(request_, user, password=PASSWORD) == "password"
+
+
+@pytest.mark.django_db
+class TestSharedFailureBudget:
+    """Login and step-up share their failures, so alternating between them buys no extra guesses."""
+
+    def _login(self, client, username, password):
+        from conftest import post_json
+
+        return post_json(client, "/api/v1/user/login", {"username": username, "password": password})
+
+    def test_a_stranger_cannot_lock_step_up_below_the_login_threshold(self, make_user, request_, client):
+        """The login form is anonymous; step-up's threshold is lower. Charging step-up from login failures
+        would let anyone block a superuser's rollback confirmation with a handful of wrong passwords."""
+        from user.lockout import LOGIN_MAX_ATTEMPTS
+
+        user = make_user(password=PASSWORD)
+        for _ in range(LOGIN_MAX_ATTEMPTS - 1):
+            assert self._login(client, user.username, "nope").status_code == 401
+        assert confirm_step_up(request_, user, password=PASSWORD) == "password"
+
+    def test_a_locked_login_locks_step_up_too(self, make_user, request_, client):
+        from user.lockout import LOGIN_MAX_ATTEMPTS
+
+        user = make_user(password=PASSWORD)
+        for _ in range(LOGIN_MAX_ATTEMPTS):
+            self._login(client, user.username, "nope")
+        with pytest.raises(HttpError) as excinfo:
+            confirm_step_up(request_, user, password=PASSWORD)
+        assert excinfo.value.status_code == 429
+
+    def test_step_up_failures_count_toward_login(self, make_user, request_, client):
+        from user.lockout import LOGIN_MAX_ATTEMPTS
+
+        user = make_user(password=PASSWORD)
+        for _ in range(MAX_FAILURES):
+            with pytest.raises(HttpError):
+                confirm_step_up(request_, user, password="nope")
+        for _ in range(LOGIN_MAX_ATTEMPTS - MAX_FAILURES):
+            self._login(client, user.username, "nope")
+        assert self._login(client, user.username, PASSWORD).status_code == 429
+
+    def test_a_username_typed_in_another_case_still_charges_the_account(self, make_user, request_, client):
+        from user.lockout import LOGIN_MAX_ATTEMPTS
+
+        user = make_user(username="MixedCase", password=PASSWORD)
+        for _ in range(LOGIN_MAX_ATTEMPTS):
+            self._login(client, "mixedcase", "nope")
+        with pytest.raises(HttpError) as excinfo:
+            confirm_step_up(request_, user, password=PASSWORD)
+        assert excinfo.value.status_code == 429
+
+    def test_a_correct_login_does_not_reset_the_step_up_budget(self, make_user, request_, client):
+        """A step-up count may hold guessed codes, which a correct password says nothing about."""
+        user = make_user(password=PASSWORD)
+        for _ in range(MAX_FAILURES - 1):
+            with pytest.raises(HttpError):
+                confirm_step_up(request_, user, password="nope")
+        assert self._login(client, user.username, PASSWORD).status_code == 200
+        with pytest.raises(HttpError):
+            confirm_step_up(request_, user, password="nope")
+        with pytest.raises(HttpError) as excinfo:
+            confirm_step_up(request_, user, password=PASSWORD)
+        assert excinfo.value.status_code == 429
+
+    def test_a_waived_factor_does_not_reset_the_count_of_guessed_codes(self, make_user, request_):
+        user = make_user(password=PASSWORD)
+        _enrol(user)
+        for _ in range(MAX_FAILURES - 1):
+            with pytest.raises(HttpError):
+                confirm_step_up(request_, user, password=PASSWORD, totp_code="000000")
+        confirm_step_up(request_, user, password=PASSWORD, second_factor=False)
+        with pytest.raises(HttpError):
+            confirm_step_up(request_, user, password=PASSWORD, totp_code="000000")
+        with pytest.raises(HttpError) as excinfo:
+            confirm_step_up(request_, user, password=PASSWORD, totp_code="000000")
+        assert excinfo.value.status_code == 429
+
+    def test_the_password_rechecks_draw_on_the_same_budget(self, make_user, client):
+        from conftest import post_json
+
+        user = make_user(password=PASSWORD)
+        client.force_login(user)
+        for _ in range(MAX_FAILURES):
+            response = post_json(
+                client, "/api/v1/user/me/change-password", {"current_password": "nope", "new_password": "x"}
+            )
+            assert response.status_code == 400
+        response = post_json(client, "/api/v1/user/me/2fa", {"password": PASSWORD})
+        assert response.status_code == 429
+
+    def test_the_counter_is_incremented_atomically(self, make_user):
+        """``add`` then ``incr``: a read-modify-write lets concurrent failures overwrite each other."""
+        from unittest import mock
+
+        from user import lockout
+
+        user = make_user(password=PASSWORD)
+        with mock.patch.object(lockout.cache, "set", wraps=lockout.cache.set) as cache_set:
+            lockout.record_stepup_failure(user, second_factor=False)
+            lockout.record_stepup_failure(user, second_factor=False)
+        attempt_key = lockout.stepup_keys(user.pk)[0]
+        assert not any(call.args and call.args[0] == attempt_key for call in cache_set.call_args_list)
+        assert lockout.cache.get(attempt_key) == 2

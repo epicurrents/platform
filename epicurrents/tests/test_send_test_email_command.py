@@ -1,11 +1,11 @@
 """What the mail test operation reports, and what it must not.
 
 Its output is captured into ``MaintenanceJob.output`` and rendered in the
-Maintenance tab. That column is deliberately outside the erasure registrations:
-the maintenance app keeps its rows to ids and hashes so nothing in them needs
-scrubbing when an account is erased. A command that printed the superusers'
-addresses would put personal data into a store with no path to remove it, and
-the only person positioned to notice is nobody.
+Maintenance tab. That column is deliberately outside the erasure registrations,
+so nothing that identifies a recipient may reach it — not the address, and not
+its hash either, which is a stable identifier of the same person. A command
+that printed either would put personal data into a store with no path to remove
+it, and the only person positioned to notice is nobody.
 
 The refusals matter as much as the send. The command exists to answer "is the
 relay configured", asked from a deployment with no shell — so answering
@@ -57,8 +57,22 @@ class TestItSends:
         second.save()
         django_mail.outbox.clear()
         _run()
-        assert len(django_mail.outbox) == 1
-        assert sorted(django_mail.outbox[0].to) == [SUPERUSER_ADDRESS, "second@example.org"]
+        assert sorted(message.to[0] for message in django_mail.outbox) == [SUPERUSER_ADDRESS, "second@example.org"]
+
+    def test_each_recipient_gets_a_message_of_their_own(self, addressed_superuser, make_superuser, settings):
+        """One message addressed to every superuser discloses each address to all the others."""
+        from django.core import mail as django_mail
+
+        settings.EMAIL_BACKEND = LOCMEM
+        second = make_superuser(username="second_su")
+        second.email = "second@example.org"
+        second.save()
+        django_mail.outbox.clear()
+        _run()
+        assert len(django_mail.outbox) == 2
+        for message in django_mail.outbox:
+            assert len(message.to) == 1
+            assert not message.cc and not message.bcc
 
     def test_an_ordinary_account_is_not_a_recipient(self, addressed_superuser, make_user, settings):
         from django.core import mail as django_mail
@@ -90,11 +104,14 @@ class TestTheReport:
         settings.EMAIL_BACKEND = LOCMEM
         assert SUPERUSER_ADDRESS not in _run()
 
-    def test_recipients_appear_as_the_hash_the_mail_path_logs(self, addressed_superuser, settings):
-        """Same truncated digest, so an operator can match this run against the
-        delivery failure it produced without either holding an address."""
+    def test_no_address_hash_reaches_the_output(self, addressed_superuser, settings):
+        """A hash still identifies the person, and this output is never erased."""
         settings.EMAIL_BACKEND = LOCMEM
-        assert address_hash(SUPERUSER_ADDRESS) in _run()
+        assert address_hash(SUPERUSER_ADDRESS) not in _run()
+
+    def test_recipients_are_reported_as_a_count(self, addressed_superuser, settings):
+        settings.EMAIL_BACKEND = LOCMEM
+        assert "Recipients: 1" in _run()
 
     def test_it_names_the_relay_it_used(self, addressed_superuser, settings):
         settings.EMAIL_BACKEND = LOCMEM
@@ -126,7 +143,9 @@ class TestItRefuses:
         message = str(caught.value)
         assert "SMTPAuthenticationError" in message
         assert SUPERUSER_ADDRESS not in message
+        assert address_hash(SUPERUSER_ADDRESS) not in message
         assert "5.7.8" not in message
+        assert "1 of 1" in message
 
     def test_the_backend_exception_is_not_chained_onto_the_refusal(self, addressed_superuser, settings):
         """``CommandError`` is printed with its cause by ``call_command``'s
