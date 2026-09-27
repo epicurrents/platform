@@ -166,7 +166,7 @@ A target reports its outcome as a message rather than throwing, and the gate's 4
 | `/library` | `LibraryView` | Top-level collections list |
 | `/library/collections/:id` | `CollectionView` | Collection detail — items, access rights |
 | `/datasets` | `DatasetsView` | Dataset list |
-| `/datasets/:id` | `DatasetView` | Dataset detail — items, access rights, and the submission pool section (author, superuser) |
+| `/datasets/:id` | `DatasetView` | Dataset detail — items, access rights, and the submission pool section (author, superuser); on a release-gated dataset, the curator review on each recording row (approval count, approve or withdraw, veto with a reason from a closed list) for whoever the review endpoint answers, which includes write grantees |
 | `/upload` | `UploadView` | Recording upload |
 | `/viewer` | `ViewerView` | Embedded signal viewer |
 | `/annotations/export` | `AnnotationExportView` | Annotation export (staff) |

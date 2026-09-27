@@ -111,7 +111,9 @@ class IngestProfile:
     members the pool's contributor group must have before intake opens (``library.pools.set_intake``). ``m`` is a
     condition on the pool rather than on each class because counting distinct contributors per class means holding
     which contributor fed which class, and beside the ingest runs that joins a recording back to its ledger. Both are
-    recorded on every release run.
+    recorded on every release run. ``approvals`` is the number of distinct curators who must
+    approve a member before a release publishes it (``library.release.approved_items``); a
+    profile that sets none asks for one, so no pool member is published without a human review.
     """
 
     key: str
@@ -129,11 +131,17 @@ class IngestProfile:
     ingest: Callable[[Any, dict], None] | None = field(default=None, compare=False)
     k: int | None = None
     m: int | None = None
+    approvals: int | None = None
 
     @property
     def all_forbidden_sidecar_keys(self) -> frozenset[str]:
         """The default forbidden keys plus the profile's own."""
         return frozenset(DEFAULT_FORBIDDEN_SIDECAR_KEYS) | frozenset(self.forbidden_sidecar_keys)
+
+    @property
+    def required_approvals(self) -> int:
+        """``approvals``, or one when the profile sets none."""
+        return self.approvals if self.approvals is not None else 1
 
 
 _PROFILES: dict[str, IngestProfile] = {}
@@ -147,12 +155,12 @@ def register_ingest_profile(profile: IngestProfile) -> None:
     to do so repeatedly.
 
     A profile naming a channel no file can carry is refused here, at boot, rather than by
-    refusing every submission later: see :func:`unsatisfiable_channels`. So is a ``k`` or ``m``
-    that is not a positive integer, which no release run or intake check could apply.
+    refusing every submission later: see :func:`unsatisfiable_channels`. So is a ``k``, ``m`` or
+    ``approvals`` that is not a positive integer, which no release run or intake check could apply.
     """
     if not profile.key or not profile.key.replace("_", "").replace("-", "").replace(".", "").isalnum():
         raise ValueError(f"Ingest profile key {profile.key!r} must be a non-empty identifier.")
-    for name in ("k", "m"):
+    for name in ("k", "m", "approvals"):
         value = getattr(profile, name)
         if value is not None and (isinstance(value, bool) or not isinstance(value, int) or value < 1):
             raise ValueError(f"Ingest profile {profile.key!r} has {name}={value!r}; it must be a positive integer.")

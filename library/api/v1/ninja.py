@@ -1677,6 +1677,212 @@ def dissolve_dataset_pool(request, dataset_id: str):
 
 
 # ---------------------------------------------------------------------------
+# Curator review of a release-gated dataset's members
+# ---------------------------------------------------------------------------
+
+
+class MemberReviewOut(Schema):
+    """One recording member's review state, as a curator sees it."""
+
+    # The recording's 32-hex hash, as the item listing names it.
+    hash: str
+    released: bool
+    approvals: int
+    approved_by_me: bool
+
+
+class DatasetReviewOut(Schema):
+    """The review state of a release-gated dataset's recording members, for its managers."""
+
+    # Approvals from distinct curators the pool's profile asks for; null for a dataset that is not a pool, whose
+    # project selector decides.
+    approvals_required: int | None
+    members: list[MemberReviewOut]
+
+
+class VetoIn(Schema):
+    """Veto a member: one reason from the closed list, never free text."""
+
+    reason: str
+
+
+def _get_reviewed_dataset(user, dataset_id: str) -> Dataset:
+    from library.release import is_dataset_manager
+
+    dataset = _get_active_dataset(dataset_id)
+    if not dataset.release_gated:
+        raise HttpError(409, "Only a release-gated dataset's members are reviewed")
+    if not is_dataset_manager(user, dataset):
+        raise HttpError(403, "Only the dataset's managers review its members")
+    return dataset
+
+
+def _reviewable_recordings(user):
+    """The recordings a curator may see in a review: active, and not FAILED unless the curator is its author or a superuser.
+
+    The FAILED-hidden rule applies to curators as to any grantee; a pooled member that failed processing is the
+    operator's to deal with, and its existence is not a curator's to learn.
+    """
+    from django.db.models import Q
+
+    from recordings.models import Recording
+
+    recordings = Recording.objects.filter(deleted_at__isnull=True)
+    if not getattr(user, "is_superuser", False):
+        recordings = recordings.exclude(Q(status=Recording.Status.FAILED) & ~Q(author_id=user.pk))
+    return recordings
+
+
+def _recording_member(dataset: Dataset, recording_hash: str, user) -> tuple[DatasetItem, str]:
+    """The dataset's membership of the recording *recording_hash* names, and the normalised hash; 404 otherwise."""
+    from recordings.models import Recording
+
+    normalized = (recording_hash or "").strip().upper()
+    if len(normalized) != 32 or not normalized.isalnum():
+        raise HttpError(400, "Invalid recording hash. Use 32 alphanumeric characters.")
+    recording = _reviewable_recordings(user).filter(stored_name__startswith=f"{normalized}.").only("id").first()
+    item = None
+    if recording is not None:
+        item = DatasetItem.objects.filter(
+            dataset=dataset,
+            content_type=ContentType.objects.get_for_model(Recording, for_concrete_model=False),
+            object_id=str(recording.pk),
+        ).first()
+    if item is None:
+        raise HttpError(404, "No such member")
+    return item, normalized
+
+
+def _approvals_required(dataset: Dataset) -> int | None:
+    from recordings.submissions import get_ingest_profile
+
+    profile = get_ingest_profile(dataset.submission_profile) if pools.is_pool(dataset) else None
+    return profile.required_approvals if profile is not None else None
+
+
+def _member_review_out(item: DatasetItem, recording_hash: str, user) -> dict:
+    from library.models import MemberApproval
+
+    approvals = MemberApproval.objects.filter(item=item)
+    return {
+        "hash": recording_hash,
+        "released": item.release_id is not None,
+        "approvals": approvals.count(),
+        "approved_by_me": approvals.filter(reviewer=user).exists(),
+    }
+
+
+@api.get("/datasets/{dataset_id}/reviews/", response=DatasetReviewOut)
+def list_dataset_reviews(request, dataset_id: str):
+    """Every recording member's approvals and whether the caller gave one, for the dataset's managers.
+
+    Counts only: which curators approved a member is the run's sign-off record, not something one
+    curator reads about another.
+    """
+    from library.models import MemberApproval
+    from recordings.models import Recording
+
+    user = _require_auth(request)
+    dataset = _get_reviewed_dataset(user, dataset_id)
+    recording_ct = ContentType.objects.get_for_model(Recording, for_concrete_model=False)
+    items = list(DatasetItem.objects.filter(dataset=dataset, content_type=recording_ct))
+    names = dict(
+        _reviewable_recordings(user)
+        .filter(pk__in=[int(item.object_id) for item in items])
+        .values_list("pk", "stored_name")
+    )
+    counts: dict[int, int] = {}
+    mine: set[int] = set()
+    for item_id, reviewer_id in MemberApproval.objects.filter(item__in=items).values_list("item_id", "reviewer_id"):
+        counts[item_id] = counts.get(item_id, 0) + 1
+        if reviewer_id == user.pk:
+            mine.add(item_id)
+    members = [
+        {
+            "hash": names[int(item.object_id)].split(".", 1)[0],
+            "released": item.release_id is not None,
+            "approvals": counts.get(item.pk, 0),
+            "approved_by_me": item.pk in mine,
+        }
+        for item in items
+        if int(item.object_id) in names
+    ]
+    members.sort(key=lambda member: member["hash"])
+    log_activity(verb="library.dataset.review.read", target=dataset, metadata={"member_count": len(members)})
+    return {"approvals_required": _approvals_required(dataset), "members": members}
+
+
+@api.post("/datasets/{dataset_id}/reviews/{recording_hash}/approval", response={201: MemberReviewOut})
+def approve_dataset_member(request, dataset_id: str, recording_hash: str):
+    """Approve an unreleased member for release. Idempotent for the same curator; a released member answers 409."""
+    from library.models import MemberApproval
+
+    user = _require_auth(request)
+    dataset = _get_reviewed_dataset(user, dataset_id)
+    item, normalized = _recording_member(dataset, recording_hash, user)
+    if item.release_id is not None:
+        raise HttpError(409, "The member has already been released")
+    try:
+        with transaction.atomic():
+            MemberApproval.objects.get_or_create(item=item, reviewer=user)
+            log_activity(verb="library.dataset.member.approval.create", target=item)
+    except IntegrityError:
+        # A concurrent approval by the same curator landed first and the member is approved either way; the
+        # annotation rolled back with the block, so it is written again.
+        log_activity(verb="library.dataset.member.approval.create", target=item)
+    return 201, _member_review_out(item, normalized, user)
+
+
+@api.delete("/datasets/{dataset_id}/reviews/{recording_hash}/approval", response=MemberReviewOut)
+def withdraw_dataset_member_approval(request, dataset_id: str, recording_hash: str):
+    """Withdraw the caller's approval of an unreleased member; a released member answers 409."""
+    from library.models import MemberApproval
+
+    user = _require_auth(request)
+    dataset = _get_reviewed_dataset(user, dataset_id)
+    item, normalized = _recording_member(dataset, recording_hash, user)
+    if item.release_id is not None:
+        raise HttpError(409, "The member has already been released")
+    with transaction.atomic():
+        for approval in MemberApproval.objects.filter(item=item, reviewer=user):
+            approval.delete()
+        log_activity(verb="library.dataset.member.approval.delete", target=item)
+    return _member_review_out(item, normalized, user)
+
+
+@api.post("/datasets/{dataset_id}/reviews/{recording_hash}/veto", response={204: None})
+def veto_dataset_member(request, dataset_id: str, recording_hash: str, payload: VetoIn):
+    """Veto a member for identifying content: removed at once, released or not.
+
+    A pooled recording, owned by the system user, is deleted with its file; a recording a platform
+    user owns leaves only this dataset (``library.release.veto_member``). One curator's veto is
+    final and cannot be undone. The reason is a code from ``VetoReason`` and is the only thing
+    recorded about why; free text would describe the patient.
+    """
+    from library.models import VetoReason
+    from library.release import veto_member
+
+    user = _require_auth(request)
+    dataset = _get_reviewed_dataset(user, dataset_id)
+    if payload.reason not in VetoReason.values:
+        raise HttpError(400, "Unknown veto reason")
+    item, _normalized = _recording_member(dataset, recording_hash, user)
+    with transaction.atomic():
+        # Before the deletion, so the membership's key is still there to target; what went is added after.
+        log_activity(
+            verb="library.dataset.member.veto",
+            target=item,
+            metadata={"reason": payload.reason, "released": item.release_id is not None},
+        )
+        try:
+            removed = veto_member(item)
+        except OSError as exc:
+            raise HttpError(500, "The recording's file could not be removed; nothing was changed") from exc
+        log_activity(verb="library.dataset.member.veto", metadata={"removed": removed})
+    return 204, None
+
+
+# ---------------------------------------------------------------------------
 # Dataset item membership
 # ---------------------------------------------------------------------------
 

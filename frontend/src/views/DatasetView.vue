@@ -33,6 +33,14 @@ import {
     type AssessmentPayload,
     type DatasetFolder,
     type DatasetPool,
+    approveDatasetMember,
+    getDatasetReview,
+    vetoDatasetMember,
+    withdrawDatasetMemberApproval,
+    VETO_REASONS,
+    type DatasetMemberReview,
+    type DatasetReview,
+    type VetoReason,
 } from '#api/library'
 import { getMediaContentTypeId } from '#api/media'
 import { getRecordingDetail, recordingName, type Recording } from '#api/recordings'
@@ -41,6 +49,7 @@ import { useRecordingsStore } from '#stores/recordings'
 import { useLibraryStore } from '#stores/library'
 import { useAuthStore } from '#stores/auth'
 import { toastNameWarnings } from '#lib/nameWarnings'
+import { errorDetail } from '#lib/http'
 import { showToast } from '#lib/toast'
 import ViewerConfigEditor from '#components/ViewerConfigEditor.vue'
 import type { ViewerSettingsOverrides } from '#lib/viewerConfig'
@@ -76,6 +85,7 @@ onMounted(async () => {
         items.value = its
         folders.value = tree
         accessRights.value = rights
+        loadReview()
 
         if (!recordingsStore.recordings.length) {
             recordingsStore.load()
@@ -134,6 +144,116 @@ async function onPoolChange (next: DatasetPool, changed: boolean) {
         } catch {
             // The pool section already reported the write; a stale gate flag here is cosmetic.
         }
+        loadReview()
+    }
+}
+
+// ── Curator review ────────────────────────────────────────────────────────
+
+// Answered to the dataset's managers only, which is the server's rule and wider than the owner check above: a holder
+// of a write grant curates too. A refusal leaves the page without review controls rather than reporting an error.
+const review = ref<DatasetReview | null>(null)
+const reviewByHash = computed(() => new Map((review.value?.members ?? []).map(member => [member.hash, member])))
+
+async function loadReview () {
+    if (!dataset.value?.release_gated) {
+        review.value = null
+        return
+    }
+    try {
+        review.value = await getDatasetReview(datasetId.value)
+    } catch {
+        review.value = null
+    }
+}
+
+/**
+ * The review state of an item's recording, or null when the caller does not review this dataset.
+ * @param item - A row of the items section.
+ */
+function reviewOf (item: CollectionItem): DatasetMemberReview | null {
+    return item.object_hash ? reviewByHash.value.get(item.object_hash) ?? null : null
+}
+
+/**
+ * The approval tag of an unreleased member: approvals so far against those the profile asks for.
+ * @param member - The member's review state.
+ */
+function approvalLabel (member: DatasetMemberReview) {
+    const required = review.value?.approvals_required
+    if (required === null || required === undefined) {
+        return t('{count} approved', SCOPE, { count: member.approvals })
+    }
+    return t('{count} of {required} approvals', SCOPE, { count: member.approvals, required })
+}
+
+/**
+ * Replace one member's review state after a write.
+ * @param next - The state the server answered with.
+ */
+function setMemberReview (next: DatasetMemberReview) {
+    if (!review.value) {
+        return
+    }
+    review.value.members = review.value.members.map(member => member.hash === next.hash ? next : member)
+}
+
+async function setApproval (item: CollectionItem, approve: boolean) {
+    if (!item.object_hash) {
+        return
+    }
+    try {
+        const next = approve
+            ? await approveDatasetMember(datasetId.value, item.object_hash)
+            : await withdrawDatasetMemberApproval(datasetId.value, item.object_hash)
+        setMemberReview(next)
+        showToast(approve ? t('Approved for release.', SCOPE) : t('Approval withdrawn.', SCOPE), 'neutral')
+    } catch (err) {
+        showToast(errorDetail(err, t('The approval could not be changed.', SCOPE)), 'danger')
+    }
+}
+
+const vetoReasonLabels: Record<VetoReason, string> = {
+    device: t('Implanted or external device', SCOPE),
+    other: t('Other identifying content', SCOPE),
+    rare_condition: t('Rare condition or syndrome', SCOPE),
+    skull_defect: t('Skull defect or breach rhythm', SCOPE),
+    unusual_protocol: t('Unusual protocol', SCOPE),
+}
+const vetoItem = ref<CollectionItem | null>(null)
+const vetoInput = reactive({ reason: '' })
+const vetoing = ref(false)
+
+function openVeto (item: CollectionItem) {
+    vetoInput.reason = ''
+    vetoItem.value = item
+}
+
+function closeVeto () {
+    if (vetoing.value) {
+        return
+    }
+    vetoItem.value = null
+}
+
+async function confirmVeto () {
+    const item = vetoItem.value
+    if (!item?.object_hash || !vetoInput.reason) {
+        return
+    }
+    vetoing.value = true
+    try {
+        await vetoDatasetMember(datasetId.value, item.object_hash, vetoInput.reason as VetoReason)
+        items.value = items.value.filter(row => row.id !== item.id)
+        if (review.value) {
+            review.value.members = review.value.members.filter(member => member.hash !== item.object_hash)
+        }
+        vetoItem.value = null
+        showToast(t('The member was vetoed and removed.', SCOPE), 'neutral')
+    } catch (err) {
+        showToast(errorDetail(err, t('The veto failed. Nothing was removed.', SCOPE)), 'danger')
+    } finally {
+        vetoing.value = false
     }
 }
 
@@ -629,6 +749,10 @@ function onRecordingAction(value: string, item: CollectionItem) {
         openEditRecording(item)
     } else if (value === 'move-folder') {
         openMoveItem(item)
+    } else if (value === 'approve' || value === 'withdraw-approval') {
+        setApproval(item, value === 'approve')
+    } else if (value === 'veto') {
+        openVeto(item)
     } else {
         removeItem(item)
     }
@@ -814,6 +938,9 @@ const assessFn = (right: AccessRight, payload: AssessmentPayload) =>
                                     <wa-tag v-if="dataset?.release_gated && !item.release_month" size="small" variant="warning">
                                         {{ t('Unreleased', SCOPE) }}
                                     </wa-tag>
+                                    <wa-tag v-if="reviewOf(item) && !reviewOf(item)?.released" size="small" variant="neutral">
+                                        {{ approvalLabel(reviewOf(item)!) }}
+                                    </wa-tag>
                                 </template>
                                 <template #actions>
                                     <wa-dropdown-item value="edit">
@@ -827,6 +954,20 @@ const assessFn = (right: AccessRight, payload: AssessmentPayload) =>
                                     <wa-dropdown-item v-if="canManageFolders && folders.length" value="move-folder">
                                         <wa-icon name="folder-open" slot="icon"></wa-icon>
                                         {{ t('Move to folder', SCOPE) }}
+                                    </wa-dropdown-item>
+                                    <template v-if="reviewOf(item) && !reviewOf(item)?.released">
+                                        <wa-dropdown-item v-if="!reviewOf(item)?.approved_by_me" value="approve">
+                                            <wa-icon name="check" slot="icon"></wa-icon>
+                                            {{ t('Approve for release', SCOPE) }}
+                                        </wa-dropdown-item>
+                                        <wa-dropdown-item v-else value="withdraw-approval">
+                                            <wa-icon name="rotate-left" slot="icon"></wa-icon>
+                                            {{ t('Withdraw approval', SCOPE) }}
+                                        </wa-dropdown-item>
+                                    </template>
+                                    <wa-dropdown-item v-if="reviewOf(item)" value="veto" variant="danger">
+                                        <wa-icon name="ban" slot="icon"></wa-icon>
+                                        {{ t('Veto…', SCOPE) }}
                                     </wa-dropdown-item>
                                     <wa-dropdown-item v-if="!isPool" value="remove" variant="danger">
                                         <wa-icon name="xmark" slot="icon"></wa-icon>
@@ -1131,6 +1272,49 @@ const assessFn = (right: AccessRight, payload: AssessmentPayload) =>
                 @click="submitFolder"
             >
                 {{ editingFolder ? t('Save', SCOPE) : t('Create', SCOPE) }}
+            </wa-button>
+        </div>
+    </wa-dialog>
+
+    <!-- Veto dialog -->
+    <wa-dialog
+        :label="t('Veto recording', SCOPE)"
+        :open="!!vetoItem"
+        @wa-hide.self="closeVeto"
+    >
+        <div class="dialog-form">
+            <p>
+                {{ t('A veto removes the member at once, released or not, and cannot be undone: a pooled recording is deleted from the platform, and any other recording leaves this dataset. Use it for content that identifies the patient whatever the class size.', SCOPE) }}
+            </p>
+            <wa-select
+                :disabled="vetoing"
+                :label="t('Reason', SCOPE)"
+                :placeholder="t('Choose a reason', SCOPE)"
+                size="s"
+                v-wa="[vetoInput, 'reason']"
+            >
+                <wa-option v-for="reason in VETO_REASONS" :key="reason" :value="reason">
+                    {{ vetoReasonLabels[reason] }}
+                </wa-option>
+            </wa-select>
+        </div>
+        <div slot="footer" class="form-actions">
+            <wa-button
+                appearance="filled-outlined"
+                :disabled="vetoing"
+                variant="neutral"
+                @click="closeVeto"
+            >
+                {{ t('Cancel', SCOPE) }}
+            </wa-button>
+            <wa-button
+                appearance="filled-outlined"
+                :disabled="!vetoInput.reason"
+                :loading="vetoing"
+                variant="danger"
+                @click="confirmVeto"
+            >
+                {{ t('Veto and remove', SCOPE) }}
             </wa-button>
         </div>
     </wa-dialog>

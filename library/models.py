@@ -525,6 +525,52 @@ class DatasetItem(models.Model):
         ]
 
 
+class MemberApproval(models.Model):
+    """One curator's approval of one member of a release-gated dataset for release.
+
+    A curator is a dataset manager (``library.release.is_dataset_manager``). A project's release
+    selector asks for a number of approvals from distinct curators before a member is published
+    (``library.release.approved_items``), and the run records the approvers as its sign-off. A
+    veto is not a row: it removes the member at once, audited with its reason code, deleting a
+    pooled recording outright, since one a curator found identifying has no reason to stay. The
+    row holds no free text, because a typed reason tends to describe the feature that identifies
+    the patient.
+    """
+
+    item = models.ForeignKey(DatasetItem, on_delete=models.CASCADE, related_name="approvals")
+    # Null once the curator's account is deleted; the approval still counts for the member.
+    reviewer = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="member_approvals",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["item", "reviewer"],
+                condition=models.Q(reviewer__isnull=False),
+                name="library_approval_one_per_reviewer",
+            ),
+        ]
+
+    def __str__(self) -> str:
+        return f"MemberApproval(item={self.item_id} by={self.reviewer_id})"
+
+
+class VetoReason(models.TextChoices):
+    """Why a curator vetoed a member: a closed list, so no reason in the trail describes the patient."""
+
+    RARE_CONDITION = "rare_condition", "Rare condition or syndrome"
+    SKULL_DEFECT = "skull_defect", "Skull defect or breach rhythm"
+    DEVICE = "device", "Implanted or external device"
+    UNUSUAL_PROTOCOL = "unusual_protocol", "Unusual protocol"
+    OTHER = "other", "Other identifying content"
+
+
 class Tag(models.Model):
     """A hierarchical label that can be applied to any object.
 

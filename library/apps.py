@@ -82,6 +82,10 @@ class LibraryConfig(AppConfig):
             "author",
             fields=("released_on", "profile_version", "member_count", "assessment_reference", "created_at"),
         )
+        # A curator's approval of a member is their activity record: when and
+        # that they approved, never which recording, whose hash is another
+        # subject's data. The row holds no free text, so nothing to scrub.
+        register_export_relation("library.memberapproval", "reviewer", fields=("created_at",))
         from activity.erasure import register_subject_pii
 
         register_subject_pii(

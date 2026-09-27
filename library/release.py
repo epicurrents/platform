@@ -37,7 +37,9 @@ start of M+2, so every member waits between one and two months and a month's sub
 every contributor surface together. The cadence is the platform's; which eligible members a run
 publishes is the project's, through :func:`register_release_selector`. Without a selector a run
 publishes everything eligible. :func:`select_by_class_size` is the class-size condition a selector
-builds on: an eligible member is published once its equivalence class holds k recordings. The equivalence classes the anonymity report counts are the
+builds on: an eligible member is published once its equivalence class holds k recordings.
+:func:`approved_items` is the curator review: a member is published once enough dataset managers
+approved it, and :func:`veto_member` removes one a manager found identifying. The equivalence classes the anonymity report counts are the
 project's too, through :func:`register_equivalence_class`; the reports themselves are in
 :mod:`library.reports`.
 """
@@ -449,6 +451,71 @@ def select_by_class_size(dataset: Dataset, eligible: list[DatasetItem], *, k: in
     return selected
 
 
+def approval_counts(items: list[DatasetItem]) -> dict[int, int]:
+    """The number of curator approvals each of *items* holds, keyed by item primary key."""
+    from django.db.models import Count
+
+    from library.models import MemberApproval
+
+    counted = (
+        MemberApproval.objects.filter(item__in=[item.pk for item in items])
+        .values("item_id")
+        .annotate(n=Count("pk"))
+        .values_list("item_id", "n")
+    )
+    return {item.pk: 0 for item in items} | dict(counted)
+
+
+def approved_items(items: list[DatasetItem], *, required: int) -> list[DatasetItem]:
+    """The members of *items* approved by at least *required* distinct curators, in their given order.
+
+    An approval whose curator's account has since been deleted still counts: it was given by a
+    distinct curator when it was made, which the per-reviewer constraint guaranteed.
+    """
+    counts = approval_counts(items)
+    return [item for item in items if counts[item.pk] >= required]
+
+
+def approvers_of(items: list[DatasetItem]) -> list[int]:
+    """Primary keys of the curators who approved any of *items*, sorted: the sign-off of a run releasing them."""
+    from library.models import MemberApproval
+
+    ids = MemberApproval.objects.filter(item__in=[item.pk for item in items], reviewer__isnull=False).values_list(
+        "reviewer_id", flat=True
+    )
+    return sorted(set(ids))
+
+
+def veto_member(item: DatasetItem) -> str:
+    """Remove a vetoed recording member, and return what went: ``"recording"`` or ``"membership"``.
+
+    A recording the system user owns, which is how every pooled submission is stored, is removed
+    whole: its file is unlinked, then the recording is deleted and with it the membership. The
+    file goes first, as in the purge: a row outliving its bytes is a dead pointer, while bytes
+    outliving their row are what a veto exists to prevent, and an unlink failure raises and
+    deletes nothing. A recording a platform user owns loses only its membership: a curator is a
+    dataset manager, and managing a dataset confers no right to delete another user's data.
+
+    Must be called inside an audited scope and a transaction, so each deletion is recorded. Only
+    recording members are vetoed; another member type raises ``ValueError``.
+    """
+    from pathlib import Path
+
+    from epicurrents.system_user import get_system_user
+    from recordings.models import Recording
+
+    if item.content_type_id != ContentType.objects.get_for_model(Recording, for_concrete_model=False).pk:
+        raise ValueError("Only a recording member can be vetoed")
+    recording = Recording.objects.filter(pk=int(item.object_id)).first()
+    if recording is None or recording.author_id != get_system_user().pk:
+        item.delete()
+        return "membership"
+    if recording.file_path:
+        Path(recording.file_path).unlink(missing_ok=True)
+    recording.delete()
+    return "recording"
+
+
 def decide_release(dataset: Dataset, *, as_of: date) -> tuple[list[DatasetItem], ReleaseDecision]:
     """Compute the eligible set and hand it to the registered selector, or publish it whole."""
     eligible = eligible_items(dataset, as_of=as_of)
@@ -476,8 +543,10 @@ def run_release(
     Must be called inside an audited scope and a transaction: the run row is created, each
     released item is saved with its release pointer so the audit signal records the change,
     and nothing else moves. Command-line values fill whichever record fields the selector left
-    blank. A run that releases nothing still leaves a row, since a run with an empty eligible
-    set or a selector that withheld everything is a fact worth dating.
+    blank, except the sign-off, which is the union of the selector's and the command line's: the
+    curators who approved the members and anyone who signed the run off as a whole. A run that
+    releases nothing still leaves a row, since a run with an empty eligible set or a selector
+    that withheld everything is a fact worth dating.
     """
     if not dataset.release_gated:
         raise ValueError("Dataset is not release-gated")
@@ -490,7 +559,7 @@ def run_release(
         deidentification_versions=deidentification_versions_of(decision.items),
         k=decision.k if decision.k is not None else k,
         m=decision.m if decision.m is not None else m,
-        sign_off_user_ids=list(decision.sign_off_user_ids or sign_off_user_ids or []),
+        sign_off_user_ids=sorted(set(decision.sign_off_user_ids or []) | set(sign_off_user_ids or [])),
         assessment_reference=decision.assessment_reference or assessment_reference,
         member_count=len(decision.items),
     )

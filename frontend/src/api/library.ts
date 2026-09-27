@@ -253,6 +253,54 @@ export async function deleteDataset(id: number | string): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
+// Curator review of a release-gated dataset's members
+// ---------------------------------------------------------------------------
+
+/** One recording member's review state, as a curator sees it. */
+export interface DatasetMemberReview {
+    /** How many curators approved it; never who. */
+    approvals: number
+    approved_by_me: boolean
+    /** The recording's 32-hex hash, as the item listing names it. */
+    hash: string
+    released: boolean
+}
+
+/** The review state of a release-gated dataset's recording members, answered to its managers only. */
+export interface DatasetReview {
+    /** Approvals from distinct curators the pool's profile asks for; null when the dataset is not a pool. */
+    approvals_required: number | null
+    members: DatasetMemberReview[]
+}
+
+/** The closed list of veto reasons; free text is never recorded. */
+export const VETO_REASONS = ['rare_condition', 'skull_defect', 'device', 'unusual_protocol', 'other'] as const
+export type VetoReason = typeof VETO_REASONS[number]
+
+/** The review state; 403 for a caller who does not manage the dataset. */
+export async function getDatasetReview(id: number | string): Promise<DatasetReview> {
+    const response = await http.get<DatasetReview>(`/api/v1/library/datasets/${id}/reviews/`)
+    return response.data
+}
+
+/** Approve an unreleased member for release. */
+export async function approveDatasetMember(id: number | string, hash: string): Promise<DatasetMemberReview> {
+    const response = await http.post<DatasetMemberReview>(`/api/v1/library/datasets/${id}/reviews/${hash}/approval`)
+    return response.data
+}
+
+/** Withdraw the caller's approval of an unreleased member. */
+export async function withdrawDatasetMemberApproval(id: number | string, hash: string): Promise<DatasetMemberReview> {
+    const response = await http.delete<DatasetMemberReview>(`/api/v1/library/datasets/${id}/reviews/${hash}/approval`)
+    return response.data
+}
+
+/** Veto a member: the recording is removed at once and for good. */
+export async function vetoDatasetMember(id: number | string, hash: string, reason: VetoReason): Promise<void> {
+    await http.post(`/api/v1/library/datasets/${id}/reviews/${hash}/veto`, { reason })
+}
+
+// ---------------------------------------------------------------------------
 // Submission pools
 // ---------------------------------------------------------------------------
 

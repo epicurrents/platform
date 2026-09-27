@@ -489,12 +489,16 @@ To check the table against the tree, walk the AST for `log_activity` / `with_sys
 | `library.dataset.item.move` | `move_dataset_item` |
 | `library.dataset.item.remove` | `remove_dataset_item` |
 | `library.dataset.list` | `list_datasets` |
+| `library.dataset.member.approval.create` | `approve_dataset_member` |
+| `library.dataset.member.approval.delete` | `withdraw_dataset_member_approval` |
+| `library.dataset.member.veto` | `veto_dataset_member` |
 | `library.dataset.pool.create` | `configure_dataset_pool` |
 | `library.dataset.pool.delete` | `dissolve_dataset_pool` |
 | `library.dataset.pool.read` | `get_dataset_pool` |
 | `library.dataset.pool.update` | `update_dataset_pool` |
 | `library.dataset.read` | `get_dataset` |
 | `library.dataset.release` | `handle` † |
+| `library.dataset.review.read` | `list_dataset_reviews` |
 | `library.dataset.snapshot.create` | `create_dataset_snapshot` |
 | `library.dataset.snapshot.list` | `list_dataset_snapshots` |
 | `library.dataset.snapshot.read` | `get_dataset_snapshot` |
