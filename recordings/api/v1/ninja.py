@@ -226,7 +226,8 @@ class RecordingOut(Schema):
     prefix when the author has not set a custom name).
 
     ``stored_hash`` is the SHA-256 of the file as stored, after
-    de-identification; it is empty until processing completes. The digest of
+    de-identification; it is empty until processing completes, and empty for a
+    reader of a release-gated member they do not manage. The digest of
     the bytes as uploaded (``Recording.file_hash``) is never serialised, to
     anyone. ``created_at`` is exact for the author and superusers and
     truncated to the first of its month for every other reader.
@@ -464,6 +465,21 @@ def _release_month_of(recording, *, can_see_author_fields: bool, release_month_b
     return release_month_for(recording)
 
 
+def _stored_digest_withheld(recording, *, can_see_author_fields: bool, user, withheld_ids: set | None = None) -> bool:
+    """True when the caller receives no ``stored_hash`` for *recording*: a gated member they do not manage.
+
+    The decision is ``library.release.stored_digest_withheld_ids``; authors and superusers always
+    receive the digest. *withheld_ids* is the batch answer a listing computes once.
+    """
+    if can_see_author_fields:
+        return False
+    if withheld_ids is not None:
+        return str(recording.pk) in withheld_ids
+    from library.release import stored_digest_withheld
+
+    return stored_digest_withheld(user, recording)
+
+
 def _hidden_for_caller(recording, user, fed, share_token: str | None = None) -> bool:
     """Return True when *recording* must answer 404 to this caller: FAILED-hidden, or a gated member it may not see.
 
@@ -500,16 +516,20 @@ def _with_listing_order(queryset):
     )
 
 
-def _ensure_pinned_content(recording, expect_stored_hash: str | None) -> None:
+def _ensure_pinned_content(recording, expect_stored_hash: str | None, *, digest_withheld: bool) -> None:
     """Answer 412 when the caller pinned a ``stored_hash`` the recording no longer has.
 
     ``stored_hash`` moves whenever the platform rewrites the file and stays put across metadata
     edits, so a release manifest, a dataset snapshot or a cached analysis can carry it and fail
     loudly on a reprocessed recording instead of reading different bytes under the same URL.
     Checked after access resolution, so the answer is given to a caller who may read the bytes.
+    A caller the digest is withheld from gets 400 for any pin: comparing a guessed digest would
+    tell them what the response withholds.
     """
     if expect_stored_hash is None:
         return
+    if digest_withheld:
+        raise HttpError(400, "expect_stored_hash is not available for this recording")
     pinned = expect_stored_hash.strip().lower()
     if len(pinned) != 64 or any(c not in "0123456789abcdef" for c in pinned):
         raise HttpError(400, "expect_stored_hash must be a 64-character hexadecimal SHA-256 digest")
@@ -1193,6 +1213,7 @@ def _build_recording_out(
     fed=None,
     trashed_collection_by_pk: dict | None = None,
     release_month_by_pk: dict | None = None,
+    digest_withheld_ids: set | None = None,
 ) -> dict:
     """Assemble a RecordingOut-compatible dict for a single Recording instance.
 
@@ -1211,6 +1232,9 @@ def _build_recording_out(
     release_month = _release_month_of(
         recording, can_see_author_fields=can_see_author_fields, release_month_by_pk=release_month_by_pk
     )
+    digest_withheld = _stored_digest_withheld(
+        recording, can_see_author_fields=can_see_author_fields, user=user, withheld_ids=digest_withheld_ids
+    )
     out = {
         "hash": recording.stored_name.split(".", 1)[0],
         "original_name": (recording.original_name if can_see_author_fields else None),
@@ -1219,7 +1243,7 @@ def _build_recording_out(
         "processing_error": ((recording.processing_error or None) if can_see_author_fields else None),
         "file_extension": recording.file_extension,
         "file_size": recording.file_size,
-        "stored_hash": recording.stored_hash,
+        "stored_hash": "" if digest_withheld else recording.stored_hash,
         "content_hash": recording.content_hash,
         "status": recording.status,
         "modality": recording.modality,
@@ -1732,11 +1756,12 @@ def list_recordings(
     prefetch_related_objects(visible, "events", "interruptions", "labels")
 
     # Batch-fetch RecordingMeta (with per-channel SignalInfo) to avoid N+1 queries.
-    from library.release import release_months_by_id
+    from library.release import release_months_by_id, stored_digest_withheld_ids
     from recordings.models import RecordingMeta
 
     recording_ct = ContentType.objects.get_for_model(Recording, for_concrete_model=False)
     release_month_by_pk = release_months_by_id(recording_ct, [r.pk for r in visible])
+    digest_withheld_ids = stored_digest_withheld_ids(user, recording_ct, [r.pk for r in visible])
     meta_by_pk = {
         int(m.object_id): m
         for m in RecordingMeta.objects.filter(
@@ -1811,6 +1836,7 @@ def list_recordings(
             fed=fed,
             trashed_collection_by_pk=trashed_collection_by_pk,
             release_month_by_pk=release_month_by_pk,
+            digest_withheld_ids=digest_withheld_ids,
         )
         for r in visible
     ]
@@ -2016,6 +2042,7 @@ def recording_detail_slice(
 
     can_see_author_fields = _can_see_original_name(user, recording, fed)
     release_month = _release_month_of(recording, can_see_author_fields=can_see_author_fields)
+    digest_withheld = _stored_digest_withheld(recording, can_see_author_fields=can_see_author_fields, user=user)
     return {
         "hash": recording.stored_name.split(".", 1)[0],
         "original_name": (recording.original_name if can_see_author_fields else None),
@@ -2023,7 +2050,7 @@ def recording_detail_slice(
         "has_custom_name": _has_custom_display_name(recording),
         "file_extension": recording.file_extension,
         "file_size": recording.file_size,
-        "stored_hash": recording.stored_hash,
+        "stored_hash": "" if digest_withheld else recording.stored_hash,
         "content_hash": recording.content_hash,
         "status": recording.status,
         "modality": recording.modality,
@@ -2439,7 +2466,14 @@ def download_recording(
             f"Recording is not yet available for download (status: {recording.status})",
         )
 
-    _ensure_pinned_content(recording, expect_stored_hash)
+    _ensure_pinned_content(
+        recording,
+        expect_stored_hash,
+        digest_withheld=expect_stored_hash is not None
+        and _stored_digest_withheld(
+            recording, can_see_author_fields=_can_see_original_name(user, recording, fed), user=user
+        ),
+    )
 
     file_path = Path(recording.file_path)
     if not file_path.exists() or not file_path.is_file():
@@ -2608,7 +2642,14 @@ def slice_recording(
     if meta is None or not meta.data_record_count or not meta.data_record_duration:
         raise HttpError(422, "Recording metadata not available for time-range slicing")
 
-    _ensure_pinned_content(recording, expect_stored_hash)
+    _ensure_pinned_content(
+        recording,
+        expect_stored_hash,
+        digest_withheld=expect_stored_hash is not None
+        and _stored_digest_withheld(
+            recording, can_see_author_fields=_can_see_original_name(user, recording, fed), user=user
+        ),
+    )
 
     file_path = Path(recording.file_path)
     if not file_path.exists() or not file_path.is_file():

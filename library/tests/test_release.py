@@ -331,6 +331,67 @@ class TestRecordingSurfaces:
         assert hashes == [HASHES[0]]
 
 
+class TestStoredDigest:
+    """A gated member's stored_hash, and the pin that tests it, reach its managers and superusers only."""
+
+    DIGEST = "c" * 64
+
+    def _released_member(self, make_user):
+        author, reader = make_user(), make_user()
+        recording = _recording(author, stored_hash=self.DIGEST)
+        dataset, items = _gated_dataset(author, recording)
+        _release(dataset, *items)
+        return author, reader, recording, dataset
+
+    def test_a_reader_receives_no_digest_on_detail_or_listing(self, client, make_user):
+        author, reader, recording, dataset = self._released_member(make_user)
+        _grant(dataset, author, target=reader)
+        client.force_login(reader)
+        assert _detail(client, recording).json()["stored_hash"] == ""
+        assert [row["stored_hash"] for row in client.get("/recordings/api/v1/").json()] == [""]
+
+    def test_a_reader_cannot_pin_the_content(self, client, make_user):
+        author, reader, recording, dataset = self._released_member(make_user)
+        _grant(dataset, author, target=reader)
+        client.force_login(reader)
+        for pin in (self.DIGEST, "d" * 64):
+            resp = client.get(f"/recordings/api/v1/{HASHES[0]}/file", {"expect_stored_hash": pin})
+            # The same answer for the right and a wrong digest: a pin is not an oracle.
+            assert resp.status_code == 400
+
+    def test_a_manager_receives_the_digest_and_may_pin(self, client, make_user):
+        author, manager, recording, dataset = self._released_member(make_user)
+        _grant(dataset, author, target=manager, can_write=True)
+        client.force_login(manager)
+        assert _detail(client, recording).json()["stored_hash"] == self.DIGEST
+        resp = client.get(f"/recordings/api/v1/{HASHES[0]}/file", {"expect_stored_hash": "d" * 64})
+        assert resp.status_code == 412
+
+    def test_the_author_and_a_superuser_receive_the_digest(self, client, make_user, superuser):
+        author, _reader, recording, _dataset = self._released_member(make_user)
+        for caller in (author, superuser):
+            client.force_login(caller)
+            assert _detail(client, recording).json()["stored_hash"] == self.DIGEST
+
+    def test_a_peer_receives_no_digest(self, client, make_user):
+        author, _reader, _recording_obj, dataset = self._released_member(make_user)
+        peer = _make_peer(author)
+        ct = ContentType.objects.get_for_model(Dataset, for_concrete_model=False)
+        AccessRight.objects.create(
+            content_type=ct, object_id=str(dataset.pk), access_giver=author, federated_peer=peer, can_read=True
+        )
+        with _as_peer(peer):
+            rows = client.get("/recordings/api/v1/").json()
+        assert [row["stored_hash"] for row in rows] == [""]
+
+    def test_a_recording_outside_any_gated_dataset_keeps_its_digest(self, client, make_user):
+        author, reader = make_user(), make_user()
+        recording = _recording(author, stored_hash=self.DIGEST)
+        _grant(recording, author, target=reader)
+        client.force_login(reader)
+        assert _detail(client, recording).json()["stored_hash"] == self.DIGEST
+
+
 # ---------------------------------------------------------------------------
 # Dataset surfaces
 # ---------------------------------------------------------------------------

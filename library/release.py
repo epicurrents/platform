@@ -7,16 +7,18 @@ surfacing one by one as it arrives, and a member from resolving for a request ca
 token; a narrowed condition serves a pooled recording to a forwardable link with nothing in any
 log to notice. :func:`release_month_for` and :func:`release_month_subquery` replace the upload time
 with the release month, and :func:`member_name_subquery` keeps a listing from being an arrival
-order; either regressing reinstates the arrival timing the pool exists to hide. And
+order; either regressing reinstates the arrival timing the pool exists to hide.
+:func:`stored_digest_withheld_ids` keeps a member's digest, and the content pin that tests it, from
+readers who could hold a contributor's receipt; a widened answer lets a receipt find its member. And
 :func:`eligibility_cutoff` with :func:`eligible_items` is the cadence: a member uploaded in M
 eligible from the run at the start of M+2, one regime for backlog and new submissions alike, so
 the release month says nothing about which kind a recording is. Contract
 tests are in ``library/tests/test_release.py`` (``TestMemberGate``, ``TestRecordingSurfaces``,
-``TestDatasetSurfaces``, ``TestCadence``, ``TestClassSize``, ``TestReleaseCommand``); the assessment that depends on
+``TestDatasetSurfaces``, ``TestCadence``, ``TestClassSize``, ``TestStoredDigest``, ``TestReleaseCommand``); the assessment that depends on
 them is ``docs/anonymisation-compliance.md``.
 
 A release-gated dataset (``Dataset.release_gated``) is a pool whose members must not surface one
-by one as they arrive. Three rules follow, all enforced here and registered from
+by one as they arrive. Four rules follow, all enforced here and registered from
 ``library.apps.LibraryConfig.ready()``:
 
 - **Unreleased members are hidden.** A member with no ``DatasetItem.release`` resolves for the
@@ -28,6 +30,10 @@ by one as they arrive. Three rules follow, all enforced here and registered from
   the token. A forwardable link fails the onward-transfer test the gate exists for, and the
   accountability argument needs an individual account. The dataset itself is hidden from
   share-token callers by :func:`dataset_hidden_from_reader`, so a join link lists nothing.
+- **A member's stored digest is served to managers only.** ``stored_hash`` and the content pin
+  on the byte-serving endpoints are withheld from every other reader through
+  :func:`stored_digest_withheld_ids`, because the digest could equal the hash on a contributor's
+  receipt.
 - **A released member is dated by its release month.** ``DatasetRelease.release_month`` replaces
   the upload time on every surface that serves a time to a reader who is not a manager, and
   listings of members order by name rather than by any time.
@@ -203,6 +209,48 @@ def release_month_for(obj: Any) -> datetime | None:
         return None
     ct = ContentType.objects.get_for_model(obj, for_concrete_model=False)
     return release_months_by_id(ct, [object_pk]).get(str(object_pk))
+
+
+def stored_digest_withheld_ids(user: Any, content_type: ContentType, object_ids) -> set[str]:
+    """``object_id`` values among *object_ids* whose stored digest this caller must not receive.
+
+    A member of a live release-gated dataset serves its ``stored_hash`` only to a manager of one
+    of its gated datasets and to superusers; the recording's author is exempted by the caller,
+    which already knows it. A pooled contributor holds a receipt naming the submitted bytes by
+    their SHA-256, and nothing guarantees the ingest pass changes every file, so a served digest
+    could equal a receipt and let whoever holds one find the member in a listing. Withholding it
+    also closes the content pin to the same readers, since a pin answers whether a guessed digest
+    matches. ``user=None`` is the federated shape and receives none.
+    """
+    rows = list(
+        DatasetItem.objects.filter(
+            content_type=content_type,
+            object_id__in=[str(pk) for pk in object_ids],
+            dataset__release_gated=True,
+            dataset__deleted_at__isnull=True,
+        ).values_list("object_id", "dataset_id")
+    )
+    if not rows:
+        return set()
+    if user is not None and getattr(user, "is_superuser", False):
+        return set()
+    managed: set[int] = set()
+    if user is not None and getattr(user, "is_authenticated", False):
+        datasets = Dataset.objects.filter(pk__in={dataset_id for _object_id, dataset_id in rows})
+        managed = {dataset.pk for dataset in datasets if is_dataset_manager(user, dataset)}
+    member_of: dict[str, set[int]] = {}
+    for object_id, dataset_id in rows:
+        member_of.setdefault(str(object_id), set()).add(dataset_id)
+    return {object_id for object_id, dataset_ids in member_of.items() if not dataset_ids & managed}
+
+
+def stored_digest_withheld(user: Any, obj: Any) -> bool:
+    """True when *obj*'s stored digest is withheld from this caller; see :func:`stored_digest_withheld_ids`."""
+    object_pk = getattr(obj, "pk", None)
+    if object_pk is None:
+        return False
+    ct = ContentType.objects.get_for_model(obj, for_concrete_model=False)
+    return str(object_pk) in stored_digest_withheld_ids(user, ct, [object_pk])
 
 
 def release_month_subquery(model) -> Subquery:
