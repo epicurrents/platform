@@ -51,6 +51,7 @@ INSTALLED_APPS = [
     "library.apps.LibraryConfig",
     "media.apps.MediaConfig",
     "federation.apps.FederationConfig",
+    "maintenance.apps.MaintenanceConfig",
     "django.contrib.admin",
     "django.contrib.auth",
     "django.contrib.contenttypes",
@@ -70,6 +71,12 @@ MIDDLEWARE = [
     # every Activity row's actor silently drops to AnonymousUser.  Pinned by
     # epicurrents/tests/test_middleware_failure_modes.py.
     "django.contrib.auth.middleware.AuthenticationMiddleware",
+    # Answers 503 while update/maintenance.json exists. After AuthenticationMiddleware
+    # because the policy depends on whether the caller is a superuser, and before
+    # the throttle and the audit middleware so a request refused for maintenance
+    # burns no throttle budget and writes no Activity row. Pinned by
+    # maintenance/tests/test_maintenance_lock.py. See maintenance/lock.py.
+    "epicurrents.middleware.MaintenanceLockMiddleware",
     # Per-identity API request-rate throttle. Runs after AuthenticationMiddleware
     # and SessionMiddleware (it keys on request.user / session) and before the
     # audit middleware so a throttled flood creates no Activity rows. Fails open;
@@ -175,6 +182,18 @@ CELERY_BEAT_SCHEDULE = {
         "task": "epicurrents.tasks.purge_expired_access_rights",
         # Runs every 6 hours. Adjust via django-celery-beat admin if needed.
         "schedule": 6 * 60 * 60,
+    },
+    "maintenance-sync-spool": {
+        "task": "maintenance.tasks.sync_spool",
+        # The host agent ticks every minute; the same cadence keeps the job rows
+        # within a minute of the spool. Cheap when nothing changed: the task
+        # opens no audited scope unless it has something to write.
+        "schedule": 60,
+    },
+    "maintenance-prune-spool": {
+        "task": "maintenance.tasks.prune_spool",
+        # Daily. Removes the spool files of jobs finished a month ago.
+        "schedule": 24 * 60 * 60,
     },
     "clear-expired-sessions": {
         "task": "epicurrents.tasks.clear_expired_sessions",
@@ -387,6 +406,8 @@ ACTIVITY_PATH_SKIP_LIST: tuple[str, ...] = (
     "/annotations/api/v1/health",  # annotations.health
     "/api/v1/notifications/vapid-public-key",  # static public push key
     "/api/v1/user/auth-config",  # public login-method discovery
+    "/api/v1/maintenance/lock",  # maintenance flag probe the SPA polls
+    "/api/v1/maintenance/lock/",
 )
 
 
@@ -546,6 +567,14 @@ EMAIL_USE_SSL = env_bool("EMAIL_USE_SSL", default=False)
 EMAIL_HOST_USER = config("EMAIL_HOST_USER", default="")
 EMAIL_HOST_PASSWORD = config("EMAIL_HOST_PASSWORD", default="")
 DEFAULT_FROM_EMAIL = config("EMAIL_FROM", default=EMAIL_HOST_USER or "noreply@epicurrents.local")
+# Django leaves this at None, which means the socket's own default — in practice
+# no deadline at all. Mail is sent from inside the workers (the reset task, and
+# maintenance notifications, which go out synchronously from a beat job that
+# runs every minute), so a relay that accepts the connection and then stalls
+# holds a worker child for as long as it cares to, and the next minute's send
+# takes another, with recording processing queued behind them. A relay that
+# cannot answer in 20 s is not going to; the send fails and the task retries.
+EMAIL_TIMEOUT = config("EMAIL_TIMEOUT", default=20, cast=int)
 
 # Base URL of the frontend, used to build password reset links in emails
 FRONTEND_URL = config("FRONTEND_URL", default="http://localhost:5173")
@@ -606,6 +635,37 @@ FEDERATION_ALLOW_PRIVATE_PEER_URLS = env_bool("FEDERATION_ALLOW_PRIVATE_PEER_URL
 # is listed here.
 FEDERATION_ALLOWED_PEER_CIDRS = config("FEDERATION_ALLOWED_PEER_CIDRS", default="", cast=Csv())
 
+# Remote maintenance: management operations requested from the web UI (see
+# maintenance/README.md and docs/engineering-notes/remote-maintenance-design.md).
+# Off by default on both tiers. The master flag mounts the maintenance API and
+# the admin tab; without it the endpoints answer 404 and nothing below matters.
+REMOTE_MAINTENANCE_ENABLED = env_bool("REMOTE_MAINTENANCE_ENABLED", default=False)
+# The host tier: platform updates applied by the root-owned host agent from a
+# package uploaded through the UI. Needs the agent installed on the host; the
+# flag alone makes the operation requestable, so leave it off until it is.
+REMOTE_UPDATE_ENABLED = env_bool("REMOTE_UPDATE_ENABLED", default=False)
+# Minutes an applied update waits for a superuser's confirmation before the
+# agent rolls it back. A request may name its own window; both are clamped to
+# 5–1440 by the agent as well as here.
+REMOTE_UPDATE_VERIFY_WINDOW_MINUTES = min(1440, max(5, config("REMOTE_UPDATE_VERIFY_WINDOW_MINUTES", default=30, cast=int)))
+# Largest package the upload endpoint accepts, in bytes; also declared to the
+# proxy's body limit guard.
+REMOTE_UPDATE_MAX_PACKAGE_SIZE = config("REMOTE_UPDATE_MAX_PACKAGE_SIZE", default=1024 * 1024 * 1024, cast=int)
+# Uploaded packages kept beside the one applied; older ones are pruned.
+REMOTE_UPDATE_KEEP_PACKAGES = config("REMOTE_UPDATE_KEEP_PACKAGES", default=2, cast=int)
+# The release public key the upload endpoint verifies a package's manifest
+# against: RELEASE_KEY.pub at the deployment root, which the previous package
+# installed. The host agent keeps its own root-owned copy; this one is what
+# lets the UI refuse a bad package immediately rather than a minute later.
+REMOTE_UPDATE_RELEASE_KEY_PATH = config("REMOTE_UPDATE_RELEASE_KEY_PATH", default=str(BASE_DIR / "RELEASE_KEY.pub"))
+# The spool the web tier and the host agent share: the maintenance flag, job
+# requests and statuses, uploaded packages. ./update in the deployment root,
+# which update.sh already excludes from every sync and snapshot; the production
+# overlay bind-mounts it and sets this to the mount point.
+MAINTENANCE_SPOOL_PATH = config("MAINTENANCE_SPOOL_PATH", default=str(BASE_DIR / "update"))
+# Characters of a celery-tier job's captured command output kept on the row.
+MAINTENANCE_JOB_OUTPUT_LIMIT = config("MAINTENANCE_JOB_OUTPUT_LIMIT", default=64 * 1024, cast=int)
+
 # Global per-identity request-rate throttle on the REST API surface (see
 # epicurrents/throttle.py). Keyed per authenticated user / share token /
 # session, never naively per IP — deployments serve NAT'd shared-egress groups
@@ -618,12 +678,19 @@ API_THROTTLE_ENABLED = env_bool("API_THROTTLE_ENABLED", default=True)
 API_THROTTLE_RATES = {
     "default": config("API_THROTTLE_RATE_DEFAULT", default=300, cast=int),
     "upload": config("API_THROTTLE_RATE_UPLOAD", default=30, cast=int),
+    "maintenance": config("API_THROTTLE_RATE_MAINTENANCE", default=120, cast=int),
 }
 # Ordered (path-prefix, scope) pairs; first match wins. Uploads are heavier and
 # rarer than reads, so they carry a tighter ceiling than the default scope.
 API_THROTTLE_SCOPE_MAP = (
     ("/recordings/api/v1/upload", "upload"),
     ("/media/api/v1/upload", "upload"),
+    # The jobs routes carry the step-up confirmation, so their scope is a
+    # ceiling on guesses as well; the per-account lockout in user/stepup.py is
+    # the real bound, which is why this stays wide enough for the Maintenance
+    # tab to poll a job every few seconds. Package uploads are uploads.
+    ("/api/v1/maintenance/jobs", "maintenance"),
+    ("/api/v1/maintenance/packages", "upload"),
 )
 # Single high ceiling for unidentified callers (no user, token, or session),
 # keyed on client IP — the only tier where shared egress is unavoidable, so it

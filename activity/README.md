@@ -496,6 +496,28 @@ To check the table against the tree, walk the AST for `log_activity` / `with_sys
 | `library.tag.read` | `get_tag_detail` |
 | `library.tag.update` | `update_tag` |
 
+### `maintenance`
+
+| Verb | Emitted by |
+|---|---|
+| `maintenance.job.abandon` | `abandon_job` |
+| `maintenance.job.cancel` | `cancel_job` |
+| `maintenance.job.create` | `create_job` |
+| `maintenance.job.list` | `list_jobs` |
+| `maintenance.job.log` | `get_job_log` |
+| `maintenance.job.read` | `get_job` |
+| `maintenance.job.reap` | `reap_stale_jobs` † |
+| `maintenance.job.rollback` | `rollback_job` |
+| `maintenance.job.run` | `run_job` † |
+| `maintenance.job.sync` | `spool.sync` † |
+| `maintenance.job.verify` | `verify_job` |
+| `maintenance.operation.list` | `list_operations` |
+| `maintenance.package.create` | `upload_package` |
+| `maintenance.package.delete` | `delete_package` |
+| `maintenance.package.list` | `list_packages` |
+| `maintenance.package.sync` | `packaging.reconcile` † |
+| `maintenance.status.read` | `get_status` |
+
 ### `media`
 
 | Verb | Emitted by |
@@ -551,6 +573,7 @@ To check the table against the tree, walk the AST for `log_activity` / `with_sys
 | `user.account.create` | `create_account` |
 | `user.account.erase` | `_scrub_only` †, `handle` † |
 | `user.account.groups.set` | `set_account_groups` |
+| `user.account.invite.resend` | `resend_account_invitation` |
 | `user.account.list` | `list_accounts` |
 | `user.account.password.set` | `set_account_password` |
 | `user.account.read` | `get_account` |

@@ -4,12 +4,14 @@ import { useRouter, useRoute } from 'vue-router'
 import axios from 'axios'
 import { t } from '#i18n'
 import { useAuthStore } from '#stores/auth'
+import { useMaintenanceStore } from '#stores/maintenance'
 import { fetchAuthConfig, requestPasswordReset, type OIDCProvider } from '#api/user'
 
 const SCOPE = 'LoginView'
 const router = useRouter()
 const route = useRoute()
 const authStore = useAuthStore()
+const maintenanceStore = useMaintenanceStore()
 
 const input = reactive({ username: '', password: '', resetEmail: '', code: '' })
 const error = ref<string | null>(null)
@@ -276,6 +278,12 @@ function toggleForgot () {
 
         <form v-else-if="mode === 'signin'" class="login-form" @submit.prevent="submit">
             <h1>{{ t('Sign in', SCOPE) }}</h1>
+            <wa-callout v-if="maintenanceStore.locked" variant="warning">
+                {{ maintenanceStore.notice?.message }}
+                {{ maintenanceStore.suspended
+                    ? t('Signing in is possible again once the maintenance is over; this page checks by itself.', SCOPE)
+                    : t('You can sign in and look around; changes are not accepted until the update is confirmed.', SCOPE) }}
+            </wa-callout>
             <wa-callout v-if="error" variant="danger">{{ error }}</wa-callout>
             <wa-input
                 autocomplete="username"
@@ -295,6 +303,7 @@ function toggleForgot () {
             ></wa-input>
             <wa-button
                 appearance="filled-outlined"
+                :disabled="maintenanceStore.suspended"
                 :loading="loading"
                 type="submit"
                 variant="brand"

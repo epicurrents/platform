@@ -91,6 +91,18 @@ describe('authGuard', () => {
         expect(result).toEqual({ name: 'home' })
     })
 
+    it('sends a staff user who is not a superuser away from a superuser-only route', async () => {
+        mockFetchMe.mockResolvedValueOnce({ ...STUDENT, is_staff: true })
+        const result = await authGuard(route({ requiresAuth: true, requiresStaff: true, requiresSuperuser: true }))
+        expect(result).toEqual({ name: 'home' })
+    })
+
+    it('lets a superuser through a superuser-only route', async () => {
+        mockFetchMe.mockResolvedValueOnce({ ...STUDENT, is_superuser: true })
+        const result = await authGuard(route({ requiresAuth: true, requiresSuperuser: true }))
+        expect(result).toBe(true)
+    })
+
     it('exempts a share-token URL from the auth check', async () => {
         const result = await authGuard(route({ requiresAuthUnlessToken: true }, { token: 'share' }))
         expect(result).toBe(true)

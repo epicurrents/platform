@@ -21,6 +21,7 @@ import admin_panel_settings from '@material-symbols/svg-400/outlined/admin_panel
 import arrow_back from '@material-symbols/svg-400/outlined/arrow_back.svg?raw'
 import arrow_forward from '@material-symbols/svg-400/outlined/arrow_forward.svg?raw'
 import attach_file from '@material-symbols/svg-400/outlined/attach_file.svg?raw'
+import block from '@material-symbols/svg-400/outlined/block.svg?raw'
 import check from '@material-symbols/svg-400/outlined/check.svg?raw'
 import check_box from '@material-symbols/svg-400/outlined/check_box.svg?raw'
 import check_box_outline_blank from '@material-symbols/svg-400/outlined/check_box_outline_blank.svg?raw'
@@ -33,9 +34,9 @@ import dark_mode from '@material-symbols/svg-400/outlined/dark_mode.svg?raw'
 import database from '@material-symbols/svg-400/outlined/database.svg?raw'
 import delete_ from '@material-symbols/svg-400/outlined/delete.svg?raw'
 import description from '@material-symbols/svg-400/outlined/description.svg?raw'
-import download from '@material-symbols/svg-400/outlined/download.svg?raw'
 import desktop_windows from '@material-symbols/svg-400/outlined/desktop_windows.svg?raw'
 import directory_sync from '@material-symbols/svg-400/outlined/directory_sync.svg?raw'
+import download from '@material-symbols/svg-400/outlined/download.svg?raw'
 import edit from '@material-symbols/svg-400/outlined/edit.svg?raw'
 import error from '@material-symbols/svg-400/outlined/error.svg?raw'
 import file_copy from '@material-symbols/svg-400/outlined/file_copy.svg?raw'
@@ -45,12 +46,14 @@ import folder_open from '@material-symbols/svg-400/outlined/folder_open.svg?raw'
 import format_list_numbered from '@material-symbols/svg-400/outlined/format_list_numbered.svg?raw'
 import group from '@material-symbols/svg-400/outlined/group.svg?raw'
 import groups from '@material-symbols/svg-400/outlined/groups.svg?raw'
+import handyman from '@material-symbols/svg-400/outlined/handyman.svg?raw'
 import home from '@material-symbols/svg-400/outlined/home.svg?raw'
 import info from '@material-symbols/svg-400/outlined/info.svg?raw'
 import key from '@material-symbols/svg-400/outlined/key.svg?raw'
 import light_mode from '@material-symbols/svg-400/outlined/light_mode.svg?raw'
 import link from '@material-symbols/svg-400/outlined/link.svg?raw'
 import lock from '@material-symbols/svg-400/outlined/lock.svg?raw'
+import mail from '@material-symbols/svg-400/outlined/mail.svg?raw'
 import lock_open from '@material-symbols/svg-400/outlined/lock_open.svg?raw'
 import logout from '@material-symbols/svg-400/outlined/logout.svg?raw'
 import menu_book from '@material-symbols/svg-400/outlined/menu_book.svg?raw'
@@ -68,6 +71,7 @@ import schedule from '@material-symbols/svg-400/outlined/schedule.svg?raw'
 import school from '@material-symbols/svg-400/outlined/school.svg?raw'
 import share from '@material-symbols/svg-400/outlined/share.svg?raw'
 import tune from '@material-symbols/svg-400/outlined/tune.svg?raw'
+import undo from '@material-symbols/svg-400/outlined/undo.svg?raw'
 import vital_signs from '@material-symbols/svg-400/outlined/vital_signs.svg?raw'
 import warning from '@material-symbols/svg-400/outlined/warning.svg?raw'
 
@@ -77,6 +81,7 @@ const ICON_SVGS: Record<string, string> = {
     arrow_back,
     arrow_forward,
     attach_file,
+    block,
     check,
     check_box,
     check_box_outline_blank,
@@ -101,12 +106,14 @@ const ICON_SVGS: Record<string, string> = {
     format_list_numbered,
     group,
     groups,
+    handyman,
     home,
     info,
     key,
     light_mode,
     link,
     lock,
+    mail,
     lock_open,
     logout,
     menu_book,
@@ -124,6 +131,7 @@ const ICON_SVGS: Record<string, string> = {
     school,
     share,
     tune,
+    undo,
     vital_signs,
     warning,
 }
@@ -140,9 +148,11 @@ const FA_TO_MATERIAL: Record<string, string> = {
     'arrow-right':                 'arrow_forward',
     'arrow-up-right-from-square':  'open_in_new',
     'arrows-rotate':               'directory_sync',
+    'ban':                        'block',
     'bell':                        'notifications',
     'book-open':                   'menu_book',
     'check':                       'check',
+    'camera':                      'photo_camera',
     'circle-check':                'check_circle',
     'circle-exclamation':          'error',
     'circle-info':                 'info',
@@ -152,6 +162,7 @@ const FA_TO_MATERIAL: Record<string, string> = {
     'display':                     'desktop_windows',
     'download':                    'download',
     'ellipsis':                    'more_horiz',
+    'envelope':                    'mail',
     'file':                        'description',
     'file-music':                  'monitor_heart',
     'files':                       'file_copy',
@@ -168,13 +179,16 @@ const FA_TO_MATERIAL: Record<string, string> = {
     'list-ol':                     'format_list_numbered',
     'lock':                        'lock',
     'lock-open':                   'lock_open',
+    'mail':                        'mail',
     'moon':                        'dark_mode',
-    'right-from-bracket':          'logout',
     'paperclip':                   'attach_file',
     'pencil':                      'edit',
     'play':                        'play_arrow',
     'play-circle':                 'play_circle',
     'plus':                        'add',
+    'right-from-bracket':          'logout',
+    'rotate-left':                'undo',
+    'screwdriver-wrench':         'handyman',
     'share':                       'share',
     'sliders':                     'tune',
     'spinner':                     'progress_activity',

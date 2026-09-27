@@ -46,6 +46,15 @@ class TestBootstrapShSecondPass:
         assert fakebin.has_call("docker-compose.prod.yml")
         assert fakebin.has_call("up -d")
 
+    def test_the_spool_directories_exist_before_the_stack_comes_up(self, fakebin, tmp_path):
+        # The production overlay bind-mounts ./update; a source the runtime
+        # creates itself belongs to root, and the web tier could never write
+        # a maintenance request into it.
+        make_env(tmp_path)
+        result = run_script(BOOTSTRAP, fakebin, cwd=tmp_path)
+        assert result.returncode == 0, result.stderr
+        assert (tmp_path / "update" / "packages").is_dir() and (tmp_path / "update" / "jobs").is_dir()
+
     def test_vendored_assets_are_produced(self, fakebin, tmp_path):
         # frontend/vendor is gitignored, absent from the image and excluded from the
         # update rsync, so a deployment gets it here or not at all. The interpreter half

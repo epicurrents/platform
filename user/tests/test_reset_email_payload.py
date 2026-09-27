@@ -36,7 +36,7 @@ class TestBrokerPayload:
             post_json(client, RESET_PW_URL, {"email": "payload_leak@example.com"})
         serialized = repr(delay.call_args)
         assert "payload_leak@example.com" not in serialized
-        assert "reset-password?uid=" not in serialized
+        assert "uid=" not in serialized
 
 
 @pytest.mark.django_db
@@ -54,7 +54,7 @@ class TestTaskStillSends:
 
         kwargs = send_mail.call_args.kwargs
         assert kwargs["recipient_list"] == ["sends_ok@example.com"]
-        assert "https://eeg.example.com/reset-password?uid=" in kwargs["message"]
+        assert "https://eeg.example.com/reset-password#uid=" in kwargs["message"]
         assert "token=" in kwargs["message"]
 
     def test_a_missing_user_is_not_an_error(self, make_user):
@@ -76,7 +76,7 @@ class TestTaskStillSends:
 
             send_password_reset_email(user.pk)
 
-        assert "https://eeg.example.com/reset-password?uid=" in send_mail.call_args.kwargs["message"]
+        assert "https://eeg.example.com/reset-password#uid=" in send_mail.call_args.kwargs["message"]
 
     def test_an_inactive_user_is_not_mailed(self, make_user):
         from user.tasks import send_password_reset_email

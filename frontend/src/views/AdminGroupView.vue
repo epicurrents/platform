@@ -22,6 +22,13 @@
  *
  * There is no single-group read endpoint; the group roster is the source.
  *
+ * Only the roles the operator changed are sent. Setting a role to a value
+ * asks for the operator's own credentials, since it grants the role to every
+ * member at once, and the server asks whenever the payload carries a value —
+ * changed or not — so resending the unchanged ones would make every rename of
+ * a group holding a role a confirmed action. The changed set is a subset of
+ * the rendered keys, so the padded-map clear stays impossible.
+ *
  * @package    epicurrents-platform
  */
 import { computed, onMounted, reactive, ref } from 'vue'
@@ -36,8 +43,10 @@ import {
     type GroupDetail,
     type RoleProvider,
 } from '#api/admin'
+import { withStepUp } from '#composables/useStepUpPrompt'
 import { t } from '#i18n'
 import { errorDetail } from '#lib/http'
+import { changedRoles, rolesNeedStepUp } from '#lib/stepUp'
 import { showToast } from '#lib/toast'
 import { setPageTitle } from '#router'
 import { useAuthStore } from '#stores/auth'
@@ -155,22 +164,39 @@ function displayName (account: Account) {
 }
 
 async function save () {
+    const current = group.value
+    if (!current || saving.value) {
+        return
+    }
     saveError.value = ''
     saving.value = true
+    // Rendered keys only, then only the changed ones. `rolesPayload` maps the
+    // blank option to null, which is how "no role" is expressed — an empty
+    // string is not one of a provider's declared choices and the server rejects it.
+    const roles = hasRoles.value
+        ? changedRoles(rolesPayload(roleProviders.value.map(provider => provider.key), roleValues), current.roles)
+        : {}
+    const payload = {
+        name: form.name.trim(),
+        ...(Object.keys(roles).length ? { roles } : {}),
+    }
     try {
-        const updated = await updateGroup(groupId, {
-            name: form.name.trim(),
-            // Rendered keys only. `rolesPayload` maps the blank option to null,
-            // which is how "no role" is expressed — an empty string is not one
-            // of a provider's declared choices and the server rejects it.
-            ...(hasRoles.value
-                ? { roles: rolesPayload(roleProviders.value.map(provider => provider.key), roleValues) }
-                : {}),
-        })
-        setGroup(updated)
-        form.name = updated.name
-        seedRoleValues(updated, roleProviders.value)
-        showToast(t('Group saved.', SCOPE), 'neutral')
+        const saved = await withStepUp(
+            rolesNeedStepUp(roles),
+            {
+                title: t('Confirm the change', SCOPE),
+                message: t('Setting a role grants it to every member of the group, so it asks for your own credentials.', SCOPE),
+            },
+            async (stepUp) => {
+                const updated = await updateGroup(groupId, { ...payload, ...stepUp })
+                setGroup(updated)
+                form.name = updated.name
+                seedRoleValues(updated, roleProviders.value)
+            },
+        )
+        if (saved) {
+            showToast(t('Group saved.', SCOPE), 'neutral')
+        }
     } catch (err) {
         saveError.value = errorDetail(err, t('The group could not be saved. Nothing was changed.', SCOPE))
     } finally {

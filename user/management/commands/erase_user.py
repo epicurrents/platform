@@ -6,7 +6,11 @@ account row and everything that cascades from it, unlinks the owned
 recording / media files that a bare ``User.delete()`` would orphan on
 disk, flushes the subject's sessions, and finishes by scrubbing the
 subject's personal data out of the audit trail via
-``activity.erasure.erase_subject``. Erasing a user any other way
+``activity.erasure.erase_subject``. It then appends the erasure (primary
+key and ``date_joined`` only) to the maintenance spool's erasure record,
+which a database restore cannot reach, so a rollback to an older snapshot
+is refused without acknowledgement and re-erases the account afterwards;
+see ``maintenance/erasures.py``. Erasing a user any other way
 (admin, shell) skips the file unlinks and the audit scrub and leaves
 the request unfulfillable. Contract test:
 ``user/tests/test_erase_user.py``. See AGENTS.md → *Load-bearing
@@ -89,6 +93,7 @@ class Command(BaseCommand):
             self.stdout.write(self.style.WARNING("Dry run — nothing was deleted. Re-run with --yes to erase."))
             return
 
+        date_joined = user.date_joined
         with with_system_activity(
             "user.account.erase",
             interface=Activity.Interface.COMMAND,
@@ -102,6 +107,7 @@ class Command(BaseCommand):
             summary = erase_subject(user_id)
 
         self.stdout.write(self.style.SUCCESS(f"User {user_id} erased."))
+        self._record_erasure(user_id, date_joined)
         self.stdout.write(f"Sessions flushed: {sessions_flushed}")
         for label, count in summary.items():
             self.stdout.write(f"Audit rows scrubbed [{label}]: {count}")
@@ -118,6 +124,27 @@ class Command(BaseCommand):
             )
             for stored_name in preserved:
                 self.stdout.write(f"  {stored_name}")
+
+    def _record_erasure(self, user_id: int, date_joined):
+        """Append the erasure to the record a database restore cannot reach; warn when that fails.
+
+        The erasure itself is complete either way. Without the record, a
+        rollback to a snapshot older than this erasure restores the account and
+        nothing re-erases it; see maintenance/README.md → *Erasures and
+        rollbacks*.
+        """
+        from maintenance.erasures import record_erasure
+
+        if record_erasure(user_id, date_joined):
+            return
+        self.stderr.write(
+            self.style.ERROR(
+                "WARNING: the erasure could not be recorded in the maintenance spool "
+                "(MAINTENANCE_SPOOL_PATH). A database restore to a snapshot taken before now "
+                f"would bring account {user_id} back, and nothing would erase it again. "
+                "Keep a note of this erasure outside the database."
+            )
+        )
 
     def _scrub_only(self, user_id: int, *, confirmed: bool):
         """Audit-trail-only path for an account deleted outside this command."""

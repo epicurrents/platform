@@ -1,0 +1,604 @@
+"""Projecting the spool onto the job rows, including after a database restore erased them."""
+
+import json
+from datetime import timedelta
+
+import pytest
+from django.utils import timezone
+
+from activity.models import Activity, ObjectChangeLog
+from maintenance import spool
+from maintenance.models import MaintenanceJob, MaintenancePackage
+from maintenance.tests.conftest import place_package_files
+
+
+def _host_job(user=None, state="requested", **fields):
+    return MaintenanceJob.objects.create(
+        operation="platform.update",
+        executor="host",
+        requested_by=user,
+        state=state,
+        in_flight=state in MaintenanceJob.IN_FLIGHT_STATES,
+        **fields,
+    )
+
+
+@pytest.mark.django_db
+class TestApplyStatus:
+    def test_a_newer_status_is_applied(self, spool_dir, superuser, write_status, no_push):
+        job = _host_job(superuser)
+        write_status(
+            job.job_id,
+            "running",
+            step="build",
+            started_at="2026-09-20T10:01:00Z",
+            installed_version_before="0.1.1",
+            target_version="0.1.2",
+            agent_version="1",
+            snapshot="pre-update-20260920-100100",
+        )
+        counts = spool.sync(force=True)
+        assert counts["applied"] == 1
+        job.refresh_from_db()
+        assert job.state == "running" and job.in_flight and job.step == "build"
+        assert job.started_at.isoformat() == "2026-09-20T10:01:00+00:00"
+        assert job.snapshot == "pre-update-20260920-100100" and job.agent_version == "1"
+        assert job.spool_updated_at.isoformat() == "2026-09-20T10:05:00+00:00"
+
+    def test_a_status_naming_no_target_keeps_the_one_the_request_took_from_the_snapshot(
+        self, spool_dir, superuser, write_status, no_push
+    ):
+        job = MaintenanceJob.objects.create(
+            operation="platform.rollback",
+            executor="host",
+            requested_by=superuser,
+            state="requested",
+            in_flight=True,
+            target_version="0.1.3",
+            args={"snapshot": "backup-20260921-122237", "restore_database": True},
+        )
+        write_status(
+            job.job_id, "succeeded", target_version="", running_version="0.1.3", snapshot="backup-20260921-122237"
+        )
+        assert spool.sync(force=True)["applied"] == 1
+        job.refresh_from_db()
+        assert job.state == "succeeded" and job.target_version == "0.1.3" and job.running_version == "0.1.3"
+
+    def test_an_older_status_is_ignored(self, spool_dir, superuser, write_status, no_push):
+        job = _host_job(superuser, state="running", spool_updated_at=timezone.now())
+        write_status(job.job_id, "failed", updated_at="2020-01-01T00:00:00Z")
+        assert spool.sync(force=True)["applied"] == 0
+        job.refresh_from_db()
+        assert job.state == "running"
+
+    def test_a_terminal_status_clears_in_flight_and_stamps_finished(self, spool_dir, superuser, write_status, no_push):
+        job = _host_job(superuser, state="running")
+        write_status(job.job_id, "rolled_back", reason="deadline", finished_at="2026-09-20T10:40:00Z")
+        spool.sync(force=True)
+        job.refresh_from_db()
+        assert job.state == "rolled_back" and not job.in_flight and job.reason == "deadline"
+        assert job.finished_at is not None
+
+    def test_an_unknown_state_or_missing_timestamp_is_ignored(self, spool_dir, superuser, write_status, no_push):
+        job = _host_job(superuser)
+        write_status(job.job_id, "exploded")
+        assert spool.sync(force=True)["applied"] == 0
+        spool.write_json_atomic(spool.status_path(job.job_id), {"protocol": 1, "state": "running"})
+        assert spool.sync(force=True)["applied"] == 0
+        job.refresh_from_db()
+        assert job.state == "requested"
+
+    def test_a_newer_protocol_is_refused(self, spool_dir, superuser, write_status, no_push):
+        job = _host_job(superuser)
+        write_status(job.job_id, "running", protocol=2)
+        assert spool.sync(force=True)["applied"] == 0
+        job.refresh_from_db()
+        assert job.state == "requested"
+
+    def test_nothing_to_do_opens_no_audited_scope(self, spool_dir, superuser, no_push):
+        _host_job(superuser)
+        before = Activity.objects.count()
+        assert spool.sync(force=True) == {
+            "applied": 0,
+            "created": 0,
+            "orphaned": 0,
+            "notified": 0,
+            "skipped": False,
+            "packages": {"created": 0, "pruned": 0, "swept": 0},
+        }
+        assert Activity.objects.count() == before
+
+    def test_a_change_is_audited_under_the_sync_verb(self, spool_dir, superuser, write_status, no_push):
+        job = _host_job(superuser)
+        write_status(job.job_id, "running")
+        spool.sync(force=True)
+        row = Activity.objects.filter(verb="maintenance.job.sync").get()
+        assert row.interface == Activity.Interface.CELERY
+        assert row.metadata == {"applied": 1, "created": 0, "orphaned": 0}
+        assert ObjectChangeLog.objects.filter(object_id=str(job.pk), action="modify").exists()
+
+    def test_the_cache_lock_coalesces_callers(self, spool_dir, superuser, write_status, no_push):
+        job = _host_job(superuser)
+        write_status(job.job_id, "running")
+        assert spool.sync()["applied"] == 1
+        write_status(job.job_id, "succeeded", updated_at="2026-09-20T10:06:00Z")
+        assert spool.sync()["skipped"] is True
+        assert spool.sync(force=True)["applied"] == 1
+
+
+@pytest.mark.django_db
+class TestRestore:
+    def test_rows_are_recreated_from_the_spool_after_a_database_restore(
+        self, spool_dir, superuser, write_status, no_push
+    ):
+        place_package_files("d" * 64, "0.2.0")
+        package = MaintenancePackage.objects.create(sha256="d" * 64, version="0.2.0")
+        job = _host_job(superuser, args={"package_sha256": package.sha256}, package=package)
+        spool.write_request(job)
+        write_status(
+            job.job_id, "awaiting_verification", verify_deadline="2026-09-20T10:35:00Z", target_version="0.2.0"
+        )
+        job_id, requested_at = job.job_id, json.loads(spool.request_path(job.job_id).read_text())["requested_at"]
+        # The restore: every row written after the dump is gone.
+        MaintenanceJob.objects.all().delete()
+
+        counts = spool.sync(force=True)
+        assert counts["created"] == 1
+        recreated = MaintenanceJob.objects.get(job_id=job_id)
+        assert recreated.requested_by == superuser and recreated.package == package
+        assert recreated.operation == "platform.update" and recreated.executor == "host"
+        assert recreated.state == "awaiting_verification" and recreated.in_flight
+        assert recreated.verify_deadline.isoformat() == "2026-09-20T10:35:00+00:00"
+        assert recreated.created_at.isoformat().replace("+00:00", "Z") == requested_at
+        assert recreated.last_notified_state == "awaiting_verification"
+
+    def test_a_recreated_rollback_row_takes_its_target_from_the_heartbeat(
+        self, spool_dir, superuser, write_status, no_push
+    ):
+        spool.write_json_atomic(
+            spool.spool_path() / "agent.json",
+            {
+                "protocol": 1,
+                "version": "2",
+                "enabled": True,
+                "last_run": spool.now_iso(),
+                "snapshots": [{"name": "backup-20260921-122237", "version": "0.1.3", "code": True}],
+            },
+        )
+        job = MaintenanceJob.objects.create(
+            operation="platform.rollback",
+            executor="host",
+            requested_by=superuser,
+            state="requested",
+            in_flight=True,
+            target_version="0.1.3",
+            args={"snapshot": "backup-20260921-122237", "restore_database": True},
+        )
+        spool.write_request(job)
+        write_status(job.job_id, "succeeded", target_version="", running_version="0.1.3")
+        # The restore the rollback performed erased the row the request made.
+        MaintenanceJob.objects.all().delete()
+
+        assert spool.sync(force=True)["created"] == 1
+        recreated = MaintenanceJob.objects.get(job_id=job.job_id)
+        assert recreated.operation == "platform.rollback" and recreated.state == "succeeded"
+        assert recreated.target_version == "0.1.3"
+
+    def test_a_request_for_a_deleted_user_still_comes_back(self, spool_dir, make_user, no_push):
+        user = make_user()
+        job = _host_job(user)
+        spool.write_request(job)
+        MaintenanceJob.objects.all().delete()
+        user.delete()
+        spool.sync(force=True)
+        assert MaintenanceJob.objects.get(job_id=job.job_id).requested_by is None
+
+    def test_a_second_in_flight_row_is_not_recreated(self, spool_dir, superuser, no_push):
+        job = _host_job(superuser)
+        spool.write_request(job)
+        MaintenanceJob.objects.all().delete()
+        _host_job(superuser, state="running")
+        counts = spool.sync(force=True)
+        assert counts["created"] == 0
+        assert MaintenanceJob.objects.count() == 1
+
+
+@pytest.mark.django_db
+class TestOrphans:
+    def test_an_old_in_flight_row_with_no_files_is_failed_as_orphaned(self, spool_dir, superuser, no_push):
+        job = _host_job(superuser, state="running", created_at=timezone.now() - timedelta(minutes=5))
+        assert spool.sync(force=True)["orphaned"] == 1
+        job.refresh_from_db()
+        assert job.state == "failed" and job.reason == "orphaned" and not job.in_flight
+
+    def test_a_fresh_row_is_left_alone_for_its_on_commit_write(self, spool_dir, superuser, no_push):
+        job = _host_job(superuser)
+        assert spool.sync(force=True)["orphaned"] == 0
+        job.refresh_from_db()
+        assert job.state == "requested"
+
+    def test_celery_rows_are_never_orphaned_by_the_spool(self, spool_dir, no_push):
+        job = MaintenanceJob.objects.create(
+            operation="a.b", executor="celery", state="running", created_at=timezone.now() - timedelta(hours=1)
+        )
+        assert spool.sync(force=True)["orphaned"] == 0
+        job.refresh_from_db()
+        assert job.state == "running"
+
+
+@pytest.mark.django_db
+class TestNotifications:
+    def test_each_attention_state_notifies_every_superuser_once(
+        self, spool_dir, make_superuser, make_user, write_status, no_push, django_capture_on_commit_callbacks
+    ):
+        first, second = make_superuser(), make_superuser()
+        make_user()
+        job = _host_job(first)
+        write_status(job.job_id, "running")
+        with django_capture_on_commit_callbacks(execute=True):
+            spool.sync(force=True)
+        assert no_push == [], "running is not an attention state"
+        write_status(job.job_id, "awaiting_verification", updated_at="2026-09-20T10:06:00Z", target_version="0.1.2")
+        with django_capture_on_commit_callbacks(execute=True):
+            spool.sync(force=True)
+        assert {n["user_id"] for n in no_push} == {first.pk, second.pk}
+        assert all(n["data"] == {"type": "maintenance", "job_id": str(job.job_id)} for n in no_push)
+        assert "0.1.2" in no_push[0]["title"]
+        write_status(job.job_id, "awaiting_verification", updated_at="2026-09-20T10:07:00Z", step="health")
+        with django_capture_on_commit_callbacks(execute=True):
+            spool.sync(force=True)
+        assert len(no_push) == 2, "the same state again is not announced again"
+
+    def test_a_status_that_cannot_be_saved_announces_nothing(
+        self, spool_dir, superuser, write_status, no_push, django_capture_on_commit_callbacks
+    ):
+        """Saved first, announced after: a status refused every tick must not notify every tick."""
+        _host_job(superuser, state="running")
+        other = _host_job(superuser, state="failed")
+        for minute in range(3):
+            write_status(other.job_id, "rolling_back", updated_at=f"2026-09-20T10:0{minute + 5}:00Z")
+            with django_capture_on_commit_callbacks(execute=True):
+                spool.sync(force=True)
+        assert no_push == []
+        other.refresh_from_db()
+        assert other.state == "failed" and other.last_notified_state == ""
+
+    def test_the_sending_happens_after_the_commit_not_inside_the_sync(
+        self, spool_dir, superuser, write_status, no_push, django_capture_on_commit_callbacks
+    ):
+        job = _host_job(superuser)
+        write_status(job.job_id, "failed", reason="refused_hash")
+        with django_capture_on_commit_callbacks(execute=False) as callbacks:
+            spool.sync(force=True)
+        assert no_push == [], "nothing sent while the sync ran"
+        job.refresh_from_db()
+        assert job.last_notified_state == "failed", "the bookkeeping is saved with the state"
+        for callback in callbacks:
+            callback()
+        assert [n["user_id"] for n in no_push] == [superuser.pk]
+
+    def test_mail_goes_out_when_a_backend_is_configured(
+        self, spool_dir, superuser, write_status, no_push, settings, django_capture_on_commit_callbacks
+    ):
+        from django.core import mail
+
+        settings.EMAIL_BACKEND = "django.core.mail.backends.locmem.EmailBackend"
+        superuser.email = "root@example.org"
+        superuser.save()
+        job = _host_job(superuser)
+        write_status(job.job_id, "rollback_failed")
+        with django_capture_on_commit_callbacks(execute=True):
+            spool.sync(force=True)
+        assert len(mail.outbox) == 1 and mail.outbox[0].to == ["root@example.org"]
+        assert "shell" in mail.outbox[0].body
+
+    def test_no_mail_through_the_console_backend(self, spool_dir, superuser, write_status, no_push, settings):
+        from django.core import mail
+
+        settings.EMAIL_BACKEND = "django.core.mail.backends.console.EmailBackend"
+        superuser.email = "root@example.org"
+        superuser.save()
+        job = _host_job(superuser)
+        write_status(job.job_id, "failed")
+        spool.sync(force=True)
+        assert mail.outbox == []
+
+    def test_state_changes_reach_the_security_log(self, spool_dir, superuser, write_status, no_push, caplog):
+        import logging
+
+        caplog.set_level(logging.WARNING, logger="epicurrents.security")
+        job = _host_job(superuser)
+        write_status(job.job_id, "failed", reason="refused_signature")
+        spool.sync(force=True)
+        events = [r for r in caplog.records if getattr(r, "security_event_type", "") == "maintenance.job_state"]
+        assert len(events) == 1
+        assert events[0].state == "failed" and events[0].reason == "refused_signature"
+
+
+@pytest.mark.django_db
+class TestSpoolFiles:
+    def test_writes_are_atomic_and_leave_no_temporary_file(self, spool_dir, superuser):
+        job = _host_job(superuser)
+        spool.write_request(job)
+        spool.write_marker(job, "verify", by_user_id=superuser.pk)
+        names = sorted(p.name for p in spool.jobs_dir().iterdir())
+        assert names == [f"{job.job_id}.json", f"{job.job_id}.verify"]
+
+    def test_files_with_unusable_names_are_skipped(self, spool_dir, no_push):
+        spool.jobs_dir().mkdir()
+        (spool.jobs_dir() / "notes.json").write_text('{"protocol": 1}')
+        (spool.jobs_dir() / "x.status.json").write_text('{"protocol": 1}')
+        assert spool.sync(force=True)["created"] == 0
+
+    def test_the_agent_summary(self, spool_dir):
+        assert spool.agent_summary()["installed"] is False
+        spool.write_json_atomic(
+            spool.spool_path() / "agent.json",
+            {"protocol": 1, "version": "1", "enabled": True, "runtime": "docker", "last_run": "2020-01-01T00:00:00Z"},
+        )
+        summary = spool.agent_summary()
+        assert summary["installed"] and summary["enabled"] and summary["stale"] is True
+        spool.write_json_atomic(
+            spool.spool_path() / "agent.json",
+            {"protocol": 1, "version": "1", "enabled": False, "last_run": spool.now_iso()},
+        )
+        assert spool.agent_summary()["stale"] is False
+
+    def test_the_agent_summary_keeps_only_snapshots_of_the_expected_shape(self, spool_dir):
+        spool.write_json_atomic(
+            spool.spool_path() / "agent.json",
+            {
+                "protocol": 1,
+                "version": "2",
+                "enabled": True,
+                "last_run": spool.now_iso(),
+                "self_update": True,
+                "key_id": "0123456789abcdef",
+                "next_key_id": None,
+                "snapshots": [
+                    {
+                        "name": "pre-update-20260901-100000",
+                        "taken_at": "2026-09-01T10:00:00Z",
+                        "version": "0.1.0",
+                        "code": True,
+                        "migrations": "none",
+                    },
+                    {"name": "../etc", "taken_at": "x", "version": "1", "code": True, "migrations": None},
+                    "junk",
+                    {"name": "backup-20260902-110000", "version": 3, "code": 1, "migrations": "maybe", "taken_at": 5},
+                ],
+            },
+        )
+        summary = spool.agent_summary()
+        assert (
+            summary["self_update"] is True
+            and summary["key_id"] == "0123456789abcdef"
+            and summary["next_key_id"] is None
+        )
+        assert summary["snapshots"] == [
+            {
+                "name": "pre-update-20260901-100000",
+                "taken_at": "2026-09-01T10:00:00Z",
+                "version": "0.1.0",
+                "code": True,
+                "migrations": "none",
+            },
+            {"name": "backup-20260902-110000", "taken_at": None, "version": "3", "code": True, "migrations": None},
+        ]
+        spool.write_json_atomic(
+            spool.spool_path() / "agent.json",
+            {"protocol": 1, "version": "1", "enabled": True, "last_run": spool.now_iso()},
+        )
+        summary = spool.agent_summary()
+        assert summary["snapshots"] == [] and summary["self_update"] is None and summary["key_id"] is None
+
+    def test_migrations_applied_follows_the_status_file(self, spool_dir, superuser, write_status, no_push):
+        job = _host_job(superuser, state="running")
+        write_status(job.job_id, "awaiting_verification", migrations_applied=False)
+        spool.sync(force=True)
+        job.refresh_from_db()
+        assert job.migrations_applied is False
+        write_status(job.job_id, "succeeded", updated_at="2026-09-20T10:06:00Z", migrations_applied="no")
+        spool.sync(force=True)
+        job.refresh_from_db()
+        assert job.migrations_applied is None
+
+    def test_prune_removes_the_files_of_long_finished_jobs_only(self, spool_dir, superuser):
+        from maintenance.tasks import prune_spool
+
+        old = _host_job(superuser, state="succeeded", finished_at=timezone.now() - timedelta(days=40))
+        recent = _host_job(superuser, state="succeeded", finished_at=timezone.now() - timedelta(days=1))
+        for job in (old, recent):
+            spool.write_request(job)
+            spool.log_path(job.job_id).write_text("log")
+        assert prune_spool() == {"removed": 2}
+        assert not spool.request_path(old.job_id).exists()
+        assert spool.request_path(recent.job_id).exists() and spool.log_path(recent.job_id).exists()
+        assert MaintenanceJob.objects.count() == 2, "rows are the audit record and stay"
+
+
+@pytest.mark.django_db
+class TestCleanSlateFindings:
+    def test_a_status_that_would_put_a_second_job_in_flight_is_skipped_not_fatal(
+        self, spool_dir, superuser, write_status, no_push
+    ):
+        stale = _host_job(superuser, state="failed", reason="orphaned", finished_at=timezone.now())
+        live = MaintenanceJob.objects.create(operation="a.b", executor="celery", state="running")
+        write_status(stale.job_id, "running")
+        counts = spool.sync(force=True)
+        assert counts["applied"] == 0
+        stale.refresh_from_db()
+        live.refresh_from_db()
+        assert stale.state == "failed" and live.state == "running"
+
+    def test_the_sync_writes_only_the_fields_a_status_owns(self, spool_dir, superuser, write_status, no_push):
+        job = _host_job(superuser, state="awaiting_verification")
+        write_status(job.job_id, "awaiting_verification", step="health")
+        stamp = timezone.now()
+        # A verify request lands between the sync loading the row and saving it.
+        MaintenanceJob.objects.filter(pk=job.pk).update(verify_requested_at=stamp)
+        spool.sync(force=True)
+        job.refresh_from_db()
+        assert job.step == "health" and job.verify_requested_at == stamp
+
+    def test_only_in_flight_and_named_rows_are_loaded(
+        self, spool_dir, superuser, write_status, no_push, django_assert_num_queries
+    ):
+        for _ in range(3):
+            _host_job(superuser, state="succeeded", finished_at=timezone.now())
+        assert spool.sync(force=True)["applied"] == 0
+        from django.db import connection
+        from django.test.utils import CaptureQueriesContext
+
+        with CaptureQueriesContext(connection) as captured:
+            spool.sync(force=True)
+        sql = " ".join(q["sql"] for q in captured.captured_queries)
+        assert '"in_flight"' in sql and "job_id" in sql
+
+
+@pytest.mark.django_db
+class TestClaimContract:
+    def test_a_claimed_request_is_a_request_for_re_creation(self, spool_dir, superuser, no_push):
+        job = _host_job(superuser)
+        spool.write_request(job)
+        spool.request_path(job.job_id).rename(spool.claimed_path(job.job_id))
+        job_id = job.job_id
+        MaintenanceJob.objects.all().delete()
+        assert spool.sync(force=True)["created"] == 1
+        assert MaintenanceJob.objects.get().job_id == job_id
+
+    def test_a_claimed_request_keeps_its_row_from_being_orphaned(self, spool_dir, superuser, no_push):
+        job = _host_job(superuser, created_at=timezone.now() - timedelta(minutes=5))
+        spool.write_request(job)
+        spool.request_path(job.job_id).rename(spool.claimed_path(job.job_id))
+        assert spool.sync(force=True)["orphaned"] == 0
+        job.refresh_from_db()
+        assert job.in_flight
+
+    def test_the_claimed_suffix_is_not_misread_as_a_request_id(self, spool_dir):
+        import uuid
+
+        job_id = uuid.uuid4()
+        assert spool._job_id_of(spool.claimed_path(job_id), ".claimed.json") == job_id
+        assert spool._job_id_of(spool.claimed_path(job_id), ".json") is None
+
+
+@pytest.mark.django_db
+class TestStatusMayNotResurrect:
+    @pytest.mark.parametrize("state", ["accepted", "running", "succeeded", "failed"])
+    def test_a_cancelled_row_is_final(self, spool_dir, superuser, write_status, no_push, state):
+        job = _host_job(superuser, state="cancelled")
+        write_status(job.job_id, state)
+        spool.sync(force=True)
+        job.refresh_from_db()
+        assert job.state == "cancelled" and not job.in_flight
+
+    @pytest.mark.parametrize("settled", ["failed", "rolled_back", "rollback_failed"])
+    def test_a_settled_row_never_goes_back_in_flight(self, spool_dir, superuser, write_status, no_push, settled):
+        job = _host_job(superuser, state=settled)
+        write_status(job.job_id, "running")
+        spool.sync(force=True)
+        job.refresh_from_db()
+        assert job.state == settled
+
+    def test_a_late_rollback_of_a_succeeded_update_is_the_one_exception(
+        self, spool_dir, superuser, write_status, no_push
+    ):
+        job = _host_job(superuser, state="succeeded")
+        write_status(job.job_id, "rolling_back")
+        spool.sync(force=True)
+        job.refresh_from_db()
+        assert job.state == "rolling_back" and job.in_flight
+
+    def test_a_row_settled_by_the_web_tier_may_learn_the_outcome(self, spool_dir, superuser, write_status, no_push):
+        job = _host_job(superuser, state="failed", reason="abandoned")
+        write_status(job.job_id, "rolled_back")
+        spool.sync(force=True)
+        job.refresh_from_db()
+        assert job.state == "rolled_back"
+
+
+@pytest.mark.django_db
+class TestStatusFieldBounds:
+    def test_an_overlong_field_is_clipped_rather_than_failing_every_sync(
+        self, spool_dir, superuser, write_status, no_push
+    ):
+        job = _host_job(superuser)
+        write_status(job.job_id, "running", step="s" * 500, reason="r" * 500, running_version="9" * 99)
+        spool.sync(force=True)
+        job.refresh_from_db()
+        assert job.state == "running" and len(job.step) == 64 and len(job.reason) == 64
+        assert len(job.running_version) == 32
+
+    def test_a_database_error_on_one_row_does_not_fail_the_sync(
+        self, spool_dir, superuser, write_status, no_push, monkeypatch
+    ):
+        from django.db import DataError
+
+        job = _host_job(superuser)
+        write_status(job.job_id, "running")
+
+        def refuse(self, *args, **kwargs):
+            raise DataError("value too long")
+
+        monkeypatch.setattr(MaintenanceJob, "save", refuse)
+        counts = spool.sync(force=True)
+        assert counts["applied"] == 0
+
+
+@pytest.mark.django_db
+class TestErasureReapplyAfterRestore:
+    def _capture(self, monkeypatch):
+        from maintenance import tasks
+
+        calls = []
+        monkeypatch.setattr(tasks.reapply_erasures, "delay", lambda: calls.append(True))
+        return calls
+
+    def test_a_rolled_back_update_re_applies_erasures(
+        self, spool_dir, superuser, write_status, no_push, monkeypatch, django_capture_on_commit_callbacks
+    ):
+        calls = self._capture(monkeypatch)
+        job = _host_job(superuser, state="rolling_back")
+        write_status(job.job_id, "rolled_back")
+        with django_capture_on_commit_callbacks(execute=True):
+            spool.sync(force=True)
+        assert calls == [True]
+        write_status(job.job_id, "rolled_back", updated_at="2026-09-20T10:09:00Z", step="done")
+        with django_capture_on_commit_callbacks(execute=True):
+            spool.sync(force=True)
+        assert calls == [True], "only on the transition, not on every status that repeats it"
+
+    def test_a_restore_that_kept_the_database_does_not(
+        self, spool_dir, superuser, write_status, no_push, monkeypatch, django_capture_on_commit_callbacks
+    ):
+        calls = self._capture(monkeypatch)
+        job = MaintenanceJob.objects.create(
+            operation="platform.rollback",
+            executor="host",
+            state="running",
+            in_flight=True,
+            args={"snapshot": "pre-update-20260920-120000", "restore_database": False},
+        )
+        write_status(job.job_id, "succeeded")
+        with django_capture_on_commit_callbacks(execute=True):
+            spool.sync(force=True)
+        assert calls == []
+
+    def test_a_restore_row_re_created_from_the_spool_re_applies_erasures(
+        self, spool_dir, superuser, write_status, no_push, monkeypatch, django_capture_on_commit_callbacks
+    ):
+        calls = self._capture(monkeypatch)
+        job = MaintenanceJob.objects.create(
+            operation="platform.rollback",
+            executor="host",
+            state="running",
+            in_flight=True,
+            args={"snapshot": "pre-update-20260920-120000", "restore_database": True},
+        )
+        spool.write_request(job)
+        write_status(job.job_id, "succeeded")
+        MaintenanceJob.objects.all().delete()
+        with django_capture_on_commit_callbacks(execute=True):
+            spool.sync(force=True)
+        assert calls == [True]

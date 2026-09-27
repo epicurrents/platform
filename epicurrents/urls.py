@@ -41,6 +41,7 @@ from epicurrents.views import (
 from federation.api.v1.ninja import api as federation_api
 from federation.views import federation_well_known
 from library.api.v1.ninja import api as library_api
+from maintenance.api.v1.ninja import api as maintenance_api
 from notifications.api.v1.ninja import api as notifications_api
 from user.api.v1.ninja import api as user_api
 
@@ -63,6 +64,7 @@ urlpatterns = [
     path("api/v1/notifications/", notifications_api.urls),
     path("api/v1/library/", library_api.urls),
     path("api/v1/federation/", federation_api.urls),
+    path("api/v1/maintenance/", maintenance_api.urls),
     path(
         ".well-known/epicurrents-federation.json",
         federation_well_known,

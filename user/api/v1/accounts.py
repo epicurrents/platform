@@ -23,6 +23,17 @@ user's concrete fields — so without an explicit ``record_modify_change``, the
 single most consequential operation here would be the one that left no trace.
 The resulting membership rides on the row's hash as a recomputable digest; see
 user/audit_digests.py.
+
+Every write that could hand someone a way in asks the caller for step-up
+confirmation (user/stepup.py) first: creating an account with a password or a
+staff tier, changing an account's tier, activation or email, setting a
+password, removing a second factor, adding group members, and giving a group a
+project role. A superuser session cookie is otherwise enough to mint a new
+superuser, or to strip the caller's own second factor and set a new password,
+which turns one stolen cookie into a permanent account. Setting a password or
+resetting the second factor on the caller's own account is refused outright:
+the profile flows exist for that, and they ask for the current credential.
+Each of these writes is also reported to the security log.
 """
 
 from django.contrib.auth import get_user_model
@@ -40,7 +51,10 @@ from epicurrents.auth import enforce_session_csrf
 from epicurrents.models import AccessRight
 from epicurrents.security_log import get_client_ip, log_security_event
 from user.audit_digests import GROUP_MEMBERSHIP_DIGEST_KEY, compute_group_membership_digest
+from user.identity import is_externally_authenticated, provider_label
 from user.roles import get_role_providers, read_group_roles, read_roles, write_group_role
+from user.stepup import confirm_step_up
+from user.tasks import mail_deliverable, send_welcome_email
 from user.two_factor import active_credential
 
 router = Router()
@@ -79,19 +93,55 @@ class AccountOut(Schema):
     last_login: str | None
     groups: list[GroupRef]
     roles: dict[str, list[str]]
+    #: The provider this account signs in through, or null for a local account.
+    #: Set only when the account has no local password of its own; see
+    #: user/identity.py for why holding an identity is not by itself enough.
+    external_provider: str | None
+    #: The account was created without a password and can still be invited.
+    is_invite_pending: bool
+
+
+class AccountCreatedOut(AccountOut):
+    """A newly created account, and whether an invitation was actually mailed.
+
+    ``invitation_sent`` is false for an account created with a password, one
+    created deactivated, and any account on a deployment with no mail backend
+    configured — where sending would print the link to the container log.
+    """
+
+    invitation_sent: bool
 
 
 class AccountCreateIn(Schema):
-    """New-account payload. Everything but ``username`` and ``password`` optional."""
+    """New-account payload. Only ``username`` is required.
+
+    Omitting ``password`` is the ordinary way to add someone: the account is
+    created with no usable password and an invitation carrying a set-password
+    link is mailed to ``email``, which is then required. The alternative leaves
+    an operator holding a credential they have to convey out of band.
+
+    ``password`` here is the new account's. The caller's step-up credentials are
+    ``current_password`` and ``totp_code``, required when ``password`` is
+    supplied or either staff tier is set.
+    """
 
     username: str
-    password: str
+    password: str | None = None
     email: str = ""
     first_name: str = ""
     last_name: str = ""
     is_active: bool = True
     is_staff: bool = False
     is_superuser: bool = False
+    current_password: str | None = None
+    totp_code: str | None = None
+
+
+class StepUpIn(Schema):
+    """The caller's step-up credentials: their own password, and a code when they have a second factor."""
+
+    password: str | None = None
+    totp_code: str | None = None
 
 
 class AccountUpdateIn(Schema):
@@ -108,16 +158,20 @@ class AccountUpdateIn(Schema):
     is_active: bool | None = None
     is_staff: bool | None = None
     is_superuser: bool | None = None
+    #: Step-up credentials, required when the edit changes ``is_staff``,
+    #: ``is_superuser`` or ``email``, or activates the account.
+    password: str | None = None
+    totp_code: str | None = None
 
 
-class SetPasswordIn(Schema):
-    """Operator-set password for another account."""
+class SetPasswordIn(StepUpIn):
+    """Operator-set password for another account, with the caller's step-up credentials."""
 
     new_password: str
 
 
-class GroupMembershipIn(Schema):
-    """Replacement membership, from either direction."""
+class GroupMembershipIn(StepUpIn):
+    """Replacement membership, from either direction. Step-up is required when it adds anyone."""
 
     group_ids: list[int] | None = None
     user_ids: list[int] | None = None
@@ -129,12 +183,13 @@ class GroupIn(Schema):
     name: str
 
 
-class GroupUpdateIn(Schema):
+class GroupUpdateIn(StepUpIn):
     """Partial group edit. Omitted fields are left alone.
 
     ``roles`` is a partial map: an absent key is untouched, so a client that
     does not know a project's role exists cannot clear it. An explicit ``null``
-    value clears that role.
+    value clears that role. Setting any role to a value needs step-up; clearing
+    one does not.
     """
 
     name: str | None = None
@@ -189,7 +244,12 @@ def _require_superuser(request):
 
 
 def _serialize_account(user) -> dict:
-    """Serialize one account to an ``AccountOut`` dict."""
+    """Serialize one account to an ``AccountOut`` dict.
+
+    Both identity-derived fields read ``external_identities``, so a caller
+    serializing a page of accounts prefetches it or pays a query per row.
+    """
+    external = is_externally_authenticated(user)
     return {
         "id": user.pk,
         "username": user.username,
@@ -204,7 +264,23 @@ def _serialize_account(user) -> dict:
         "last_login": user.last_login.isoformat() if user.last_login else None,
         "groups": [{"id": group.pk, "name": group.name} for group in user.groups.all()],
         "roles": read_roles(user),
+        "external_provider": provider_label(user) if external else None,
+        "is_invite_pending": not external and not user.has_usable_password(),
     }
+
+
+def _step_up(request, actor, *, password: str | None, totp_code: str | None) -> None:
+    """Confirm the caller's own credentials before a write that could hand someone a way in."""
+    confirm_step_up(request, actor, password=password, totp_code=totp_code)
+
+
+def _refuse_self(actor, account, what: str) -> None:
+    """Refuse an operator credential action aimed at the caller's own account."""
+    if account.pk == actor.pk:
+        raise HttpError(
+            409,
+            f"Use your profile page to {what} on your own account; it asks for your current credentials.",
+        )
 
 
 def _serialize_group(group, *, member_count: int, grant_count: int) -> dict:
@@ -221,7 +297,12 @@ def _serialize_group(group, *, member_count: int, grant_count: int) -> dict:
 def _get_account(account_id: int):
     """Fetch an account by primary key or raise 404."""
     User = get_user_model()
-    user = User.objects.filter(pk=account_id).select_related("two_factor").prefetch_related("groups").first()
+    user = (
+        User.objects.filter(pk=account_id)
+        .select_related("two_factor")
+        .prefetch_related("groups", "external_identities")
+        .first()
+    )
     if user is None:
         raise HttpError(404, "Account not found.")
     return user
@@ -321,7 +402,9 @@ def list_accounts(request, q: str = "", limit: int = 100, offset: int = 0):
     # select_related on the credential, not just the group prefetch: without it
     # the is_2fa_enabled column costs one query per row on a 500-row page.
     page = list(
-        accounts.order_by("username").select_related("two_factor").prefetch_related("groups")[offset : offset + limit]
+        accounts.order_by("username")
+        .select_related("two_factor")
+        .prefetch_related("groups", "external_identities")[offset : offset + limit]
     )
     log_activity(
         verb="user.account.list",
@@ -339,14 +422,25 @@ def get_account(request, account_id: int):
     return _serialize_account(account)
 
 
-@router.post("/accounts", response={201: AccountOut})
+@router.post("/accounts", response={201: AccountCreatedOut})
 def create_account(request, payload: AccountCreateIn):
-    """Create an account.
+    """Create an account, by invitation unless a password is supplied.
 
-    The password is validated against ``AUTH_PASSWORD_VALIDATORS`` before
+    Without a password the account gets an unusable one and an invitation
+    carrying a set-password link, so the credential is chosen by the person who
+    will use it and passes through nobody else. That needs an address to send
+    to, which is why ``email`` stops being optional in that case.
+
+    A supplied password is validated against ``AUTH_PASSWORD_VALIDATORS`` before
     anything is written, so a rejected password leaves no half-made account.
+
+    Step-up (``current_password``, ``totp_code``) is required when a password is
+    supplied or either staff tier is set. Both leave the caller holding a way in
+    that outlives their session: a staff or superuser account is one directly,
+    and so is any account whose password they chose. An invited ordinary
+    account needs none, since its credential reaches only the invited address.
     """
-    _require_superuser(request)
+    actor = _require_superuser(request)
     username = payload.username.strip()
     if not username:
         raise HttpError(400, "Username is required.")
@@ -356,9 +450,15 @@ def create_account(request, payload: AccountCreateIn):
         raise HttpError(409, "An account with that username already exists.")
 
     email = _validated_email(payload.email)
-    # An unsaved instance is enough context for UserAttributeSimilarityValidator,
-    # which is what stops "alice" from setting her password to "alice".
-    _validated_password(payload.password, user=User(username=username, email=email))
+    invite = not payload.password
+    if invite and not email:
+        raise HttpError(400, "An account created without a password needs an email address to send the invitation to.")
+    if not invite:
+        # An unsaved instance is enough context for UserAttributeSimilarityValidator,
+        # which is what stops "alice" from setting her password to "alice".
+        _validated_password(payload.password, user=User(username=username, email=email))
+    if not invite or payload.is_staff or payload.is_superuser:
+        _step_up(request, actor, password=payload.current_password, totp_code=payload.totp_code)
 
     account = User(
         username=username,
@@ -369,8 +469,26 @@ def create_account(request, payload: AccountCreateIn):
         is_staff=payload.is_staff,
         is_superuser=payload.is_superuser,
     )
-    account.set_password(payload.password)
-    account.save()
+    if invite:
+        account.set_unusable_password()
+    else:
+        account.set_password(payload.password)
+
+    # An account created deactivated is not invited yet. The task would refuse
+    # it anyway — an invitation to an account that cannot sign in is worth
+    # nothing — but it would refuse silently, leaving an operator who prepared
+    # the account ahead of time believing the mail went out. The resend action
+    # appears the moment the account is activated.
+    # Nor is it invited while no mail backend is configured: the task would
+    # decline rather than print the link to the container log, and the response
+    # says so instead of letting the operator believe it went.
+    invite_now = invite and account.is_active and mail_deliverable()
+    with transaction.atomic():
+        account.save()
+        if invite_now:
+            # Dispatched on commit so the worker cannot read the row before it
+            # exists. Only the primary key crosses the broker; see user/tasks.py.
+            transaction.on_commit(lambda: send_welcome_email.delay(account.pk))
 
     log_activity(
         verb="user.account.create",
@@ -379,9 +497,61 @@ def create_account(request, payload: AccountCreateIn):
             "is_staff": account.is_staff,
             "is_superuser": account.is_superuser,
             "is_active": account.is_active,
+            "invited": invite,
+            "invitation_sent": invite_now,
         },
     )
-    return 201, _serialize_account(account)
+    log_security_event(
+        "admin.account_created",
+        ip=get_client_ip(request),
+        actor_id=actor.pk,
+        target_id=account.pk,
+        is_staff=account.is_staff,
+        is_superuser=account.is_superuser,
+        invited=invite,
+    )
+    return 201, {**_serialize_account(account), "invitation_sent": invite_now}
+
+
+@router.post("/accounts/{account_id}/invite", response=dict)
+def resend_account_invitation(request, account_id: int):
+    """Send the set-password invitation again, for someone who missed the first one.
+
+    The link expires after three days, which an invitation sent before a holiday
+    routinely outlives, and there is no other way into an account that has never
+    had a password.
+
+    Refused rather than repurposed once the account has a password of its own:
+    this would otherwise be a way for an operator to mail a password link to any
+    account from the roster, which is the user's own request to make through
+    password reset.
+
+    Answers ``{"status": "sent", "invitation_sent": true}``, or ``"not_sent"``
+    and ``false`` when the deployment has no mail backend configured, in which
+    case nothing is queued.
+    """
+    actor = _require_superuser(request)
+    account = _get_account(account_id)
+    if is_externally_authenticated(account):
+        raise HttpError(
+            409,
+            f"This account signs in through {provider_label(account)} and does not use a password on this platform.",
+        )
+    if account.has_usable_password():
+        raise HttpError(409, "This account already has a password. The account holder can request a reset themselves.")
+    if not account.is_active:
+        raise HttpError(409, "This account is deactivated. Reactivate it before inviting the account holder in.")
+    if not account.email:
+        raise HttpError(409, "This account has no email address to send the invitation to.")
+
+    sent = mail_deliverable()
+    if sent:
+        send_welcome_email.delay(account.pk)
+    log_activity(verb="user.account.invite.resend", target=account, metadata={"invitation_sent": sent})
+    log_security_event(
+        "admin.invitation_sent", ip=get_client_ip(request), actor_id=actor.pk, target_id=account.pk, sent=sent
+    )
+    return {"status": "sent" if sent else "not_sent", "invitation_sent": sent}
 
 
 @router.patch("/accounts/{account_id}", response=AccountOut)
@@ -392,17 +562,39 @@ def update_account(request, account_id: int, payload: AccountUpdateIn):
     store and every ``AccessRight`` grant already reference by primary key, but
     it is also what an operator recognises an account by in a log line; renaming
     silently rewrites the meaning of every historical line that names it.
+
+    Step-up (``password``, ``totp_code``) is required when the edit changes
+    ``is_staff``, ``is_superuser`` or ``email``, or activates the account. A
+    tier change is privilege by definition; activation restores a way in that
+    was closed; and the address is where a password reset goes, so changing it
+    is a takeover by another name. Values equal to the current ones are not
+    changes and need nothing.
     """
-    _require_superuser(request)
+    actor = _require_superuser(request)
     account = _get_account(account_id)
 
     is_active = payload.is_active if payload.is_active is not None else account.is_active
     is_superuser = payload.is_superuser if payload.is_superuser is not None else account.is_superuser
     _guard_last_superuser(account, is_active=is_active, is_superuser=is_superuser)
 
+    new_email = _validated_email(payload.email) if payload.email is not None else account.email
+    email_changed = new_email != account.email
+    privilege_changed = [
+        field
+        for field, value in (("is_staff", payload.is_staff), ("is_superuser", payload.is_superuser))
+        if value is not None and value != getattr(account, field)
+    ]
+    if payload.is_active is True and not account.is_active:
+        privilege_changed.append("is_active")
+    if email_changed or privilege_changed:
+        _step_up(request, actor, password=payload.password, totp_code=payload.totp_code)
+
     changed: list[str] = []
     if payload.email is not None:
-        account.email = _validated_email(payload.email)
+        account.email = new_email
+        if email_changed:
+            # An operator set it, so a verified-email link may use it again.
+            account.email_self_asserted = False
         changed.append("email")
     if payload.first_name is not None:
         account.first_name = payload.first_name.strip()
@@ -425,6 +617,21 @@ def update_account(request, account_id: int, payload: AccountUpdateIn):
         target=account,
         metadata={"fields": sorted(changed)},
     )
+    if privilege_changed:
+        log_security_event(
+            "admin.account_privilege_changed",
+            ip=get_client_ip(request),
+            actor_id=actor.pk,
+            target_id=account.pk,
+            fields=sorted(privilege_changed),
+            is_staff=account.is_staff,
+            is_superuser=account.is_superuser,
+            is_active=account.is_active,
+        )
+    if email_changed:
+        log_security_event(
+            "admin.account_email_changed", ip=get_client_ip(request), actor_id=actor.pk, target_id=account.pk
+        )
     return _serialize_account(account)
 
 
@@ -436,18 +643,32 @@ def set_account_password(request, account_id: int, payload: SetPasswordIn):
     somebody back in rather than responding to a compromise, and silently
     signing the account out of a viewer session mid-review is its own harm. For
     a compromise, deactivate the account — that does end its sessions.
+
+    Needs step-up (``password``, ``totp_code`` — the caller's own). Refused with
+    409 on the caller's own account, where change-password is the route and asks
+    for the current password, and on an account that signs in through an
+    identity provider, for the reason every other password surface refuses it:
+    a local password there answers to neither the tenant nor the domain gate.
     """
-    _require_superuser(request)
+    actor = _require_superuser(request)
     account = _get_account(account_id)
+    _refuse_self(actor, account, "change the password")
+    if is_externally_authenticated(account):
+        raise HttpError(
+            409,
+            f"This account signs in through {provider_label(account)}. Its password is managed there, not here.",
+        )
     _validated_password(payload.new_password, user=account)
+    _step_up(request, actor, password=payload.password, totp_code=payload.totp_code)
     account.set_password(payload.new_password)
     account.save(update_fields=["password"])
     log_activity(verb="user.account.password.set", target=account)
+    log_security_event("admin.password_set", ip=get_client_ip(request), actor_id=actor.pk, target_id=account.pk)
     return {"status": "ok"}
 
 
 @router.delete("/accounts/{account_id}/2fa", response=dict)
-def reset_account_two_factor(request, account_id: int):
+def reset_account_two_factor(request, account_id: int, payload: StepUpIn | None = None):
     """Remove an account's second factor, for the operator recovery case.
 
     Someone loses the phone holding their authenticator and has spent their
@@ -461,12 +682,22 @@ def reset_account_two_factor(request, account_id: int):
     session used to disarm accounts is exactly what an alert rule should see.
     Deliberately not self-service — the account's own disable endpoint requires
     the password, which someone who has lost only their phone still has.
+
+    Needs step-up (``password``, ``totp_code`` in the request body), and is
+    refused with 409 on the caller's own account: stripping one's own factor
+    here is exactly the first step of turning a stolen session into a stolen
+    account, and the self-service disable endpoint asks for the password.
     """
     actor = _require_superuser(request)
     account = _get_account(account_id)
+    _refuse_self(actor, account, "remove the second factor")
     credential = getattr(account, "two_factor", None)
     if credential is None:
         raise HttpError(409, "This account does not have two-factor authentication set up.")
+    # Optional so a bodiless DELETE still reaches the auth check and answers
+    # 401 / 403 rather than a schema error; it then fails step-up with 400.
+    payload = payload or StepUpIn()
+    _step_up(request, actor, password=payload.password, totp_code=payload.totp_code)
 
     was_active = credential.confirmed_at is not None
     credential.delete()
@@ -492,6 +723,10 @@ def set_account_groups(request, account_id: int, payload: GroupMembershipIn):
     ``groups.set()`` fires ``m2m_changed``, which the audit receivers do not
     listen for, and the M2M rows are not concrete fields on the user, so the
     before / after membership rides in ``extra_payload``.
+
+    Adding the account to any group needs step-up (``password``, ``totp_code``).
+    A group carries access grants and project roles, including ones added after
+    the membership, so an addition is a grant; removals need nothing.
     """
     actor = _require_superuser(request)
     account = _get_account(account_id)
@@ -502,6 +737,11 @@ def set_account_groups(request, account_id: int, payload: GroupMembershipIn):
     missing = set(payload.group_ids) - {group.pk for group in groups}
     if missing:
         raise HttpError(404, f"No such group: {sorted(missing)}.")
+
+    before_ids = set(account.groups.values_list("pk", flat=True))
+    added = {group.pk for group in groups} - before_ids
+    if added:
+        _step_up(request, actor, password=payload.password, totp_code=payload.totp_code)
 
     before_state = serialize_instance(account)
     before = sorted(account.groups.values_list("name", flat=True))
@@ -520,6 +760,14 @@ def set_account_groups(request, account_id: int, payload: GroupMembershipIn):
         target=account,
         metadata={"groups_before": before, "groups_after": after},
     )
+    if added:
+        log_security_event(
+            "admin.group_membership_granted",
+            ip=get_client_ip(request),
+            actor_id=actor.pk,
+            target_id=account.pk,
+            group_ids=sorted(added),
+        )
     return _serialize_account(account)
 
 
@@ -579,11 +827,18 @@ def update_group(request, group_id: int, payload: GroupUpdateIn):
     and its members inherit it; there is no per-account role write. The
     provider's model write happens inside the request scope, so it lands on the
     audit trail through the ordinary signals.
+
+    Setting a role to a value needs step-up (``password``, ``totp_code``), since
+    it grants that role to every member at once; clearing one does not.
     """
-    _require_superuser(request)
+    actor = _require_superuser(request)
     group = Group.objects.filter(pk=group_id).first()
     if group is None:
         raise HttpError(404, "Group not found.")
+
+    granted_roles = sorted(key for key, value in (payload.roles or {}).items() if value is not None)
+    if granted_roles:
+        _step_up(request, actor, password=payload.password, totp_code=payload.totp_code)
 
     changed: list[str] = []
     if payload.name is not None:
@@ -613,6 +868,14 @@ def update_group(request, group_id: int, payload: GroupUpdateIn):
         target=group,
         metadata={"fields": sorted(changed), "roles": sorted(roles_changed)},
     )
+    if granted_roles:
+        log_security_event(
+            "admin.group_roles_granted",
+            ip=get_client_ip(request),
+            actor_id=actor.pk,
+            group_id=group.pk,
+            roles=granted_roles,
+        )
     return _serialize_group(
         group,
         member_count=group.user_set.count(),
@@ -660,6 +923,9 @@ def set_group_members(request, group_id: int, payload: GroupMembershipIn):
     to each user's membership, and ``erase_subject`` reaches audit rows through
     their target, so a single row targeting the group would put one user's
     membership history out of reach of every other user's erasure request.
+
+    Adding any member needs step-up (``password``, ``totp_code``), for the
+    reason ``set_account_groups`` gives.
     """
     actor = _require_superuser(request)
     group = Group.objects.filter(pk=group_id).first()
@@ -676,6 +942,9 @@ def set_group_members(request, group_id: int, payload: GroupMembershipIn):
 
     before_members = set(group.user_set.values_list("pk", flat=True))
     after_members = {user.pk for user in users}
+    added = after_members - before_members
+    if added:
+        _step_up(request, actor, password=payload.password, totp_code=payload.totp_code)
     affected = User.objects.filter(pk__in=before_members ^ after_members)
 
     with transaction.atomic():
@@ -694,6 +963,14 @@ def set_group_members(request, group_id: int, payload: GroupMembershipIn):
         target=group,
         metadata={"member_count_before": len(before_members), "member_count_after": len(after_members)},
     )
+    if added:
+        log_security_event(
+            "admin.group_membership_granted",
+            ip=get_client_ip(request),
+            actor_id=actor.pk,
+            group_id=group.pk,
+            added_count=len(added),
+        )
     return _serialize_group(
         group,
         member_count=len(after_members),

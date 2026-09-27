@@ -1,29 +1,39 @@
 <script setup lang="ts">
-import { reactive, ref, onMounted } from 'vue'
-import { useRouter, useRoute } from 'vue-router'
+/**
+ * Set a password from a reset or invitation link.
+ *
+ * The link carries its credential in the URL fragment, which the page reads
+ * once as it is set up and removes from the address bar before anything else
+ * runs; see `lib/resetLink`. The route needs no authentication, so the guard
+ * lets the navigation through with the fragment intact.
+ *
+ * @package    epicurrents-platform
+ */
+import { reactive, ref } from 'vue'
+import { useRouter } from 'vue-router'
 import { t } from '#i18n'
 import { confirmPasswordReset } from '#api/user'
+import { consumeResetFragment } from '#lib/resetLink'
 
 const SCOPE = 'ResetPasswordView'
 const router = useRouter()
-const route = useRoute()
 
 const input = reactive({ newPassword: '', confirmPassword: '' })
 const error = ref<string | null>(null)
 const success = ref(false)
 const loading = ref(false)
-const invalidLink = ref(false)
 
-const uid = ref('')
-const token = ref('')
-
-onMounted(() => {
-    uid.value = typeof route.query.uid === 'string' ? route.query.uid : ''
-    token.value = typeof route.query.token === 'string' ? route.query.token : ''
-    if (!uid.value || !token.value) {
-        invalidLink.value = true
-    }
-})
+/** Read during setup rather than on mount, so the fragment is gone before the first render. */
+const link = consumeResetFragment()
+const invalidLink = ref(link === null)
+const uid = link?.uid ?? ''
+const token = link?.token ?? ''
+/**
+ * Set by the invitation mail. The page does the same thing either way; what
+ * changes is what it says on a dead link — a person who has never signed in
+ * cannot "request a new one", so they are told who to ask instead.
+ */
+const welcome = ref(link?.welcome ?? false)
 
 async function submit () {
     error.value = null
@@ -33,10 +43,12 @@ async function submit () {
     }
     loading.value = true
     try {
-        await confirmPasswordReset(uid.value, token.value, input.newPassword)
+        await confirmPasswordReset(uid, token, input.newPassword)
         success.value = true
     } catch {
-        error.value = t('Reset link is invalid or has expired.', SCOPE)
+        error.value = welcome.value
+            ? t('This invitation link is invalid or has expired. Ask whoever created your account to send a new one.', SCOPE)
+            : t('Reset link is invalid or has expired.', SCOPE)
     } finally {
         loading.value = false
     }
@@ -50,15 +62,20 @@ function goToLogin () {
 <template>
     <main class="reset-view">
         <div class="reset-form">
-            <h1>{{ t('Set new password', SCOPE) }}</h1>
+            <h1>{{ welcome ? t('Choose a password', SCOPE) : t('Set new password', SCOPE) }}</h1>
 
-            <wa-callout v-if="invalidLink" variant="danger">
+            <wa-callout v-if="invalidLink && welcome" variant="danger">
+                {{ t('This invitation link is invalid or has expired. Ask whoever created your account to send a new one.', SCOPE) }}
+            </wa-callout>
+            <wa-callout v-else-if="invalidLink" variant="danger">
                 {{ t('This reset link is invalid. Please request a new one.', SCOPE) }}
             </wa-callout>
 
             <template v-else-if="success">
                 <wa-callout variant="success">
-                    {{ t('Your password has been reset. You can now sign in.', SCOPE) }}
+                    {{ welcome
+                        ? t('Your password is set. You can now sign in.', SCOPE)
+                        : t('Your password has been reset. You can now sign in.', SCOPE) }}
                 </wa-callout>
                 <wa-button appearance="filled-outlined" variant="brand" @click="goToLogin">
                     {{ t('Go to sign in', SCOPE) }}

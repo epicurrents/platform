@@ -284,6 +284,18 @@ class TestConfiguredVersion:
             monkey.undo()
         assert (tmp_path / "pyodide" / "9.9.9" / "pyodide-lock.json").is_file()
 
+    def test_no_configured_path_means_nothing_to_vendor(self, settings, tmp_path, capsys):
+        # A project that redefines the public mode without an asset path loads
+        # Pyodide from the CDN. update.sh runs this with the services stopped, so
+        # an error here is an update that ends with the stack down.
+        settings.PUBLIC_VIEWER_MODES = {"public": {"setup": {"containerId": "viewer"}}}
+        settings.VENDOR_DIR = str(tmp_path)
+        call_command("vendor_pyodide", "--check")
+        call_command("vendor_pyodide")
+        out = capsys.readouterr().out
+        assert "nothing to vendor" in out
+        assert not any(tmp_path.iterdir()), "a no-op must write nothing"
+
     def test_an_unparseable_setting_is_an_error(self, settings):
         settings.PUBLIC_VIEWER_MODES = {"public": {"setup": {"pyodideAssetPath": "/vendor/"}}}
         with pytest.raises(CommandError, match="pass --pyodide-version"):

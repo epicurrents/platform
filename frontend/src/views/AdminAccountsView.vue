@@ -7,14 +7,21 @@
  * no total, so paging can say "there is more" but never "N of M"; the Next
  * button is enabled on a full page and that is the whole signal available.
  *
+ * Creating an account asks for the operator's own credentials when it leaves
+ * the operator holding a way in — a password they chose, or a staff tier —
+ * and the inputs appear in the create dialog only then.
+ *
  * @package    epicurrents-platform
  */
 import { computed, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import AdminTabs from '#components/AdminTabs.vue'
+import StepUpFields from '#components/StepUpFields.vue'
 import { createAccount, listAccounts, type Account } from '#api/admin'
+import { useDialog } from '#composables/useDialog'
 import { t } from '#i18n'
 import { errorDetail } from '#lib/http'
+import { accountCreateNeedsStepUp, stepUpBody } from '#lib/stepUp'
 import { showToast } from '#lib/toast'
 import { useAuthStore } from '#stores/auth'
 
@@ -32,11 +39,14 @@ const loadError = ref('')
 const offset = ref(0)
 const search = reactive({ q: '' })
 
-const showCreate = ref(false)
-const creating = ref(false)
-const createError = ref('')
+const createDialog = useDialog()
+/** The operator's own credentials, asked for only when the new account needs them. */
+const credentials = reactive({ password: '', totp_code: '' })
 const createForm = reactive({
     username: '',
+    // Off by default: the ordinary way to add someone is an invitation they
+    // answer with a password of their own, which no operator ever sees.
+    setPassword: false,
     password: '',
     email: '',
     firstName: '',
@@ -53,6 +63,13 @@ const canWrite = computed(() => authStore.isSuperuser)
 const hasNextPage = computed(() => accounts.value.length === PAGE_SIZE)
 
 const hasPrevPage = computed(() => offset.value > 0)
+
+/** Whether this creation asks for the operator's credentials: a chosen password or a staff tier. */
+const createNeedsStepUp = computed(() => accountCreateNeedsStepUp({
+    password: createForm.setPassword ? createForm.password : '',
+    is_staff: createForm.isStaff,
+    is_superuser: createForm.isSuperuser,
+}))
 
 let searchTimer: ReturnType<typeof setTimeout> | undefined
 /**
@@ -103,8 +120,10 @@ function openAccount (account: Account) {
 }
 
 function openCreate () {
-    createError.value = ''
+    credentials.password = ''
+    credentials.totp_code = ''
     createForm.username = ''
+    createForm.setPassword = false
     createForm.password = ''
     createForm.email = ''
     createForm.firstName = ''
@@ -112,40 +131,52 @@ function openCreate () {
     createForm.isActive = true
     createForm.isStaff = false
     createForm.isSuperuser = false
-    showCreate.value = true
-}
-
-function closeCreate () {
-    if (creating.value) {
-        return
-    }
-    showCreate.value = false
+    createDialog.show()
 }
 
 async function confirmCreate () {
-    createError.value = ''
-    creating.value = true
-    try {
-        const account = await createAccount({
+    const confirmed = createNeedsStepUp.value ? stepUpBody(credentials) : {}
+    const account = await createDialog.run(
+        () => createAccount({
             username: createForm.username.trim(),
-            password: createForm.password,
+            ...(createForm.setPassword ? { password: createForm.password } : {}),
             email: createForm.email.trim(),
             first_name: createForm.firstName.trim(),
             last_name: createForm.lastName.trim(),
             is_active: createForm.isActive,
             is_staff: createForm.isStaff,
             is_superuser: createForm.isSuperuser,
-        })
-        showCreate.value = false
-        showToast(t('Account {username} created.', SCOPE, { username: account.username }), 'success')
-        router.push({ name: 'admin-account', params: { id: String(account.id) } })
-    } catch (err) {
+            // `password` above is the new account's; the operator's own goes as `current_password`.
+            ...(confirmed.password ? { current_password: confirmed.password } : {}),
+            ...(confirmed.totp_code ? { totp_code: confirmed.totp_code } : {}),
+        }),
         // The server owns every refusal here — duplicate username, rejected
-        // password, malformed email — so show what it said rather than guessing.
-        createError.value = errorDetail(err, t('The account could not be created.', SCOPE))
-    } finally {
-        creating.value = false
+        // password, malformed email, a failed confirmation — so show what it said.
+        { fallback: t('The account could not be created.', SCOPE) },
+    )
+    if (!account) {
+        credentials.totp_code = ''
+        return
     }
+    // An invitation goes out only for an active account without a password on a
+    // deployment that has outgoing mail; the toast must not claim one otherwise.
+    if (account.invitation_sent) {
+        showToast(
+            t('Account {username} created and invited by email.', SCOPE, { username: account.username }),
+            'success',
+        )
+    } else if (account.is_invite_pending && account.is_active) {
+        showToast(
+            [
+                t('Account {username} created.', SCOPE, { username: account.username }),
+                t('Outgoing mail is not configured; no invitation was sent.', SCOPE),
+            ],
+            'warning',
+        )
+    } else {
+        showToast(t('Account {username} created.', SCOPE, { username: account.username }), 'success')
+    }
+    router.push({ name: 'admin-account', params: { id: String(account.id) } })
 }
 
 function nextPage () {
@@ -265,10 +296,10 @@ onUnmounted(() => clearTimeout(searchTimer))
         </div>
     </main>
 
-    <wa-dialog :label="t('New account', SCOPE)" :open="showCreate" @wa-hide.self="closeCreate">
+    <wa-dialog :label="t('New account', SCOPE)" :open="createDialog.open.value" @wa-hide.self="createDialog.onHide">
         <div class="admin-form">
-            <wa-callout v-if="createError" variant="danger">
-                {{ createError }}
+            <wa-callout v-if="createDialog.error.value" variant="danger">
+                {{ createDialog.error.value }}
             </wa-callout>
             <wa-input
                 autocomplete="off"
@@ -277,6 +308,16 @@ onUnmounted(() => clearTimeout(searchTimer))
                 v-wa="[createForm, 'username']"
             ></wa-input>
             <wa-input
+                :label="t('Email', SCOPE)"
+                :required="!createForm.setPassword"
+                type="email"
+                v-wa="[createForm, 'email']"
+            ></wa-input>
+            <wa-switch v-wa="[createForm, 'setPassword']">{{ t('Set a password myself', SCOPE) }}</wa-switch>
+            <p v-if="!createForm.setPassword" class="form-hint">
+                {{ t('An email invites the account holder to choose their own password. The link is valid for three days and can be sent again.', SCOPE) }}
+            </p>
+            <wa-input v-if="createForm.setPassword"
                 autocomplete="new-password"
                 :label="t('Password', SCOPE)"
                 password-toggle
@@ -284,29 +325,26 @@ onUnmounted(() => clearTimeout(searchTimer))
                 type="password"
                 v-wa="[createForm, 'password']"
             ></wa-input>
-            <wa-input
-                :label="t('Email', SCOPE)"
-                type="email"
-                v-wa="[createForm, 'email']"
-            ></wa-input>
             <wa-input :label="t('First name', SCOPE)" v-wa="[createForm, 'firstName']"></wa-input>
             <wa-input :label="t('Last name', SCOPE)" v-wa="[createForm, 'lastName']"></wa-input>
             <wa-switch v-wa="[createForm, 'isActive']">{{ t('Active', SCOPE) }}</wa-switch>
             <wa-switch v-wa="[createForm, 'isStaff']">{{ t('Staff', SCOPE) }}</wa-switch>
             <wa-switch v-wa="[createForm, 'isSuperuser']">{{ t('Superuser', SCOPE) }}</wa-switch>
+            <StepUpFields v-if="createNeedsStepUp" :credentials="credentials" :step-up="authStore.stepUp" />
         </div>
         <div slot="footer" class="form-actions">
             <wa-button
                 appearance="filled-outlined"
-                :disabled="creating"
+                :disabled="createDialog.busy.value"
                 variant="neutral"
-                @click="closeCreate"
+                @click="createDialog.close"
             >
                 {{ t('Cancel', SCOPE) }}
             </wa-button>
             <wa-button
                 appearance="filled-outlined"
-                :loading="creating"
+                :disabled="createNeedsStepUp && !authStore.stepUp.available"
+                :loading="createDialog.busy.value"
                 variant="brand"
                 @click="confirmCreate"
             >
@@ -324,6 +362,12 @@ onUnmounted(() => clearTimeout(searchTimer))
 
 .admin-search {
     margin-bottom: var(--wa-space-m);
+}
+
+.form-hint {
+    color: var(--wa-color-text-quiet);
+    font-size: var(--wa-font-size-s);
+    margin: 0;
 }
 
 .admin-form {

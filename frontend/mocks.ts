@@ -19,6 +19,7 @@
  *   GET    /api/v1/user/admin/accounts/{id}
  *   PATCH  /api/v1/user/admin/accounts/{id}
  *   POST   /api/v1/user/admin/accounts/{id}/password
+ *   POST   /api/v1/user/admin/accounts/{id}/invite
  *   DELETE /api/v1/user/admin/accounts/{id}/2fa
  *   PUT    /api/v1/user/admin/accounts/{id}/groups
  *   GET    /api/v1/user/admin/groups
@@ -26,6 +27,20 @@
  *   PATCH  /api/v1/user/admin/groups/{id}
  *   DELETE /api/v1/user/admin/groups/{id}
  *   PUT    /api/v1/user/admin/groups/{id}/members
+ *   GET    /api/v1/maintenance/lock
+ *   GET    /api/v1/maintenance/status
+ *   GET    /api/v1/maintenance/operations
+ *   GET    /api/v1/maintenance/jobs
+ *   POST   /api/v1/maintenance/jobs
+ *   GET    /api/v1/maintenance/jobs/{id}
+ *   GET    /api/v1/maintenance/jobs/{id}/log
+ *   POST   /api/v1/maintenance/jobs/{id}/cancel
+ *   POST   /api/v1/maintenance/jobs/{id}/verify
+ *   POST   /api/v1/maintenance/jobs/{id}/rollback
+ *   POST   /api/v1/maintenance/jobs/{id}/abandon
+ *   GET    /api/v1/maintenance/packages
+ *   POST   /api/v1/maintenance/packages
+ *   DELETE /api/v1/maintenance/packages/{sha256}
  *
  *   GET    /annotations/api/v1/content-types
  *
@@ -72,6 +87,8 @@ interface MockUser {
     is_staff: boolean
     is_superuser: boolean
     is_2fa_enabled: boolean
+    /** Identity provider this account signs in through, or null for a local account. */
+    external_provider?: string | null
 }
 
 interface MockRecording {
@@ -139,7 +156,7 @@ interface MockAccount extends MockUser {
     is_active: boolean
     date_joined: string
     last_login: string | null
-    /** Password is never read back; held only so a set-password call has somewhere to land. */
+    /** Password is never read back; held only so a set-password call has somewhere to land. Empty for an account created by invitation, which has not chosen one yet. */
     password: string
 }
 
@@ -153,7 +170,59 @@ interface MockAuthGroup {
     grantCount: number
 }
 
+interface MockJob {
+    job_id: string
+    operation: string
+    executor: 'celery' | 'host'
+    state: string
+    reason: string
+    step: string
+    requested_by: string | null
+    package_sha256: string | null
+    args: Record<string, unknown>
+    created_at: string
+    started_at: string | null
+    finished_at: string | null
+    verify_deadline: string | null
+    verify_requested_at: string | null
+    rollback_requested_at: string | null
+    installed_version_before: string
+    target_version: string
+    running_version: string
+    snapshot: string
+    post_snapshot: string
+    migrations_applied?: boolean | null
+    output: string
+}
+
+/** A snapshot the mock host holds, as the agent's heartbeat would list it. */
+interface MockSnapshot {
+    name: string
+    taken_at: string | null
+    version: string | null
+    code: boolean
+    migrations: 'none' | 'applied' | null
+}
+
+interface MockPackage {
+    sha256: string
+    version: string
+    project: string
+    plugins: string[]
+    platform_compatible: string
+    built_at: string | null
+    size: number
+    key_id: string
+    agent_version: number
+    uploaded_by: string | null
+    uploaded_at: string
+    state: 'available' | 'unverified' | 'invalid' | 'applied' | 'pruned'
+}
+
 interface MockState {
+    jobs: MockJob[]
+    packages: MockPackage[]
+    snapshots: MockSnapshot[]
     user: MockUser
     accounts: MockAccount[]
     authGroups: MockAuthGroup[]
@@ -203,6 +272,120 @@ const MOCK_ROLE_PROVIDERS = [
 
 /** Tracks which pending recordings have been polled once (to simulate processing). */
 const _pendingFlipped = new Set<string>()
+
+/** Timers driving mock jobs through their states; cleared with the state. */
+const _jobTimers = new Set<ReturnType<typeof setTimeout>>()
+
+const IN_FLIGHT_STATES = new Set(['requested', 'accepted', 'running', 'awaiting_verification', 'rolling_back'])
+
+/** What the mock deployment runs; a package must be newer to be applicable. */
+const MOCK_INSTALLED_VERSION = '0.1.1'
+
+/**
+ * Accounts the mock pretends were erased after every snapshot, so a database restore asks for them to be
+ * acknowledged (409 `erasures_since_snapshot`). Set to 0 to exercise the plain path.
+ */
+const MOCK_ERASURES_SINCE_SNAPSHOT = 2
+
+/** The code the mock accepts as a second factor, for an account that has one. */
+const MOCK_TOTP_CODE = '123456'
+
+/** The package the seed holds; more are uploaded through the API, which accepts any three files. */
+const MOCK_PACKAGE_SHA256 = 'f'.repeat(64)
+
+/** The operation registry as the server publishes it, argument schemas included. */
+const MOCK_OPERATIONS = [
+    {
+        key: 'activity.verify_audit_integrity',
+        executor: 'celery',
+        label: 'Verify audit-trail integrity',
+        description: 'Walk every audit chain and recompute derived-state digests; reports any break, gap or mismatch.',
+        requires_step_up: false,
+        available: true,
+        args_schema: {
+            properties: {
+                derived_window_days: {
+                    anyOf: [{ type: 'integer', minimum: 0, maximum: 3650 }, { type: 'null' }],
+                    default: null,
+                    description: 'Days of derived-state rows to recompute; 0 skips that phase.',
+                    title: 'Derived Window Days',
+                },
+            },
+        },
+    },
+    {
+        key: 'recordings.refresh_signal_metadata',
+        executor: 'celery',
+        label: 'Refresh signal metadata',
+        description: 'Re-derive recording and channel metadata from the files on disk for every recording that has drifted.',
+        requires_step_up: true,
+        available: true,
+        args_schema: {
+            properties: {
+                dry_run: { type: 'boolean', default: false, description: 'Report drifted recordings without writing anything.', title: 'Dry Run' },
+            },
+        },
+    },
+    {
+        key: 'platform.update',
+        executor: 'host',
+        label: 'Update the platform',
+        description: 'Apply an uploaded, signed package with a verification window and automatic rollback. Needs the host agent.',
+        requires_step_up: true,
+        available: true,
+        args_schema: {
+            properties: {
+                package_sha256: { type: 'string', pattern: '^[0-9a-f]{64}$', description: 'sha256 of an uploaded package.', title: 'Package Sha256' },
+                verify_window_minutes: {
+                    anyOf: [{ type: 'integer', minimum: 5, maximum: 1440 }, { type: 'null' }],
+                    default: null,
+                    description: 'Minutes to wait for a confirmation before rolling back.',
+                    title: 'Verify Window Minutes',
+                },
+            },
+            required: ['package_sha256'],
+        },
+    },
+    {
+        key: 'platform.backup',
+        executor: 'host',
+        label: 'Take a snapshot',
+        description: 'Snapshot the code, the database and the configuration on the host, without interrupting the platform. The newest three are kept. Needs the host agent.',
+        requires_step_up: true,
+        available: true,
+        args_schema: { properties: {} },
+    },
+    {
+        key: 'platform.rollback',
+        executor: 'host',
+        label: 'Roll back to a snapshot',
+        description: 'Restore a snapshot the host holds: the code, and the database unless it is kept. The platform is suspended while it runs. Needs the host agent.',
+        requires_step_up: true,
+        available: true,
+        args_schema: {
+            properties: {
+                snapshot: {
+                    type: 'string',
+                    pattern: '^[A-Za-z0-9][A-Za-z0-9_-]*-[0-9]{8}-[0-9]{6}$',
+                    description: 'A snapshot on the host, by the name the agent reports.',
+                    title: 'Snapshot',
+                },
+                restore_database: {
+                    type: 'boolean',
+                    default: true,
+                    description: 'Restore the database from the snapshot as well; everything written since it is lost. Off, the database is kept, which the agent allows only when no migration was applied since the snapshot.',
+                    title: 'Restore Database',
+                },
+            },
+            required: ['snapshot'],
+        },
+    },
+]
+
+/** The snapshot names the mock agent reports, newest first. */
+function snapshotsOut(): MockSnapshot[] {
+    return [..._state.snapshots].sort((a, b) => (b.taken_at ?? '').localeCompare(a.taken_at ?? ''))
+}
 
 // ─── Session cookie ───────────────────────────────────────────────────────────
 
@@ -566,9 +749,42 @@ function buildSeed(): MockState {
             password: 'mock',
         },
         {
+            // Invited and has not chosen a password yet, so the account page
+            // shows the pending state and the resend control.
+            id: 4,
+            username: 'a.okonkwo',
+            email: 'a.okonkwo@epicurrents.dev',
+            first_name: 'Ada',
+            last_name: 'Okonkwo',
+            is_staff: false,
+            is_superuser: false,
+            is_2fa_enabled: false,
+            is_active: true,
+            date_joined: ago(3600 * 6),
+            last_login: null,
+            password: '',
+        },
+        {
+            // Signs in through the identity provider, so every password control
+            // is hidden rather than left to be refused.
+            id: 5,
+            username: 'l.bergstrom',
+            email: 'l.bergstrom@epicurrents.dev',
+            first_name: 'Liv',
+            last_name: 'Bergström',
+            is_staff: false,
+            is_superuser: false,
+            is_2fa_enabled: false,
+            is_active: true,
+            date_joined: ago(3600 * 24 * 60),
+            last_login: ago(3600 * 5),
+            password: '',
+            external_provider: 'Microsoft',
+        },
+        {
             // Deactivated and unnamed, so the roster shows both the inactive
             // marker and the username fallback for a row with no display name.
-            id: 4,
+            id: 6,
             username: 'former.account',
             email: 'former@epicurrents.dev',
             first_name: '',
@@ -611,7 +827,102 @@ function buildSeed(): MockState {
         datasets,
         datasetItems,
         datasetAccess,
-        seq: { rec: 17, coll: 3, ds: 3, item: 4, access: 2, account: 5, group: 3 },
+        seq: { rec: 17, coll: 3, ds: 3, item: 4, access: 2, account: 7, group: 3 },
+        snapshots: [
+            {
+                name: 'pre-update-20260917-101500',
+                taken_at: '2026-09-17T10:15:00Z',
+                version: '0.1.0',
+                code: true,
+                migrations: 'applied',
+            },
+            {
+                name: 'backup-20260910-080000',
+                taken_at: '2026-09-10T08:00:00Z',
+                version: '0.1.0',
+                code: true,
+                migrations: null,
+            },
+        ],
+        packages: [
+            {
+                sha256: MOCK_PACKAGE_SHA256,
+                version: '0.1.2',
+                project: '',
+                plugins: [],
+                platform_compatible: '>=0.1,<0.2',
+                built_at: ago(3600 * 24 * 4),
+                size: 48_300_000,
+                key_id: '0123456789abcdef',
+                agent_version: 1,
+                uploaded_by: user.username,
+                uploaded_at: ago(3600 * 24 * 3 + 600),
+                state: 'available',
+            },
+            {
+                sha256: 'e'.repeat(64),
+                version: '0.1.4',
+                project: '',
+                plugins: [],
+                platform_compatible: '>=0.1,<0.2',
+                built_at: ago(3600 * 24 * 2),
+                size: 48_100_000,
+                key_id: '0123456789abcdef',
+                agent_version: 1,
+                uploaded_by: user.username,
+                uploaded_at: ago(3600 * 24 * 2 + 600),
+                // The archive did not hash to what its manifest says: listed, never applicable.
+                state: 'invalid',
+            },
+        ],
+        jobs: [
+            {
+                job_id: '3f2c1a2e-9d4b-4c6e-8a1f-0b7d5e6c9a10',
+                operation: 'activity.verify_audit_integrity',
+                executor: 'celery',
+                state: 'succeeded',
+                reason: '',
+                step: '',
+                requested_by: user.username,
+                package_sha256: null,
+                args: {},
+                created_at: ago(3600 * 26),
+                started_at: ago(3600 * 26 - 2),
+                finished_at: ago(3600 * 26 - 9),
+                verify_deadline: null,
+                verify_requested_at: null,
+                rollback_requested_at: null,
+                installed_version_before: '',
+                target_version: '',
+                running_version: '',
+                snapshot: '',
+                post_snapshot: '',
+                output: '{\n  "chain_breaks": 0,\n  "chain_gaps": [],\n  "chains_checked": 12\n}\nAudit trail verified: no anomalies.\n',
+            },
+            {
+                job_id: '8b6d2c4a-1e3f-4a5b-9c7d-2e1f0a9b8c7d',
+                operation: 'platform.update',
+                executor: 'host',
+                state: 'rolled_back',
+                reason: 'deadline',
+                step: 'health',
+                requested_by: user.username,
+                package_sha256: MOCK_PACKAGE_SHA256,
+                args: { package_sha256: MOCK_PACKAGE_SHA256 },
+                created_at: ago(3600 * 24 * 3),
+                started_at: ago(3600 * 24 * 3 - 30),
+                finished_at: ago(3600 * 24 * 3 - 2400),
+                verify_deadline: ago(3600 * 24 * 3 - 2100),
+                verify_requested_at: null,
+                rollback_requested_at: null,
+                installed_version_before: '0.1.1',
+                target_version: '0.1.2',
+                running_version: '0.1.1',
+                snapshot: 'pre-update-20260917-101500',
+                post_snapshot: 'post-update-20260917-104500',
+                output: '',
+            },
+        ],
     }
 }
 
@@ -620,6 +931,8 @@ let _state: MockState
 export function resetState(): void {
     _state = buildSeed()
     _pendingFlipped.clear()
+    for (const timer of _jobTimers) clearTimeout(timer)
+    _jobTimers.clear()
 }
 
 // Initialize on module load so the first request is always ready.
@@ -638,6 +951,164 @@ function readBody(req: IncomingMessage): Promise<Record<string, unknown>> {
         })
         req.on('error', reject)
     })
+}
+
+function readRaw(req: IncomingMessage): Promise<Buffer> {
+    return new Promise((resolve, reject) => {
+        const chunks: Buffer[] = []
+        req.on('data', (chunk: Buffer) => chunks.push(chunk))
+        req.on('end', () => resolve(Buffer.concat(chunks)))
+        req.on('error', reject)
+    })
+}
+
+/**
+ * The `manifest` part of a multipart package upload, parsed, or `null`. Enough
+ * of a parser for the mock: the part's headers end at the first blank line and
+ * its body at the next boundary. Nothing else in the body is read.
+ */
+function manifestFromUpload(raw: Buffer, contentType: string): Record<string, unknown> | null {
+    const boundary = /boundary=("?)([^";]+)\1/.exec(contentType)?.[2]
+    if (!boundary) return null
+    const text = raw.toString('latin1')
+    for (const part of text.split(`--${boundary}`)) {
+        if (!/name="manifest"/.test(part)) continue
+        const start = part.indexOf('\r\n\r\n')
+        if (start < 0) continue
+        const body = part.slice(start + 4).replace(/\r\n$/, '')
+        try { return JSON.parse(Buffer.from(body, 'latin1').toString('utf-8')) as Record<string, unknown> }
+        catch { return null }
+    }
+    return null
+}
+
+/** Compare dotted versions numerically, so 0.1.10 is newer than 0.1.9. */
+function compareVersions(a: string, b: string): number {
+    const left = a.split('.').map(Number)
+    const right = b.split('.').map(Number)
+    for (let i = 0; i < Math.max(left.length, right.length); i += 1) {
+        const diff = (left[i] ?? 0) - (right[i] ?? 0)
+        if (diff !== 0) return diff
+    }
+    return 0
+}
+
+/** A package as the API returns it; `applicable` is derived, as on the server. */
+function packageOut(pkg: MockPackage) {
+    return { ...pkg, applicable: pkg.state === 'available' && compareVersions(pkg.version, MOCK_INSTALLED_VERSION) > 0 }
+}
+
+/**
+ * The mock user's step-up method, as `user/stepup.py` derives it: the password for an account with one of its own,
+ * the code as well when a factor is enrolled, and the code alone for an externally authenticated account.
+ */
+function stepUpMethod(): 'password' | 'password+totp' | 'totp' | null {
+    const hasPassword = !_state.user.external_provider
+    const hasFactor = _state.user.is_2fa_enabled
+    if (hasPassword && hasFactor) return 'password+totp'
+    if (hasPassword) return 'password'
+    if (hasFactor) return 'totp'
+    return null
+}
+
+/**
+ * Check step-up credentials the way `confirm_step_up` does: the password is `password`, the code `123456`.
+ * `secondFactor: false` waives the code for an account that has a password, as verify does.
+ * Answers the refusal and returns true when the credentials do not hold.
+ */
+function refuseStepUp(res: ServerResponse, body: Record<string, unknown>, secondFactor = true): boolean {
+    const method = stepUpMethod()
+    if (method === null) {
+        send(res, 409, {
+            detail: 'This account signs in through an external provider and has no second factor; it cannot confirm.',
+        })
+        return true
+    }
+    const passwordOk = !method.includes('password') || body.password === 'password'
+    const codeNeeded = method === 'totp' || (secondFactor && method.includes('totp'))
+    const codeOk = !codeNeeded || String(body.totp_code ?? '').trim() === MOCK_TOTP_CODE
+    if (passwordOk && codeOk) return false
+    send(res, 400, { detail: 'Confirmation failed.' })
+    return true
+}
+
+interface MockLock {
+    phase: 'updating' | 'verifying' | 'rolling_back'
+    since: string | null
+    expected_until: string | null
+    message: string
+    job_id: string
+}
+
+/** The maintenance flag the mock host would have raised, derived from the job in flight. */
+function currentLock(): MockLock | null {
+    const job = _state.jobs.find(j => IN_FLIGHT_STATES.has(j.state))
+    if (!job) return null
+    if (job.state === 'awaiting_verification') {
+        return {
+            phase: 'verifying',
+            since: job.started_at,
+            expected_until: job.verify_deadline,
+            message: 'The platform was updated and waits for confirmation.',
+            job_id: job.job_id,
+        }
+    }
+    if (job.state === 'rolling_back' || (job.operation === 'platform.rollback' && job.state === 'running')) {
+        return {
+            phase: 'rolling_back',
+            since: job.started_at,
+            expected_until: null,
+            message: 'The platform is being rolled back.',
+            job_id: job.job_id,
+        }
+    }
+    if (job.operation === 'platform.update' && job.state === 'running' && job.step !== 'snapshot') {
+        return {
+            phase: 'updating',
+            since: job.started_at,
+            expected_until: new Date(Date.now() + 5 * 60_000).toISOString(),
+            message: 'The platform is being updated.',
+            job_id: job.job_id,
+        }
+    }
+    return null
+}
+
+/** Paths the lock never refuses, as `_LOCK_EXEMPT_PATHS` on the server. */
+const LOCK_EXEMPT_PATHS = new Set(['/api/v1/maintenance/lock', '/api/v1/health', '/api/v1/health/'])
+
+/**
+ * The lock's policy, as `maintenance_verdict`: while `verifying` a superuser is exempt and only a non-superuser's
+ * unsafe requests are refused (sign-in and sign-out pass); otherwise only a superuser's safe requests pass.
+ */
+function lockRefuses(lock: MockLock, method: string, path: string, loggedIn: boolean): boolean {
+    if (LOCK_EXEMPT_PATHS.has(path)) return false
+    const safe = method === 'GET' || method === 'HEAD' || method === 'OPTIONS'
+    const superuser = loggedIn && _state.user.is_superuser
+    if (lock.phase === 'verifying') {
+        if (superuser || safe) return false
+        return !path.startsWith('/api/v1/user/login') && !path.startsWith('/api/v1/user/logout')
+    }
+    return !(superuser && safe)
+}
+
+/** The 503 the lock middleware answers with, `Retry-After` included. */
+function maintenanceRefusal(res: ServerResponse, lock: MockLock): true {
+    const body = JSON.stringify({
+        detail: 'maintenance',
+        phase: lock.phase,
+        since: lock.since,
+        expected_until: lock.expected_until,
+        message: lock.message,
+    })
+    res.writeHead(503, {
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(body),
+        'Retry-After': '30',
+        'Cache-Control': 'no-store',
+    })
+    res.end(body)
+    return true
 }
 
 function send(res: ServerResponse, status: number, data: unknown): true {
@@ -703,6 +1174,8 @@ function accountOut(account: MockAccount) {
         last_login: account.last_login,
         groups: groupsOf(account.id),
         roles,
+        external_provider: account.external_provider ?? null,
+        is_invite_pending: !account.external_provider && !account.password,
     }
 }
 
@@ -829,6 +1302,108 @@ function enrichItem(contentTypeId: number, objectId: string): { object_name: str
     return { object_name: null, object_hash: null }
 }
 
+// ─── Maintenance helpers ──────────────────────────────────────────────────────
+
+function jobOut(job: MockJob) {
+    return {
+        ...job,
+        migrations_applied: job.migrations_applied ?? null,
+        in_flight: IN_FLIGHT_STATES.has(job.state),
+        // Staff see no output; the mock user is a superuser, so it is included.
+        output: _state.user.is_superuser ? job.output : null,
+    }
+}
+
+/** Run `fn` later unless the state has been reset in between. */
+function later(ms: number, fn: () => void): void {
+    const timer = setTimeout(() => {
+        _jobTimers.delete(timer)
+        fn()
+    }, ms)
+    _jobTimers.add(timer)
+}
+
+/**
+ * Walk a fresh job through the states its tier goes through, on a timer, so
+ * the job page has something to poll. A celery job finishes by itself; a host
+ * update stops at the confirmation window and waits for verify or rollback.
+ */
+function driveJob(job: MockJob): void {
+    if (job.executor === 'host') {
+        // The agent claims the request file before it starts: from here on it cannot be cancelled.
+        later(700, () => {
+            if (job.state === 'requested') job.step = 'check'
+        })
+    }
+    later(1500, () => {
+        if (job.state !== 'requested') return
+        job.state = 'running'
+        job.started_at = ago(0)
+        job.step = job.executor === 'host' ? 'snapshot' : ''
+        if (job.executor === 'celery') {
+            later(3000, () => {
+                if (job.state !== 'running') return
+                job.state = 'succeeded'
+                job.finished_at = ago(0)
+                job.output = job.operation === 'activity.verify_audit_integrity'
+                    ? '{\n  "chain_breaks": 0,\n  "chain_gaps": [],\n  "chains_checked": 12\n}\nAudit trail verified: no anomalies.\n'
+                    : `Checked 17 recordings, 0 drifted${job.args.dry_run ? ' (dry run)' : ''}.\n`
+            })
+            return
+        }
+        job.installed_version_before = MOCK_INSTALLED_VERSION
+        if (job.operation === 'platform.backup') {
+            later(2500, () => {
+                if (job.state !== 'running') return
+                const stamp = new Date().toISOString().replace(/[-:T]/g, '').slice(0, 15).replace(/^(\d{8})(\d{6}).*$/, '$1-$2')
+                job.snapshot = `backup-${stamp}`
+                job.state = 'succeeded'
+                job.finished_at = ago(0)
+                _state.snapshots.push({
+                    name: job.snapshot,
+                    taken_at: new Date().toISOString().replace(/\.\d+Z$/, 'Z'),
+                    version: MOCK_INSTALLED_VERSION,
+                    code: true,
+                    migrations: null,
+                })
+            })
+            return
+        }
+        if (job.operation === 'platform.rollback') {
+            job.snapshot = String(job.args.snapshot ?? '')
+            job.step = 'snapshot'
+            later(2000, () => {
+                if (job.state !== 'running') return
+                job.post_snapshot = 'pre-rollback-20260920-130000'
+                job.step = job.args.restore_database === false ? 'restore-code' : 'restore-db'
+                later(2500, () => {
+                    if (job.state !== 'running') return
+                    job.state = 'succeeded'
+                    job.step = 'health'
+                    job.running_version = job.target_version || MOCK_INSTALLED_VERSION
+                    job.finished_at = ago(0)
+                })
+            })
+            return
+        }
+        job.snapshot = 'pre-update-20260920-120000'
+        later(2000, () => {
+            if (job.state !== 'running') return
+            job.step = 'build'
+            later(2500, () => {
+                if (job.state !== 'running') return
+                job.state = 'awaiting_verification'
+                job.step = 'health'
+                job.running_version = job.target_version
+                // An odd patch version migrates, an even one does not: both rollback shapes can be seen.
+                job.migrations_applied = Number(job.target_version.split('.')[2] ?? 1) % 2 === 1
+                const minutes = typeof job.args.verify_window_minutes === 'number' ? job.args.verify_window_minutes : 30
+                job.verify_deadline = new Date(Date.now() + minutes * 60_000).toISOString()
+            })
+        })
+    })
+}
+
 // ─── Route handler ────────────────────────────────────────────────────────────
 
 export async function handleMock(
@@ -837,6 +1412,22 @@ export async function handleMock(
     req: IncomingMessage,
     res: ServerResponse,
 ): Promise<boolean> {
+
+    // ── Maintenance lock ──────────────────────────────────────────────────────
+    // The public probe answers whatever the lock is; everything else passes the
+    // lock middleware's policy first, as it does on the server.
+
+    const lock = currentLock()
+    if (path === '/api/v1/maintenance/lock' && method === 'GET') {
+        if (lock === null) {
+            return send(res, 200, { locked: false, phase: null, since: null, expected_until: null, message: null })
+        }
+        const { phase, since, expected_until, message } = lock
+        return send(res, 200, { locked: true, phase, since, expected_until, message })
+    }
+    if (lock !== null && lockRefuses(lock, method, path, isLoggedIn(req))) {
+        return maintenanceRefusal(res, lock)
+    }
 
     // ── User API ──────────────────────────────────────────────────────────────
 
@@ -866,7 +1457,10 @@ export async function handleMock(
         if (method === 'GET') return send(res, 200, { authenticated: true, user: _state.user })
         if (method === 'PATCH') {
             const body = await readBody(req)
-            if (typeof body.email === 'string') _state.user.email = body.email
+            if (typeof body.email === 'string' && body.email.trim() !== _state.user.email) {
+                if (refuseStepUp(res, body)) return true
+            }
+            if (typeof body.email === 'string') _state.user.email = body.email.trim()
             if (typeof body.first_name === 'string') _state.user.first_name = body.first_name
             if (typeof body.last_name === 'string') _state.user.last_name = body.last_name
             return send(res, 200, _state.user)
@@ -917,13 +1511,23 @@ export async function handleMock(
                 return conflict(res, 'An account with that username already exists.')
             }
             const password = String(body.password ?? '')
-            if (password.length < 8) {
+            const email = String(body.email ?? '')
+            if (password && password.length < 8) {
                 return send(res, 400, { detail: 'This password is too short. It must contain at least 8 characters.' })
+            }
+            if (!password && !email) {
+                return send(res, 400, {
+                    detail: 'An account created without a password needs an email address to send the invitation to.',
+                })
+            }
+            if (password || body.is_staff === true || body.is_superuser === true) {
+                // The caller's own password arrives as `current_password`; `password` is the new account's.
+                if (refuseStepUp(res, { password: body.current_password, totp_code: body.totp_code })) return true
             }
             const account: MockAccount = {
                 id: _state.seq.account++,
                 username,
-                email: String(body.email ?? ''),
+                email,
                 first_name: String(body.first_name ?? ''),
                 last_name: String(body.last_name ?? ''),
                 is_active: body.is_active !== false,
@@ -935,10 +1539,11 @@ export async function handleMock(
                 password,
             }
             _state.accounts.push(account)
-            return send(res, 201, accountOut(account))
+            // The mock has no mail backend, so an invitation is never actually sent.
+            return send(res, 201, { ...accountOut(account), invitation_sent: false })
         }
 
-        const accountMatch = /^accounts\/(\d+)(\/groups|\/password|\/2fa)?$/.exec(tail)
+        const accountMatch = /^accounts\/(\d+)(\/groups|\/password|\/2fa|\/invite)?$/.exec(tail)
         if (accountMatch) {
             const account = _state.accounts.find(a => a.id === Number(accountMatch[1]))
             if (!account) return send(res, 404, { detail: 'Account not found.' })
@@ -954,6 +1559,11 @@ export async function handleMock(
                 const nextSuper = body.is_superuser === undefined ? account.is_superuser : body.is_superuser === true
                 const guard = lastSuperuserRefusal(account, nextActive, nextSuper)
                 if (guard) return conflict(res, guard)
+                const emailChanged = body.email !== undefined && String(body.email).trim() !== account.email
+                const staffChanged = body.is_staff !== undefined && (body.is_staff === true) !== account.is_staff
+                const granted = emailChanged || staffChanged || nextSuper !== account.is_superuser
+                    || (nextActive && !account.is_active)
+                if (granted && refuseStepUp(res, body)) return true
                 if (body.email !== undefined) account.email = String(body.email)
                 if (body.first_name !== undefined) account.first_name = String(body.first_name)
                 if (body.last_name !== undefined) account.last_name = String(body.last_name)
@@ -968,6 +1578,9 @@ export async function handleMock(
             }
 
             if (suffix === '/password' && method === 'POST') {
+                if (account.id === MOCK_USER_ID) {
+                    return conflict(res, 'You cannot change the password on your own account here; use your profile.')
+                }
                 const body = await readBody(req)
                 const password = String(body.new_password ?? '')
                 if (password.length < 8) {
@@ -975,11 +1588,39 @@ export async function handleMock(
                         detail: 'This password is too short. It must contain at least 8 characters.',
                     })
                 }
+                if (refuseStepUp(res, body)) return true
                 account.password = password
                 return send(res, 200, { status: 'ok' })
             }
 
+            if (suffix === '/invite' && method === 'POST') {
+                if (account.external_provider) {
+                    return conflict(res, `This account signs in through ${account.external_provider} `
+                        + 'and does not use a password on this platform.')
+                }
+                if (account.password) {
+                    return conflict(res, 'This account already has a password. '
+                        + 'The account holder can request a reset themselves.')
+                }
+                if (!account.is_active) {
+                    return conflict(res, 'This account is deactivated. '
+                        + 'Reactivate it before inviting the account holder in.')
+                }
+                if (!account.email) {
+                    return conflict(res, 'This account has no email address to send the invitation to.')
+                }
+                // No mail backend in the mock: the link would only reach a log.
+                return send(res, 200, { status: 'not_sent', invitation_sent: false })
+            }
+
             if (suffix === '/2fa' && method === 'DELETE') {
+                if (account.id === MOCK_USER_ID) {
+                    return conflict(res, 'You cannot remove the second factor on your own account here; use your profile.')
+                }
+                if (!account.is_2fa_enabled) {
+                    return conflict(res, 'This account does not have two-factor authentication set up.')
+                }
+                if (refuseStepUp(res, await readBody(req))) return true
                 account.is_2fa_enabled = false
                 if (account.id === MOCK_USER_ID) _state.user.is_2fa_enabled = false
                 return send(res, 200, { status: 'reset' })
@@ -991,6 +1632,9 @@ export async function handleMock(
                 if (groupIds === null) return send(res, 400, { detail: 'group_ids is required.' })
                 const missing = groupIds.filter(id => !_state.authGroups.some(g => g.id === id))
                 if (missing.length) return send(res, 404, { detail: `No such group: ${missing.join(', ')}.` })
+                const held = new Set(groupsOf(account.id).map(group => group.id))
+                const adds = groupIds.some(id => !held.has(id))
+                if (adds && refuseStepUp(res, body)) return true
                 for (const group of _state.authGroups) {
                     const shouldHold = groupIds.includes(group.id)
                     group.memberIds = group.memberIds.filter(id => id !== account.id)
@@ -1045,6 +1689,7 @@ export async function handleMock(
                         }
                     }
                 }
+                if (roles && Object.values(roles).some(value => value !== null) && refuseStepUp(res, body)) return true
                 if (body.name !== undefined) {
                     const name = String(body.name).trim()
                     if (!name) return send(res, 400, { detail: 'Group name is required.' })
@@ -1073,8 +1718,307 @@ export async function handleMock(
                 if (userIds === null) return send(res, 400, { detail: 'user_ids is required.' })
                 const missing = userIds.filter(id => !_state.accounts.some(a => a.id === id))
                 if (missing.length) return send(res, 404, { detail: `No such account: ${missing.join(', ')}.` })
+                if (userIds.some(id => !group.memberIds.includes(id)) && refuseStepUp(res, body)) return true
                 group.memberIds = [...userIds]
                 return send(res, 200, groupOut(group))
+            }
+        }
+
+        return notFound(res)
+    }
+
+    // ── Maintenance ───────────────────────────────────────────────────────────
+
+    if (path.startsWith('/api/v1/maintenance/')) {
+        if (!isLoggedIn(req)) return send(res, 401, { detail: 'Not authenticated' })
+        if (!_state.user.is_staff && !_state.user.is_superuser) {
+            return send(res, 403, { detail: 'Staff access required.' })
+        }
+        const tail = path.slice('/api/v1/maintenance/'.length)
+        const inFlight = _state.jobs.find(j => IN_FLIGHT_STATES.has(j.state)) ?? null
+
+        if (tail === 'status' && method === 'GET') {
+            return send(res, 200, {
+                remote_maintenance_enabled: true,
+                remote_update_enabled: true,
+                installed_version: MOCK_INSTALLED_VERSION,
+                server_now: new Date().toISOString(),
+                spool_writable: true,
+                release_key_present: true,
+                release_key_ids: ['0123456789abcdef'],
+                agent: {
+                    installed: true,
+                    enabled: true,
+                    version: '2',
+                    runtime: 'docker',
+                    last_run: ago(20),
+                    stale: false,
+                    capabilities: ['platform.update', 'platform.backup', 'platform.rollback'],
+                    updater_script: 3,
+                    self_update: false,
+                    key_id: '0123456789abcdef',
+                    next_key_id: null,
+                    snapshots: snapshotsOut(),
+                },
+                lock,
+                in_flight_job: inFlight?.job_id ?? null,
+                step_up: stepUpMethod() === null
+                    ? {
+                        method: null,
+                        available: false,
+                        reason: 'This account signs in through an external provider and has no second factor enrolled.',
+                    }
+                    : { method: stepUpMethod(), available: true, reason: null },
+            })
+        }
+
+        if (tail === 'operations' && method === 'GET') {
+            return send(res, 200, MOCK_OPERATIONS)
+        }
+
+        if (tail === 'jobs' && method === 'GET') {
+            const rows = [..._state.jobs].sort((a, b) => b.created_at.localeCompare(a.created_at))
+            return send(res, 200, rows.map(jobOut))
+        }
+
+        if (tail === 'packages' && method === 'GET') {
+            const rows = [..._state.packages].sort((a, b) => b.uploaded_at.localeCompare(a.uploaded_at))
+            return send(res, 200, rows.map(packageOut))
+        }
+
+        if (method !== 'GET' && !_state.user.is_superuser) {
+            return send(res, 403, { detail: 'Superuser access required.' })
+        }
+
+        if (tail === 'packages' && method === 'POST') {
+            if (lock !== null) return conflict(res, 'The platform is locked for maintenance; upload the package afterwards.')
+            // The real endpoint verifies a signature; the mock accepts any three
+            // parts and reads what it can from the manifest so the list looks right.
+            const raw = await readRaw(req)
+            const contentType = String(req.headers['content-type'] ?? '')
+            const partNames = ['package', 'manifest', 'signature']
+            const text = raw.toString('latin1')
+            const absent = partNames.filter(name => !text.includes(`name="${name}"`))
+            if (absent.length) return send(res, 422, { detail: `Missing multipart part(s): ${absent.join(', ')}.` })
+            const manifest = manifestFromUpload(raw, contentType) ?? {}
+            const version = typeof manifest.version === 'string' ? manifest.version : '0.1.3'
+            if (compareVersions(version, MOCK_INSTALLED_VERSION) <= 0) {
+                return send(res, 400, {
+                    detail: `The package is version ${version} and the installed platform is ${MOCK_INSTALLED_VERSION}; a remote update applies only a newer release.`,
+                    reason: 'version_not_newer',
+                })
+            }
+            const sha256 = typeof manifest.sha256 === 'string' && manifest.sha256.length === 64
+                ? manifest.sha256
+                : randomUUID().replace(/-/g, '').repeat(2)
+            if (_state.packages.some(p => p.sha256 === sha256 && p.state !== 'pruned')) {
+                return send(res, 409, { detail: 'This package has already been uploaded.', reason: 'duplicate' })
+            }
+            const pkg: MockPackage = {
+                sha256,
+                version,
+                project: typeof manifest.project === 'string' ? manifest.project : '',
+                plugins: Array.isArray(manifest.plugins) ? manifest.plugins.map(String) : [],
+                platform_compatible: typeof manifest.platform_compatible === 'string' ? manifest.platform_compatible : '',
+                built_at: typeof manifest.built_at === 'string' ? manifest.built_at : null,
+                size: typeof manifest.size === 'number' ? manifest.size : raw.length,
+                key_id: typeof manifest.key_id === 'string' ? manifest.key_id : '',
+                agent_version: typeof manifest.agent_version === 'number' ? manifest.agent_version : 0,
+                uploaded_by: _state.user.username,
+                uploaded_at: ago(0),
+                // The archive is hashed in the worker after the upload answers.
+                state: 'unverified',
+            }
+            _state.packages = _state.packages.filter(p => p.sha256 !== sha256)
+            _state.packages.push(pkg)
+            later(4000, () => {
+                if (pkg.state === 'unverified') pkg.state = 'available'
+            })
+            return send(res, 201, packageOut(pkg))
+        }
+
+        const packageMatch = /^packages\/([0-9a-f]{64})$/.exec(tail)
+        if (packageMatch && method === 'DELETE') {
+            const pkg = _state.packages.find(p => p.sha256 === packageMatch[1])
+            if (!pkg) return send(res, 404, { detail: 'No such package' })
+            if (lock !== null) return conflict(res, 'The platform is locked for maintenance; remove the package afterwards.')
+            if (pkg.state === 'pruned') return conflict(res, 'This package has already been removed.')
+            if (inFlight?.package_sha256 === pkg.sha256) return conflict(res, 'A job in flight refers to this package.')
+            pkg.state = 'pruned'
+            return send(res, 200, packageOut(pkg))
+        }
+
+        if (tail === 'jobs' && method === 'POST') {
+            const body = await readBody(req)
+            const operation = MOCK_OPERATIONS.find(op => op.key === body.operation)
+            if (!operation) return send(res, 400, { detail: 'Unknown operation.' })
+            const args = (typeof body.args === 'object' && body.args !== null ? body.args : {}) as Record<string, unknown>
+            if (lock !== null) return conflict(res, 'The platform is locked for maintenance; request the operation afterwards.')
+            const chosen = operation.key === 'platform.update'
+                ? _state.packages.find(p => p.sha256 === args.package_sha256 && p.state === 'available')
+                : undefined
+            if (operation.key === 'platform.update' && !chosen) {
+                return send(res, 400, { detail: 'No uploaded package has that hash.' })
+            }
+            if (chosen && !packageOut(chosen).applicable) {
+                return send(res, 400, { detail: `Package ${chosen.version} is not newer than the installed ${MOCK_INSTALLED_VERSION}.` })
+            }
+            const snapshot = operation.key === 'platform.rollback'
+                ? _state.snapshots.find(s => s.name === args.snapshot)
+                : undefined
+            if (operation.key === 'platform.rollback' && !snapshot) {
+                return send(res, 400, { detail: 'The host agent reports no snapshot by that name.' })
+            }
+            if (inFlight) return conflict(res, 'Another maintenance job is in flight.')
+            // A restore of the database answers 409 while accounts were erased since, until acknowledged.
+            const restoresDatabase = operation.key === 'platform.rollback' && args.restore_database !== false
+            if (restoresDatabase && MOCK_ERASURES_SINCE_SNAPSHOT > 0 && body.acknowledge_erasures !== true) {
+                return send(res, 409, {
+                    detail: `${MOCK_ERASURES_SINCE_SNAPSHOT} account(s) were erased after the snapshot; restoring the `
+                        + 'database brings their data back until they are erased again. Resend with '
+                        + 'acknowledge_erasures to go ahead.',
+                    reason: 'erasures_since_snapshot',
+                    erasures: MOCK_ERASURES_SINCE_SNAPSHOT,
+                })
+            }
+            if (operation.requires_step_up && refuseStepUp(res, body)) return true
+            const job: MockJob = {
+                job_id: randomUUID(),
+                operation: operation.key,
+                executor: operation.executor as 'celery' | 'host',
+                state: 'requested',
+                reason: '',
+                step: '',
+                requested_by: _state.user.username,
+                package_sha256: chosen?.sha256 ?? null,
+                args,
+                created_at: ago(0),
+                started_at: null,
+                finished_at: null,
+                verify_deadline: null,
+                verify_requested_at: null,
+                rollback_requested_at: null,
+                installed_version_before: '',
+                target_version: chosen?.version ?? snapshot?.version ?? '',
+                running_version: '',
+                snapshot: '',
+                post_snapshot: '',
+                migrations_applied: null,
+                output: '',
+            }
+            _state.jobs.push(job)
+            driveJob(job)
+            return send(res, 202, jobOut(job))
+        }
+
+        const jobMatch = /^jobs\/([0-9a-f-]{36})(\/log|\/cancel|\/verify|\/rollback|\/abandon)?$/.exec(tail)
+        if (jobMatch) {
+            const job = _state.jobs.find(j => j.job_id === jobMatch[1])
+            if (!job) return send(res, 404, { detail: 'No such job' })
+            const suffix = jobMatch[2] ?? ''
+
+            if (suffix === '' && method === 'GET') return send(res, 200, jobOut(job))
+
+            if (suffix === '/log' && method === 'GET') {
+                if (!_state.user.is_superuser) return send(res, 403, { detail: 'Superuser access required.' })
+                const text = job.executor === 'host' && job.started_at
+                    ? `::step=check\n::step=snapshot\n::snapshot=${job.snapshot}\n::step=build\n[+] Building 42.1s (18/18) FINISHED\n::step=${job.step}\n`
+                    : job.output
+                return send(res, 200, { job_id: job.job_id, log: text, truncated: false, bytes: text.length })
+            }
+
+            if (suffix === '/cancel' && method === 'POST') {
+                if (job.state !== 'requested') return conflict(res, `A job in state '${job.state}' cannot be cancelled.`)
+                if (job.executor === 'host' && job.step) {
+                    return conflict(res, 'The host agent has already picked this request up.')
+                }
+                job.state = 'cancelled'
+                job.finished_at = ago(0)
+                return send(res, 200, jobOut(job))
+            }
+
+            const body = await readBody(req)
+
+            if (suffix === '/abandon' && method === 'POST') {
+                if (!IN_FLIGHT_STATES.has(job.state)) return conflict(res, `A job in state '${job.state}' is not in flight.`)
+                // The mock agent always reports, so a host job cannot be abandoned under it.
+                if (job.executor === 'host') {
+                    return conflict(res, "The host agent is running and will report this job's outcome itself.")
+                }
+                if (refuseStepUp(res, body)) return true
+                job.state = 'failed'
+                job.reason = 'abandoned'
+                job.finished_at = ago(0)
+                return send(res, 200, jobOut(job))
+            }
+
+            if (suffix === '/verify' && method === 'POST') {
+                if (job.operation !== 'platform.update') return conflict(res, 'Only an update has a verification window.')
+                if (job.state !== 'awaiting_verification') return conflict(res, `A job in state '${job.state}' is not awaiting verification.`)
+                if (job.verify_deadline && Date.parse(job.verify_deadline) <= Date.now()) {
+                    return conflict(res, 'The verification window has closed; the update is being rolled back.')
+                }
+                if (job.verify_requested_at) return conflict(res, 'This update has already been confirmed.')
+                if (job.rollback_requested_at) return conflict(res, 'A rollback of this update has already been asked for.')
+                // Verify waives the second factor for an account that has a password.
+                if (refuseStepUp(res, body, false)) return true
+                job.verify_requested_at = ago(0)
+                later(2000, () => {
+                    if (job.state !== 'awaiting_verification') return
+                    job.state = 'succeeded'
+                    job.finished_at = ago(0)
+                    const applied = _state.packages.find(p => p.sha256 === job.package_sha256)
+                    if (applied) applied.state = 'applied'
+                })
+                return send(res, 200, jobOut(job))
+            }
+
+            if (suffix === '/rollback' && method === 'POST') {
+                if (job.operation !== 'platform.update') {
+                    return conflict(res, 'Only an update can be rolled back here; a snapshot is restored with the roll-back operation.')
+                }
+                if (job.state !== 'awaiting_verification' && !(job.state === 'succeeded' && job.snapshot)) {
+                    return conflict(res, `A job in state '${job.state}' cannot be rolled back.`)
+                }
+                if (job.rollback_requested_at) return conflict(res, 'A rollback of this update has already been asked for.')
+                if (job.state === 'awaiting_verification' && job.verify_requested_at) {
+                    return conflict(res, 'This update has already been confirmed.')
+                }
+                if (job.state === 'succeeded') {
+                    if (inFlight) return conflict(res, 'Another maintenance job is in flight.')
+                    const later_ = _state.jobs.some(other => other !== job
+                        && ['platform.update', 'platform.rollback'].includes(other.operation)
+                        && other.state === 'succeeded'
+                        && other.created_at > job.created_at)
+                    if (later_) {
+                        return conflict(res, 'A later update or restore has succeeded; only the newest update can be rolled back.')
+                    }
+                }
+                const restores = job.migrations_applied !== false && MOCK_ERASURES_SINCE_SNAPSHOT > 0
+                if (restores && body.acknowledge_erasures !== true) {
+                    return send(res, 409, {
+                        detail: `${MOCK_ERASURES_SINCE_SNAPSHOT} account(s) were erased after the snapshot; restoring the `
+                            + 'database brings their data back until they are erased again. Resend with '
+                            + 'acknowledge_erasures to go ahead.',
+                        reason: 'erasures_since_snapshot',
+                        erasures: MOCK_ERASURES_SINCE_SNAPSHOT,
+                    })
+                }
+                if (refuseStepUp(res, body)) return true
+                job.rollback_requested_at = ago(0)
+                later(2000, () => {
+                    if (!['awaiting_verification', 'succeeded'].includes(job.state)) return
+                    job.state = 'rolling_back'
+                    job.reason = 'requested'
+                    job.post_snapshot = 'post-update-20260920-123000'
+                    later(4000, () => {
+                        if (job.state !== 'rolling_back') return
+                        job.state = 'rolled_back'
+                        job.running_version = job.installed_version_before
+                        job.finished_at = ago(0)
+                    })
+                })
+                return send(res, 200, jobOut(job))
             }
         }
 

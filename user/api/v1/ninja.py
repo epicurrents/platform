@@ -6,7 +6,7 @@ POST   /login                  Authenticate and open a session, or ask for a sec
 POST   /login/2fa              Verify the second factor and finish opening the session.
 POST   /logout                 Destroy the current session.
 GET    /me                     Return the authenticated user's profile.
-PATCH  /me                     Update email, first name, or last name.
+PATCH  /me                     Update email (step-up required), first name, or last name.
 POST   /me/change-password     Change the current password; keeps the session alive.
 POST   /reset-password         Send a password reset link (rate-limited per email).
 POST   /reset-password/confirm Validate reset token and set a new password.
@@ -52,8 +52,10 @@ from ninja.errors import HttpError
 from activity.audit import log_activity
 from epicurrents.auth import enforce_session_csrf
 from epicurrents.security_log import get_client_ip, log_security_event
+from user import lockout
 from user.api.v1.accounts import router as accounts_router
 from user.api.v1.two_factor import router as two_factor_router
+from user.identity import is_externally_authenticated, provider_label
 from user.models import TwoFactorCredential, UserPreference
 from user.oidc import (
     OIDCAuthError,
@@ -71,6 +73,7 @@ from user.oidc import (
     validate_id_token,
 )
 from user.roles import read_roles
+from user.stepup import check_stepup_lockout, confirm_step_up, record_password_recheck_failure
 from user.two_factor import (
     active_credential,
     build_provisioning_uri,
@@ -100,9 +103,11 @@ api.add_router("/me/2fa", two_factor_router)
 # Max failed login attempts before a 5-minute lockout per username. The second
 # factor reuses both, keyed on the pending account instead of the username: it
 # is the same policy applied to the same login, and giving the code prompt its
-# own budget would only widen the total number of guesses a login allows.
-_LOGIN_MAX_ATTEMPTS = 10
-_LOGIN_LOCKOUT_WINDOW = 5 * 60
+# own budget would only widen the total number of guesses a login allows. The
+# counters themselves live in user/lockout.py, which also charges every failure
+# to the step-up budget guarding the same credential.
+_LOGIN_MAX_ATTEMPTS = lockout.LOGIN_MAX_ATTEMPTS
+_LOGIN_LOCKOUT_WINDOW = lockout.LOCKOUT_SECONDS
 
 # Session key holding the account that passed the password step and now owes a
 # code, and how long it may sit there. Five minutes is long enough to fetch a
@@ -178,6 +183,12 @@ class UserOut(Schema):
     is_superuser: bool
     is_2fa_enabled: bool = False
     roles: dict[str, list[str]] = {}
+    #: The identity provider this account signs in through, or null for an
+    #: account with a password of its own. The profile page reads it to decide
+    #: whether to offer a change-password form at all: without it the form is
+    #: rendered, the submission is refused, and the person is left reading an
+    #: error about a password they never had.
+    external_provider: str | None = None
 
 
 class LoginResultOut(Schema):
@@ -225,11 +236,17 @@ class UserSearchOut(Schema):
 
 
 class ProfileIn(Schema):
-    """Payload for updating profile fields. All fields are optional."""
+    """Payload for updating profile fields. All fields are optional.
+
+    ``password`` and ``totp_code`` are the step-up credentials, required only
+    when ``email`` changes the address; see ``update_profile_endpoint``.
+    """
 
     email: str | None = None
     first_name: str | None = None
     last_name: str | None = None
+    password: str | None = None
+    totp_code: str | None = None
 
 
 class ChangePasswordIn(Schema):
@@ -281,6 +298,7 @@ def _serialize_user(user) -> dict:
         "is_superuser": user.is_superuser,
         "is_2fa_enabled": active_credential(user) is not None,
         "roles": read_roles(user),
+        "external_provider": provider_label(user) if is_externally_authenticated(user) else None,
     }
 
 
@@ -335,7 +353,8 @@ def login_endpoint(request, credentials: LoginIn):
 
     Failed attempts are counted per username. After ``_LOGIN_MAX_ATTEMPTS``
     consecutive failures the account is locked out for ``_LOGIN_LOCKOUT_WINDOW``
-    seconds. The counter resets on a successful login.
+    seconds. The counter resets on a successful login. While the username is
+    locked out here, step-up refuses the account too; see user/lockout.py.
 
     An account with a confirmed second factor does **not** get a session here.
     The password result is recorded as a pending marker on the session and the
@@ -346,11 +365,9 @@ def login_endpoint(request, credentials: LoginIn):
     says as much — and is not disclosed to anyone who fails the password.
     """
 
-    username_key = hashlib.sha256(credentials.username.strip().lower().encode()).hexdigest()
-    lockout_key = f"login_lockout:{username_key}"
-    attempt_key = f"login_attempts:{username_key}"
+    username_key = lockout.username_key(credentials.username)
 
-    if cache.get(lockout_key):
+    if lockout.login_locked(username_key):
         # Hashed username only — never write the raw input to the log stream.
         log_security_event(
             "auth.login_blocked",
@@ -361,18 +378,14 @@ def login_endpoint(request, credentials: LoginIn):
 
     user = authenticate(request, username=credentials.username, password=credentials.password)
     if user is None:
-        attempts = (cache.get(attempt_key) or 0) + 1
+        attempts = lockout.record_login_failure(credentials.username)
         if attempts >= _LOGIN_MAX_ATTEMPTS:
-            cache.set(lockout_key, 1, timeout=_LOGIN_LOCKOUT_WINDOW)
-            cache.delete(attempt_key)
             log_security_event(
                 "auth.login_lockout",
                 ip=get_client_ip(request),
                 username_hash=username_key,
                 attempts=attempts,
             )
-        else:
-            cache.set(attempt_key, attempts, timeout=_LOGIN_LOCKOUT_WINDOW)
         log_security_event(
             "auth.login_failed",
             ip=get_client_ip(request),
@@ -381,9 +394,10 @@ def login_endpoint(request, credentials: LoginIn):
         )
         raise HttpError(401, "Invalid credentials")
 
-    # Password accepted — clear any previous failure counters.
-    cache.delete(lockout_key)
-    cache.delete(attempt_key)
+    # Password accepted — clear any previous failure counters for it. Only the
+    # login counter: the step-up and code-prompt counters also hold guessed
+    # codes, which a correct password says nothing about.
+    lockout.clear_login(credentials.username)
 
     enrolled = active_credential(user) is not None
     must_enrol = not enrolled and two_factor_required(user)
@@ -478,7 +492,7 @@ def login_two_factor_setup_endpoint(request):
     # lockout a delay rather than a limit. Failed attempts are not counted here:
     # there is nothing to fail, and counting a restarted enrolment as an attempt
     # would lock out the very user this endpoint exists to let in.
-    if cache.get(f"login_2fa_lockout:{user.pk}"):
+    if lockout.login_2fa_locked(user.pk):
         log_security_event("auth.2fa_blocked", ip=get_client_ip(request), actor_id=user.pk, phase="enrolment")
         raise HttpError(429, "Too many failed codes. Please wait before trying again.")
 
@@ -536,9 +550,7 @@ def login_two_factor_endpoint(request, payload: TwoFactorCodeIn):
     if user is None:
         raise HttpError(401, "No login in progress. Please sign in again.")
 
-    lockout_key = f"login_2fa_lockout:{user.pk}"
-    attempt_key = f"login_2fa_attempts:{user.pk}"
-    if cache.get(lockout_key):
+    if lockout.login_2fa_locked(user.pk):
         log_security_event(
             "auth.2fa_blocked",
             ip=get_client_ip(request),
@@ -567,12 +579,7 @@ def login_two_factor_endpoint(request, payload: TwoFactorCodeIn):
         used_backup = verified
 
     if not verified:
-        attempts = (cache.get(attempt_key) or 0) + 1
-        if attempts >= _LOGIN_MAX_ATTEMPTS:
-            cache.set(lockout_key, 1, timeout=_LOGIN_LOCKOUT_WINDOW)
-            cache.delete(attempt_key)
-        else:
-            cache.set(attempt_key, attempts, timeout=_LOGIN_LOCKOUT_WINDOW)
+        attempts = lockout.record_code_failure(user)
         log_security_event(
             "auth.2fa_failed",
             ip=get_client_ip(request),
@@ -581,8 +588,7 @@ def login_two_factor_endpoint(request, payload: TwoFactorCodeIn):
         )
         raise HttpError(401, "Invalid code")
 
-    cache.delete(lockout_key)
-    cache.delete(attempt_key)
+    lockout.clear_login_2fa(user.pk)
 
     backup_codes = None
     if enrolling:
@@ -652,16 +658,34 @@ def me_endpoint(request):
 
 @api.patch("/me", response=UserOut)
 def update_profile_endpoint(request, payload: ProfileIn):
-    """Update the current user's email, first name, and/or last name."""
+    """Update the current user's email, first name, and/or last name.
+
+    Changing the address needs step-up confirmation (``password``, plus
+    ``totp_code`` when a second factor is enrolled). The address is where a
+    password reset is mailed, so without it a stolen session becomes a stolen
+    account by way of the reset form — the one route to a new password that
+    never asks for the old one. Setting it to the value it already has is not a
+    change and needs nothing.
+
+    An address set here is marked ``email_self_asserted``, which keeps it from
+    ever being used to link an external login to this account; see
+    user/oidc.py.
+    """
 
     user = _require_auth(request)
     fields_updated: list[str] = []
+    email_changed = False
     if payload.email is not None:
+        address = payload.email.strip()
         try:
-            validate_email(payload.email)
+            validate_email(address)
         except ValidationError:
             raise HttpError(400, "Enter a valid email address.")
-        user.email = payload.email
+        if address != user.email:
+            confirm_step_up(request, user, password=payload.password, totp_code=payload.totp_code)
+            user.email = address
+            user.email_self_asserted = True
+            email_changed = True
         fields_updated.append("email")
     if payload.first_name is not None:
         user.first_name = payload.first_name
@@ -675,15 +699,32 @@ def update_profile_endpoint(request, payload: ProfileIn):
         target=user,
         metadata={"fields_updated": fields_updated},
     )
+    if email_changed:
+        log_security_event("auth.email_changed", ip=get_client_ip(request), actor_id=user.pk)
     return _serialize_user(user)
 
 
 @api.post("/me/change-password")
 def change_password_endpoint(request, payload: ChangePasswordIn):
-    """Change the current user's password. Keeps the session alive."""
+    """Change the current user's password. Keeps the session alive.
+
+    An account that signs in through an identity provider is refused before the
+    password check rather than by it. ``check_password`` against an unusable
+    password is false, so without this the answer is "your current password is
+    incorrect" — which is not what happened, and sends the person looking for a
+    password they have never had.
+    """
 
     user = _require_auth(request)
+    if is_externally_authenticated(user):
+        raise HttpError(
+            409,
+            f"This account signs in through {provider_label(user)}. Its password is managed there, not here.",
+        )
+    # Same budget as step-up; see user/lockout.py.
+    check_stepup_lockout(request, user)
     if not user.check_password(payload.current_password):
+        record_password_recheck_failure(user)
         raise HttpError(400, "Current password is incorrect")
     try:
         validate_password(payload.new_password, user=user)
@@ -752,12 +793,31 @@ def request_password_reset(request, payload: PasswordResetRequestIn):
 
     from user.tasks import send_password_reset_email
 
+    # An account provisioned through an identity provider gets no link. Setting
+    # a local password on it would create a way in that answers to neither the
+    # tenant nor the email-domain gate in user/oidc.py, which between them are
+    # the whole of the control over who may sign in. The response is the same
+    # "ok" as every other outcome, and the rate limit was already consumed
+    # above, so nothing about this reaches the caller.
+    refused = [user for user in users if is_externally_authenticated(user)]
+    for user in refused:
+        # target_id, not actor_id: the caller is anonymous, and the account is
+        # what the request was aimed at.
+        log_security_event(
+            "auth.password_reset_refused_external",
+            ip=get_client_ip(request),
+            target_id=user.pk,
+            provider=provider_label(user),
+        )
+
     # Only the primary key crosses the broker. The URL embeds a token valid for
     # three days and the recipient address is personal data, and the broker now
     # persists to an append-only file, so both would outlive their use on disk.
     # The task mints the token and reads the address at send time.
+    refused_ids = {user.pk for user in refused}
     for user in users:
-        send_password_reset_email.delay(user.pk)
+        if user.pk not in refused_ids:
+            send_password_reset_email.delay(user.pk)
 
     # One Activity row exists per request — log_activity annotates the row the
     # middleware already created rather than appending — so calling it in the
@@ -767,7 +827,7 @@ def request_password_reset(request, payload: PasswordResetRequestIn):
         log_activity(
             verb="user.password.reset.request",
             target=users[0],
-            metadata={"email_hash": email_key, "found": True},
+            metadata={"email_hash": email_key, "found": True, "refused_external": len(refused)},
         )
     else:
         # Several accounts share the address. The row cannot target all of them,
@@ -776,7 +836,7 @@ def request_password_reset(request, payload: PasswordResetRequestIn):
         # account but one. Record the shape of what happened, not who it was.
         log_activity(
             verb="user.password.reset.request",
-            metadata={"found": True, "account_count": len(users)},
+            metadata={"found": True, "account_count": len(users), "refused_external": len(refused)},
         )
     return {"status": "ok"}
 
@@ -845,7 +905,25 @@ def list_groups(request):
 
 @api.post("/reset-password/confirm")
 def confirm_password_reset(request, payload: PasswordResetConfirmIn):
-    """Validate reset token and set a new password."""
+    """Validate reset token and set a new password.
+
+    The externally-authenticated gate is repeated here rather than left to the
+    endpoints that hand links out, because a link can outlive the account state
+    it was minted for. An invitation is sent to a local account; before the
+    three days are up the person signs in through the provider for the first
+    time and is linked by verified email; the invitation link is still valid,
+    and confirming it would mint exactly the local password the gate exists to
+    prevent — through the one path that never asked.
+
+    A deactivated account is refused with the answer an invalid token gets.
+    Deactivation is how an operator answers a compromise, and a reset link
+    minted before it — or one the attacker requested — would otherwise hand the
+    account a fresh password for the day it is reactivated. The same answer,
+    because a distinct one would tell the link holder the account's state.
+
+    The link carries ``uid`` and ``token`` in the URL fragment, which the page
+    reads and sends here in the body; see user/tasks.py.
+    """
 
     User = get_user_model()
     try:
@@ -854,8 +932,20 @@ def confirm_password_reset(request, payload: PasswordResetConfirmIn):
     except (User.DoesNotExist, ValueError, TypeError, OverflowError):
         raise HttpError(400, "Invalid reset link")
 
-    if not default_token_generator.check_token(user, payload.token):
+    if not user.is_active or not default_token_generator.check_token(user, payload.token):
         raise HttpError(400, "Reset link is invalid or has expired")
+
+    if is_externally_authenticated(user):
+        # Named rather than answered with the generic refusal: whoever holds
+        # this link holds a valid token for the account already, so there is
+        # nothing to withhold, and they need to know to sign in the other way.
+        log_security_event(
+            "auth.password_reset_refused_external",
+            ip=get_client_ip(request),
+            target_id=user.pk,
+            provider=provider_label(user),
+        )
+        raise HttpError(409, f"This account signs in through {provider_label(user)}. Use that to sign in.")
 
     try:
         validate_password(payload.new_password, user=user)

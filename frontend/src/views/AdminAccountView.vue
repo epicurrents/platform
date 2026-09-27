@@ -12,14 +12,23 @@
  * `wa-select`: the `v-wa` directive writes a scalar onto the element's `value`,
  * which a multiple select would need an array for.
  *
+ * Changes that grant a way in — a staff tier, a new address, an activation, a
+ * group added — ask for the operator's own credentials through the shared
+ * step-up prompt, and only those: a rename saves in one click. Setting a
+ * password and clearing a second factor always ask, inside their own dialogs,
+ * and neither is offered on the operator's own account, where the server
+ * refuses both and the profile page is the route.
+ *
  * @package    epicurrents-platform
  */
 import { computed, onMounted, reactive, ref } from 'vue'
 import { RouterLink, useRoute, useRouter } from 'vue-router'
+import StepUpFields from '#components/StepUpFields.vue'
 import {
     fetchAccount,
     listGroups,
     listRoleProviders,
+    resendAccountInvitation,
     resetAccountTwoFactor,
     setAccountGroups,
     setAccountPassword,
@@ -28,9 +37,12 @@ import {
     type GroupDetail,
     type RoleProvider,
 } from '#api/admin'
+import { useDialog } from '#composables/useDialog'
+import { withStepUp } from '#composables/useStepUpPrompt'
 import { t } from '#i18n'
 import { formatDate, formatDateTime } from '#lib/datetime'
 import { errorDetail } from '#lib/http'
+import { accountUpdateNeedsStepUp, membershipAddsAny, stepUpBody } from '#lib/stepUp'
 import { showToast } from '#lib/toast'
 import { setPageTitle } from '#router'
 import { useAuthStore } from '#stores/auth'
@@ -62,15 +74,17 @@ const form = reactive({
 })
 const selectedGroupIds = ref(new Set<number>())
 
-const showPassword = ref(false)
-const settingPassword = ref(false)
-const passwordError = ref('')
+const passwordDialog = useDialog()
 const passwordForm = reactive({ newPassword: '' })
+const resendingInvitation = ref(false)
 
-const showResetTwoFactor = ref(false)
-const resettingTwoFactor = ref(false)
+const resetTwoFactorDialog = useDialog()
+/** The operator's own credentials, for the two dialogs that always ask for them. */
+const credentials = reactive({ password: '', totp_code: '' })
 
 const canWrite = computed(() => authStore.isSuperuser)
+/** The server refuses a password set and a second-factor clear on the caller's own account. */
+const isSelf = computed(() => account.value !== null && account.value.id === authStore.user?.id)
 
 const displayName = computed(() => {
     if (!account.value) {
@@ -198,20 +212,36 @@ function toggleGroup (groupId: number, event: Event) {
 }
 
 async function saveDetails () {
+    const current = account.value
+    if (!current || savingDetails.value) {
+        return
+    }
     detailsError.value = ''
     savingDetails.value = true
+    const payload = {
+        email: form.email.trim(),
+        first_name: form.firstName.trim(),
+        last_name: form.lastName.trim(),
+        is_active: form.isActive,
+        is_staff: form.isStaff,
+        is_superuser: form.isSuperuser,
+    }
     try {
-        const updated = await updateAccount(accountId, {
-            email: form.email.trim(),
-            first_name: form.firstName.trim(),
-            last_name: form.lastName.trim(),
-            is_active: form.isActive,
-            is_staff: form.isStaff,
-            is_superuser: form.isSuperuser,
-        })
-        setAccount(updated)
-        resetDetailsForm(updated)
-        showToast(t('Account updated.', SCOPE), 'neutral')
+        const saved = await withStepUp(
+            accountUpdateNeedsStepUp(current, payload),
+            {
+                title: t('Confirm the change', SCOPE),
+                message: t('Changing a staff tier or the email address, or activating an account, asks for your own credentials.', SCOPE),
+            },
+            async (stepUp) => {
+                const updated = await updateAccount(accountId, { ...payload, ...stepUp })
+                setAccount(updated)
+                resetDetailsForm(updated)
+            },
+        )
+        if (saved) {
+            showToast(t('Account updated.', SCOPE), 'neutral')
+        }
     } catch (err) {
         // Covers the last-active-superuser guard, which is decided against
         // server state this client cannot see.
@@ -222,13 +252,29 @@ async function saveDetails () {
 }
 
 async function saveGroups () {
+    const current = account.value
+    if (!current || savingGroups.value) {
+        return
+    }
     savingGroups.value = true
+    const groupIds = [...selectedGroupIds.value]
     try {
-        const updated = await setAccountGroups(accountId, [...selectedGroupIds.value])
-        // Deliberately not resetDetailsForm: unsaved edits in the details
-        // form are the operator's, not the server's to overwrite.
-        setAccount(updated)
-        showToast(t('Group membership updated.', SCOPE), 'neutral')
+        const saved = await withStepUp(
+            membershipAddsAny(current.groups.map(group => group.id), groupIds),
+            {
+                title: t('Confirm the change', SCOPE),
+                message: t('Adding an account to a group grants what the group carries, so it asks for your own credentials.', SCOPE),
+            },
+            async (stepUp) => {
+                const updated = await setAccountGroups(accountId, groupIds, stepUp)
+                // Deliberately not resetDetailsForm: unsaved edits in the details
+                // form are the operator's, not the server's to overwrite.
+                setAccount(updated)
+            },
+        )
+        if (saved) {
+            showToast(t('Group membership updated.', SCOPE), 'neutral')
+        }
     } catch (err) {
         showToast(errorDetail(err, t('Group membership could not be updated.', SCOPE)), 'danger')
     } finally {
@@ -236,61 +282,79 @@ async function saveGroups () {
     }
 }
 
-function openPassword () {
-    passwordError.value = ''
-    passwordForm.newPassword = ''
-    showPassword.value = true
+function clearCredentials () {
+    credentials.password = ''
+    credentials.totp_code = ''
 }
 
-function closePassword () {
-    if (settingPassword.value) {
-        return
-    }
-    showPassword.value = false
+function openPassword () {
+    passwordForm.newPassword = ''
+    clearCredentials()
+    passwordDialog.show()
 }
 
 async function confirmPassword () {
-    passwordError.value = ''
-    settingPassword.value = true
-    try {
-        await setAccountPassword(accountId, passwordForm.newPassword)
-        showPassword.value = false
-        showToast(t('Password set.', SCOPE), 'neutral')
-    } catch (err) {
+    const done = await passwordDialog.run(
+        async () => {
+            await setAccountPassword(accountId, passwordForm.newPassword, stepUpBody(credentials))
+            return true
+        },
         // The password validators answer with their messages joined into one string.
-        passwordError.value = errorDetail(err, t('The password could not be set.', SCOPE))
+        { fallback: t('The password could not be set.', SCOPE) },
+    )
+    if (!done) {
+        credentials.totp_code = ''
+        return
+    }
+    // The account now has a password, so the invitation no longer applies.
+    // Patched rather than reloaded, for the reason the second-factor reset
+    // patches: re-applying the whole account would discard unsaved edits in
+    // the details form above.
+    if (account.value) {
+        account.value = { ...account.value, is_invite_pending: false }
+    }
+    showToast(t('Password set.', SCOPE), 'neutral')
+}
+
+async function resendInvitation () {
+    resendingInvitation.value = true
+    try {
+        const result = await resendAccountInvitation(accountId)
+        if (result.invitation_sent) {
+            showToast(t('Invitation sent again.', SCOPE), 'success')
+        } else {
+            showToast(t('Outgoing mail is not configured; no invitation was sent.', SCOPE), 'warning')
+        }
+    } catch (err) {
+        showToast(errorDetail(err, t('The invitation could not be sent.', SCOPE)), 'danger')
     } finally {
-        settingPassword.value = false
+        resendingInvitation.value = false
     }
 }
 
 function openResetTwoFactor () {
-    showResetTwoFactor.value = true
-}
-
-function closeResetTwoFactor () {
-    if (resettingTwoFactor.value) {
-        return
-    }
-    showResetTwoFactor.value = false
+    clearCredentials()
+    resetTwoFactorDialog.show()
 }
 
 async function confirmResetTwoFactor () {
-    resettingTwoFactor.value = true
-    try {
-        await resetAccountTwoFactor(accountId)
-        showResetTwoFactor.value = false
-        // Only the flag changed; re-applying the whole account would also reset
-        // the details form and discard edits the operator has not saved yet.
-        if (account.value) {
-            account.value = { ...account.value, is_2fa_enabled: false }
-        }
-        showToast(t('Second factor cleared.', SCOPE), 'neutral')
-    } catch (err) {
-        showToast(errorDetail(err, t('The second factor could not be cleared.', SCOPE)), 'danger')
-    } finally {
-        resettingTwoFactor.value = false
+    const done = await resetTwoFactorDialog.run(
+        async () => {
+            await resetAccountTwoFactor(accountId, stepUpBody(credentials))
+            return true
+        },
+        { fallback: t('The second factor could not be cleared.', SCOPE) },
+    )
+    if (!done) {
+        credentials.totp_code = ''
+        return
     }
+    // Only the flag changed; re-applying the whole account would also reset
+    // the details form and discard edits the operator has not saved yet.
+    if (account.value) {
+        account.value = { ...account.value, is_2fa_enabled: false }
+    }
+    showToast(t('Second factor cleared.', SCOPE), 'neutral')
 }
 
 onMounted(load)
@@ -465,16 +529,37 @@ onMounted(load)
                 <div class="section-header">
                     <h2>{{ t('Sign-in', SCOPE) }}</h2>
                 </div>
+                <p v-if="account.external_provider" class="admin-hint">
+                    {{ t('Signs in through {provider}. There is no password on this platform to set or reset.', SCOPE, { provider: account.external_provider }) }}
+                </p>
+                <p v-else-if="account.is_invite_pending && !account.is_active" class="admin-hint">
+                    {{ t('No invitation has been sent: the account is deactivated. Activate it to send one.', SCOPE) }}
+                </p>
+                <p v-else-if="account.is_invite_pending" class="admin-hint">
+                    {{ t('Invited, and has not chosen a password yet.', SCOPE) }}
+                </p>
                 <p class="admin-hint">
                     {{ t('Second factor', SCOPE) }}:
                     {{ account.is_2fa_enabled ? t('enrolled', SCOPE) : t('not enrolled', SCOPE) }}
                 </p>
+                <p v-if="canWrite && isSelf" class="admin-hint">
+                    {{ t('This is your own account. Change its password and second factor on your profile page.', SCOPE) }}
+                </p>
                 <div v-if="canWrite" class="form-actions">
-                    <wa-button appearance="plain" @click="openPassword">
+                    <wa-button v-if="account.is_invite_pending"
+                        appearance="plain"
+                        :disabled="resendingInvitation || !account.email || !account.is_active"
+                        variant="brand"
+                        @click="resendInvitation"
+                    >
+                        <wa-icon name="envelope" slot="start"></wa-icon>
+                        {{ t('Resend invitation', SCOPE) }}
+                    </wa-button>
+                    <wa-button v-if="!account.external_provider && !isSelf" appearance="plain" @click="openPassword">
                         <wa-icon name="key" slot="start"></wa-icon>
                         {{ t('Set password', SCOPE) }}
                     </wa-button>
-                    <wa-button
+                    <wa-button v-if="!isSelf"
                         appearance="plain"
                         :disabled="!account.is_2fa_enabled"
                         variant="danger"
@@ -491,10 +576,14 @@ onMounted(load)
         </template>
     </main>
 
-    <wa-dialog :label="t('Set password', SCOPE)" :open="showPassword" @wa-hide.self="closePassword">
+    <wa-dialog
+        :label="t('Set password', SCOPE)"
+        :open="passwordDialog.open.value"
+        @wa-hide.self="passwordDialog.onHide"
+    >
         <div class="admin-form">
-            <wa-callout v-if="passwordError" variant="danger">
-                {{ passwordError }}
+            <wa-callout v-if="passwordDialog.error.value" variant="danger">
+                {{ passwordDialog.error.value }}
             </wa-callout>
             <p class="admin-hint">
                 {{ t('This does not sign the account out of its open sessions. Deactivate the account instead if the credentials may be compromised.', SCOPE) }}
@@ -507,19 +596,21 @@ onMounted(load)
                 type="password"
                 v-wa="[passwordForm, 'newPassword']"
             ></wa-input>
+            <StepUpFields :credentials="credentials" :step-up="authStore.stepUp" />
         </div>
         <div slot="footer" class="form-actions">
             <wa-button
                 appearance="filled-outlined"
-                :disabled="settingPassword"
+                :disabled="passwordDialog.busy.value"
                 variant="neutral"
-                @click="closePassword"
+                @click="passwordDialog.close"
             >
                 {{ t('Cancel', SCOPE) }}
             </wa-button>
             <wa-button
                 appearance="filled-outlined"
-                :loading="settingPassword"
+                :disabled="!authStore.stepUp.available"
+                :loading="passwordDialog.busy.value"
                 variant="brand"
                 @click="confirmPassword"
             >
@@ -530,26 +621,33 @@ onMounted(load)
 
     <wa-dialog
         :label="t('Clear second factor', SCOPE)"
-        :open="showResetTwoFactor"
-        @wa-hide.self="closeResetTwoFactor"
+        :open="resetTwoFactorDialog.open.value"
+        @wa-hide.self="resetTwoFactorDialog.onHide"
     >
-        <i18n-t class="dialog-text" keypath="AdminAccountView.clear_two_factor_confirm" tag="p">
-            <template #name>
-                <strong>{{ account?.username }}</strong>
-            </template>
-        </i18n-t>
+        <div class="admin-form">
+            <wa-callout v-if="resetTwoFactorDialog.error.value" variant="danger">
+                {{ resetTwoFactorDialog.error.value }}
+            </wa-callout>
+            <i18n-t class="dialog-text" keypath="AdminAccountView.clear_two_factor_confirm" tag="p">
+                <template #name>
+                    <strong>{{ account?.username }}</strong>
+                </template>
+            </i18n-t>
+            <StepUpFields :credentials="credentials" :step-up="authStore.stepUp" />
+        </div>
         <div slot="footer" class="form-actions">
             <wa-button
                 appearance="filled-outlined"
-                :disabled="resettingTwoFactor"
+                :disabled="resetTwoFactorDialog.busy.value"
                 variant="neutral"
-                @click="closeResetTwoFactor"
+                @click="resetTwoFactorDialog.close"
             >
                 {{ t('Cancel', SCOPE) }}
             </wa-button>
             <wa-button
                 appearance="filled-outlined"
-                :loading="resettingTwoFactor"
+                :disabled="!authStore.stepUp.available"
+                :loading="resetTwoFactorDialog.busy.value"
                 variant="danger"
                 @click="confirmResetTwoFactor"
             >

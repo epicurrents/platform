@@ -3,6 +3,7 @@ import { computed, onMounted, onUnmounted } from 'vue'
 import { RouterLink, RouterView, useRoute, useRouter } from 'vue-router'
 import ToastStack from '#components/ToastStack.vue'
 import AppLogo from '#components/AppLogo.vue'
+import StepUpDialog from '#components/StepUpDialog.vue'
 import { t } from '#i18n'
 import { showToast } from '#lib/toast'
 import { getViewerSetup, setViewerSetup } from '#lib/viewerGlobal'
@@ -12,12 +13,14 @@ import { plugin as pluginsPlugin } from '#plugins/active'
 import type { ProjectNavLink } from '#projects/types'
 import { useAuthStore } from '#stores/auth'
 import { useDeploymentStore } from '#stores/deployment'
+import { useMaintenanceStore } from '#stores/maintenance'
 import { useThemeStore, type ThemeMode } from '#stores/theme'
 
 const SCOPE = 'App'
 
 const authStore = useAuthStore()
 const deploymentStore = useDeploymentStore()
+const maintenanceStore = useMaintenanceStore()
 const themeStore = useThemeStore()
 const route = useRoute()
 const router = useRouter()
@@ -36,6 +39,8 @@ const router = useRouter()
 // `progress`) belong on the same object.
 onMounted(() => {
     deploymentStore.init()
+    // Ask the public lock probe once, so a page opened during maintenance says so before a request is refused.
+    maintenanceStore.init()
     if (typeof window.__EPICURRENTS__ === 'undefined') {
         // The Epicurrents constructor seeds these fields on viewer startup,
         // but the platform App.vue mounts before any viewer instance exists.
@@ -151,6 +156,9 @@ const showNavigation = computed(() => {
     return authStore.isAuthenticated && route.name !== 'viewer' && !route.meta.fullscreen
 })
 
+/** A superuser is exempt while an update awaits confirmation, and is told what that exemption costs. */
+const showVerifyingAside = computed(() => maintenanceStore.banner?.phase === 'verifying' && authStore.isSuperuser)
+
 const profileName = computed(() => {
     const firstName = authStore.user?.first_name ?? ''
     const lastName = authStore.user?.last_name ?? ''
@@ -188,6 +196,25 @@ function handleUserMenu (event: Event) {
 </script>
 
 <template>
+    <!--
+        Maintenance banner. Fed by the maintenance store, which learns of the
+        lock from a refused request, a status read or the public lock probe,
+        and keeps it until the probe says it has lifted. At the top rather than
+        the bottom because it explains why the page is not working, which a
+        reader looks for above the content, not below it.
+    -->
+    <div v-if="maintenanceStore.banner" class="maintenance-banner">
+        <wa-icon name="screwdriver-wrench"></wa-icon>
+        <span>{{ maintenanceStore.banner.message }}</span>
+        <span v-if="showVerifyingAside" class="maintenance-banner__aside">
+            {{ t('Update awaiting confirmation. Changes you make now are lost if it is rolled back.', SCOPE) }}
+        </span>
+        <span v-else-if="maintenanceStore.banner.expected_until" class="maintenance-banner__aside">
+            {{ t('Expected back', SCOPE) }}
+            <wa-relative-time :date="maintenanceStore.banner.expected_until"></wa-relative-time>
+        </span>
+    </div>
+
     <nav v-if="showNavigation" class="app-nav">
         <RouterLink class="nav-brand" to="/">
             <AppLogo class="nav-brand__logo" :stroke-width="12" />
@@ -279,6 +306,8 @@ function handleUserMenu (event: Event) {
         <ToastStack icon-library="default" />
     </div>
 
+    <StepUpDialog />
+
     <!--
         Dev-mode banner. Sourced from /api/v1/health.mode; visible only when
         the backend reports DJANGO_MODE=development. Pinned to the bottom of
@@ -290,6 +319,25 @@ function handleUserMenu (event: Event) {
 </template>
 
 <style scoped>
+/* Maintenance banner: a warning strip above the nav, in the flow rather than
+   fixed, so it pushes the page down instead of covering the nav's controls. */
+.maintenance-banner {
+    align-items: center;
+    background: var(--wa-color-warning-fill-loud);
+    color: var(--wa-color-warning-on-loud);
+    display: flex;
+    flex-wrap: wrap;
+    font-size: var(--wa-font-size-s);
+    font-weight: 600;
+    gap: var(--wa-space-s);
+    justify-content: center;
+    padding: var(--wa-space-xs) var(--wa-space-m);
+}
+
+.maintenance-banner__aside {
+    font-weight: 400;
+}
+
 .nav-icon {
     /* 0.9em rendered the toolbar icons noticeably smaller than the
      * adjacent text caps — particularly the profile-link icon, which
@@ -337,7 +385,7 @@ function handleUserMenu (event: Event) {
     align-items: center;
     background: var(--wa-color-warning-fill-loud);
     bottom: 0;
-    color: white;
+    color: var(--wa-color-warning-on-loud);
     display: flex;
     font-size: 0.75rem;
     font-weight: 600;

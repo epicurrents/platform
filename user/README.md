@@ -11,7 +11,7 @@ Permission tiers (`is_staff` / `is_superuser`) live on the model but the rules f
 
 ### `User`
 
-Subclass of Django's `AbstractUser` with no extra fields. Lives in `user_user` (Django's standard `<app>_<model>` table-name convention). The subclass exists for one reason: setting `AUTH_USER_MODEL = "user.User"` from day one means that adding a profile field (avatar, locale, signature key, anything) later is a regular Django migration rather than a notoriously painful model-swap operation.
+Subclass of Django's `AbstractUser` with one extra field. Lives in `user_user` (Django's standard `<app>_<model>` table-name convention). The subclass exists for one reason: setting `AUTH_USER_MODEL = "user.User"` from day one means that adding a profile field (avatar, locale, signature key, anything) later is a regular Django migration rather than a notoriously painful model-swap operation.
 
 `is_staff` and `is_superuser` are the platform-wide access tiers:
 
@@ -21,6 +21,8 @@ Subclass of Django's `AbstractUser` with no extra fields. Lives in `user_user` (
 | `is_superuser` | Destructive / irreversible actions (epoch generation with `--clear`, future data-deletion flows). Strict subset of staff: anything a superuser can do, a staff user should also be able to do or see in read-only form. |
 
 Use these directly when staff vs superuser expresses the distinction.
+
+`email_self_asserted` is true when the address was last written by the account holder through `PATCH /me` rather than by an operator. Nothing verifies an address a user types, so such an address never links an external login by verified email; see [provisioning policy](#external-login-openid-connect). An operator setting the address clears it.
 
 ### `ExternalIdentity`
 
@@ -62,7 +64,7 @@ Mounted at `/api/v1/user/`. Full request/response detail in [api/v1/ninja.py](ap
 | `POST` | `/me/2fa/backup-codes` | Discard the caller's unused recovery codes and issue a fresh set. Requires the password. |
 | `POST` | `/me/2fa/disable` | Remove the caller's second factor. Requires the password. |
 | `GET` | `/me` | Auth-state probe: always HTTP 200 with `{ authenticated, user }` — `user` is the serialized profile when signed in, `null` otherwise. Returning logged-out as a 200 rather than a 401 keeps the SPA's per-boot probe out of the console error stream. |
-| `PATCH` | `/me` | Update `email`, `first_name`, or `last_name`. |
+| `PATCH` | `/me` | Update `email`, `first_name`, or `last_name`. Changing `email` needs [step-up](#security-mechanisms) (`password`, plus `totp_code` when a factor is enrolled), because the address is where a reset link goes. |
 | `POST` | `/me/change-password` | Change the current password. Keeps the session alive via `update_session_auth_hash`. |
 | `POST` | `/reset-password` | Request a password reset link by email. Rate-limited per email address. |
 | `POST` | `/reset-password/confirm` | Validate a reset token and set a new password. |
@@ -82,6 +84,7 @@ Mounted at `/api/v1/user/`. Full request/response detail in [api/v1/ninja.py](ap
 | `is_staff`, `is_superuser` | Both exposed so the frontend can gate UI elements. The auth store derives `isStaff` (true when either flag is set) and `isSuperuser` (true only when `is_superuser`). |
 | `is_2fa_enabled` | Whether a confirmed second factor gates this account's password login. An unconfirmed enrolment reads as `false`. |
 | `roles` | Project-supplied roles the user inherits through group membership, keyed by the role key the active project registered (e.g. a teaching project's `course_role` → `["instructor"]`). Read through the [project-role registry](#project-roles) — the user app imports no project. Empty map when the deployment defines no roles. |
+| `external_provider` | Display name of the identity provider this account signs in through, or `null`. Set only for an account that also has no local password; see [Externally authenticated accounts](#externally-authenticated-accounts). The profile page reads it to decide whether to render a change-password form at all. |
 
 `UserSearchOut` is a smaller shape returned by `/search`: `id`, `username`, `first_name`, `last_name`. No `email` is exposed (it's PII that doesn't need to leak through search auto-complete).
 
@@ -101,26 +104,56 @@ The one endpoint below with no client is `PUT /admin/groups/{id}/members`. Both 
 |---|---|---|---|
 | `GET` | `/admin/accounts?q=&limit=&offset=` | Staff | List accounts, inactive ones included. `limit` is capped at 500. |
 | `GET` | `/admin/accounts/{id}` | Staff | One account, with group membership and project roles. |
-| `POST` | `/admin/accounts` | Superuser | Create an account. |
-| `PATCH` | `/admin/accounts/{id}` | Superuser | Edit account fields. Username is not editable; roles belong to groups. |
-| `POST` | `/admin/accounts/{id}/password` | Superuser | Set another account's password. |
-| `DELETE` | `/admin/accounts/{id}/2fa` | Superuser | Remove an account's second factor, for a lost authenticator. See [Two-factor authentication](#two-factor-authentication-totp). |
-| `PUT` | `/admin/accounts/{id}/groups` | Superuser | Replace one account's group membership. |
+| `POST` | `/admin/accounts` | Superuser | Create an account, by invitation unless a password is supplied. Step-up (`current_password`, `totp_code`) when a password is supplied or a staff tier set. Answers `invitation_sent`. |
+| `PATCH` | `/admin/accounts/{id}` | Superuser | Edit account fields. Username is not editable; roles belong to groups. Step-up when `is_staff`, `is_superuser` or `email` changes, or the account is activated. |
+| `POST` | `/admin/accounts/{id}/password` | Superuser | Set another account's password. Step-up; 409 on the caller's own account and on an externally authenticated one. |
+| `POST` | `/admin/accounts/{id}/invite` | Superuser | Send the set-password invitation again. Refused once the account has a password of its own. Answers `{status, invitation_sent}`. |
+| `DELETE` | `/admin/accounts/{id}/2fa` | Superuser | Remove an account's second factor, for a lost authenticator. Step-up in the body; 409 on the caller's own account. See [Two-factor authentication](#two-factor-authentication-totp). |
+| `PUT` | `/admin/accounts/{id}/groups` | Superuser | Replace one account's group membership. Step-up when it adds a group. |
 | `GET` | `/admin/groups` | Staff | Groups with member and grant counts and their project roles. |
 | `POST` | `/admin/groups` | Superuser | Create a group. |
-| `PATCH` | `/admin/groups/{id}` | Superuser | Rename a group and/or set its [project roles](#project-roles). |
+| `PATCH` | `/admin/groups/{id}` | Superuser | Rename a group and/or set its [project roles](#project-roles). Step-up when a role is set to a value. |
 | `DELETE` | `/admin/groups/{id}` | Superuser | Delete a group, refused while grants target it. |
-| `PUT` | `/admin/groups/{id}/members` | Superuser | Replace one group's membership. |
+| `PUT` | `/admin/groups/{id}/members` | Superuser | Replace one group's membership. Step-up when it adds a member. |
 | `GET` | `/admin/roles` | Staff | Project-supplied roles this deployment defines. |
 
-Four rules the surface enforces, each of which has a test that fails without it:
+Five rules the surface enforces, each of which has a test that fails without it:
 
 - **No account deletion.** [`erase_user`](#account-erasure-gdpr-art-17) is the only sanctioned path, because it unlinks owned recording and media files — something FK cascade never does. A CRUD delete would strand PHI on disk exactly as the admin's delete button did.
 - **The last active superuser cannot be demoted or deactivated.** Writes here are superuser-only, so that change would lock every operator out of account administration; the way back in is a management command on the host, which needs shell access the operator may not have at that moment. Refused with a 409.
 - **A group with live `AccessRight` rows cannot be deleted.** The rows would cascade away with it, revoking access for everyone in the group at once and leaving no record of what was withdrawn. The refusal reports the count, and `GET /admin/groups` carries it so the answer is visible before the attempt.
 - **Passwords go through `AUTH_PASSWORD_VALIDATORS`.** Otherwise an operator-set password would face a lower bar than one a user sets for themselves.
+- **A write that could hand someone a way in needs step-up.** Without it a stolen superuser cookie was a permanent account: reset the caller's own second factor, set a new password, or mint a fresh superuser, all without proving a credential. The writes marked above call `confirm_step_up` with the caller's own credentials. The fields are `password` and `totp_code` everywhere except account creation, where `password` is already the new account's and the caller's is `current_password`. Setting a password or resetting the second factor on the caller's own account is refused with 409, since the profile flows cover that and ask for the current credential. Removals, deactivation, renames and no-op edits need nothing; adding group members does, because a group carries grants and roles added after the membership. Each of these writes also emits an `admin.*` security event (taxonomy in [epicurrents/security_log.py](../epicurrents/security_log.py)).
 
 Setting a password deliberately does **not** flush the account's sessions. An operator setting a password is usually helping somebody back in rather than responding to a compromise, and signing them out of a viewer session mid-review is its own harm. For a compromise, deactivate the account — that does end its sessions.
+
+### Creating an account by invitation
+
+`password` on `POST /admin/accounts` is optional, and omitting it is the ordinary way to add someone. The account is created with an unusable password and `send_welcome_email` mails a set-password link, so the credential is chosen by the person who will use it and passes through nobody — where an operator-set password has to be conveyed out of band, which is where it gets written down.
+
+`email` becomes required in that case, because the invitation is the only way into the account. An invitation to an address the account does not have goes nowhere and leaves an account nobody can sign in to, with nothing reporting it.
+
+The link is Django's password-reset token, carrying `PASSWORD_RESET_TIMEOUT` (three days) and the `welcome=1` marker that changes what the page says on a dead link — a person who has never signed in cannot "request a new one", so they are told who to ask. Reusing that token rather than adding a second type keeps one expiry and one set of invalidation rules; the resend action is what covers the person who was away for the three days.
+
+`POST /admin/accounts/{id}/invite` is that resend, audited as `user.account.invite.resend`. It refuses an account that already has a password, which otherwise makes this a way for an operator to mail a password link to anyone on the roster — a request that belongs to the account holder, through password reset. It also refuses a deactivated account, an account with no address, and an externally authenticated one.
+
+`AccountOut.is_invite_pending` says whether the account is in that state, and the account page shows the resend control only when it is.
+
+Neither creation nor resend queues the task when the deployment has no mail backend outside development (`mail_deliverable` in [tasks.py](tasks.py)), and both say so: `invitation_sent: false` on the creation response, `{"status": "not_sent", "invitation_sent": false}` from the resend. The console backend would otherwise print the live link and the address to the worker log.
+
+The task takes a primary key and mints the token at send time, for the reason the reset task does: the broker persists its queue to an append-only file, so a rendered link would sit on disk with a live token beside the recipient's address until a rewrite that a quiet deployment may not do for months. Contract test in [tests/test_invite_flow.py](tests/test_invite_flow.py).
+
+### Externally authenticated accounts
+
+An account provisioned through OIDC has an unusable password on purpose: its access is decided by the tenant (`tid`) claim and the email-domain allowlist in [oidc.py](oidc.py), and a local password on it answers to neither. Four surfaces could put one there, and all four refuse — `request_password_reset` sends no link, `POST /me/change-password` and `POST /admin/accounts/{id}/password` answer 409 naming the provider, and the invitation is never sent.
+
+**`has_usable_password()` is not the discriminator**, which is the trap to know before touching any of them. An invited account has an unusable password too, until the person follows the link — so that test refuses exactly the accounts the invitation exists to serve. `is_externally_authenticated` in [identity.py](identity.py) is the single decision site, and it asks two things: the account holds an `ExternalIdentity` row, *and* it has no usable password.
+
+The second half is what separates the two ways an account comes to hold an identity. An account linked to a provider by verified email (`OIDC_LINK_BY_VERIFIED_EMAIL`) keeps the password it already had, and that password login exists either way — refusing it a reset takes away a recovery path without closing anything, since nothing new is bypassed by restoring a credential the account already uses. So it stays a local account for all four purposes, and only a provider-provisioned one is refused.
+
+The reset refusal answers `ok` like every other outcome and consumes the rate limit the same way, so nothing about it reaches the caller; it records `auth.password_reset_refused_external` in the security log instead. Where one address is shared by an external and a local account, the local one still gets its link.
+
+All of this is inert while `OIDC_ENABLED` is off, which is why [tests/test_external_identity_gate.py](tests/test_external_identity_gate.py) pins it: nothing here can be noticed by using a deployment as it is configured today, and it goes live on the day an operator turns the flag on.
 
 ### Group membership and the audit trail
 
@@ -176,6 +209,8 @@ Cache keys:
 
 Keys are kept separate so the lockout can expire on its own schedule without interference from a stale counter, and so neither key contains a raw username.
 
+**The failure budget is shared.** [lockout.py](lockout.py) holds every counter and charges each failure to every counter guarding the same credential: a wrong password at login also counts toward the account's step-up lockout, a wrong code at the login code prompt too, and a step-up failure toward the login counter (password) or the code prompt's (second factor). Otherwise a session holder could alternate surfaces for fifteen password guesses where one surface allows ten. The password re-checks on the two-factor management endpoints and change-password draw on the step-up budget too, and answer 429 while it is spent. A success clears only the counters of what it proved — a correct password never resets a count that may hold guessed codes. Counters are incremented with `cache.add` then `cache.incr`, so concurrent failures cannot overwrite each other's count.
+
 ### Two-factor authentication (TOTP)
 
 Opt-in per account, from the profile page. RFC 6238 TOTP over `pyotp`, with hashed single-use recovery codes. Mechanism in [two_factor.py](two_factor.py), enrolment endpoints in [api/v1/two_factor.py](api/v1/two_factor.py), the login gate in [api/v1/ninja.py](api/v1/ninja.py).
@@ -206,9 +241,17 @@ Three of the four management writes re-check the password (`_confirm_password`).
 
 Turning either on does not lock anybody out. The blocker they once had — that an account required to enrol cannot reach the session-authenticated endpoints above, because it has no session yet — is what `POST /login/2fa/setup` solves: it enrols from the pending-login state, and `POST /login/2fa` then completes the same login with the first code. Accounts with no usable password are exempt, since enrolment re-confirms the password and an externally-authenticated account could never satisfy that.
 
+### Step-up confirmation
+
+A session proves someone signed in once, not that the person at the keyboard now is the one who did. Before an action that changes the platform itself — the maintenance app's requests and rollbacks, the account-administration writes listed under [account administration](#account-administration), and an email change on `PATCH /me` — the caller confirms with a fresh credential through `confirm_step_up` in [stepup.py](stepup.py): the password, plus a TOTP or recovery code when the account has a confirmed second factor. It generalises the `_confirm_password` re-check the two-factor management endpoints make.
+
+Which credentials an account has decides the method, and `step_up_method` reports it ahead of time so a UI can ask for the right ones: `password`, `password+totp`, or `totp` alone for an account with no usable password (provisioned through an external provider). An account with neither answers 409, since the state of the account rather than the request is the problem; such an account cannot use the feature, and re-authenticating against the provider was rejected for now as a second login flow to maintain. A caller may waive the second factor (`second_factor=False`) for a confirmation that only closes a window rather than opening one; the waiver does not apply to an account whose factor is its only credential, which would otherwise confirm with nothing.
+
+A wrong or missing credential answers 400 without saying which, is logged as `auth.stepup_failed` with the reason, and counts towards a lockout: five failures lock the account out of step-up for five minutes (429), and a success clears the count. The lockout shares its failures with the login lockouts; see [login rate limiting](#security-mechanisms). The codes are spent the same way as at login, so an observed TOTP does not replay.
+
 ### Password validation
 
-All new passwords (from `/me/change-password` and `/reset-password/confirm`) are run through Django's `validate_password` with the validators configured in `AUTH_PASSWORD_VALIDATORS`. Default validators (set in [epicurrents/settings/common.py](../epicurrents/settings/common.py)):
+All new passwords (from `/me/change-password`, `/reset-password/confirm` and the account-administration surface) are run through Django's `validate_password` with the validators configured in `AUTH_PASSWORD_VALIDATORS`. Default validators (set in [epicurrents/settings/common.py](../epicurrents/settings/common.py)):
 
 - `UserAttributeSimilarityValidator`
 - `MinimumLengthValidator`
@@ -233,7 +276,11 @@ The matching client-side cooldown duration in `LoginView.vue` is hardcoded to th
 
 ### Reset token
 
-Standard Django `default_token_generator`. Links are `{FRONTEND_URL}/reset-password?uid=<b64>&token=<tok>`; the `uid` is a urlsafe-base64 of the user PK and the token expires after 3 days (Django default — overridable via `PASSWORD_RESET_TIMEOUT` setting if needed).
+Standard Django `default_token_generator`. Links are `{FRONTEND_URL}/reset-password#uid=<b64>&token=<tok>` (invitations append `&welcome=1`); the `uid` is a urlsafe-base64 of the user PK and the token expires after 3 days (Django default — overridable via `PASSWORD_RESET_TIMEOUT` setting if needed).
+
+The values ride in the fragment rather than the query string because a fragment never leaves the browser: it is not sent to the server serving the page, so it stays out of access and proxy logs, and it is not repeated in the `Referer` of anything the page loads. The page reads it, removes it from the address bar, and posts both values to `/reset-password/confirm` in the body.
+
+Confirmation refuses a deactivated account with the same 400 an invalid token gets. Deactivation is how an operator answers a compromise, and a link minted before it would otherwise give the account a fresh password for the day it is reactivated.
 
 ## External login (OpenID Connect)
 
@@ -260,7 +307,7 @@ The callback is a GET that writes (it can create a `User` + `ExternalIdentity`).
 
 On a first login (no matching `ExternalIdentity`):
 
-- If `OIDC_LINK_BY_VERIFIED_EMAIL` and the token carries a verified email matching an active user, the identity links to that account.
+- If `OIDC_LINK_BY_VERIFIED_EMAIL` and the token carries a verified email matching exactly one active user (case-insensitively) whose address an operator set, the identity links to that account. An address the holder set through `PATCH /me` (`email_self_asserted`) never links: nothing verifies it, and without the rule a stolen session could set a victim's address and claim the victim's first provider login. Two active accounts holding the address do not link either. A candidate that fails falls through to the next rule as if nothing had matched.
 - Otherwise, if `OIDC_AUTO_CREATE_USERS`, a password-less user is created (`set_unusable_password()` — these accounts authenticate only through the provider).
 - Otherwise the login is refused (`auto_create_disabled`).
 
@@ -375,9 +422,11 @@ Erasing a user does **not** erase patient data inside recordings they uploaded �
 
 ## Email delivery
 
-`send_password_reset_email` ([tasks.py](tasks.py)) is the only outbound email path. It is fired from `request_password_reset` via `.delay()` so the HTTP response returns immediately regardless of the SMTP backend's latency, and delivery goes through `_deliver`, which wraps `django.core.mail.send_mail` with Celery retry semantics: up to 3 retries on SMTP failure, 60-second delay between attempts, recipients hashed before anything reaches the log stream.
+`send_password_reset_email` and `send_welcome_email` ([tasks.py](tasks.py)) are this app's outbound email paths. It is fired from `request_password_reset` via `.delay()` so the HTTP response returns immediately regardless of the SMTP backend's latency, and delivery goes through `_deliver`, which wraps `django.core.mail.send_mail` with Celery retry semantics: up to 3 retries on SMTP failure, 60-second delay between attempts, recipients hashed before anything reaches the log stream.
 
 The task takes a user primary key, not a rendered message. It mints the reset token and reads the address inside the worker, because Celery arguments cross a broker that persists them to an append-only file — a payload holding the reset URL would leave a token valid for three days sitting on disk next to the recipient's address, until an AOF rewrite that may be months away. Add mail flows in the same shape; there is deliberately no generic send-this-text-to-this-address task to reach for.
+
+Outside development (`DEBUG` off), neither task sends anything while `EMAIL_BACKEND` is the console backend. They log a warning naming the task and neither the recipient nor the link, because the console backend writes both to the worker's standard output, which is a shipped and retained log. The configured-backend test is `maintenance.notify.mail_configured`, reused so the two senders agree.
 
 Email settings come from environment variables documented in [epicurrents/README.md](../epicurrents/README.md#settings-the-core-app-consumes-directly).
 

@@ -21,10 +21,10 @@ run_shellcheck() {
     fi
 }
 
-echo "==> shellcheck scripts/*.sh scripts/lib/*.sh borgmatic/*.sh examples/hetzner/*.sh"
-run_shellcheck scripts/*.sh scripts/lib/*.sh borgmatic/*.sh examples/hetzner/*.sh
-echo "==> bash -n scripts/*.sh scripts/lib/*.sh borgmatic/*.sh examples/hetzner/*.sh"
-for f in scripts/*.sh scripts/lib/*.sh borgmatic/*.sh examples/hetzner/*.sh; do
+echo "==> shellcheck scripts/*.sh scripts/lib/*.sh scripts/updater/*.sh borgmatic/*.sh examples/hetzner/*.sh"
+run_shellcheck scripts/*.sh scripts/lib/*.sh scripts/updater/*.sh borgmatic/*.sh examples/hetzner/*.sh
+echo "==> bash -n scripts/*.sh scripts/lib/*.sh scripts/updater/*.sh borgmatic/*.sh examples/hetzner/*.sh"
+for f in scripts/*.sh scripts/lib/*.sh scripts/updater/*.sh borgmatic/*.sh examples/hetzner/*.sh; do
     bash -n "$f"
 done
 echo "    ok"

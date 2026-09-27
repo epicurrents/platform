@@ -69,6 +69,38 @@ Event types in current use:
   ``auto_create_disabled``, ``inactive_user``, or ``provider_unavailable``.
   The ``provider`` field names the identity provider (e.g. ``entra``). No
   email / subject is logged — the reason token is sufficient.
+- ``auth.password_reset_refused_external`` — a password-reset link was asked
+  for, and withheld, for an account that signs in through an identity provider
+  and has no local password. Confirming such a link would mint a password that
+  bypasses the tenant and email-domain gates the provider login is subject to,
+  so the request is answered ``ok`` like every other reset request and no mail
+  is sent. ``target_id`` is the account (the caller is anonymous, so there is
+  no actor) and ``provider`` names the provider. A run of these against one
+  account is someone testing whether the external accounts have a second way
+  in.
+- ``auth.email_changed`` — an account changed its own email address through
+  ``PATCH /me``, having passed step-up. ``actor_id`` identifies it. The address
+  is where a reset link goes, so a change followed shortly by a reset request
+  is the shape of a session being turned into an account.
+- ``admin.account_created`` — an operator created an account. ``actor_id`` is
+  the operator, ``target_id`` the account; ``is_staff``, ``is_superuser`` and
+  ``invited`` describe it. A new superuser is worth an alert on its own.
+- ``admin.account_privilege_changed`` — an operator changed an account's
+  ``is_staff`` or ``is_superuser``, or reactivated it. ``actor_id``,
+  ``target_id``, ``fields`` (what changed) and the resulting ``is_staff``,
+  ``is_superuser``, ``is_active``.
+- ``admin.account_email_changed`` — an operator changed an account's email
+  address. ``actor_id``, ``target_id``.
+- ``admin.password_set`` — an operator set another account's password.
+  ``actor_id``, ``target_id``.
+- ``admin.invitation_sent`` — an operator asked for an account's invitation to
+  be sent again. ``actor_id``, ``target_id``, and ``sent``, false when no mail
+  backend is configured and nothing was queued.
+- ``admin.group_membership_granted`` — an operator added members to a group.
+  ``actor_id``, and either ``target_id`` with ``group_ids`` (from the account
+  side) or ``group_id`` with ``added_count`` (from the group side).
+- ``admin.group_roles_granted`` — an operator set a project role on a group,
+  granting it to every member. ``actor_id``, ``group_id``, ``roles`` (keys).
 - ``permission.denied`` — a centralised ``ensure_*`` permission check refused
   the request. The specific permission (read / write / modify / annotate)
   is carried in the ``permission`` field.
@@ -124,6 +156,39 @@ Event types in current use:
   time. Operational signal, not a tamper alarm: usually means a
   module deregistered a digester or a row predates a digester
   rename. Fields: ``change_id``, ``content_type``, ``digest_key``.
+- ``auth.stepup_failed`` — a step-up confirmation (``user.stepup``) before a
+  sensitive request was refused. ``reason`` is ``password``, ``second_factor``
+  or ``locked_out``; ``actor_id`` identifies the account, and ``attempts`` (on
+  the first two) counts failures toward the step-up lockout, which shares its
+  failures with the login lockouts.
+- ``maintenance.job_requested`` — a superuser requested a maintenance
+  operation. Fields: ``job_id``, ``operation``, ``executor``, ``actor_id``.
+- ``maintenance.rollback_requested`` — a superuser asked for an update to be
+  rolled back; ``reason`` carries the job's state at the time
+  (``awaiting_verification`` or ``succeeded``). Fields: ``job_id``, ``actor_id``.
+- ``maintenance.job_state`` — a job changed state as reported by its executor:
+  the celery tier at completion, the host agent through the spool. Recorded
+  here because a rollback restores the database dump and erases the audit rows
+  written since the update's snapshot; the log stream survives. Fields:
+  ``job_id``, ``operation``, ``state``, ``reason``.
+- ``maintenance.job_abandoned`` — a superuser failed a job in flight as
+  ``abandoned`` because its executor is gone: a celery-tier job whose worker
+  left no outcome, or a host-tier job while the agent's heartbeat is stale or
+  absent. Frees the one-in-flight slot, so a job the executor is in fact still
+  running can have a second started beside it; worth an alert. Fields:
+  ``job_id``, ``operation``, ``executor``, ``state_before``, ``actor_id``.
+- ``maintenance.package_uploaded`` — a superuser uploaded an update package
+  that passed every check and now sits in the spool, where a request may name
+  it; the moment new code enters a deployment. Fields: ``sha256``,
+  ``version``, ``pruned`` (older packages removed to make room), ``actor_id``.
+- ``maintenance.package_rejected`` — an uploaded package was refused before it
+  reached the spool. ``reason`` is one of ``key_missing``, ``signature``,
+  ``manifest``, ``hash``, ``too_large``, ``version_not_newer``,
+  ``incompatible``, ``duplicate``, ``disk``, ``spool``; a run of ``signature`` or
+  ``hash`` refusals from one account is worth a look. Fields: ``reason``,
+  ``version`` (as the manifest declared it, when readable), ``actor_id``.
+- ``maintenance.package_removed`` — a superuser removed an uploaded package.
+  Fields: ``sha256``, ``version``, ``actor_id``.
 - ``throttle.rate_limited`` — an API request exceeded the global
   per-identity request-rate ceiling and was rejected with 429. Fields:
   ``scope`` (the throttle scope the path mapped to), ``identity_kind``

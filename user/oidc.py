@@ -15,11 +15,15 @@ user, and which user:
    documented in user/README.md). It fails **closed**: an absent / unparseable
    domain is rejected when an allowlist is configured.
 3. :func:`resolve_identity` — find-or-create keyed on the pairwise ``sub``
-   claim, applying the auto-create and verified-email linking policy.
+   claim, applying the auto-create and verified-email linking policy. A
+   first login links to an existing account only when exactly one active
+   account holds the verified address and an operator, not the account
+   holder, set it there (``User.email_self_asserted``).
 
 Silently weakening any of these (dropping the ``tid`` check, defaulting the
-domain gate open, linking on an unverified email) opens cross-tenant or
-cross-domain account access. The signature / JWKS validation in
+domain gate open, linking on an unverified email, or linking to an address the
+account holder typed in themselves) opens cross-tenant or cross-domain account
+access. The signature / JWKS validation in
 :func:`validate_id_token` is the cryptographic root of trust.
 
 Contract test: [user/tests/test_oidc.py](tests/test_oidc.py). See AGENTS.md →
@@ -285,13 +289,23 @@ def resolve_identity(provider_name: str, provider_cfg: dict, claims: dict):
 
 
 def _link_or_create_user(claims: dict, email: str, email_verified: bool):
-    """Resolve the local ``User`` for a first-time identity per the link/create policy."""
+    """Resolve the local ``User`` for a first-time identity per the link/create policy.
+
+    Linking by verified email trusts the *local* address as much as the
+    provider's, and the local one is weaker: nothing verifies what a user types
+    into ``PATCH /me``. So a link needs the provider to vouch for the address,
+    exactly one active account to hold it — ``email`` is not unique, and picking
+    one of several would hand the login to whichever sorted first — and that
+    account's address to have been set by an operator. A candidate that fails
+    either test falls through to the create policy as if nothing had matched,
+    which leaves the existing account untouched.
+    """
     User = get_user_model()
     link_by_email = getattr(settings, "OIDC_LINK_BY_VERIFIED_EMAIL", False)
     if link_by_email and email and email_verified:
-        match = User.objects.filter(email__iexact=email, is_active=True).first()
-        if match is not None:
-            return match
+        matches = list(User.objects.filter(email__iexact=email, is_active=True)[:2])
+        if len(matches) == 1 and not matches[0].email_self_asserted:
+            return matches[0]
     if not getattr(settings, "OIDC_AUTO_CREATE_USERS", False):
         raise OIDCAuthError("auto_create_disabled")
     return _create_user(claims, email)

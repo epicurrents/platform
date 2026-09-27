@@ -176,6 +176,56 @@ class TestResolveIdentity:
         assert exc.value.reason == "auto_create_disabled"
 
 
+@pytest.mark.django_db
+class TestLinkByEmailNeedsATrustworthyLocalAddress:
+    """A verified provider email only proves the provider's half. The local
+    address must name exactly one account and have been set by an operator,
+    or an attacker with a session could set a victim's address on their own
+    account and receive the victim's first provider login."""
+
+    @override_settings(OIDC_AUTO_CREATE_USERS=False, OIDC_LINK_BY_VERIFIED_EMAIL=True)
+    def test_a_self_asserted_address_does_not_link(self):
+        existing = get_user_model().objects.create_user(username="alice", email="alice@hospital-a.org", password="x")
+        existing.email_self_asserted = True
+        existing.save(update_fields=["email_self_asserted"])
+        with pytest.raises(OIDCAuthError) as exc:
+            resolve_identity("entra", provider(), make_claims())
+        assert exc.value.reason == "auto_create_disabled"
+        assert ExternalIdentity.objects.count() == 0
+
+    @override_settings(OIDC_AUTO_CREATE_USERS=True, OIDC_LINK_BY_VERIFIED_EMAIL=True)
+    def test_a_self_asserted_address_falls_through_to_a_new_account(self):
+        existing = get_user_model().objects.create_user(username="alice", email="alice@hospital-a.org", password="x")
+        existing.email_self_asserted = True
+        existing.save(update_fields=["email_self_asserted"])
+        identity, created = resolve_identity("entra", provider(), make_claims())
+        assert created is True
+        assert identity.user.pk != existing.pk
+
+    @override_settings(OIDC_AUTO_CREATE_USERS=False, OIDC_LINK_BY_VERIFIED_EMAIL=True)
+    def test_two_accounts_holding_the_address_do_not_link(self):
+        User = get_user_model()
+        User.objects.create_user(username="alice", email="alice@hospital-a.org", password="x")
+        User.objects.create_user(username="alice2", email="Alice@Hospital-A.org", password="x")
+        with pytest.raises(OIDCAuthError) as exc:
+            resolve_identity("entra", provider(), make_claims())
+        assert exc.value.reason == "auto_create_disabled"
+
+    @override_settings(OIDC_AUTO_CREATE_USERS=False, OIDC_LINK_BY_VERIFIED_EMAIL=True)
+    def test_an_inactive_namesake_does_not_make_the_match_ambiguous(self):
+        User = get_user_model()
+        active = User.objects.create_user(username="alice", email="alice@hospital-a.org", password="x")
+        User.objects.create_user(username="old_alice", email="alice@hospital-a.org", password="x", is_active=False)
+        identity, _ = resolve_identity("entra", provider(), make_claims())
+        assert identity.user.pk == active.pk
+
+    @override_settings(OIDC_AUTO_CREATE_USERS=False, OIDC_LINK_BY_VERIFIED_EMAIL=True)
+    def test_the_match_is_case_insensitive(self):
+        existing = get_user_model().objects.create_user(username="alice", email="ALICE@hospital-a.org", password="x")
+        identity, _ = resolve_identity("entra", provider(), make_claims())
+        assert identity.user.pk == existing.pk
+
+
 # ── Endpoints ────────────────────────────────────────────────────────────────
 
 

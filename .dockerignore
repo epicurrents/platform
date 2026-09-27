@@ -16,10 +16,21 @@ venv/
 env/
 *.egg-info/
 
-# Environment
+# Environment. At any depth: a project or plugin may carry its own .env, and the
+# anchored form reaches only the context root.
 .env
 .env.*
+**/.env
+**/.env.*
 !.env.example
+
+# Deployment state. Snapshots hold a database dump and a copy of .env; the
+# spool holds uploaded packages and job logs; the installed file list is the
+# previous release's. None of it is code, and COPY . . would bake every byte of
+# it into the image — the dumps into an artifact that outlives every erasure.
+backups/
+update/
+.epicurrents-files
 
 # Logs
 *.log
@@ -102,3 +113,8 @@ recordings/converters/*
 # operator runbook notes). Host-only: nothing in the image reads them, and they
 # name a real organisation and its open compliance gaps.
 local/
+
+# The viewer pin is the one frontend file the image needs: the production
+# vendor service has no /code bind and reads the pin baked in here, and
+# without it every update fails the viewer step with "No pin file".
+!frontend/viewer-pin.json

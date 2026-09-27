@@ -1,8 +1,8 @@
 """User model and external-identity link rows.
 
-``User`` is a thin ``AbstractUser`` subclass that acts as ``AUTH_USER_MODEL``;
-no extra fields are defined on it so that future schema additions (avatar,
-preferences) can land as a normal migration rather than a model swap.
+``User`` is a thin ``AbstractUser`` subclass that acts as ``AUTH_USER_MODEL``,
+so that schema additions land as a normal migration rather than a model swap.
+Its one addition so far records where the account's email address came from.
 
 ``TwoFactorCredential`` holds a user's TOTP secret and recovery codes for the
 optional second login factor.
@@ -24,7 +24,18 @@ from django.db import models
 
 
 class User(AbstractUser):
-    """Custom user model. Extends AbstractUser to allow future additions."""
+    """Custom user model.
+
+    ``email_self_asserted`` is true when the address was last written by the
+    account holder through ``PATCH /me`` rather than by an operator. Nothing
+    verifies an address a user types, and linking an external login by verified
+    email (``OIDC_LINK_BY_VERIFIED_EMAIL``) trusts the local address to name the
+    person who owns it — so an address the holder set themselves never links.
+    Otherwise a stolen session could set a victim's address and claim the
+    victim's first provider login. An operator setting the address clears it.
+    """
+
+    email_self_asserted = models.BooleanField(default=False)
 
     class Meta(AbstractUser.Meta):
         swappable = "AUTH_USER_MODEL"

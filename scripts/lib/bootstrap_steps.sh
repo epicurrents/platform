@@ -412,6 +412,14 @@ if [ -f .env ] && grep -qE '^PROXY_DOMAIN=[^[:space:]]' .env; then
     COMPOSE_PROD="$COMPOSE_PROD -f docker-compose.proxy.yml"
 fi
 
+# ── The maintenance spool ────────────────────────────────────────────────────
+# The package drop directory, and under it what the platform and the host agent
+# exchange. Created by this unprivileged run before the production overlay
+# bind-mounts it: a source the runtime creates itself belongs to root, and the
+# web tier could then never write a request into it. Not a step of its own —
+# there is nothing to report.
+mkdir -p update/packages update/jobs
+
 # ── 9. Start the stack ───────────────────────────────────────────────────────
 
 step_up() {

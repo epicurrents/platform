@@ -38,7 +38,40 @@ PLATFORM_APPS = [
     "notifications",
     "library",
     "federation",
+    "maintenance",
 ]
+
+
+def _installed_platform_apps() -> list[str]:
+    """The platform's own apps as INSTALLED_APPS names them: every ``<app>.apps.<Config>`` whose tree is in the repo."""
+    source = (REPO_ROOT / "epicurrents" / "settings" / "common.py").read_text()
+    names = re.findall(r'^\s*"([a-z_]+)\.apps\.[A-Za-z]+Config",', source, flags=re.MULTILINE)
+    return [name for name in names if (REPO_ROOT / name / "apps.py").is_file()]
+
+
+def _packaged_platform_dirs() -> list[str]:
+    match = re.search(r"^PLATFORM_DIRS=\(\n(.*?)^\)", FIXTURE.read_text(), flags=re.MULTILINE | re.DOTALL)
+    assert match, "PLATFORM_DIRS not found in the packager"
+    return match.group(1).split()
+
+
+class TestEveryInstalledAppShips:
+    """A platform app missing from the packager's list is an image that dies at django.setup().
+
+    Found by the first remote-update run against a real host: the maintenance app
+    had been installed for a day and every package built since could not boot.
+    Nothing in the mocked suites imports the package's settings, so the list is
+    checked against the settings module directly.
+    """
+
+    def test_the_packager_copies_every_app_the_settings_install(self):
+        installed = _installed_platform_apps()
+        assert installed, "the settings scan found no platform apps; the regex has drifted"
+        missing = sorted(set(installed) - set(_packaged_platform_dirs()))
+        assert not missing, f"apps in INSTALLED_APPS that make-bootstrap-fixture.sh does not ship: {missing}"
+
+    def test_the_expected_list_here_matches_the_settings(self):
+        assert sorted(PLATFORM_APPS) == sorted(_installed_platform_apps())
 
 
 def _run(dest, *args):
@@ -324,21 +357,23 @@ class TestDemoPackage:
         result = _run(dest, "--demo")
         assert result.returncode == 0, result.stderr
         assert (dest / "frontend" / "dist" / "index.html").is_file()
+        assert (dest / "frontend" / "viewer-pin.json").is_file()
         runner = dest / "start.sh"
         assert runner.is_file()
         assert os.access(runner, os.X_OK)
         assert (dest / "README.md").is_file()
 
-    def test_bundles_update_sh_and_drop_dir(self, tmp_path):
+    def test_bundles_update_sh_but_no_drop_dir(self, tmp_path):
         # Archive-mode self-update (scripts/update.sh) needs the updater bundled
-        # at the deployment root, executable, plus its ./update drop dir and a
-        # root docker-compose.yml — update.sh's root marker and archive check.
+        # at the deployment root, executable, and a root docker-compose.yml —
+        # update.sh's root marker. The ./update drop dir is the deployment's:
+        # start.sh creates it, and update.sh refuses an archive that carries it.
         dest = tmp_path / "demo"
         assert _run(dest, "--demo").returncode == 0
         updater = dest / "update.sh"
         assert updater.is_file()
         assert os.access(updater, os.X_OK)
-        assert (dest / "update").is_dir()
+        assert not (dest / "update").exists()
         assert (dest / "docker-compose.yml").is_file()
 
     def test_omits_viewer_dist_source_and_ci_artifacts(self, tmp_path):
@@ -367,6 +402,9 @@ class TestDistPackage:
         assert result.returncode == 0, result.stderr
         assert (dest / "frontend" / "dist" / "index.html").is_file()
         assert (dest / "frontend" / "viewer-dist" / "epicurrents-lib.umd.js").is_file()
+        # update.sh runs vendor_viewer on every update, and it refuses a tree
+        # without the pin; a package that leaves it out fails its first update.
+        assert (dest / "frontend" / "viewer-pin.json").is_file()
         assert (dest / "projects" / "example" / "apps.py").is_file()
         runner = (dest / "start.sh").read_text()
         assert 'ACTIVE_PROJECT="example"' in runner
@@ -461,6 +499,30 @@ class TestDistTailnet:
             script = dest / name
             assert script.is_file()
             assert os.access(script, os.X_OK)
+
+    def test_bundles_the_host_agent_verbatim_and_executable(self, tmp_path):
+        # The root-owned half of a remote update ships with every distribution,
+        # so the operator installs it from the package they already hold.
+        dest = tmp_path / "dist"
+        assert _run(dest, "--dist").returncode == 0
+        for name in (
+            "epicurrents-updater.sh",
+            "install-updater.sh",
+            "epicurrents-updater.service",
+            "epicurrents-updater.timer",
+            "README.md",
+        ):
+            shipped = dest / "updater" / name
+            assert shipped.is_file(), name
+            assert shipped.read_bytes() == (SCRIPTS_DIR / "updater" / name).read_bytes(), name
+        for name in ("epicurrents-updater.sh", "install-updater.sh"):
+            assert os.access(dest / "updater" / name, os.X_OK), name
+        assert "## Apply later releases from the web UI" in (dest / "README.md").read_text()
+
+    def test_a_demo_carries_no_host_agent(self, tmp_path):
+        dest = tmp_path / "demo"
+        assert _run(dest, "--demo").returncode == 0
+        assert not (dest / "updater").exists()
 
     def test_tailnet_scripts_find_the_root_from_the_deployment_level(self, tmp_path):
         # In the repo they sit in scripts/ and walk up one level; bundled here they
@@ -813,6 +875,23 @@ class TestStartShPreflight:
         assert "prepare-host.sh" in result.stderr
         assert "STUB-DOCKER" not in result.stderr, "the build started under root"
 
+    def test_creates_the_spool_directories_before_the_stack_comes_up(self, tmp_path):
+        # A bind-mount source the runtime creates itself belongs to root, and the
+        # web tier could then never write a request into it; start.sh makes them
+        # as the account that runs the stack, before any compose call.
+        dest = tmp_path / "dist"
+        assert _run(dest, "--dist").returncode == 0
+        assert not (dest / "update" / "jobs").exists()
+        path = _stub_path(
+            tmp_path,
+            docker=_DOCKER_STUB,
+            getent="exit 0",
+            stat=_stat_stub(uid=0, gid=0, mode=777),
+        )
+        result = self._start(dest, path)
+        assert "STUB-DOCKER" in result.stderr, result.stderr
+        assert (dest / "update" / "packages").is_dir() and (dest / "update" / "jobs").is_dir()
+
     def test_accepts_a_world_writable_tree_it_does_not_own(self, tmp_path):
         # Ownership is a proxy; writability is the property. A tree owned by root but
         # world-writable is one uid 1000 can write, and refusing it would be wrong.
@@ -991,6 +1070,46 @@ esac
         # explanation: an operator who passed --user and got something else needs to
         # be told why, or the script looks like it ignored them.
         assert "uid 1000 already belongs to" in result.stdout, result.stdout
+
+    def test_with_updater_installs_the_agent_after_the_handover(self, tmp_path, fakebin):
+        # The installer creates spool directories owned by whoever owns the tree,
+        # so it has to run after the chown, never before it.
+        dest = tmp_path / "dist"
+        assert _run(dest, "--dist").returncode == 0
+        log = tmp_path / "installer.log"
+        (dest / "updater" / "install-updater.sh").write_text(
+            "#!/bin/sh\nprintf 'installer %s\\n' \"$*\" >> " + repr(str(log)) + "\n"
+        )
+        self._root_env(fakebin, uid_1000_owner="ubuntu")
+
+        result = self._prepare(dest, fakebin, "--with-updater", "--no-sudoers")
+
+        assert result.returncode == 0, result.stderr
+        assert log.read_text().strip() == f"installer --root {dest}"
+        assert "Remote-maintenance agent" in result.stdout
+        # Ordering: the chown is logged by the fake, the installer by its own log;
+        # the summary line for the installer comes after the handover line.
+        assert result.stdout.index("is now owned by") < result.stdout.index("Remote-maintenance agent")
+        assert "install-updater.sh" not in result.stdout.split("Host prepared")[1], (
+            "told to install what was just installed"
+        )
+
+    def test_without_the_flag_the_summary_points_at_the_installer(self, tmp_path, fakebin):
+        dest = tmp_path / "dist"
+        assert _run(dest, "--dist").returncode == 0
+        self._root_env(fakebin, uid_1000_owner="ubuntu")
+        result = self._prepare(dest, fakebin, "--no-sudoers")
+        assert result.returncode == 0, result.stderr
+        assert "sudo ./updater/install-updater.sh" in result.stdout
+        helped = subprocess.run(
+            ["bash", str(dest / "prepare-host.sh"), "--help"],
+            check=False,
+            capture_output=True,
+            text=True,
+            env={"PATH": f"{fakebin.path}:/usr/bin:/bin", "HOME": str(dest)},
+        )
+        assert "--with-updater" in helped.stdout
+        assert "set -euo" not in helped.stdout, "the help range runs past the header"
 
     def test_creates_the_deployment_account_at_uid_1000_when_the_uid_is_free(self, tmp_path, fakebin):
         # The other half of the same decision: on an image with no uid-1000 account
