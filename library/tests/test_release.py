@@ -91,6 +91,17 @@ def _release(dataset, *items, on=date(2026, 10, 1)):
     return release
 
 
+#: The date the release tests run on: after every ``as_of`` they use, since a run may not be dated in the future.
+TODAY = datetime(2026, 11, 15, 12, tzinfo=UTC)
+
+
+@pytest.fixture
+def frozen_today(monkeypatch):
+    """Pin ``timezone.now`` to :data:`TODAY`, so fixed ``as_of`` dates are not in the future."""
+    monkeypatch.setattr("django.utils.timezone.now", lambda: TODAY)
+    return TODAY
+
+
 @pytest.fixture(autouse=True)
 def _no_selector():
     register_release_selector(None)
@@ -143,7 +154,7 @@ class TestMemberGate:
     def test_the_dataset_author_and_a_write_grantee_manage_unreleased_members(self, make_user):
         author, manager, reader = make_user(), make_user(), make_user()
         recording = _recording(author)
-        dataset, _ = _gated_dataset(make_user(), recording)
+        dataset, _ = _gated_dataset(author, recording)
         _grant(dataset, dataset.author, target=manager, can_write=True)
         _grant(dataset, dataset.author, target=reader)
         assert member_hidden_from_reader(dataset.author, recording) is False
@@ -562,6 +573,7 @@ class TestClassSize:
         assert select_by_class_size(dataset, items, k=1) == []
 
 
+@pytest.mark.usefixtures("frozen_today")
 class TestReleaseCommand:
     def _run(self, *args):
         out = io.StringIO()
@@ -594,7 +606,7 @@ class TestReleaseCommand:
         release = DatasetRelease.objects.get(dataset=dataset)
         assert release.release_month == datetime(2026, 10, 1, tzinfo=UTC)
         assert (release.profile_version, release.k, release.m, release.member_count) == ("3", 5, 2, 1)
-        assert release.sign_off_user_ids == [author.pk] and release.author == author
+        assert list(release.sign_offs.values_list("user_id", flat=True)) == [author.pk] and release.author == author
         assert release.assessment_reference == "Assessment: pool v3"
         items[0].refresh_from_db()
         items[1].refresh_from_db()

@@ -25,7 +25,7 @@ All four extend the abstract `AnnotationBase`, which provides the generic FK tar
 
 Convention: stored uppercase. The `save()` method uppercases the value before writing.
 
-For server-generated annotations created during recording ingest, `annotation_hash(recording_pk, suffix)` in [recordings/event_translation.py](../recordings/event_translation.py) derives a deterministic hash from the recording PK + a per-annotation suffix (`"original-annotations"`, `"interruption:<position>"`, `"source-events"`, `"original-annotation:<index>"` and `"source-event:<index>"` for the translated rows). Keyed on the PK so re-uploading the same file produces a fresh set of hashes against the new Recording row.
+For server-generated annotations created during recording ingest, `annotation_hash(recording, suffix)` in [recordings/event_translation.py](../recordings/event_translation.py) derives a deterministic hash from the stem of the recording's random `stored_name` + a per-annotation suffix (`"original-annotations"`, `"interruption:<position>"`, `"source-events"`, `"original-annotation:<index>"` and `"source-event:<index>"` for the translated rows). Keyed on the stored name, which is fresh per upload, so re-uploading the same file produces a fresh set of hashes against the new Recording row. Never keyed on the PK: the hash is served to every reader, and a sequential PK behind a fixed suffix is brute-forced in under a second. Rows written before the change keep their PK-derived hashes.
 
 ### `content_hash`
 
@@ -229,7 +229,7 @@ The previous `cascade_delete_annotations_for_target_object` `post_delete` signal
 | Converter sidecar (`.e` → EDF today; generic across future converters) | `Annotation` | `"Source events"` | `"source-events"` |
 | Each embedded text event and each sidecar item, through the [event translation](../recordings/README.md#event-translation) | `Event`, with a `Code` where the event translated | The term's name, or `"Source annotation"` / `"Source event"` for an untranslated one | `"original-annotation:<index>"` / `"source-event:<index>"` |
 
-All four use `annotation_hash(recording.pk, suffix)` from [recordings/event_translation.py](../recordings/event_translation.py), keyed on the recording PK. See [recordings/README.md](../recordings/README.md) for the ingest pipeline that produces them.
+All four use `annotation_hash(recording, suffix)` from [recordings/event_translation.py](../recordings/event_translation.py), keyed on the recording's `stored_name`. See [recordings/README.md](../recordings/README.md) for the ingest pipeline that produces them.
 
 ## Settings consumed
 
@@ -256,7 +256,7 @@ pytest annotations/tests/
 ## Gotchas
 
 - **`object_hash` is caller-supplied, not generated.** The platform validates the format (32 alphanumeric chars) but doesn't generate it for you. Tests that create multiple annotations on the same target must use distinct hash values, or the unique constraint fires.
-- **Re-uploading a recording produces fresh annotation hashes.** `_annotation_hash` is keyed on the recording PK, and re-upload creates a new Recording row with a new PK. The annotations from the previous upload remain attached to the previous PK. This is the intended behaviour (file identity is per-row, not per-content), but worth knowing if you're chasing "why are there two sets of annotations on what looks like the same file".
+- **Re-uploading a recording produces fresh annotation hashes.** `annotation_hash` is keyed on the recording's random `stored_name`, and re-upload creates a new Recording row with a new stored name. The annotations from the previous upload remain attached to the previous row. This is the intended behaviour (file identity is per-row, not per-content), but worth knowing if you're chasing "why are there two sets of annotations on what looks like the same file".
 - **`AnnotationBase` is abstract — don't add fields there.** Every field on `AnnotationBase` participates in `content_hash` via subclass `_hash_fields()`, and adding a field requires a migration on all four concrete tables plus invalidates every stored hash. Use `Code` for project-specific labelling instead. The full rationale is in [Project-specific labelling via `Code`](#project-specific-labelling-via-code).
 - **`list_annotations` requires the recording author to have an explicit `AccessRight`.** `can_read_object` doesn't auto-grant on authorship for the read-list path — it goes through the standard `AccessRight` lookup. In tests, this means `baker.make(Recording, author=user)` is not enough on its own; create an `AccessRight` row for the author too if the test exercises a list endpoint. (Tests that target a single annotation directly aren't affected.)
 - **`Annotation` is the only type without `Code` support.** If a project needs to attach a code to a bundle-style annotation, the workaround is to use one `Event` (with `timestamp=0` if positional context doesn't matter) as the code carrier.

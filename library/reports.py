@@ -170,15 +170,14 @@ def class_sizes(items: list[DatasetItem]) -> tuple[dict[str, int] | None, int]:
 
     Returns the sizes keyed by the class key's string form, and the number of members the
     function left unclassified. The sizes are ``None`` when no function is registered, which
-    is a different fact from every class being empty. A recording that no longer exists is
-    counted as unclassified rather than handed to the function.
+    is a different fact from every class being empty. A recording that is not live and READY
+    is counted as unclassified rather than handed to the function; the anonymity report passes
+    only present members, as :func:`library.release.select_by_class_size` counts only them.
     """
     fn = equivalence_class_function()
     if fn is None:
         return None, len(items)
-    from recordings.models import Recording
-
-    by_pk = Recording.objects.in_bulk([int(item.object_id) for item in items])
+    by_pk = _present_recordings(items)
     sizes: dict[str, int] = {}
     unclassified = 0
     for item in items:
@@ -225,22 +224,36 @@ def class_summary(sizes: dict[str, int] | None, unclassified: int, k: int | None
     }
 
 
+def _present_recordings(items: list[DatasetItem]) -> dict[int, Any]:
+    """The recordings among *items* that a reader could still read: not trashed, READY. Keyed by primary key."""
+    from recordings.models import Recording
+
+    pks = [int(item.object_id) for item in items if str(item.object_id).isdigit()]
+    return Recording.objects.filter(deleted_at__isnull=True, status=Recording.Status.READY).in_bulk(pks)
+
+
 def anonymity_report(dataset: Dataset, release: DatasetRelease) -> dict[str, Any]:
     """The ¶ 41 record of *release* as it stands now, with the pool's class sizes as released up to it.
 
-    The pool is every member released by this run or an earlier one and still present; a
-    withdrawn member has left it, which is why the report is worth re-running. A member is
-    flagged ``changed_since_release`` when the pass version now stamped on it is not among the
-    versions the run recorded, so a re-processed recording is visible at the release it belongs
-    to. The recorded m is repeated, never recomputed: the platform holds no contributor per
-    recording once the pool has ingested it.
+    The pool is every member released by this run or an earlier one and still present, meaning
+    live and READY, as :func:`library.release.select_by_class_size` counts it; a trashed, failed
+    or deleted member has left it and counts as withdrawn, which is why the report is worth
+    re-running. A member is flagged ``changed_since_release`` when the pass version now stamped on
+    it differs from the version it carried when the run released it
+    (``DatasetItem.released_deidentification_version``); a member released before that was
+    recorded falls back to the run's version set. The recorded m is repeated, never recomputed:
+    the platform holds no contributor per recording once the pool has ingested it.
     """
     from recordings.models import RecordingMeta
 
-    released = _recording_items(dataset, release=release)
-    pool = _recording_items(dataset, release__released_on__lte=release.released_on, release__isnull=False)
+    released_items = _recording_items(dataset, release=release)
+    present = _present_recordings(released_items)
+    released = [item for item in released_items if int(item.object_id) in present]
+    pool_items = _recording_items(dataset, release__released_on__lte=release.released_on, release__isnull=False)
+    present_pool = _present_recordings(pool_items)
+    pool = [item for item in pool_items if int(item.object_id) in present_pool]
     stamped = {
-        object_id: version
+        str(object_id): version
         for object_id, version in RecordingMeta.objects.filter(
             content_type=_recording_ct(), object_id__in=[item.object_id for item in released]
         ).values_list("object_id", "deidentification_version")
@@ -248,12 +261,18 @@ def anonymity_report(dataset: Dataset, release: DatasetRelease) -> dict[str, Any
     recorded = {int(v) for v in release.deidentification_versions}
     members = []
     for item in released:
-        version = stamped.get(item.object_id)
+        version = stamped.get(str(item.object_id))
+        if version is None:
+            changed = False
+        elif item.released_deidentification_version is not None:
+            changed = int(version) != item.released_deidentification_version
+        else:
+            changed = bool(recorded) and int(version) not in recorded
         members.append(
             {
                 "member": member_handle(item),
                 "deidentification_version": version,
-                "changed_since_release": bool(recorded) and version is not None and int(version) not in recorded,
+                "changed_since_release": changed,
             }
         )
     sizes, unclassified = class_sizes(pool)
@@ -266,7 +285,7 @@ def anonymity_report(dataset: Dataset, release: DatasetRelease) -> dict[str, Any
         "deidentification_versions": list(release.deidentification_versions),
         "k": release.k,
         "m": release.m,
-        "sign_off_count": len(release.sign_off_user_ids or []),
+        "sign_off_count": release.sign_offs.count(),
         "assessment_reference": release.assessment_reference,
         "member_count": release.member_count,
         "present_count": len(released),

@@ -11,6 +11,9 @@ the deliberate PHI-removal contract:
 * ``startdate_bytes = b"01.01.85"`` — EDF+ de-identification convention
 * ``starttime_bytes = b"00.00.00"``
 
+The per-signal reserved field is written blank for the same reason: the spec
+gives it no content, so whatever a writer put there is a signature or free text.
+
 These look like they could be parameterised "for testability", or
 swapped for a real value "to be more useful".  Don't.  Each silent
 change of those constants leaks PHI:
@@ -285,11 +288,14 @@ def wall_clock_to_data_position(onset: float, gaps: GapMap) -> float:
 # Version of the de-identification pass — ``_build_clean_header`` for the
 # subject fields and ``deidentify_signal_infos`` for the channel block — stamped
 # on ``RecordingMeta.deidentification_version`` at ingest so every stored file
-# names the pass that wrote it. Bump on any behaviour change to either function:
-# ``recordings/tests/test_deidentification_record.py`` pins a digest of their
-# source against this value, so the bump cannot be forgotten, and the report
-# command flags every recording written by an older pass.
-DEIDENTIFICATION_VERSION = 2
+# names the pass that wrote it. Bump on any behaviour change to either function
+# or to what they call: ``recordings/tests/test_deidentification_record.py``
+# pins a digest of their source against this value — from version 3 on together
+# with the helpers they call, the prefiltering format, the ASCII cleaning and the
+# canonical-label resolution and tables in ``channel_labels`` — so the bump
+# cannot be forgotten, and the report command flags every recording written by
+# an older pass. Version 3 blanks the per-signal reserved field.
+DEIDENTIFICATION_VERSION = 3
 
 
 @dataclass
@@ -1560,6 +1566,9 @@ def _build_clean_header(header: EdfHeader, signal_infos: list[EdfSignalInfo]) ->
     - Start date     → ``"01.01.85"`` (EDF+ de-identification convention date).
     - Start time     → ``"00.00.00"``.
 
+    - Per-signal reserved → blank. The spec gives it no content, so anything a
+      writer put there is a vendor or site signature, or free text.
+
     All other text fields are ASCII-cleaned (non-ASCII chars replaced or
     dropped) and truncated / space-padded to their spec-mandated width.
     The binary version byte for BDF (0xFF) is preserved unchanged.
@@ -1648,7 +1657,7 @@ def _build_clean_header(header: EdfHeader, signal_infos: list[EdfSignalInfo]) ->
             _SW_PREFILTERING,
         )
         + _sig_section([str(s.sample_count) for s in signal_infos], _SW_SAMPLE_COUNT)
-        + _sig_section([_ascii_clean(s.reserved, _SW_RESERVED) for s in signal_infos], _SW_RESERVED)
+        + _sig_section(["" for _ in signal_infos], _SW_RESERVED)
     )
 
     return general + sections

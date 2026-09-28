@@ -17,7 +17,7 @@ vi.mock('#i18n', () => ({
 }))
 
 import { submitFile, uploadRecording, type SubmissionPool, type SubmissionProfile } from '#api/recordings'
-import { createSubmissionTarget, createUploadTarget, profileConstraints } from './exportTargets'
+import { createSubmissionTarget, createUploadTarget, profileConstraints, violationText } from './exportTargets'
 
 const mockSubmit = vi.mocked(submitFile)
 const mockUpload = vi.mocked(uploadRecording)
@@ -189,29 +189,38 @@ describe('createSubmissionTarget', () => {
         expect(mockSubmit).not.toHaveBeenCalled()
     })
 
-    it('reports the gate\'s violations', async () => {
+    it('reports the gate\'s violations in translated sentences, once per code', async () => {
         mockSubmit.mockResolvedValue({
             accepted: false,
             violations: [
                 { code: 'duration', message: 'Wrong length.' },
-                { code: 'channels', message: 'Wrong channels.' },
+                { code: 'range', message: 'Fp1: physical minimum -400 differs from the profile.' },
+                { code: 'range', message: 'Fp2: physical minimum -400 differs from the profile.' },
             ],
         })
         const result = await createSubmissionTarget(makePool())!.submit({ data: bytes, sidecar: '{}' })
-        expect(result).toEqual({ message: 'Refused: Wrong length. Wrong channels.', success: false })
+        expect(result).toEqual({
+            message: 'Refused: The length of the excerpt is not one the pool accepts. '
+                + 'The signal range differs from the one the pool asks for.',
+            success: false,
+        })
     })
 
-    it('reports a missing hash function rather than throwing', async () => {
-        const digest = vi.spyOn(crypto.subtle, 'digest').mockRejectedValue(new Error('insecure context'))
+    it('falls back to the gate\'s message for a code it does not know', () => {
+        expect(violationText({ code: 'future_check', message: 'Something new.' })).toBe('Something new.')
+    })
+
+    it('reports a missing hash function as an insecure connection, not a script error', async () => {
+        const digest = vi.spyOn(crypto.subtle, 'digest').mockRejectedValue(new TypeError('reading \'digest\''))
         const result = await createSubmissionTarget(makePool())!.submit({ data: bytes, sidecar: '{}' })
         digest.mockRestore()
-        expect(result.success).toBe(false)
+        expect(result).toEqual({ message: 'Submitting needs a secure (https) connection.', success: false })
         expect(mockSubmit).not.toHaveBeenCalled()
     })
 
-    it('reports a sidecar that is not JSON without sending anything', async () => {
+    it('reports a sidecar that is not JSON without sending anything or showing the parser error', async () => {
         const result = await createSubmissionTarget(makePool())!.submit({ data: bytes, sidecar: '{' })
-        expect(result.success).toBe(false)
+        expect(result).toEqual({ message: 'The viewer produced a sidecar that could not be read.', success: false })
         expect(mockSubmit).not.toHaveBeenCalled()
     })
 })

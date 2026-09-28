@@ -4,8 +4,9 @@ EDPB Guidelines 02/2026 paragraph 41: the controller documents the anonymisation
 recording and keeps that documentation. The record is two columns stamped on ``RecordingMeta``, a
 documentary payload sealed into the READY audit row, and the ``deidentification_report`` command
 that presents them. The first class pins the bump discipline for ``DEIDENTIFICATION_VERSION``: a
-digest of the two de-identification functions' source is recorded against the version, so a
-behaviour change to either fails here until the constant moves with it.
+digest of the de-identification pass's source — the two entry functions and, from version 3, the
+helpers and label resolution they depend on — is recorded against the version, so a behaviour
+change fails here until the constant moves with it.
 """
 
 import ast
@@ -42,14 +43,53 @@ from recordings.processors.edf import (
 from recordings.tasks import _save_edf_results, process_recording
 from recordings.tests.test_edf_processor import _make_edfplus_file
 
-# One entry per version the pass has had: the sha256 of the two functions' source with docstrings
-# and comments removed. A behaviour change to either function changes the digest; add the next
-# version's digest here in the commit that bumps DEIDENTIFICATION_VERSION, and never re-pin an
-# existing version to a new digest, since recordings stamped with it were written by the old code.
+# One entry per version the pass has had: the sha256 of the pass's source with docstrings and
+# comments removed. A behaviour change changes the digest; add the next version's digest here in the
+# commit that bumps DEIDENTIFICATION_VERSION, and never re-pin an existing version to a new digest,
+# since recordings stamped with it were written by the old code.
+#
+# Versions 1 and 2 were pinned over the two entry functions alone, which let a change to a label
+# table or the prefiltering format move the pass's output under an unchanged version. From version
+# 3 the digest also covers what the two call and what decides the labels they write
+# (``_PASS_SCOPE_EDF`` and every resolution-side definition in ``channel_labels``); the older pins
+# keep their two-function digest, which is what the scheme recorded when they were written.
 PINNED_SOURCE_DIGESTS = {
     1: "0a9d581ddfab1a3f05ffd1f7b024feff1ae13a4a38302c6173b2f3707d67b4a0",
     2: "742540826cb2490ebfb2dbcd4677ccc1223a14c0eb44270b770e013736d5b79c",
+    3: "8252d47cc2ad9a6f0709b939fe9757f407eb59cf9bcb778e991e5ba3093e3a6e",
 }
+_TWO_FUNCTION_VERSIONS = frozenset({1, 2})
+
+#: Definitions in ``processors/edf.py`` inside the pass from version 3: the two entry points, the
+#: helpers they call, and the parse-time label resolution whose ``canonical_label`` they write.
+_PASS_SCOPE_EDF = (
+    "_build_clean_header",
+    "deidentify_signal_infos",
+    "_ascii_clean",
+    "_pad",
+    "_SYMBOL_MAP",
+    "format_prefiltering",
+    "parse_prefiltering",
+    "extract_signal_type",
+    "_DEFAULT_TYPE_MATCHERS",
+)
+#: Definitions in ``processors/channel_labels.py`` outside the pass: the layout assessment and the
+#: channel order, which ``CHANNEL_ORDER_VERSION`` versions. Everything else in the module is inside,
+#: so a helper added to the label resolution is covered without anyone remembering to list it.
+_OUTSIDE_PASS_CHANNEL_LABELS = frozenset(
+    {
+        "LAYOUT_REFERENTIAL",
+        "LAYOUT_BIPOLAR",
+        "LAYOUT_MIXED",
+        "LAYOUT_UNKNOWN",
+        "assess_channel_layout",
+        "CHANNEL_ORDER_VERSION",
+        "CANONICAL_EEG_ORDER",
+        "_EEG_ORDER_RANK",
+        "_UNRANKED",
+        "eeg_order_rank",
+    }
+)
 
 SECRET = b"Seizure onset, patient Doe"
 
@@ -67,8 +107,58 @@ def _source_digest(*sources: str) -> str:
     return hashlib.sha256("\n".join(_normalised(s) for s in sources).encode()).hexdigest()
 
 
-def current_source_digest() -> str:
-    return _source_digest(inspect.getsource(_build_clean_header), inspect.getsource(deidentify_signal_infos))
+def _strip_docstrings(node: ast.AST) -> ast.AST:
+    for child in ast.walk(node):
+        body = getattr(child, "body", None)
+        if isinstance(child, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and body:
+            first = body[0]
+            if (
+                isinstance(first, ast.Expr)
+                and isinstance(first.value, ast.Constant)
+                and isinstance(first.value.value, str)
+            ):
+                child.body = body[1:] or [ast.Pass()]
+    return node
+
+
+def _defined_names(node: ast.stmt) -> set[str]:
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+        return {node.name}
+    if isinstance(node, ast.Assign):
+        return {t.id for t in node.targets if isinstance(t, ast.Name)}
+    if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+        return {node.target.id}
+    return set()
+
+
+def _module_definitions(module) -> list[ast.stmt]:
+    tree = _strip_docstrings(ast.parse(inspect.getsource(module)))
+    return [node for node in tree.body if _defined_names(node)]
+
+
+def _pass_scope_source() -> str:
+    """The canonical source of everything inside the pass from version 3, in a fixed order."""
+    from recordings.processors import channel_labels, edf
+
+    by_name = {}
+    for node in _module_definitions(edf):
+        for name in _defined_names(node):
+            by_name[name] = node
+    missing = [name for name in _PASS_SCOPE_EDF if name not in by_name]
+    assert not missing, f"the pass scope names definitions edf.py no longer has: {missing}"
+    parts = [ast.unparse(by_name[name]) for name in _PASS_SCOPE_EDF]
+    parts += [
+        ast.unparse(node)
+        for node in _module_definitions(channel_labels)
+        if not _defined_names(node) <= _OUTSIDE_PASS_CHANNEL_LABELS
+    ]
+    return "\n".join(parts)
+
+
+def current_source_digest(version: int = DEIDENTIFICATION_VERSION) -> str:
+    if version in _TWO_FUNCTION_VERSIONS:
+        return _source_digest(inspect.getsource(_build_clean_header), inspect.getsource(deidentify_signal_infos))
+    return hashlib.sha256(_pass_scope_source().encode()).hexdigest()
 
 
 class TestVersionBumpDiscipline:
@@ -78,9 +168,18 @@ class TestVersionBumpDiscipline:
             f"add {current_source_digest()!r} under that key"
         )
         assert PINNED_SOURCE_DIGESTS[DEIDENTIFICATION_VERSION] == current_source_digest(), (
-            "_build_clean_header or deidentify_signal_infos changed but DEIDENTIFICATION_VERSION did not; bump the "
+            "the de-identification pass (its entry points, their helpers or the label resolution) changed but "
+            "DEIDENTIFICATION_VERSION did not; bump the "
             f"constant and pin the new digest {current_source_digest()!r} under the new version"
         )
+
+    def test_the_digest_covers_the_helpers_and_the_label_tables(self):
+        scope = _pass_scope_source()
+        for name in ("_TEN_TEN_ELECTRODES", "classify_channel", "canonicalise_label_keep_reference", "_ascii_clean"):
+            assert name in scope
+        for name in ("format_prefiltering", "_SYMBOL_MAP", "_DEFAULT_TYPE_MATCHERS"):
+            assert name in scope
+        assert "CANONICAL_EEG_ORDER" not in scope
 
     def test_versions_are_never_reused(self):
         assert len(set(PINNED_SOURCE_DIGESTS.values())) == len(PINNED_SOURCE_DIGESTS)

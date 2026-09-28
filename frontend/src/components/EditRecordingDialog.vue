@@ -2,6 +2,7 @@
 import axios from 'axios'
 import { reactive, ref, watch } from 'vue'
 import { t } from '#i18n'
+import { errorDetail } from '#lib/http'
 import { toastNameWarnings } from '#lib/nameWarnings'
 import { showToast } from '#lib/toast'
 import { updateRecording, type Recording } from '#api/recordings'
@@ -61,9 +62,11 @@ async function submit () {
         toastNameWarnings(updated.warnings)
         emit('close')
     } catch (err) {
+        // A 400 is the published-source check, whose message says what is wrong with the value: not a DOI or URL,
+        // or a URL carrying credentials, a query or a fragment.
         error.value = axios.isAxiosError(err) && err.response?.status === 400
-            ? t('The published source must be a DOI or an http(s) URL.', SCOPE)
-            : t('Failed to update recording. Please try again.', SCOPE)
+            ? errorDetail(err, t('The published source must be a DOI or an http(s) URL.', SCOPE))
+            : errorDetail(err, t('Failed to update recording. Please try again.', SCOPE))
     } finally {
         loading.value = false
     }
@@ -104,7 +107,7 @@ async function submit () {
             </wa-select>
             <wa-input
                 :disabled="loading"
-                :hint="t('DOI or URL of the published dataset this recording was taken from, if any. Shown to every reader.', SCOPE)"
+                :hint="t('DOI or URL of the published dataset this recording was taken from, if any, without a query or login details. Shown to every reader.', SCOPE)"
                 :label="t('Published source', SCOPE)"
                 placeholder="10.xxxx/... or https://..."
                 size="s"

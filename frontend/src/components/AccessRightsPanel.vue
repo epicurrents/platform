@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, ref, reactive, watch } from 'vue'
 import { t } from '#i18n'
+import { errorDetail } from '#lib/http'
 import { showToast } from '#lib/toast'
 import { searchUsers, listGroups } from '#api/user'
 import type { UserSearchResult, Group } from '#api/user'
@@ -13,7 +14,7 @@ const props = defineProps<{
     accessRights: AccessRight[]
     grantFn: (payload: GrantAccessPayload) => Promise<AccessRight>
     revokeFn: (right: AccessRight) => Promise<void>
-    /** When given, each grant the caller may assess gets an assessment control; see epicurrents.assessment. */
+    /** When given, each grant whose `can_assess` is set gets an assessment control; see epicurrents.assessment. */
     assessFn?: (right: AccessRight, payload: AssessmentPayload) => Promise<AccessRight>
     infoMessage?: string
     readPermLabel?: string
@@ -169,8 +170,7 @@ async function submitGrant() {
         emit('update:accessRights', [...props.accessRights, right])
         showGrantAccess.value = false
     } catch (e: unknown) {
-        const msg = (e as { response?: { data?: { detail?: string } } })?.response?.data?.detail
-        grantError.value = msg ?? t('Failed to grant access.', SCOPE)
+        grantError.value = errorDetail(e, t('Failed to grant access.', SCOPE))
     } finally {
         grantLoading.value = false
     }
@@ -184,6 +184,24 @@ const assessmentForm = reactive({ kind: '' as AssessmentKind, reference: '', dat
 const assessmentLoading = ref(false)
 const assessmentError = ref<string | null>(null)
 const showAssessmentHelp = ref(false)
+
+/** Today as `YYYY-MM-DD` in local time: the latest date an assessment can have been made, which the server enforces. */
+function todayIso () {
+    const now = new Date()
+    const month = String(now.getMonth() + 1).padStart(2, '0')
+    const day = String(now.getDate()).padStart(2, '0')
+    return `${now.getFullYear()}-${month}-${day}`
+}
+
+const assessmentMaxDate = ref(todayIso())
+
+function onAssessmentHelpShow () {
+    showAssessmentHelp.value = true
+}
+
+function onAssessmentHelpHide () {
+    showAssessmentHelp.value = false
+}
 
 const assessmentKindOptions = computed(() => [
     { value: '', label: t('Other document or link', SCOPE) },
@@ -200,6 +218,7 @@ function openAssessment(right: AccessRight) {
     assessmentForm.reference = stored.identifier
     assessmentForm.date = right.assessment_date ?? ''
     assessmentError.value = null
+    assessmentMaxDate.value = todayIso()
     showAssessmentHelp.value = false
     showAssessment.value = true
 }
@@ -219,6 +238,10 @@ async function saveAssessment(clear = false) {
         assessmentError.value = t('Give both a reference and a date, or clear the assessment.', SCOPE)
         return
     }
+    if (date > assessmentMaxDate.value) {
+        assessmentError.value = t('The date cannot be in the future.', SCOPE)
+        return
+    }
     assessmentError.value = null
     assessmentLoading.value = true
     try {
@@ -230,8 +253,7 @@ async function saveAssessment(clear = false) {
             'neutral',
         )
     } catch (e: unknown) {
-        const msg = (e as { response?: { data?: { detail?: string } } })?.response?.data?.detail
-        assessmentError.value = msg ?? t('Failed to save the assessment.', SCOPE)
+        assessmentError.value = errorDetail(e, t('Failed to save the assessment.', SCOPE))
     } finally {
         assessmentLoading.value = false
     }
@@ -336,7 +358,7 @@ function userDisplayName(user: UserSearchResult): string {
                 <span v-if="right.assessment_reference" class="access-assessment">{{ assessmentLabel(right) }}</span>
             </span>
             <span class="access-perms">{{ accessPermsLabel(right) }}</span>
-            <wa-button v-if="assessFn"
+            <wa-button v-if="assessFn && right.can_assess"
                 appearance="plain"
                 size="s"
                 :title="t('Contextual assessment', SCOPE)"
@@ -376,8 +398,8 @@ function userDisplayName(user: UserSearchResult): string {
             <wa-details
                 :open="showAssessmentHelp"
                 :summary="t('What to record here', SCOPE)"
-                @wa-show.self="showAssessmentHelp = true"
-                @wa-hide.self="showAssessmentHelp = false"
+                @wa-show.self="onAssessmentHelpShow"
+                @wa-hide.self="onAssessmentHelpHide"
             >
                 <p class="assessment-help">
                     {{ t(
@@ -445,6 +467,7 @@ function userDisplayName(user: UserSearchResult): string {
             <wa-input
                 :disabled="assessmentLoading"
                 :label="t('Date made or last re-run', SCOPE)"
+                :max="assessmentMaxDate"
                 size="s"
                 type="date"
                 v-wa="[assessmentForm, 'date']"

@@ -47,7 +47,10 @@ _SIGNAL_HEADER = 256
 #: The container marker, as the viewer's encoder writes it into the reserved field.
 _MARKER = re.compile(r"^(?P<format>EDF|BDF)(?P<plus>\+[CD])?\s+EC:(?P<total>\d+):(?P<kib>\d+)$")
 
-#: The standards a footer event may declare a term of. The term itself says which one owns it.
+#: The standards a footer event or label may declare a term of. The term itself says which one owns it. Both are the
+#: platform's pinned, closed vocabularies; a project vocabulary may admit placeholders (HED ``Description/<text>``),
+#: and a code value is exempt from annotation-text redaction, so a file-supplied code under one would be free text
+#: served to every reader.
 _DECLARING_STANDARDS = ("epicurrents.eeg", "epicurrents.biosignal")
 
 
@@ -238,7 +241,7 @@ def save_footer_events(recording, footer: dict, *, discard_text: bool | None = N
             author=system_user,
             target_content_type=recording_ct,
             target_object_id=str(recording.pk),
-            object_hash=annotation_hash(recording.pk, f"footer-interruption:{index}"),
+            object_hash=annotation_hash(recording, f"footer-interruption:{index}"),
             timestamp=start,
             duration=duration,
         )
@@ -268,7 +271,7 @@ def save_footer_events(recording, footer: dict, *, discard_text: bool | None = N
         name="Source events",
         target_content_type=recording_ct,
         target_object_id=str(recording.pk),
-        object_hash=annotation_hash(recording.pk, "footer-events"),
+        object_hash=annotation_hash(recording, "footer-events"),
         content=content,
     )
 
@@ -306,12 +309,13 @@ def _accepted_code(standard: str, value: str):
     """The vocabulary registered for *standard* when it accepts *value*, else ``None``: the registry, fail-closed.
 
     Unlike the API's ``validate_code``, an unregistered standard is refused whatever the strict-vocabulary setting
-    says, because a code nobody validates is text a file supplied.
+    says, because a code nobody validates is text a file supplied. So is a code under a vocabulary not registered
+    as ``closed``: only an enumerated set keeps a file from choosing the value.
     """
     from annotations.vocabularies import get_vocabulary
 
     vocabulary = get_vocabulary(standard)
-    if vocabulary is None:
+    if vocabulary is None or not vocabulary.closed:
         return None
     try:
         vocabulary.validator(value, None)
@@ -334,8 +338,8 @@ def _term_name(vocabulary, value: str) -> str | None:
 def save_footer_labels(recording, footer: dict) -> tuple[int, int]:
     """Write one system-authored ``Label`` on *recording* per footer label declaring an accepted code.
 
-    A code is accepted when a vocabulary is registered for its standard and that vocabulary's validator accepts the
-    value. The label's accepted codes become its ``Code`` rows; its ``name`` is the display name the first accepted
+    A code is accepted when its standard is registered as a closed vocabulary and that vocabulary's validator accepts
+    the value. The label's accepted codes become its ``Code`` rows; its ``name`` is the display name the first accepted
     code's vocabulary gives the term, or the code where it gives none, and its ``value`` is that code, never the
     template's own value. A label with no accepted code writes nothing: there is no placeholder, since a label
     records a fact rather than a moment, and nothing of the template's text or annotator is stored anywhere.
@@ -370,7 +374,7 @@ def save_footer_labels(recording, footer: dict) -> tuple[int, int]:
             author=system_user,
             target_content_type=recording_ct,
             target_object_id=str(recording.pk),
-            object_hash=annotation_hash(recording.pk, f"footer-label:{index}"),
+            object_hash=annotation_hash(recording, f"footer-label:{index}"),
             name=name[:255],
             value=first_value,
         )

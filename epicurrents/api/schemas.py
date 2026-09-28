@@ -28,7 +28,9 @@ class AccessRightOut(Schema):
 
     ``assessment_reference`` and ``assessment_date`` are ``None`` both when no
     assessment is recorded and when the caller may not see it, so a grantee who
-    can list rights cannot tell the two apart.
+    can list rights cannot tell the two apart. ``can_assess`` says whether the
+    caller may record one on this row: the same answer as seeing it, so it tells
+    the caller nothing about the row's contents.
     """
 
     id: int
@@ -44,6 +46,7 @@ class AccessRightOut(Schema):
     expires_at: datetime | None
     assessment_reference: str | None = None
     assessment_date: date | None = None
+    can_assess: bool = False
 
 
 class AssessmentIn(Schema):
@@ -92,4 +95,5 @@ def access_right_out(right, *, assessment_visible: bool) -> AccessRightOut:
         expires_at=right.expires_at,
         assessment_reference=(right.assessment_reference or None) if assessment_visible else None,
         assessment_date=right.assessment_date if assessment_visible else None,
+        can_assess=assessment_visible,
     )

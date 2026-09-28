@@ -721,6 +721,7 @@ async function submitExport () {
         } else {
             showToast(t('Dataset created with {count} item(s).', SCOPE, { count: result.exported_count }), 'success')
         }
+        toastNameWarnings(result.warnings)
         router.push({ name: 'dataset', params: { id: result.dataset.object_hash ?? result.dataset.id } })
     } catch {
         exportError.value = t('Failed to export the collection.', SCOPE)

@@ -1,9 +1,9 @@
-"""Purge members of release-gated datasets by the hash of the bytes they were submitted as.
+"""Purge pooled recordings by the hash of the bytes they were submitted as.
 
-The withdrawal path for a dataset pool: a contributor asks for a recording to go, naming it by the
-SHA-256 of the file it submitted, and the operator runs this command with those hashes. For each
-hash it finds the matching members of release-gated datasets (``Recording.file_hash``, the digest of
-the upload as received), unlinks each file, deletes each row so the audit signal records the
+The withdrawal path for a submission pool: a contributor asks for a recording to go, naming it by
+the SHA-256 of the file it submitted, and the operator runs this command with those hashes. For each
+hash it finds the matching pooled recordings (``Recording.file_hash``, the digest of the upload as
+received), unlinks each file, deletes each row so the audit signal records the
 deletion, and reports per hash whether it was ``purged`` or ``not found``. That report, handed back
 to the contributor, is the only confirmation of withdrawal the platform gives and its only answer to
 whether a hash exists; no endpoint answers that question to any role. It is also the dataset's
@@ -17,10 +17,12 @@ deleted first, under the row lock the pooled ingest takes before it creates a re
 withdrawal racing an ingest run either removes the file before it becomes a recording or finds the
 recording it became.
 
-Scope is members of release-gated datasets only, trashed ones included, so a centre's withdrawal
-cannot remove a platform user's own recording that happens to share the bytes; a match outside the
-scope is reported as not found. The originals preservation volume is never touched, as nowhere in
-the platform reads it back; a release-gated deployment refuses to configure one.
+Scope is pooled recordings only: recordings the system user owns, which only the pooled ingest
+creates, that are members of a dataset configured as a submission pool, trashed ones included. A
+centre's withdrawal therefore cannot remove a platform user's own recording that happens to share
+the bytes, whatever dataset it was placed in, gated or not; a match outside the scope is reported as
+not found. The originals preservation volume is never touched, as nowhere in the platform reads it
+back; a release-gated deployment refuses to configure one.
 
 Audited as ``recordings.purge_dataset`` with counts in the metadata; each deletion is recorded under
 it.
@@ -63,18 +65,24 @@ def _normalise(value: str) -> str | None:
 
 
 def _member_pks(dataset: Dataset | None) -> set[int]:
-    """Primary keys of every recording that is a member of a release-gated dataset, or of *dataset*."""
+    """Primary keys of the system-authored recordings that are members of a submission pool, or of *dataset*."""
+    from library.release import system_user_id
+
+    system_id = system_user_id()
+    if system_id is None:
+        return set()
     recording_ct = ContentType.objects.get_for_model(Recording, for_concrete_model=False)
-    items = DatasetItem.objects.filter(content_type=recording_ct, dataset__release_gated=True)
+    items = DatasetItem.objects.filter(content_type=recording_ct).exclude(dataset__submission_profile="")
     if dataset is not None:
         items = items.filter(dataset=dataset)
-    return {int(pk) for pk in items.values_list("object_id", flat=True) if str(pk).isdigit()}
+    pks = {int(pk) for pk in items.values_list("object_id", flat=True) if str(pk).isdigit()}
+    return set(Recording.objects.filter(pk__in=pks, author_id=system_id).values_list("pk", flat=True))
 
 
 class Command(BaseCommand):
-    """Purge release-gated dataset members by submitted-file hash and report per hash."""
+    """Purge pooled recordings by submitted-file hash and report per hash."""
 
-    help = "Purge members of release-gated datasets by the SHA-256 of the submitted file"
+    help = "Purge pooled recordings by the SHA-256 of the submitted file"
 
     def add_arguments(self, parser):
         parser.add_argument("hashes", nargs="*", help="SHA-256 digests of the submitted files")
@@ -98,8 +106,8 @@ class Command(BaseCommand):
             from library.management.commands.release_dataset import _resolve_dataset
 
             dataset = _resolve_dataset(options["dataset"])
-            if not dataset.release_gated:
-                raise CommandError(f"Dataset {dataset.object_hash} is not release-gated")
+            if not dataset.submission_profile:
+                raise CommandError(f"Dataset {dataset.object_hash} is not a submission pool")
 
         scope = _member_pks(dataset)
         self._dataset = dataset
@@ -136,8 +144,8 @@ class Command(BaseCommand):
         return list(Recording.objects.filter(file_hash__iexact=digest, pk__in=scope).order_by("pk"))
 
     def _spooled(self, digest: str):
-        """Spool rows of release-gated pools (or of the given dataset) submitted as *digest*."""
-        rows = SubmissionFile.objects.filter(file_hash__iexact=digest, ledger__dataset__release_gated=True)
+        """Spool rows of submission pools (or of the given dataset) submitted as *digest*."""
+        rows = SubmissionFile.objects.filter(file_hash__iexact=digest).exclude(ledger__dataset__submission_profile="")
         if self._dataset is not None:
             rows = rows.filter(ledger__dataset=self._dataset)
         return rows

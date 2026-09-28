@@ -20,7 +20,7 @@ from django.core.management.base import CommandError
 from django.utils import timezone
 
 from activity.models import Activity
-from library.models import Dataset
+from library.models import Dataset, DatasetReleaseSignOff
 from library.release import equivalence_class_function, register_equivalence_class
 from library.reports import BYTE_VERBS, READ_VERBS, access_report, anonymity_report, class_summary
 from library.tests.test_release import _add, _gated_dataset, _recording, _release
@@ -106,20 +106,41 @@ class TestAccessReport:
         for user in (author, a, b):
             assert user.username not in text
 
-    def test_account_less_and_refused_requests_are_kept_apart(self, make_user):
+    def test_account_less_requests_and_server_errors_are_kept_apart(self, make_user):
         author, reader = make_user(), make_user()
         one = _recording(author, index=0)
         dataset, _ = _gated_dataset(author, one)
         _read(one, actor=None)
-        _read(one, actor=reader, status=404)
-        _read(one, actor=reader, status=403)
         _read(one, actor=reader, status=500)
         _read(one, actor=reader)
 
         report = access_report(dataset, since=_since())
 
-        assert (report["requests"], report["readers"], report["no_account"], report["refused"]) == (2, 1, 1, 2)
+        assert (report["requests"], report["readers"], report["no_account"], report["refused"]) == (2, 1, 1, 0)
         assert report["members"][0]["no_account"] == 1
+
+    def test_requests_the_gate_refused_are_counted(self, client, make_user):
+        """Real refusals: a dataset grantee and a share-token caller asking for an unreleased member both get 404.
+
+        Counts only once the recording endpoints annotate a refusal with the read verb and the target
+        recording, as they do a served read; until then the refused rows carry neither.
+        """
+        from library.tests.test_release import HASHES, _grant
+
+        author, reader = make_user(), make_user()
+        one = _recording(author, index=0)
+        dataset, _ = _gated_dataset(author, one)
+        _grant(dataset, author, target=reader)
+        _grant(one, author, token="t" * 32)
+        client.force_login(reader)
+        assert client.get(f"/recordings/api/v1/{HASHES[0]}").status_code == 404
+        client.logout()
+        assert client.get(f"/recordings/api/v1/{HASHES[0]}", {"share_token": "t" * 32}).status_code == 404
+
+        report = access_report(dataset, since=_since())
+
+        assert report["refused"] == 2
+        assert report["requests"] == 0
 
     def test_archived_rows_count_and_rows_outside_the_window_do_not(self, make_user):
         author, reader = make_user(), make_user()
@@ -221,9 +242,9 @@ class TestAnonymityReport:
         release.profile_version = "3"
         release.deidentification_versions = [2]
         release.k, release.m = 5, 2
-        release.sign_off_user_ids = [author.pk]
         release.assessment_reference = "Assessment: pool v3"
         release.save()
+        DatasetReleaseSignOff.objects.create(release=release, user=author)
         items[2].delete()
 
         report = anonymity_report(dataset, release)

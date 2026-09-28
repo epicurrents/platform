@@ -523,8 +523,12 @@ class SubmissionFile(models.Model):
     row is deleted once ingested: kept, any of them would be a join from a
     recording back to its ledger.
 
-    A row that fails ingest stays, with ``status`` ``failed`` and the error
-    text, for the operator; no recording is left, since the ingest rolls back.
+    A row that fails ingest stays, with ``status`` ``failed``, the error text
+    and ``failed_at``, for the operator; no recording is left, since the ingest
+    rolls back. Its retention window runs from ``failed_at``, not from receipt,
+    so a file held for months before failing still gets the whole window.
+    Deleting a row unlinks its spooled bytes once the deletion commits
+    (``recordings.submissions.unlink_spooled_bytes``), whichever path deletes it.
     """
 
     class Status(models.TextChoices):
@@ -551,6 +555,7 @@ class SubmissionFile(models.Model):
     )
     error = models.TextField(blank=True, default="")
     received_at = models.DateTimeField(auto_now_add=True)
+    failed_at = models.DateTimeField(null=True, blank=True)
 
     class Meta:
         indexes = [

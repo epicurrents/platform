@@ -78,7 +78,6 @@ export interface AccountUpdate extends StepUpCredentials {
     is_superuser?: boolean
 }
 
-/** A group with its roles and the two counts that decide whether it can be deleted. */
 /** What owns a dedicated group, which then carries no grant or role and is removed with its owner. */
 export interface DedicatedGroupOwner {
     /** Stable token for the owning feature, e.g. `submission_pool`. */
@@ -87,6 +86,7 @@ export interface DedicatedGroupOwner {
     object_hash: string
 }
 
+/** A group with its roles and the two counts that decide whether it can be deleted. */
 export interface GroupDetail {
     id: number
     name: string

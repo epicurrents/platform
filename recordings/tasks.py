@@ -210,7 +210,7 @@ def _save_edf_results(recording, result, *, events_from_sidecar: bool = False) -
             author=system_user,
             target_content_type=recording_ct,
             target_object_id=str(recording.pk),
-            object_hash=_annotation_hash(recording.pk, f"interruption:{data_pos}"),
+            object_hash=_annotation_hash(recording, f"interruption:{data_pos}"),
             timestamp=data_pos,
             duration=gap_duration,
         )
@@ -272,7 +272,7 @@ def _save_edf_results(recording, result, *, events_from_sidecar: bool = False) -
             name="Original annotations",
             target_content_type=recording_ct,
             target_object_id=str(recording.pk),
-            object_hash=_annotation_hash(recording.pk, "original-annotations"),
+            object_hash=_annotation_hash(recording, "original-annotations"),
             content=content,
         )
 
@@ -891,13 +891,14 @@ def ingest_pooled_submissions() -> dict:
     ``failed`` with the error for the operator and is not retried.
 
     A pool whose profile sets ``m`` is held until it has that many contributors: its files stay
-    in the spool while fewer than ``m`` of its ledgers have a file ingested or waiting, so the
+    in the spool while fewer than ``m`` of its ledgers have a file ingested or waiting past the
+    pooling delay, so the
     run that first takes the pool's files takes them from ``m`` contributors, a file failing
     at ingest aside. The count is the pool's, never a
     class's, since contributors per class would join a recording to its ledger.
 
-    Each run also retires failed rows older than ``RECORDINGS_SUBMISSION_FAILED_RETENTION_DAYS``,
-    and files of a held pool that have waited longer than
+    Each run also retires failed rows that failed longer ago than ``RECORDINGS_SUBMISSION_FAILED_RETENTION_DAYS``,
+    sweeps spool files no row accounts for (:func:`sweep_spool`), and files of a held pool that have waited longer than
     ``RECORDINGS_SUBMISSION_WAITING_RETENTION_DAYS``, unlinking the spooled bytes and deleting the
     row under ``recordings.submission.purge``, so a contributor's file the platform could not or
     did not ingest does not stay on disk indefinitely: the contributor holds the file anyway.
@@ -910,11 +911,12 @@ def ingest_pooled_submissions() -> dict:
     from recordings.models import SubmissionFile
 
     _purge_failed_submissions()
-    held = pools_short_of_contributors()
-    _retire_waiting_submissions(held)
-
+    sweep_spool()
     delay_hours = getattr(settings, "RECORDINGS_SUBMISSION_POOLING_DELAY_HOURS", 24)
     cutoff = timezone.now() - timedelta(hours=delay_hours)
+    held = pools_short_of_contributors(cutoff)
+    _retire_waiting_submissions(held)
+
     pending = list(
         SubmissionFile.objects.filter(status=SubmissionFile.Status.PENDING, received_at__lt=cutoff)
         .exclude(ledger__dataset_id__in=held)
@@ -955,19 +957,28 @@ def ingest_pooled_submissions() -> dict:
 _WITHDRAWN = "withdrawn"
 
 
-def pools_short_of_contributors() -> set[int]:
+def pools_short_of_contributors(cutoff=None) -> set[int]:
     """Primary keys of the pools whose profile sets ``m`` and that have fewer than ``m`` contributors.
 
-    A contributor is a ledger with a file ingested or waiting in the spool; a ledger whose every
-    file failed contributed nothing. A pool whose profile is no longer registered is not held here:
-    its files fail at ingest, which is the existing answer to a profile gone missing.
+    A contributor is a ledger with a file ingested, or with a file waiting in the spool that this
+    run would take: received before *cutoff*, the pooling-delay boundary, which defaults to now minus
+    ``RECORDINGS_SUBMISSION_POOLING_DELAY_HOURS``. A file still inside the delay does not count, or a
+    second contributor submitting an hour before the run would release the first contributor's
+    files alone. A ledger whose every file failed contributed nothing. A pool whose profile is no
+    longer registered is not held here: its files fail at ingest, which is the existing answer to a
+    profile gone missing.
     """
     from django.db.models import Exists, OuterRef, Q
 
     from recordings.models import SubmissionFile, SubmissionLedger
     from recordings.submissions import get_ingest_profile
 
-    waiting = SubmissionFile.objects.filter(ledger=OuterRef("pk"), status=SubmissionFile.Status.PENDING)
+    if cutoff is None:
+        delay_hours = getattr(settings, "RECORDINGS_SUBMISSION_POOLING_DELAY_HOURS", 24)
+        cutoff = timezone.now() - timedelta(hours=delay_hours)
+    waiting = SubmissionFile.objects.filter(
+        ledger=OuterRef("pk"), status=SubmissionFile.Status.PENDING, received_at__lt=cutoff
+    )
     contributing = SubmissionLedger.objects.filter(Q(ingested_count__gt=0) | Exists(waiting)).values_list(
         "dataset_id", "dataset__submission_profile"
     )
@@ -985,13 +996,73 @@ def pools_short_of_contributors() -> set[int]:
 
 
 def _purge_failed_submissions() -> int:
-    """Unlink and delete failed submission rows past the retention window; returns how many."""
+    """Unlink and delete failed submission rows past the retention window; returns how many.
+
+    The window runs from ``failed_at``, so a file that waited in a held pool before failing keeps its
+    row for the whole window. A failed row written before ``failed_at`` existed falls back to receipt.
+    """
+    from django.db.models import Q
+
     from recordings.models import SubmissionFile
 
     retention_days = getattr(settings, "RECORDINGS_SUBMISSION_FAILED_RETENTION_DAYS", 30)
     cutoff = timezone.now() - timedelta(days=retention_days)
-    stale = list(SubmissionFile.objects.filter(status=SubmissionFile.Status.FAILED, received_at__lt=cutoff))
+    stale = list(
+        SubmissionFile.objects.filter(status=SubmissionFile.Status.FAILED).filter(
+            Q(failed_at__lt=cutoff) | Q(failed_at__isnull=True, received_at__lt=cutoff)
+        )
+    )
     return _retire_submissions(stale, reason="failed", retention_days=retention_days)
+
+
+def sweep_spool() -> int:
+    """Unlink files in the submission spool that no row accounts for; returns how many.
+
+    Bytes and row are written in one transaction, but a worker dying between the write and the
+    commit leaves bytes without a row, and nothing that retires submissions goes by anything but
+    rows. A regular file directly in the spool, older than
+    ``RECORDINGS_SUBMISSION_SPOOL_SWEEP_GRACE_HOURS``, is unlinked when no ``SubmissionFile`` names
+    it and no ``Recording`` does: the pooled ingest renames a file to its recording's stored name
+    in the spool, where it waits for processing to move it. Filesystem housekeeping only, so no
+    audited scope; the count is logged, never a name.
+    """
+    from recordings.models import Recording, SubmissionFile
+    from recordings.submissions import submission_spool_root
+
+    root = submission_spool_root()
+    if not root.is_dir():
+        return 0
+    grace_hours = getattr(settings, "RECORDINGS_SUBMISSION_SPOOL_SWEEP_GRACE_HOURS", 24)
+    threshold = (timezone.now() - timedelta(hours=grace_hours)).timestamp()
+    candidates = []
+    for entry in root.iterdir():
+        try:
+            if entry.is_file() and not entry.is_symlink() and entry.stat().st_mtime < threshold:
+                candidates.append(entry)
+        except OSError:
+            continue
+    if not candidates:
+        return 0
+    names = [entry.name for entry in candidates]
+    paths = [str(entry) for entry in candidates]
+    known = set(SubmissionFile.objects.filter(stored_name__in=names).values_list("stored_name", flat=True))
+    known |= {
+        Path(p).name for p in SubmissionFile.objects.filter(file_path__in=paths).values_list("file_path", flat=True)
+    }
+    known |= set(Recording.objects.filter(stored_name__in=names).values_list("stored_name", flat=True))
+    known |= {Path(p).name for p in Recording.objects.filter(file_path__in=paths).values_list("file_path", flat=True)}
+    swept = 0
+    for entry in candidates:
+        if entry.name in known:
+            continue
+        try:
+            entry.unlink(missing_ok=True)
+            swept += 1
+        except OSError:
+            logger.warning("sweep_spool: could not unlink an unaccounted spool file")
+    if swept:
+        logger.info("sweep_spool: unlinked %d spool file(s) no row accounts for", swept)
+    return swept
 
 
 def _retire_waiting_submissions(held: set[int]) -> int:
@@ -1062,10 +1133,12 @@ def _settle_ingested_files(ingested: list, failures: list) -> None:
         )
         ingested = [item for item in ingested if item.pk in present]
         failures = [(item, error) for item, error in failures if item.pk in present]
+        failed_at = timezone.now()
         for item, error in sorted(failures, key=lambda pair: pair[0].pk):
             item.status = SubmissionFile.Status.FAILED
             item.error = error[:2000]
-            item.save(update_fields=["status", "error", "stored_name", "file_path"])
+            item.failed_at = failed_at
+            item.save(update_fields=["status", "error", "failed_at", "stored_name", "file_path"])
         counts = Counter(item.ledger_id for item in ingested)
         for ledger in SubmissionLedger.objects.select_for_update().filter(pk__in=counts).order_by("pk"):
             ledger.ingested_count += counts[ledger.pk]
@@ -1131,6 +1204,9 @@ def _ingest_submission_file(item) -> str | None:
         stored_name = _fresh_stored_name(spooled.parent, item.file_extension)
         renamed = spooled.with_name(stored_name)
         os.replace(spooled, renamed)
+        # A rename keeps the old mtime; refreshed, so an overlapping run's spool sweep does not take
+        # the file for an orphan before this run's recording row commits.
+        os.utime(renamed)
         with transaction.atomic():
             if not SubmissionFile.objects.select_for_update().filter(pk=item.pk).exists():
                 raise _Withdrawn()

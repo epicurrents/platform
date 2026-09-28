@@ -144,5 +144,10 @@ def register_core_vocabularies() -> None:
     """Register the pinned vocabularies; called from ``AnnotationsConfig.ready()``."""
     for standard, pin in VOCABULARY_PINS.items():
         register_vocabulary(
-            standard, label=pin.label, version=pin.version, validator=_validator(standard), term_name=_term_name
+            standard,
+            label=pin.label,
+            version=pin.version,
+            validator=_validator(standard),
+            term_name=_term_name,
+            closed=True,
         )

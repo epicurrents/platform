@@ -44,10 +44,12 @@ from recordings.submissions import (
     Violation,
     can_submit_to_dataset,
     get_ingest_profile,
+    parse_sidecar,
     public_profile,
     register_ingest_profile,
     reset_ingest_profiles,
     validate_file,
+    validate_sidecar,
     validate_submission,
 )
 from recordings.tasks import ingest_pooled_submissions
@@ -281,6 +283,57 @@ class TestGate:
         not_hex = _sidecar(data)
         not_hex["recording_sha256"] = 12
         assert "sidecar_hash" in _codes(validate_submission(_profile(), data, not_hex))
+
+    def test_a_signal_reserved_field_must_be_blank(self):
+        data = bytearray(_edf())
+        header = parse_edf_header(bytes(data))
+        offset = 256 + header.signal_count * (256 - 32)
+        data[offset : offset + 32] = b"SITE LAB 3 PT JD".ljust(32)
+        assert _codes(validate_file(_profile(), bytes(data))) == {"signal_reserved"}
+        assert validate_file(_profile(), _edf()) == []
+
+    def test_the_deidentifier_blanks_the_signal_reserved_field(self):
+        data = bytearray(_edf())
+        header = parse_edf_header(bytes(data))
+        offset = 256 + header.signal_count * (256 - 32)
+        data[offset : offset + 32] = b"SITE LAB 3 PT JD".ljust(32)
+        clean = _build_clean_header(header, parse_signal_infos(bytes(data), header))
+        assert b"SITE LAB" not in clean
+        assert clean[offset : offset + 32 * header.signal_count] == b" " * 32 * header.signal_count
+
+    def test_a_deeply_nested_sidecar_is_a_shape_violation_not_a_crash(self):
+        data = _edf()
+        deep = 1
+        for _ in range(2000):
+            deep = {"a": deep}
+        sidecar = _sidecar(data, x=deep)
+        assert _codes(validate_sidecar(_profile(), sidecar, data)) == {"sidecar_shape"}
+        # Past what either the parser or the gate's walk can hold: refused as JSON, or as a shape, never a crash.
+        raw = b'{"x":' + b'{"a":' * 50000 + b"1" + b"}" * 50001
+        try:
+            document = parse_sidecar(raw)
+        except ValueError:
+            return
+        assert _codes(validate_sidecar(_profile(), document, data)) == {"sidecar_shape"}
+
+    @pytest.mark.parametrize("raw", [b'{"x": NaN}', b'{"x": Infinity}', b'{"x": -Infinity}'])
+    def test_non_finite_numbers_are_refused_at_parse(self, raw):
+        with pytest.raises(ValueError):
+            parse_sidecar(raw)
+
+    @pytest.mark.parametrize("extra", [{"x": float("nan")}, {"x": "a\u0000b"}, {"a\u0000": 1}])
+    def test_values_the_store_cannot_hold_are_shape_violations(self, extra):
+        data = _edf()
+        assert _codes(validate_sidecar(_profile(), _sidecar(data, **extra), data)) == {"sidecar_shape"}
+
+    def test_a_profile_validator_that_raises_is_a_violation(self, caplog):
+        def broken(sidecar):
+            raise KeyError("Jane Doe")
+
+        data = _edf()
+        violations = validate_sidecar(_profile(validate_sidecar=broken), _sidecar(data), data)
+        assert _codes(violations) == {"sidecar_profile"}
+        assert "Jane" not in caplog.text
 
     def test_profile_validator_runs_after_shape_checks_pass(self):
         seen = []
@@ -537,10 +590,10 @@ class TestPoolEndpoints:
 _NAMES = itertools.count(1)
 
 
-def _spooled(pool_fixture, spool, *, age_hours=48, sidecar_extra=None, ledger=None):
+def _spooled(pool_fixture, spool, *, age_hours=48, sidecar_extra=None, ledger=None, data=None):
     dataset, contributor, _group = pool_fixture
     ledger = ledger or SubmissionLedger.objects.get_or_create(dataset=dataset, contributor=contributor)[0]
-    data = _edf()
+    data = _edf() if data is None else data
     spool.mkdir(parents=True, exist_ok=True)
     stored_name = f"{next(_NAMES):032X}.edf"
     path = spool / stored_name
@@ -675,9 +728,16 @@ class TestPooledIngest:
         with django_capture_on_commit_callbacks(execute=False) as callbacks:
             result = ingest_pooled_submissions()
         assert result == {"ingested": 1, "failed": 0}
-        assert len(callbacks) == 1
+        # One processing dispatch; the deleted file row also queues the unlink of its spool path, which the
+        # rename has already emptied, so running it must leave the recording's bytes alone.
+        processing = [c for c in callbacks if "unlink_spooled_bytes" not in c.__qualname__]
+        assert len(processing) == 1
+        for callback in callbacks:
+            if callback not in processing:
+                callback()
 
         recording = Recording.objects.get()
+        assert Path(recording.file_path).exists()
         assert recording.author == get_system_user()
         # A fresh name: the recording names neither the spool file nor the file row.
         assert recording.stored_name != row.stored_name
@@ -773,7 +833,8 @@ class TestPooledIngest:
         old = _spooled(pool, spool, age_hours=31 * 24)
         recent = _spooled(pool, spool)
         assert ingest_pooled_submissions() == {"ingested": 0, "failed": 2}
-        SubmissionFile.objects.filter(pk=old.pk).update(status=SubmissionFile.Status.FAILED)
+        # The window runs from the failure, so the old row is made to have failed 31 days ago.
+        SubmissionFile.objects.filter(pk=old.pk).update(failed_at=timezone.now() - timedelta(days=31))
         assert (spool / old.stored_name).exists()
         assert ingest_pooled_submissions() == {"ingested": 0, "failed": 0}
         assert not SubmissionFile.objects.filter(pk=old.pk).exists()
@@ -884,6 +945,16 @@ class TestContributorHold:
         _spooled(pool, spool)
         assert ingest_pooled_submissions() == {"ingested": 1, "failed": 0}
 
+    def test_a_second_contributor_inside_the_delay_does_not_release_the_hold(self, pool, spool, make_user, settings):
+        settings.RECORDINGS_SUBMISSION_POOLING_DELAY_HOURS = 24
+        register_ingest_profile(_profile(m=2))
+        first = [_spooled(pool, spool, age_hours=30) for _ in range(3)]
+        _spooled(pool, spool, age_hours=1, ledger=self._second_ledger(pool, make_user))
+        assert ingest_pooled_submissions() == {"ingested": 0, "failed": 0}
+        assert all(Path(row.file_path).exists() for row in first)
+        SubmissionFile.objects.update(received_at=timezone.now() - timedelta(hours=30))
+        assert ingest_pooled_submissions() == {"ingested": 4, "failed": 0}
+
     def test_a_ledger_whose_files_all_failed_does_not_count(self, pool, spool, make_user):
         register_ingest_profile(_profile(m=2))
         failed = _spooled(pool, spool, ledger=self._second_ledger(pool, make_user))
@@ -972,9 +1043,10 @@ class TestMaintenanceOperation:
         assert operation is not None
         assert operation.command == "release_dataset"
         assert operation.requires_step_up
-        args = operation.args_schema(
-            dataset="0" * 32, as_of="2026-11-01", dry_run=True, k=5, m=2, assessment_reference="Assessment v3"
-        )
+        # No assessment reference: free text stays out of a job's args, which every staff caller reads.
+        assert "assessment_reference" not in operation.args_schema.model_fields
+        assert operation.actor_arg == "--actor-id"
+        args = operation.args_schema(dataset="0" * 32, as_of="2026-11-01", dry_run=True, k=5, m=2)
         assert operation.command_args(args) == [
             "0" * 32,
             "--format",
@@ -986,8 +1058,195 @@ class TestMaintenanceOperation:
             "5",
             "--m",
             "2",
-            "--assessment-reference",
-            "Assessment v3",
         ]
         with pytest.raises(ValueError):
             operation.args_schema(dataset="not-a-hash")
+
+
+class TestSubmissionBodyStaysInMemory:
+    """The multipart parse of a submission writes nothing to disk, before or after the gate."""
+
+    @pytest.fixture
+    def no_temp_files(self, monkeypatch, settings):
+        # Any part past one byte would spool to a temporary file under the default handlers.
+        settings.FILE_UPLOAD_MAX_MEMORY_SIZE = 1
+        created = []
+
+        def refuse(*args, **kwargs):
+            created.append(args)
+            raise AssertionError("a submission part was spooled to a temporary file")
+
+        monkeypatch.setattr("django.core.files.uploadhandler.TemporaryUploadedFile", refuse)
+        return created
+
+    def test_an_accepted_file_never_touches_a_temporary_file(self, pool, spool, no_temp_files):
+        dataset, contributor, _group = pool
+        data = _edf()
+        response = _submit(_client(contributor), dataset, data, _sidecar(data))
+        assert response.status_code == 202, response.content
+        assert no_temp_files == []
+
+    def test_a_refused_file_never_touches_a_temporary_file(self, pool, spool, no_temp_files):
+        dataset, contributor, _group = pool
+        data = _edf(patient="Jane Doe")
+        response = _submit(_client(contributor), dataset, data, _sidecar(data))
+        assert response.status_code == 422
+        assert no_temp_files == []
+
+    def test_an_outsider_never_makes_the_server_write(self, pool, spool, make_user, no_temp_files):
+        dataset, _contributor, _group = pool
+        data = _edf()
+        assert _submit(_client(make_user()), dataset, data, _sidecar(data)).status_code == 404
+        assert _submit(Client(), dataset, data, _sidecar(data)).status_code == 401
+        assert no_temp_files == []
+
+    def test_an_oversize_body_is_refused_before_it_is_parsed(self, pool, spool, settings, no_temp_files):
+        dataset, contributor, _group = pool
+        settings.RECORDINGS_SUBMISSION_MAX_SIZE = 100
+        data = _edf() * 200
+        response = _submit(_client(contributor), dataset, data, _sidecar(data))
+        assert response.status_code == 413
+        assert no_temp_files == []
+        assert SubmissionFile.objects.count() == 0
+
+    def test_one_oversize_part_inside_the_body_cap_stops_the_parse(self, pool, spool, settings, no_temp_files):
+        dataset, contributor, _group = pool
+        data = _edf()
+        settings.RECORDINGS_SUBMISSION_MAX_SIZE = len(data) - 1
+        response = _submit(_client(contributor), dataset, data, _sidecar(data))
+        assert response.status_code == 413
+        assert no_temp_files == []
+        assert SubmissionFile.objects.count() == 0
+        assert not spool.exists() or not any(spool.iterdir())
+
+    def test_a_non_finite_sidecar_is_refused_not_stored(self, pool, spool):
+        dataset, contributor, _group = pool
+        data = _edf()
+        body = json.dumps(_sidecar(data)).encode()[:-1] + b', "x": NaN}'
+        response = _submit(_client(contributor), dataset, data, body)
+        assert response.status_code == 422
+        assert {v["code"] for v in response.json()["violations"]} == {"sidecar_shape"}
+        assert SubmissionFile.objects.count() == 0
+
+    def test_a_failed_spool_write_leaves_neither_row_nor_bytes(self, pool, spool, monkeypatch):
+        dataset, contributor, _group = pool
+        data = _edf()
+
+        def fail(self, content):
+            raise OSError("disk full")
+
+        monkeypatch.setattr(Path, "write_bytes", fail)
+        client = Client(raise_request_exception=False)
+        client.force_login(contributor)
+        response = _submit(client, dataset, data, _sidecar(data))
+        assert response.status_code == 500
+        assert SubmissionFile.objects.count() == 0
+        assert SubmissionLedger.objects.count() == 0
+        assert not spool.exists() or not any(spool.iterdir())
+
+
+class TestSpoolHousekeeping:
+    def test_deleting_a_row_by_cascade_unlinks_its_bytes(self, pool, spool, django_capture_on_commit_callbacks):
+        row = _spooled(pool, spool)
+        with django_capture_on_commit_callbacks(execute=True):
+            row.ledger.delete()
+        assert not Path(row.file_path).exists()
+
+    def test_a_rolled_back_deletion_keeps_the_bytes(self, pool, spool):
+        from django.db import transaction
+
+        row = _spooled(pool, spool)
+        with pytest.raises(RuntimeError), transaction.atomic():
+            row.delete()
+            raise RuntimeError("roll back")
+        assert Path(row.file_path).exists()
+
+    def test_the_receiver_never_unlinks_outside_the_spool(
+        self, pool, spool, tmp_path, django_capture_on_commit_callbacks
+    ):
+        row = _spooled(pool, spool)
+        outside = tmp_path / "recording.edf"
+        outside.write_bytes(b"x")
+        SubmissionFile.objects.filter(pk=row.pk).update(file_path=str(outside))
+        row.refresh_from_db()
+        with django_capture_on_commit_callbacks(execute=True):
+            row.delete()
+        assert outside.exists()
+
+    def test_the_run_sweeps_spool_bytes_no_row_accounts_for(self, pool, spool, settings, make_user):
+        import os
+
+        settings.RECORDINGS_SUBMISSION_SPOOL_SWEEP_GRACE_HOURS = 24
+        row = _spooled(pool, spool, age_hours=1)
+        old = (timezone.now() - timedelta(hours=48)).timestamp()
+        os.utime(row.file_path, (old, old))
+        orphan = spool / "ORPHAN.edf"
+        orphan.write_bytes(b"left by a dead worker")
+        os.utime(orphan, (old, old))
+        fresh_orphan = spool / "FRESH.edf"
+        fresh_orphan.write_bytes(b"a write whose commit is still in flight")
+        recording_file = spool / "RECORDING.edf"
+        recording_file.write_bytes(b"renamed for a recording awaiting processing")
+        os.utime(recording_file, (old, old))
+        Recording.objects.create(
+            author=make_user(),
+            original_name="x.edf",
+            stored_name="RECORDING.edf",
+            file_extension=".edf",
+            file_path=str(recording_file),
+            file_size=1,
+            status=Recording.Status.PENDING,
+        )
+        assert tasks.sweep_spool() == 1
+        assert not orphan.exists()
+        assert fresh_orphan.exists()
+        assert recording_file.exists()
+        assert Path(row.file_path).exists()
+
+
+class TestFailureRetention:
+    def test_a_failed_rows_window_runs_from_its_failure(self, pool, spool, settings):
+        settings.RECORDINGS_SUBMISSION_FAILED_RETENTION_DAYS = 30
+        register_ingest_profile(_profile(ingest=lambda recording, sidecar: 1 / 0))
+        row = _spooled(pool, spool, age_hours=60 * 24)
+        assert ingest_pooled_submissions() == {"ingested": 0, "failed": 1}
+        row.refresh_from_db()
+        assert row.failed_at is not None
+        assert ingest_pooled_submissions() == {"ingested": 0, "failed": 0}
+        assert SubmissionFile.objects.filter(pk=row.pk).exists(), "retired an hour after failing"
+        SubmissionFile.objects.filter(pk=row.pk).update(failed_at=timezone.now() - timedelta(days=31))
+        ingest_pooled_submissions()
+        assert not SubmissionFile.objects.filter(pk=row.pk).exists()
+        assert not Path(row.file_path).exists()
+
+
+class TestStoredBytesOfACanonicalSubmission:
+    """Residual, not a guarantee: a submission already in the platform's canonical form is stored unchanged.
+
+    The ingest pass rewrites the header into the canonical form and moves channels into canonical order;
+    it does not touch samples. A preparation tool that writes that form produces a file the pass leaves
+    byte-identical, so the stored file's digest is the submitted file's, which is the contributor's
+    receipt hash. Withholding ``stored_hash`` does not close that join for a reader with byte access:
+    such a reader can hash the bytes. These tests pin the equality so the assessment records it.
+    """
+
+    def _ingest(self, pool, spool, data, capture):
+        _spooled(pool, spool, data=data)
+        with capture(execute=True):
+            ingest_pooled_submissions()
+        recording = Recording.objects.order_by("-pk").first()
+        assert recording.status == Recording.Status.READY, recording.processing_error
+        return recording
+
+    def test_a_non_canonical_submission_is_rewritten(self, pool, spool, django_capture_on_commit_callbacks):
+        recording = self._ingest(pool, spool, _edf(), django_capture_on_commit_callbacks)
+        assert recording.stored_hash != recording.file_hash
+
+    def test_a_canonical_submission_is_stored_byte_identical(self, pool, spool, django_capture_on_commit_callbacks):
+        first = self._ingest(pool, spool, _edf(), django_capture_on_commit_callbacks)
+        canonical = Path(first.file_path).read_bytes()
+        assert validate_file(_profile(), canonical) == []
+        second = self._ingest(pool, spool, canonical, django_capture_on_commit_callbacks)
+        assert second.file_hash == hashlib.sha256(canonical).hexdigest()
+        assert second.stored_hash == second.file_hash
+        assert Path(second.file_path).read_bytes() == canonical

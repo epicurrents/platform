@@ -113,3 +113,22 @@ class TestTags:
 def test_recording_ct_is_available_for_bulk_rename(auth_client):
     """Guard for the bulk-rename fixture shape used above: the content type resolves."""
     assert ContentType.objects.get_for_model(Recording, for_concrete_model=False)
+
+
+@pytest.mark.django_db
+class TestCollectionExport:
+    def test_export_warns_on_the_written_name_description_and_folder_names(self, auth_client):
+        c, user = auth_client
+        root = baker.make(Collection, author=user, name="Doe, Jane", description="")
+        baker.make(Collection, author=user, name="Smith, John", parent=root)
+        resp = _post(c, f"{COLLECTIONS}{root.pk}/export/", {"description": "admitted 2024-03-05"})
+        assert resp.status_code == 201
+        assert _kinds(resp.json()) == [("name", "person_name"), ("description", "date"), ("folder_name", "person_name")]
+        assert Dataset.objects.filter(name="Doe, Jane").exists()
+
+    def test_a_clean_export_has_no_warnings(self, auth_client):
+        c, user = auth_client
+        root = baker.make(Collection, author=user, name="Sleep study", description="")
+        resp = _post(c, f"{COLLECTIONS}{root.pk}/export/", {})
+        assert resp.status_code == 201
+        assert resp.json()["warnings"] == []

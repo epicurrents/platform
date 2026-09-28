@@ -108,3 +108,13 @@ class RecordingsConfig(AppConfig):
         # the settings in force at ingest, which nothing can recompute — so the
         # verifier is told to count it as sealed rather than unknown.
         register_derived_state_record(target_model=Recording, key=DEIDENTIFICATION_RECORD_KEY)
+        # Deleting a submission row, by whichever path, takes its spooled bytes with it; the
+        # hourly spool sweep covers bytes a crash left without a row. See recordings/submissions.py.
+        from django.db.models.signals import pre_delete
+
+        from recordings.models import SubmissionFile
+        from recordings.submissions import unlink_spooled_bytes
+
+        pre_delete.connect(
+            unlink_spooled_bytes, sender=SubmissionFile, dispatch_uid="recordings.submissionfile.unlink_spooled_bytes"
+        )

@@ -133,7 +133,9 @@ def assessment_status(
     assessed = right.assessment_date
     if assessed is None:
         return STATUS_NONE, 0
-    reprocessed = sum(1 for pk in covered if pk in written_on and written_on[pk] > assessed)
+    # Same day counts as after: the record carries a date, not a time, and a
+    # re-write the afternoon after a morning assessment must not read current.
+    reprocessed = sum(1 for pk in covered if pk in written_on and written_on[pk] >= assessed)
     if reprocessed:
         return STATUS_REPROCESSED, reprocessed
     if assessed < cutoff:

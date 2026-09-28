@@ -220,6 +220,7 @@ class TestDatasetGrants:
         rows = {row["id"]: row for row in resp.json()}
         assert rows[assessed.pk]["assessment_reference"] is None
         assert rows[assessed.pk]["assessment_date"] is None
+        assert rows[assessed.pk]["can_assess"] is False
 
         client.force_login(author)
         rows = {row["id"]: row for row in client.get(_dataset_url(dataset)).json()}
@@ -238,6 +239,7 @@ class TestDatasetGrants:
         rows = {row["id"]: row for row in client.get(_dataset_url(dataset)).json()}
         assert rows[theirs.pk]["assessment_reference"] == "MINE"
         assert rows[authors.pk]["assessment_reference"] is None
+        assert (rows[theirs.pk]["can_assess"], rows[authors.pk]["can_assess"]) == (True, False)
 
         resp = patch_json(client, _dataset_url(dataset, authors.pk), {})
         assert resp.status_code == 403
@@ -399,6 +401,24 @@ class TestFederationGrants:
         grant = AccessRight.objects.get(pk=grant_id)
         assert grant.expires_at is None
         assert grant.assessment_reference == "PEER-DPIA"
+
+    def test_a_failed_renewal_leaves_the_assessment_unrecorded(self, auth_client, monkeypatch):
+        from federation import services
+
+        client, author = auth_client
+        grant_id = self._create(client, _recording(author), _peer()).json()["id"]
+
+        def refuse(**kwargs):
+            raise services.FederationServiceError(409, "refused")
+
+        monkeypatch.setattr(services, "renew_grant", refuse)
+        resp = patch_json(
+            client,
+            f"{FED}/grants/{grant_id}/",
+            {"expires_at": None, "assessment_reference": "PEER-DPIA", "assessment_date": "2026-03-01"},
+        )
+        assert resp.status_code == 409
+        assert AccessRight.objects.get(pk=grant_id).assessment_reference == ""
 
     def test_both_in_one_patch(self, auth_client):
         client, author = auth_client
@@ -583,6 +603,12 @@ class TestGrantAssessments:
         assert row["grant_id"] == right.pk
         assert row["status"] == "reprocessed"
         assert row["reprocessed_count"] == 1
+
+    def test_a_re_write_on_the_day_of_the_assessment_counts_as_after_it(self, user, make_user):
+        recording = _recording(user)
+        _grant(recording, user, target=make_user(), assessment_reference="R", assessment_date=TODAY - timedelta(days=4))
+        _seal_record(recording, on=TODAY - timedelta(days=4))
+        assert _run_json()["grants"][0]["status"] == "reprocessed"
 
     def test_a_dataset_grant_covers_its_recording_members(self, user, make_user):
         recording = _recording(user)

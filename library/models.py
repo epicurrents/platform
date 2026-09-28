@@ -420,9 +420,10 @@ class DatasetRelease(models.Model):
     only source of that value. The remaining fields are the process record EDPB Guidelines
     02/2026 ¶ 41 asks to be kept with a release: the preparation profile the members were
     checked against, the de-identification pass versions of what was released, the
-    equivalence-class conditions in force, who signed the run off (user primary keys, never
-    names) and a reference to the written assessment. The platform fills the version range
-    and the count; the rest comes from the project's release selector or the command line.
+    equivalence-class conditions in force, who signed the run off (``DatasetReleaseSignOff``
+    rows, never names) and a reference to the written assessment. The platform fills the
+    version range and the count; the rest comes from the project's release selector or the
+    command line.
     """
 
     dataset = models.ForeignKey(Dataset, on_delete=models.CASCADE, related_name="releases")
@@ -440,7 +441,8 @@ class DatasetRelease(models.Model):
     deidentification_versions = models.JSONField(default=list, blank=True)
     k = models.PositiveIntegerField(null=True, blank=True)
     m = models.PositiveIntegerField(null=True, blank=True)
-    sign_off_user_ids = models.JSONField(default=list, blank=True)
+    # Free text the runner typed; cleared on the live row when the runner's account is erased
+    # (library.apps), and scrubbed from the audit trail with it.
     assessment_reference = models.CharField(max_length=512, blank=True, default="")
     member_count = models.PositiveIntegerField(default=0)
     created_at = models.DateTimeField(auto_now_add=True)
@@ -457,6 +459,37 @@ class DatasetRelease(models.Model):
         if self.released_on and not self.release_month:
             self.release_month = month_start(self.released_on)
         super().save(*args, **kwargs)
+
+
+class DatasetReleaseSignOff(models.Model):
+    """One user's sign-off of one release run: a curator whose approvals it released, or an officer who signed it.
+
+    A row rather than a list of primary keys on the run, so the sign-off is a relation to the user
+    the Art. 15 subject export and ``user.checks`` can see. Null once the account is deleted; the
+    run keeps the count of who signed it.
+    """
+
+    release = models.ForeignKey(DatasetRelease, on_delete=models.CASCADE, related_name="sign_offs")
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="dataset_release_sign_offs",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["release", "user"],
+                condition=models.Q(user__isnull=False),
+                name="library_release_sign_off_one_per_user",
+            ),
+        ]
+
+    def __str__(self) -> str:
+        return f"DatasetReleaseSignOff(release={self.release_id} by={self.user_id})"
 
 
 def month_start(day) -> datetime:
@@ -499,14 +532,20 @@ class DatasetItem(models.Model):
     )
     # The release run that published this member; null means unreleased, which in
     # a release-gated dataset hides the member from everyone but its managers.
-    # PROTECT: deleting a release would silently unpublish its members.
+    # RESTRICT: deleting a release on its own would silently unpublish its members,
+    # while deleting the dataset (or its author) takes the release and the items
+    # together, which PROTECT would refuse.
     release = models.ForeignKey(
         DatasetRelease,
         null=True,
         blank=True,
-        on_delete=models.PROTECT,
+        on_delete=models.RESTRICT,
         related_name="items",
     )
+    # The de-identification pass version the member carried when a run released it, so
+    # the anonymity report can tell a member re-written since from one released at a
+    # newer version by the same run. Null for unreleased members and non-recordings.
+    released_deidentification_version = models.PositiveIntegerField(null=True, blank=True)
 
     added_at = models.DateTimeField(auto_now_add=True)
 

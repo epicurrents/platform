@@ -39,6 +39,8 @@ The registry is inert until a profile is registered from a project's ``apps.py::
 from __future__ import annotations
 
 import hashlib
+import json
+import logging
 import math
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -46,6 +48,8 @@ from pathlib import Path
 from typing import Any
 
 from django.conf import settings
+
+logger = logging.getLogger(__name__)
 
 # What ``recordings.processors.edf._build_clean_header`` writes into the four identification
 # fields. A submission must arrive already carrying them: a file that does not has either not
@@ -74,6 +78,10 @@ DEFAULT_FORBIDDEN_SIDECAR_KEYS: tuple[str, ...] = (
 )
 
 DECLARED_HASH_KEY = "recording_sha256"
+
+#: The deepest nesting a sidecar may have. The viewer's sidecar is a few levels deep; a document
+#: nested far past that is not one, and the gate's walk over it would exhaust the stack.
+SIDECAR_MAX_DEPTH = 32
 
 _FLOAT_TOLERANCE = 1e-6
 
@@ -254,6 +262,48 @@ def _nearly(a: float, b: float) -> bool:
     return math.isclose(a, b, rel_tol=0.0, abs_tol=_FLOAT_TOLERANCE)
 
 
+def _refuse_constant(name: str) -> Any:
+    raise ValueError(f"the sidecar carries {name}, which JSON does not define")
+
+
+def parse_sidecar(raw: bytes) -> Any:
+    """Parse a sidecar's bytes, raising ``ValueError`` for anything the gate cannot accept as JSON.
+
+    ``NaN`` and ``Infinity`` are refused here: Python's parser accepts them and PostgreSQL's ``jsonb``
+    does not, so a sidecar carrying one would pass the gate and fail at the insert. A document nested
+    past what the parser itself can hold raises ``RecursionError``, which is turned into the same refusal.
+    """
+    try:
+        return json.loads(raw.decode("utf-8"), parse_constant=_refuse_constant)
+    except RecursionError as exc:
+        raise ValueError("the sidecar is nested too deeply") from exc
+
+
+def _shape_problem(value: Any, depth: int = 1) -> str | None:
+    """Why *value* cannot be stored as the sidecar, or ``None``: too deep, or a string with a NUL.
+
+    Iterative, so a document of any depth is measured without recursing into it.
+    """
+    stack = [(value, depth)]
+    while stack:
+        item, level = stack.pop()
+        if level > SIDECAR_MAX_DEPTH:
+            return f"it is nested deeper than {SIDECAR_MAX_DEPTH} levels"
+        if isinstance(item, str):
+            if "\x00" in item:
+                return "a string in it contains a NUL character"
+        elif isinstance(item, dict):
+            for key, child in item.items():
+                if isinstance(key, str) and "\x00" in key:
+                    return "a key in it contains a NUL character"
+                stack.append((child, level + 1))
+        elif isinstance(item, list):
+            stack.extend((child, level + 1) for child in item)
+        elif isinstance(item, float) and not math.isfinite(item):
+            return "it carries a non-finite number"
+    return None
+
+
 def _forbidden_keys_in(value: Any, forbidden: frozenset[str], path: str = "") -> list[str]:
     """Every forbidden key found anywhere in ``value``, as dotted paths."""
     found: list[str] = []
@@ -292,6 +342,14 @@ def validate_file(profile: IngestProfile, data: bytes) -> list[Violation]:
         violations.append(Violation("identification", "The recording identification field is not blanked."))
     if _read(data, 168, 8) != BLANK_START_DATE or _read(data, 176, 8) != BLANK_START_TIME:
         violations.append(Violation("identification", "The start date and time are not the de-identified values."))
+
+    # The per-signal reserved field, raw: the spec gives it no content, so anything in it is a writer's
+    # signature or free text. It is the last per-signal section of the header.
+    ns = header.signal_count
+    reserved_start = 256 + ns * (256 - 32)
+    reserved = data[reserved_start : reserved_start + 32 * ns]
+    if ns > 0 and (len(reserved) != 32 * ns or reserved.strip(b" ")):
+        violations.append(Violation("signal_reserved", "A signal's reserved field is not blank."))
 
     if any(s.is_annotation_channel for s in signals):
         violations.append(Violation("annotations", "The file carries an annotation channel; export without TALs."))
@@ -361,6 +419,10 @@ def validate_sidecar(profile: IngestProfile, sidecar: Any, data: bytes) -> list[
     """Check the sidecar's shape, its forbidden keys and its declared hash, then ask the profile."""
     if not isinstance(sidecar, dict):
         return [Violation("sidecar_shape", "The sidecar must be a JSON object.")]
+    problem = _shape_problem(sidecar)
+    if problem is not None:
+        # Checked first and alone: the walks below recurse, and the store refuses what this names.
+        return [Violation("sidecar_shape", f"The sidecar cannot be accepted: {problem}.")]
     from recordings.container import check_viewer_sidecar
 
     violations: list[Violation] = []
@@ -386,7 +448,15 @@ def validate_sidecar(profile: IngestProfile, sidecar: Any, data: bytes) -> list[
     if violations:
         return violations
     if profile.validate_sidecar is not None:
-        violations.extend(profile.validate_sidecar(sidecar))
+        # Project code: a failure of it refuses the submission rather than answering 500, and is logged
+        # without the sidecar, which is the contributor's.
+        try:
+            answered = list(profile.validate_sidecar(sidecar))
+        except Exception as exc:
+            # The type only: an exception's message can quote the value it choked on.
+            logger.error("submission gate: profile %r validate_sidecar raised %s", profile.key, type(exc).__name__)
+            answered = [Violation("sidecar_profile", "The pool's sidecar check could not read this sidecar.")]
+        violations.extend(answered)
     return violations
 
 
@@ -418,6 +488,37 @@ def can_submit_to_dataset(user: Any, dataset: Any) -> bool:
     if getattr(dataset, "deleted_at", None) is not None:
         return False
     return user.groups.filter(pk=dataset.submission_group_id).exists()
+
+
+def unlink_spooled_bytes(sender, instance, **kwargs) -> None:
+    """``pre_delete`` receiver on ``SubmissionFile``: unlink the row's spooled bytes once the deletion commits.
+
+    Every path that deletes a row — the retirement windows, a withdrawal, a ledger or dataset
+    cascade — then takes the bytes with it, where before a cascade left them on disk with nothing
+    pointing at them. After the commit, so a rolled-back deletion keeps its bytes; a crash between
+    the commit and the unlink leaves an orphan the spool sweep removes. Only a path inside the
+    spool is touched: an ingested row still names its old spool path, which no longer exists.
+    """
+    from django.db import transaction
+
+    path = Path(instance.file_path or "")
+    if not instance.file_path:
+        return
+    try:
+        root = submission_spool_root().resolve()
+        inside = path.resolve().is_relative_to(root)
+    except OSError:
+        return
+    if not inside:
+        return
+
+    def _unlink() -> None:
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            logger.warning("submission spool: could not unlink the bytes of a deleted submission row")
+
+    transaction.on_commit(_unlink)
 
 
 def submission_spool_root() -> Path:

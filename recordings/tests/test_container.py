@@ -86,8 +86,9 @@ def _codes(event):
     return list(Code.objects.filter(content_type=ContentType.objects.get_for_model(Event), object_id=str(event.pk)))
 
 
-#: A fictional project vocabulary for the subject facts a label carries.
+#: A fictional closed project vocabulary for the subject facts a label carries.
 SUBJECT = "epicurrents.fixture.subject"
+EEG = "epicurrents.eeg"
 SUBJECT_TERMS = {"AGE_20_29": "Age 20-29", "SEX_F": "Female"}
 
 
@@ -97,7 +98,7 @@ def subject_vocabulary():
         if value not in SUBJECT_TERMS:
             raise ValueError(f"term {value!r} is not in {SUBJECT}")
 
-    register_vocabulary(SUBJECT, label="Fixture subject", validator=validate, term_name=SUBJECT_TERMS.get)
+    register_vocabulary(SUBJECT, label="Fixture subject", validator=validate, term_name=SUBJECT_TERMS.get, closed=True)
     yield
     unregister_vocabulary(SUBJECT)
 
@@ -389,21 +390,21 @@ class TestFooterLabels:
 
 
 class TestSaveLabels:
-    def test_an_accepted_code_becomes_a_system_label_named_by_the_term(self, recording, subject_vocabulary):
+    def test_an_accepted_code_becomes_a_system_label_named_by_the_term(self, recording):
         from epicurrents.system_user import get_system_user
 
         written = save_footer_labels(
-            recording, {"labels": [_label(value="twenty-something", label="Age", codes={SUBJECT: "AGE_20_29"})]}
+            recording, {"labels": [_label(value="eyes shut", label="State", codes={EEG: "EEG_ACT_EC"})]}
         )
         assert written == (1, 0)
         (label,) = _labels(recording)
-        assert (label.name, label.value, label.author) == ("Age 20-29", "AGE_20_29", get_system_user())
-        assert _label_codes(label) == [(SUBJECT, "AGE_20_29")]
+        assert (label.name, label.value, label.author) == ("Eyes closed", "EEG_ACT_EC", get_system_user())
+        assert _label_codes(label) == [(EEG, "EEG_ACT_EC")]
 
-    def test_nothing_of_the_template_text_is_stored(self, recording, subject_vocabulary):
+    def test_nothing_of_the_template_text_is_stored(self, recording):
         save_footer_labels(
             recording,
-            {"labels": [_label(value="Jane, 24", label="Jane's age", text="seen 3.4.", codes={SUBJECT: "AGE_20_29"})]},
+            {"labels": [_label(value="Jane, 24", label="Jane's state", text="seen 3.4.", codes={EEG: "EEG_ACT_EC"})]},
         )
         stored = json.dumps(list(Label.objects.values()), default=str) + json.dumps(
             list(Code.objects.values("value", "meta"))
@@ -411,9 +412,7 @@ class TestSaveLabels:
         for text in ("Jane", "seen", "Dr X", "a note"):
             assert text not in stored
 
-    def test_a_label_without_a_code_writes_nothing_and_is_counted_without_its_value(
-        self, recording, subject_vocabulary, caplog
-    ):
+    def test_a_label_without_a_code_writes_nothing_and_is_counted_without_its_value(self, recording, caplog):
         with caplog.at_level(logging.INFO, logger="recordings.container"):
             written = save_footer_labels(recording, {"labels": [_label(value="Jane, 24")]})
         assert written == (0, 1)
@@ -427,46 +426,69 @@ class TestSaveLabels:
         assert written == (0, 1)
         assert Label.objects.count() == 0
 
-    def test_a_value_the_vocabulary_rejects_is_refused(self, recording, subject_vocabulary):
-        assert save_footer_labels(recording, {"labels": [_label(codes={SUBJECT: "AGE_24"})]}) == (0, 1)
+    def test_a_value_the_vocabulary_rejects_is_refused(self, recording):
+        assert save_footer_labels(recording, {"labels": [_label(codes={EEG: "EEG_NOT_A_TERM"})]}) == (0, 1)
         assert Label.objects.count() == 0
 
-    def test_a_validator_that_fails_otherwise_refuses_the_code(self, recording):
-        def broken(value, meta):
-            raise TypeError("bug")
+    def test_a_closed_project_vocabulary_may_be_declared(self, recording, subject_vocabulary):
+        assert save_footer_labels(recording, {"labels": [_label(codes={SUBJECT: "SEX_F"})]}) == (1, 0)
+        (label,) = _labels(recording)
+        assert (label.name, label.value) == ("Female", "SEX_F")
 
-        register_vocabulary("epicurrents.fixture.broken", label="Broken", validator=broken)
+    def test_an_open_vocabulary_is_refused_even_when_it_accepts_the_value(self, recording):
+        # A file chooses the value of a code it declares, and a code value is exempt from the annotation-text
+        # rule, so only a vocabulary registered as closed may be declared from a file.
+        register_vocabulary(SUBJECT, label="Open subject", validator=lambda value, meta: None)
+        register_vocabulary("hed", label="HED", validator=lambda value, meta: None)
         try:
-            written = save_footer_labels(recording, {"labels": [_label(codes={"epicurrents.fixture.broken": "X"})]})
+            written = save_footer_labels(
+                recording,
+                {
+                    "labels": [
+                        _label(codes={SUBJECT: "SEX_F"}),
+                        _label(codes={"hed": "Description/Seen at Clinic X, pt Doe"}),
+                    ]
+                },
+            )
         finally:
-            unregister_vocabulary("epicurrents.fixture.broken")
-        assert written == (0, 1)
+            unregister_vocabulary("hed")
+            unregister_vocabulary(SUBJECT)
+        assert written == (0, 2)
+        assert Label.objects.count() == 0
+        assert not Code.objects.filter(value__contains="Clinic").exists()
 
     def test_only_the_accepted_codes_of_a_label_are_kept_and_the_first_names_it(self, recording, subject_vocabulary):
         save_footer_labels(
-            recording, {"labels": [_label(codes={"icd10": "G40.3", SUBJECT: "SEX_F", "epicurrents.eeg": "EEG_ACT_HV"})]}
+            recording,
+            {
+                "labels": [
+                    _label(
+                        codes={
+                            "icd10": "G40.3",
+                            SUBJECT: "SEX_F",
+                            EEG: "EEG_ACT_HV",
+                            "epicurrents.biosignal": "BIO_TECH_PAUSE",
+                        }
+                    )
+                ]
+            },
         )
         (label,) = _labels(recording)
         assert (label.name, label.value) == ("Female", "SEX_F")
-        assert _label_codes(label) == [("epicurrents.eeg", "EEG_ACT_HV"), (SUBJECT, "SEX_F")]
+        assert _label_codes(label) == [
+            ("epicurrents.biosignal", "BIO_TECH_PAUSE"),
+            (EEG, "EEG_ACT_HV"),
+            (SUBJECT, "SEX_F"),
+        ]
 
-    def test_a_vocabulary_that_names_no_terms_leaves_the_code_as_the_name(self, recording):
-        register_vocabulary("epicurrents.fixture.plain", label="Plain", validator=lambda value, meta: None)
-        try:
-            save_footer_labels(recording, {"labels": [_label(codes={"epicurrents.fixture.plain": "P1"})]})
-        finally:
-            unregister_vocabulary("epicurrents.fixture.plain")
-        (label,) = _labels(recording)
-        assert (label.name, label.value) == ("P1", "P1")
-
-    def test_a_malformed_footer_writes_nothing(self, recording, subject_vocabulary):
+    def test_a_malformed_footer_writes_nothing(self, recording):
         with pytest.raises(ValueError):
-            save_footer_labels(recording, {"labels": [_label(codes={SUBJECT: "SEX_F"}), "x"]})
+            save_footer_labels(recording, {"labels": [_label(codes={EEG: "EEG_ACT_EC"}), "x"]})
         assert Label.objects.count() == 0
 
-    def test_labels_are_written_under_the_discard_setting(self, recording, subject_vocabulary):
+    def test_labels_are_written_under_the_discard_setting(self, recording):
         with override_settings(RECORDINGS_DISCARD_EMBEDDED_ANNOTATIONS=True):
-            assert save_footer_labels(recording, {"labels": [_label(codes={SUBJECT: "SEX_F"})]}) == (1, 0)
+            assert save_footer_labels(recording, {"labels": [_label(codes={EEG: "EEG_ACT_EC"})]}) == (1, 0)
 
 
 class TestSaveViewerSidecar:
@@ -487,12 +509,12 @@ class TestSaveViewerSidecar:
             {
                 "events": [_event(codes={"epicurrents.eeg": "EEG_ACT_HV"})],
                 "interruptions": [[1, 2]],
-                "labels": [_label(codes={SUBJECT: "SEX_F"})],
+                "labels": [_label(codes={EEG: "EEG_ACT_EC"})],
             },
         )
         assert [e.name for e in _events(recording)] == ["Hyperventilation"]
         assert Interruption.objects.filter(target_object_id=str(recording.pk)).count() == 1
-        assert [label.name for label in _labels(recording)] == ["Female"]
+        assert [label.name for label in _labels(recording)] == ["Eyes closed"]
 
     def test_discarding_the_text_overrides_the_setting(self, recording):
         with override_settings(RECORDINGS_DISCARD_EMBEDDED_ANNOTATIONS=False):

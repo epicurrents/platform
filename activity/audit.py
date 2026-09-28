@@ -1162,8 +1162,64 @@ def _has_write_access_for_ref(user, change: ObjectChangeLog) -> bool:
     )
 
 
+class RollbackRefused(ValueError):
+    """A registered rollback guard refused the rollback: restoring the state would bypass a rule of the owning app."""
+
+
+# model label (lowercase ``app_label.model_name``) -> guards; see register_rollback_guard.
+_ROLLBACK_GUARDS: dict[str, list] = {}
+
+
+def register_rollback_guard(model_label: str, guard) -> None:
+    """Register a guard consulted before any rollback of a change on *model_label*.
+
+    Signature: ``guard(change, existing_obj) -> str | None``; return a reason to refuse, or
+    ``None`` to allow. ``existing_obj`` is the live row or ``None`` when it is gone. A rollback
+    writes rows directly, past every endpoint rule, so an app whose rows carry rules the
+    endpoints enforce (a pool's configuration, a release record) registers a guard from its
+    ``AppConfig.ready()`` refusing the rollbacks that would break them. Guards apply to
+    superusers too: they protect invariants, not access. Idempotent per callable.
+    """
+    guards = _ROLLBACK_GUARDS.setdefault(model_label.lower(), [])
+    if guard not in guards:
+        guards.append(guard)
+
+
+def rollback_refusal(change: ObjectChangeLog, existing_obj=None) -> str | None:
+    """The first reason a registered guard gives for refusing to roll back *change*, or ``None``.
+
+    ``existing_obj`` is fetched when not supplied, so a pre-flight check and the execution path
+    decide on the same row.
+    """
+    label = f"{change.content_type.app_label}.{change.content_type.model}".lower()
+    guards = _ROLLBACK_GUARDS.get(label, ())
+    if not guards:
+        return None
+    if existing_obj is None:
+        model_class = change.content_type.model_class()
+        if model_class is not None:
+            existing_obj = model_class._default_manager.filter(pk=change.object_id).first()
+    for guard in guards:
+        reason = guard(change, existing_obj)
+        if reason:
+            return reason
+    return None
+
+
 def can_rollback_change(user, change: ObjectChangeLog, existing_obj=None) -> bool:
-    """Return True when user may rollback the given change log entry.
+    """Return True when user may rollback the given change log entry and no registered guard refuses it.
+
+    The access half is :func:`_may_rollback_by_access`; a guard refusal (:func:`rollback_refusal`)
+    makes the answer False for every caller, superusers included, so a listing of rollbackable
+    changes and a bulk pre-flight never offer what execution would refuse.
+    """
+    if not _may_rollback_by_access(user, change, existing_obj):
+        return False
+    return rollback_refusal(change, existing_obj) is None
+
+
+def _may_rollback_by_access(user, change: ObjectChangeLog, existing_obj=None) -> bool:
+    """Return True when user holds the access to rollback the given change log entry.
 
     Checks (in order):
     1. Superuser — always allowed.
@@ -1294,8 +1350,11 @@ def rollback_change(*, user, change_id: int):
         raise ValueError("Target model for change log no longer exists")
 
     existing_obj = model_class._default_manager.filter(pk=change.object_id).first()
-    if not can_rollback_change(user=user, change=change, existing_obj=existing_obj):
+    if not _may_rollback_by_access(user, change, existing_obj):
         raise PermissionError("You do not have permission to rollback this object state")
+    refusal = rollback_refusal(change, existing_obj)
+    if refusal:
+        raise RollbackRefused(refusal)
 
     # Refuse to apply before_state from a row whose integrity hash no longer
     # matches its contents. A tampered row that silently rolls back would

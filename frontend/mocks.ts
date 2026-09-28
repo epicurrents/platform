@@ -59,6 +59,7 @@
  *   GET    /api/v1/library/collections/{id}/items/
  *   POST   /api/v1/library/collections/{id}/items/
  *   DELETE /api/v1/library/collections/{id}/items/{itemId}/
+ *   POST   /api/v1/library/collections/{id}/export/  (flat copy; no folders)
  *
  *   GET    /api/v1/library/datasets/          (same shape as collections)
  *   POST   /api/v1/library/datasets/
@@ -152,6 +153,45 @@ interface MockGroup {
     created_at: string
     modified_at: string
     deleted_at: string | null
+    /** Datasets only. */
+    release_gated?: boolean
+}
+
+/**
+ * The stored form of a published-source locator, or an error sentence, mirroring recordings/public_source.py: a DOI
+ * (bare or under a doi: / doi.org prefix) is stored bare and lower-cased, anything else must be an http(s) URL with a
+ * host and no userinfo, query or fragment.
+ */
+function normalisePublicSource (text: string): { value: string } | { error: string } {
+    const value = text.trim()
+    if (!value) {
+        return { value: '' }
+    }
+    const doi = /^10\.\d{4,9}\/\S+$/i
+    const prefixes = ['doi:', 'https://doi.org/', 'http://doi.org/', 'https://dx.doi.org/', 'http://dx.doi.org/']
+    const refusal = { error: 'public_source must be a DOI (10.xxxx/...) or an http(s) URL of the published dataset, or empty to clear.' }
+    for (const prefix of prefixes) {
+        if (value.toLowerCase().startsWith(prefix)) {
+            const candidate = value.slice(prefix.length)
+            return doi.test(candidate) ? { value: candidate.toLowerCase() } : refusal
+        }
+    }
+    if (doi.test(value)) {
+        return { value: value.toLowerCase() }
+    }
+    let url: URL
+    try {
+        url = new URL(value)
+    } catch {
+        return refusal
+    }
+    if (!['http:', 'https:'].includes(url.protocol) || !url.host) {
+        return refusal
+    }
+    if (url.username || url.password || url.search || url.hash || value.includes('?') || value.includes('#')) {
+        return { error: 'public_source must not carry login details, a query or a fragment.' }
+    }
+    return { value }
 }
 
 /** One row of the administration account roster. */
@@ -1214,10 +1254,11 @@ function itemOut(item: MockItem) {
     return rest
 }
 
-/** Strip internal _parent_id before sending an access right to the client. */
+/** Strip internal _parent_id before sending an access right to the client. The mock caller is the author,
+ *  who may assess every grant. */
 function accessOut(access: MockAccess) {
     const { _parent_id: _, ...rest } = access
-    return rest
+    return { ...rest, can_assess: true }
 }
 
 /** The grantee-visible label: the custom name if set, else the hash-prefix fallback. */
@@ -2161,9 +2202,15 @@ export async function handleMock(
                         if (item.object_hash === hash) item.object_name = resolved
                     }
                 }
+                if (typeof body.public_source === 'string') {
+                    const source = normalisePublicSource(body.public_source)
+                    if ('error' in source) {
+                        return send(res, 400, { detail: source.error })
+                    }
+                    rec.public_source = source.value
+                }
                 if (typeof body.modality === 'string') rec.modality = body.modality.trim().toLowerCase()
-                if (typeof body.public_source === 'string') rec.public_source = body.public_source.trim()
-                return send(res, 200, recordingOut(rec))
+                return send(res, 200, { ...recordingOut(rec), warnings: [] })
             }
             if (method === 'DELETE') {
                 rec.deleted_at = new Date().toISOString()
@@ -2338,6 +2385,41 @@ export async function handleMock(
         }
     }
 
+    // POST /api/v1/library/collections/{id}/export/ — copies the collection's own items into a new dataset, without
+    // descending into sub-collections or materialising folders.
+    {
+        const m = path.match(/^\/api\/v1\/library\/collections\/(\d+)\/export\/$/)
+        if (m && method === 'POST') {
+            const collId = Number(m[1])
+            const coll = _state.collections.find(c => c.id === collId && !c.deleted_at)
+            if (!coll) return notFound(res)
+            const body = await readBody(req)
+            const now = new Date().toISOString()
+            const ds: MockGroup = {
+                id: _state.seq.ds++,
+                name: String(body.name || coll.name),
+                description: String(body.description ?? coll.description),
+                parent_id: null,
+                author_id: MOCK_USER_ID,
+                created_at: now,
+                modified_at: now,
+                deleted_at: null,
+            }
+            _state.datasets.push(ds)
+            const sources = _state.collectionItems.filter(i => i._parent_id === collId && !i.deleted_at)
+            for (const source of sources) {
+                _state.datasetItems.push({ ...source, id: _state.seq.item++, _parent_id: ds.id, added_at: now })
+            }
+            return send(res, 201, {
+                dataset: { ...ds, release_gated: false },
+                exported_count: sources.length,
+                skipped_count: 0,
+                folder_count: 0,
+                warnings: [],
+            })
+        }
+    }
+
     // ── Datasets (mirror of collections) ──────────────────────────────────────
 
     if (path === '/api/v1/library/datasets/') {
@@ -2373,8 +2455,11 @@ export async function handleMock(
                 const body = await readBody(req)
                 if (typeof body.name === 'string') ds.name = body.name
                 if (typeof body.description === 'string') ds.description = body.description
+                // Every mock recording is the mock user's own, so the server's 409 for members authored by someone
+                // other than the dataset's author never arises here.
+                if (typeof body.release_gated === 'boolean') ds.release_gated = body.release_gated
                 ds.modified_at = new Date().toISOString()
-                return send(res, 200, ds)
+                return send(res, 200, { ...ds, release_gated: ds.release_gated ?? false, warnings: [] })
             }
             if (method === 'DELETE') {
                 ds.deleted_at = new Date().toISOString()
@@ -2389,6 +2474,8 @@ export async function handleMock(
         if (m) {
             const dsId = Number(m[1])
             if (method === 'GET') {
+                // The mock caller manages every dataset, so ids are always served; a non-manager of a release-gated
+                // dataset receives `id` and `object_id` as null.
                 return send(res, 200, _state.datasetItems.filter(i => i._parent_id === dsId).map(itemOut))
             }
             if (method === 'POST') {

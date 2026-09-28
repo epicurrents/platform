@@ -860,6 +860,11 @@ def update_group(request, group_id: int, payload: GroupUpdateIn):
         raise HttpError(404, "Group not found.")
 
     granted_roles = sorted(key for key, value in (payload.roles or {}).items() if value is not None)
+    # A dedicated group means one thing; a role would give its members another.
+    # Clearing stays allowed, so a role that predates the group's owner can go.
+    # Refused before step-up, so a request that cannot succeed spends no attempt.
+    if granted_roles and dedicated_group(group.pk) is not None:
+        raise HttpError(409, "This group exists for one purpose and carries no project role.")
     if granted_roles:
         _step_up(request, actor, password=payload.password, totp_code=payload.totp_code)
 
@@ -872,11 +877,6 @@ def update_group(request, group_id: int, payload: GroupUpdateIn):
             raise HttpError(409, "A group with that name already exists.")
         group.name = name
         changed.append("name")
-
-    # A dedicated group means one thing; a role would give its members another.
-    # Clearing stays allowed, so a role that predates the group's owner can go.
-    if dedicated_group(group.pk) is not None and any(value is not None for value in (payload.roles or {}).values()):
-        raise HttpError(409, "This group exists for one purpose and carries no project role.")
 
     roles_changed: list[str] = []
     with transaction.atomic():

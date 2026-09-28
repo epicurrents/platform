@@ -28,7 +28,7 @@ import {
     assessDatasetAccess,
     getRecordingContentTypeId,
     type Collection,
-    type CollectionItem,
+    type DatasetItem,
     type AccessRight,
     type AssessmentPayload,
     type DatasetFolder,
@@ -49,7 +49,7 @@ import { useRecordingsStore } from '#stores/recordings'
 import { useLibraryStore } from '#stores/library'
 import { useAuthStore } from '#stores/auth'
 import { toastNameWarnings } from '#lib/nameWarnings'
-import { errorDetail } from '#lib/http'
+import { errorDetail, settledFailure } from '#lib/http'
 import { showToast } from '#lib/toast'
 import ViewerConfigEditor from '#components/ViewerConfigEditor.vue'
 import type { ViewerSettingsOverrides } from '#lib/viewerConfig'
@@ -67,7 +67,7 @@ const datasetId = computed(() => String(route.params.id))
 // ── Data ─────────────────────────────────────────────────────────────────
 
 const dataset = ref<Collection | null>(null)
-const items = ref<CollectionItem[]>([])
+const items = ref<DatasetItem[]>([])
 const folders = ref<DatasetFolder[]>([])
 const accessRights = ref<AccessRight[]>([])
 const loading = ref(true)
@@ -129,12 +129,12 @@ const canManageFolders = canEditConfig
 
 // ── Submission pool ───────────────────────────────────────────────────────
 
-// Reported by the pool section, which only the owner sees. A pool owns its
-// gate and its membership: members arrive through the submission gate and are
-// withdrawn through purge, so the page offers neither the gate switch nor
-// adding and removing items by hand.
+// A pool owns its gate and its membership: members arrive through the submission gate and are withdrawn through
+// purge, so the page offers neither the gate switch nor adding, removing or editing items by hand. The pool section
+// reports the state to the owner; every other manager learns it from the review, whose `approvals_required` is set
+// exactly when the dataset is a pool.
 const pool = ref<DatasetPool | null>(null)
-const isPool = computed(() => !!pool.value?.profile)
+const isPool = computed(() => !!pool.value?.profile || (review.value?.approvals_required ?? null) !== null)
 
 async function onPoolChange (next: DatasetPool, changed: boolean) {
     pool.value = next
@@ -171,8 +171,20 @@ async function loadReview () {
  * The review state of an item's recording, or null when the caller does not review this dataset.
  * @param item - A row of the items section.
  */
-function reviewOf (item: CollectionItem): DatasetMemberReview | null {
+function reviewOf (item: DatasetItem): DatasetMemberReview | null {
     return item.object_hash ? reviewByHash.value.get(item.object_hash) ?? null : null
+}
+
+// Hashes with an approval write in flight. A second action on the same member waits for the first to answer, so
+// two writes cannot land out of order and leave the row showing the state the server did not end on.
+const pendingApprovals = reactive(new Set<string>())
+
+/**
+ * Whether an approval write for the item's recording is still waiting for its answer.
+ * @param item - A row of the items section.
+ */
+function approvalPending (item: DatasetItem) {
+    return !!item.object_hash && pendingApprovals.has(item.object_hash)
 }
 
 /**
@@ -198,18 +210,22 @@ function setMemberReview (next: DatasetMemberReview) {
     review.value.members = review.value.members.map(member => member.hash === next.hash ? next : member)
 }
 
-async function setApproval (item: CollectionItem, approve: boolean) {
-    if (!item.object_hash) {
+async function setApproval (item: DatasetItem, approve: boolean) {
+    const hash = item.object_hash
+    if (!hash || pendingApprovals.has(hash)) {
         return
     }
+    pendingApprovals.add(hash)
     try {
         const next = approve
-            ? await approveDatasetMember(datasetId.value, item.object_hash)
-            : await withdrawDatasetMemberApproval(datasetId.value, item.object_hash)
+            ? await approveDatasetMember(datasetId.value, hash)
+            : await withdrawDatasetMemberApproval(datasetId.value, hash)
         setMemberReview(next)
         showToast(approve ? t('Approved for release.', SCOPE) : t('Approval withdrawn.', SCOPE), 'neutral')
     } catch (err) {
         showToast(errorDetail(err, t('The approval could not be changed.', SCOPE)), 'danger')
+    } finally {
+        pendingApprovals.delete(hash)
     }
 }
 
@@ -220,11 +236,11 @@ const vetoReasonLabels: Record<VetoReason, string> = {
     skull_defect: t('Skull defect or breach rhythm', SCOPE),
     unusual_protocol: t('Unusual protocol', SCOPE),
 }
-const vetoItem = ref<CollectionItem | null>(null)
+const vetoItem = ref<DatasetItem | null>(null)
 const vetoInput = reactive({ reason: '' })
 const vetoing = ref(false)
 
-function openVeto (item: CollectionItem) {
+function openVeto (item: DatasetItem) {
     vetoInput.reason = ''
     vetoItem.value = item
 }
@@ -244,7 +260,7 @@ async function confirmVeto () {
     vetoing.value = true
     try {
         await vetoDatasetMember(datasetId.value, item.object_hash, vetoInput.reason as VetoReason)
-        items.value = items.value.filter(row => row.id !== item.id)
+        items.value = items.value.filter(row => row.object_hash !== item.object_hash)
         if (review.value) {
             review.value.members = review.value.members.filter(member => member.hash !== item.object_hash)
         }
@@ -266,8 +282,7 @@ async function onSaveViewerConfig (overrides: ViewerSettingsOverrides) {
         dataset.value = await updateDataset(datasetId.value, { viewer_config: overrides })
         showToast(t('Viewer settings saved.', SCOPE), 'neutral')
     } catch (err) {
-        const detail = (err as { response?: { data?: { detail?: string } } }).response?.data?.detail
-        showToast(detail ?? t('Failed to save viewer settings.', SCOPE), 'danger')
+        showToast(errorDetail(err, t('Failed to save viewer settings.', SCOPE)), 'danger')
     } finally {
         savingConfig.value = false
     }
@@ -337,7 +352,7 @@ function openSelectionInViewer() {
 interface DisplayRow {
     kind: 'folder' | 'item'
     folder?: DatasetFolder
-    item?: CollectionItem
+    item?: DatasetItem
     depth: number
 }
 
@@ -355,7 +370,7 @@ const displayRows = computed<DisplayRow[]>(() => {
         byParent.set(folder.parent_id, list)
     }
     const folderIds = new Set(folders.value.map(f => f.id))
-    const itemsByFolder = new Map<number | null, CollectionItem[]>()
+    const itemsByFolder = new Map<number | null, DatasetItem[]>()
     for (const item of items.value) {
         const key = item.folder_id !== null && folderIds.has(item.folder_id) ? item.folder_id : null
         const list = itemsByFolder.get(key) ?? []
@@ -398,6 +413,23 @@ function folderSubtreeIds(folderId: number): Set<number> {
 /** Indent a folder select option to its tree depth with em-spaces. */
 function folderOptionLabel(option: { folder: DatasetFolder; depth: number }) {
     return `${'\u2003'.repeat(option.depth)}${option.folder.name}`
+}
+
+/**
+ * The key of an item row. A reader who does not manage a release-gated dataset receives no item id, so the
+ * recording or media hash stands in.
+ * @param item - A row of the items section.
+ */
+function itemKey (item: DatasetItem) {
+    return item.id !== null ? `i${item.id}` : `h${item.object_hash ?? ''}`
+}
+
+/**
+ * The label of an item row: its resolved name, or a placeholder naming whatever identifies it.
+ * @param item - A row of the items section.
+ */
+function itemName (item: DatasetItem) {
+    return item.object_name ?? t('Item #{id}', SCOPE, { id: item.id ?? item.object_hash ?? '' })
 }
 
 /** Folders in display order with their depth, for indented select options. */
@@ -516,11 +548,11 @@ function onFolderAction(event: Event, folder: DatasetFolder) {
 
 // ── Move item to folder ──────────────────────────────────────────────────
 
-const movingItem = ref<CollectionItem | null>(null)
+const movingItem = ref<DatasetItem | null>(null)
 const moveItemLoading = ref(false)
 const moveInput = reactive({ folderId: '' })
 
-function openMoveItem(item: CollectionItem) {
+function openMoveItem(item: DatasetItem) {
     movingItem.value = item
     moveInput.folderId = item.folder_id === null ? '' : String(item.folder_id)
 }
@@ -530,20 +562,21 @@ function closeMoveItem() {
 }
 
 async function submitMoveItem() {
-    if (!movingItem.value) {
+    const itemId = movingItem.value?.id
+    if (itemId === null || itemId === undefined) {
         return
     }
     moveItemLoading.value = true
     try {
         const folderId = moveInput.folderId ? Number(moveInput.folderId) : null
-        const updated = await moveDatasetItem(datasetId.value, movingItem.value.id, folderId)
+        const updated = await moveDatasetItem(datasetId.value, itemId, folderId)
         const row = items.value.find(i => i.id === updated.id)
         if (row) {
             row.folder_id = updated.folder_id
         }
         movingItem.value = null
-    } catch {
-        showToast(t('Failed to move item.', SCOPE), 'danger')
+    } catch (err) {
+        showToast(errorDetail(err, t('Failed to move item.', SCOPE)), 'danger')
     } finally {
         moveItemLoading.value = false
     }
@@ -583,18 +616,36 @@ async function submitEdit() {
             name: input.editName.trim(),
             description: input.editDescription.trim(),
         }
+        const wasGated = dataset.value?.release_gated ?? false
         if (canEditConfig.value && !isPool.value) {
             payload.release_gated = input.editReleaseGated
         }
         dataset.value = await updateDataset(datasetId.value, payload)
         showEdit.value = false
         showToast(t('Dataset updated.', SCOPE), 'success')
-        toastNameWarnings(dataset.value?.warnings)
-    } catch {
-        editError.value = t('Failed to update dataset.', SCOPE)
+        toastNameWarnings(dataset.value.warnings)
+        if ((dataset.value.release_gated ?? false) !== wasGated) {
+            await reloadAfterGateChange()
+        }
+    } catch (err) {
+        // A 409 names why the gate cannot change, e.g. members not authored by the dataset's author.
+        editError.value = errorDetail(err, t('Failed to update dataset.', SCOPE))
     } finally {
         editLoading.value = false
     }
+}
+
+/**
+ * Refresh what the release gate decides after it was switched: the review controls, and the item list, whose
+ * order and release months follow the gate.
+ */
+async function reloadAfterGateChange () {
+    try {
+        items.value = await listDatasetItems(datasetId.value)
+    } catch {
+        // The update itself succeeded; a stale list corrects itself on the next load.
+    }
+    await loadReview()
 }
 
 // ── Delete dataset ────────────────────────────────────────────────────────
@@ -615,8 +666,9 @@ async function confirmDelete() {
         }
         showToast(t('"{name}" moved to trash.', SCOPE, { name: dataset.value?.name ?? '' }), 'neutral')
         router.push({ name: 'datasets' })
-    } catch {
-        showToast(t('Failed to delete dataset.', SCOPE), 'danger')
+    } catch (err) {
+        // A pool refuses deletion with a 409 naming what has to happen first.
+        showToast(errorDetail(err, t('Failed to delete dataset.', SCOPE)), 'danger')
         deleteLoading.value = false
     }
 }
@@ -662,13 +714,17 @@ async function submitAddItem() {
                 items.value.push(r.value)
             }
         })
-        const failed = results.filter(r => r.status === 'rejected')
-        if (failed.length) {
-            addItemError.value = t('{count} recording(s) could not be added.', SCOPE, { count: failed.length })
+        const failure = settledFailure(results)
+        if (failure) {
+            addItemError.value = failure.reason
+                ? t('{count} recording(s) could not be added: {reason}', SCOPE, failure)
+                : t('{count} recording(s) could not be added.', SCOPE, failure)
             return
         }
         showAddItem.value = false
         addItemSelectedHashes.value = []
+    } catch (err) {
+        addItemError.value = errorDetail(err, t('Failed to add recordings.', SCOPE))
     } finally {
         addItemLoading.value = false
     }
@@ -717,32 +773,38 @@ async function onAddMediaSubmit (hashes: string[]) {
                 items.value.push(r.value)
             }
         })
-        const failed = results.filter(r => r.status === 'rejected')
-        if (failed.length) {
+        const failure = settledFailure(results)
+        if (failure) {
             showToast(
-                t('{count} media file(s) could not be added.', SCOPE, { count: failed.length }),
+                failure.reason
+                    ? t('{count} media file(s) could not be added: {reason}', SCOPE, failure)
+                    : t('{count} media file(s) could not be added.', SCOPE, failure),
                 'warning',
             )
         }
         showAddMedia.value = false
-    } catch {
-        showToast(t('Failed to add media files.', SCOPE), 'danger')
+    } catch (err) {
+        showToast(errorDetail(err, t('Failed to add media files.', SCOPE)), 'danger')
     }
 }
 
-async function removeItem(item: CollectionItem) {
+async function removeItem(item: DatasetItem) {
+    const itemId = item.id
+    if (itemId === null) {
+        return
+    }
     try {
-        await removeDatasetItem(datasetId.value, item.id)
-        items.value = items.value.filter(i => i.id !== item.id)
-    } catch {
-        showToast(t('Failed to remove item.', SCOPE), 'danger')
+        await removeDatasetItem(datasetId.value, itemId)
+        items.value = items.value.filter(i => i.id !== itemId)
+    } catch (err) {
+        showToast(errorDetail(err, t('Failed to remove item.', SCOPE)), 'danger')
     }
 }
 
-const attachMediaItem = ref<CollectionItem | null>(null)
+const attachMediaItem = ref<DatasetItem | null>(null)
 
 /** Route the recording row menu: attach media opens the dialog, anything else removes. */
-function onRecordingAction(value: string, item: CollectionItem) {
+function onRecordingAction(value: string, item: DatasetItem) {
     if (value === 'attach-media') {
         attachMediaItem.value = item
     } else if (value === 'edit') {
@@ -759,7 +821,7 @@ function onRecordingAction(value: string, item: CollectionItem) {
 }
 
 /** Route the media row menu: move to folder opens the dialog, anything else removes. */
-function onMediaAction(value: string, item: CollectionItem) {
+function onMediaAction(value: string, item: DatasetItem) {
     if (value === 'move-folder') {
         openMoveItem(item)
     } else {
@@ -773,7 +835,7 @@ const editingRec = ref<Recording | null>(null)
 
 // The dataset list only carries the item's hash and name, so fetch the full
 // recording before opening the shared edit dialog.
-async function openEditRecording(item: CollectionItem) {
+async function openEditRecording(item: DatasetItem) {
     if (!item.object_hash) {
         return
     }
@@ -801,6 +863,7 @@ const revokeFn = (right: AccessRight) =>
 
 const assessFn = (right: AccessRight, payload: AssessmentPayload) =>
     assessDatasetAccess(datasetId.value, right.id, payload)
+
 </script>
 
 <template>
@@ -889,7 +952,7 @@ const assessFn = (right: AccessRight, payload: AssessmentPayload) =>
             </p>
 
             <div v-else class="list-rows" ref="listRef">
-                <template v-for="row in displayRows" :key="row.kind === 'folder' ? `f${row.folder!.id}` : `i${row.item!.id}`">
+                <template v-for="row in displayRows" :key="row.kind === 'folder' ? `f${row.folder!.id}` : itemKey(row.item!)">
                     <div v-if="row.kind === 'folder' && row.folder"
                         class="folder-row"
                         :style="{ paddingLeft: `${row.depth * 1.5}rem` }"
@@ -919,14 +982,14 @@ const assessFn = (right: AccessRight, payload: AssessmentPayload) =>
                     <template v-else-if="row.item">
                         <div v-for="item in [row.item]"
                             class="tree-row"
-                            :key="item.id"
+                            :key="itemKey(item)"
                             :style="{ paddingLeft: `${row.depth * 1.5}rem` }"
                         >
                             <RecordingListRow v-if="item.object_type === 'recording' && item.object_hash"
                                 :hash="item.object_hash"
                                 :is-focused="focusedHash === item.object_hash"
                                 :is-selected="selected.has(item.object_hash)"
-                                :name="item.object_name ?? t('Item #{id}', SCOPE, { id: item.id })"
+                                :name="itemName(item)"
                                 :selection-active="selected.size > 0"
                                 @checkbox-click="onCheckboxClick(item.object_hash)"
                                 @dropdown-action="onRecordingAction($event, item)"
@@ -935,32 +998,37 @@ const assessFn = (right: AccessRight, payload: AssessmentPayload) =>
                                 @row-dblclick="openRecordings([item.object_hash])"
                             >
                                 <template #meta>
-                                    <wa-tag v-if="dataset?.release_gated && !item.release_month" size="small" variant="warning">
+                                    <wa-tag v-if="dataset?.release_gated && !item.release_month" size="s" variant="warning">
                                         {{ t('Unreleased', SCOPE) }}
                                     </wa-tag>
-                                    <wa-tag v-if="reviewOf(item) && !reviewOf(item)?.released" size="small" variant="neutral">
+                                    <wa-tag v-if="reviewOf(item) && !reviewOf(item)?.released" size="s" variant="neutral">
                                         {{ approvalLabel(reviewOf(item)!) }}
                                     </wa-tag>
                                 </template>
                                 <template #actions>
-                                    <wa-dropdown-item value="edit">
-                                        <wa-icon name="pencil" slot="icon"></wa-icon>
-                                        {{ t('Edit', SCOPE) }}
-                                    </wa-dropdown-item>
-                                    <wa-dropdown-item value="attach-media">
-                                        <wa-icon name="paperclip" slot="icon"></wa-icon>
-                                        {{ t('Attach media', SCOPE) }}
-                                    </wa-dropdown-item>
-                                    <wa-dropdown-item v-if="canManageFolders && folders.length" value="move-folder">
+                                    <template v-if="!isPool">
+                                        <wa-dropdown-item value="edit">
+                                            <wa-icon name="pencil" slot="icon"></wa-icon>
+                                            {{ t('Edit', SCOPE) }}
+                                        </wa-dropdown-item>
+                                        <wa-dropdown-item value="attach-media">
+                                            <wa-icon name="paperclip" slot="icon"></wa-icon>
+                                            {{ t('Attach media', SCOPE) }}
+                                        </wa-dropdown-item>
+                                    </template>
+                                    <wa-dropdown-item v-if="canManageFolders && folders.length && item.id !== null" value="move-folder">
                                         <wa-icon name="folder-open" slot="icon"></wa-icon>
                                         {{ t('Move to folder', SCOPE) }}
                                     </wa-dropdown-item>
                                     <template v-if="reviewOf(item) && !reviewOf(item)?.released">
-                                        <wa-dropdown-item v-if="!reviewOf(item)?.approved_by_me" value="approve">
+                                        <wa-dropdown-item v-if="!reviewOf(item)?.approved_by_me"
+                                            :disabled="approvalPending(item)"
+                                            value="approve"
+                                        >
                                             <wa-icon name="check" slot="icon"></wa-icon>
                                             {{ t('Approve for release', SCOPE) }}
                                         </wa-dropdown-item>
-                                        <wa-dropdown-item v-else value="withdraw-approval">
+                                        <wa-dropdown-item v-else :disabled="approvalPending(item)" value="withdraw-approval">
                                             <wa-icon name="rotate-left" slot="icon"></wa-icon>
                                             {{ t('Withdraw approval', SCOPE) }}
                                         </wa-dropdown-item>
@@ -969,7 +1037,7 @@ const assessFn = (right: AccessRight, payload: AssessmentPayload) =>
                                         <wa-icon name="ban" slot="icon"></wa-icon>
                                         {{ t('Veto…', SCOPE) }}
                                     </wa-dropdown-item>
-                                    <wa-dropdown-item v-if="!isPool" value="remove" variant="danger">
+                                    <wa-dropdown-item v-if="!isPool && item.id !== null" value="remove" variant="danger">
                                         <wa-icon name="xmark" slot="icon"></wa-icon>
                                         {{ t('Remove from dataset', SCOPE) }}
                                     </wa-dropdown-item>
@@ -981,17 +1049,17 @@ const assessFn = (right: AccessRight, payload: AssessmentPayload) =>
                                 :is-focused="false"
                                 :is-selected="false"
                                 :is-supported="item.is_supported ?? false"
-                                :name="item.object_name ?? t('Item #{id}', SCOPE, { id: item.id })"
+                                :name="itemName(item)"
                                 @dropdown-action="onMediaAction($event, item)"
                                 @open="openMedia(item.object_hash)"
                                 @row-dblclick="openMedia(item.object_hash)"
                             >
                                 <template #actions>
-                                    <wa-dropdown-item v-if="canManageFolders && folders.length" value="move-folder">
+                                    <wa-dropdown-item v-if="canManageFolders && folders.length && item.id !== null" value="move-folder">
                                         <wa-icon name="folder-open" slot="icon"></wa-icon>
                                         {{ t('Move to folder', SCOPE) }}
                                     </wa-dropdown-item>
-                                    <wa-dropdown-item v-if="!isPool" value="remove" variant="danger">
+                                    <wa-dropdown-item v-if="!isPool && item.id !== null" value="remove" variant="danger">
                                         <wa-icon name="xmark" slot="icon"></wa-icon>
                                         {{ t('Remove from dataset', SCOPE) }}
                                     </wa-dropdown-item>
@@ -1001,7 +1069,7 @@ const assessFn = (right: AccessRight, payload: AssessmentPayload) =>
                                 <div class="list-row-main">
                                     <wa-icon class="icon-muted" name="file"></wa-icon>
                                     <span class="list-row-name">
-                                        {{ item.object_name ?? t('Item #{id}', SCOPE, { id: item.id }) }}
+                                        {{ itemName(item) }}
                                     </span>
                                 </div>
                             </div>

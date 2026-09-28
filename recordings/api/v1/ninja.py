@@ -353,7 +353,8 @@ class RecordingPatchIn(Schema):
     Set ``display_name`` to an empty string to clear it and revert to the
     default (``stored_name`` hash prefix). ``public_source`` takes a DOI or an
     http(s) URL of the published dataset the data was taken from, or an empty
-    string to clear it; anything else is refused with 400.
+    string to clear it; anything else is refused with 400, a URL carrying a
+    login, a query string or a fragment included.
     """
 
     display_name: str | None = None
@@ -478,6 +479,48 @@ def _stored_digest_withheld(recording, *, can_see_author_fields: bool, user, wit
     from library.release import stored_digest_withheld
 
     return stored_digest_withheld(user, recording)
+
+
+def _reads_under_middleware(recording, *, user, fed, share_token: str | None = None) -> bool:
+    """True when the caller's read terms on *recording* carry ``apply_middleware``.
+
+    Authors and superusers read raw. A peer reads on its federated terms, everyone else on the
+    terms ``get_read_access_result`` resolves, share token included.
+    """
+    if fed is not None:
+        fed_peer, remote_user_id = fed
+        return get_federated_read_access_result(fed_peer, remote_user_id, recording).apply_middleware
+    if (
+        user is not None
+        and getattr(user, "is_authenticated", False)
+        and (getattr(user, "is_superuser", False) or recording.author_id == user.pk)
+    ):
+        return False
+    return get_read_access_result(user=user, obj=recording, share_token=share_token).apply_middleware
+
+
+def _text_digest_withheld(meta, *, can_see_author_fields: bool, under_middleware) -> bool:
+    """True when ``stored_hash`` digests annotation text the caller's grant strips from the bytes.
+
+    A recording stored with its annotation text (``annotation_text_preserved``) is served to a
+    de-identifying reader with that text removed, so its ``stored_hash`` digests bytes the reader
+    never receives. With every other byte in hand, the reader could confirm a guessed annotation
+    against it offline, and where ingest changed nothing the digest is also the uploaded file's.
+    *under_middleware* is a callable, resolved only for a recording that keeps its text.
+    """
+    if can_see_author_fields or meta is None or not getattr(meta, "annotation_text_preserved", False):
+        return False
+    return bool(under_middleware())
+
+
+def _annotation_text_preserved(recording) -> bool:
+    """The stored ``annotation_text_preserved`` flag of *recording*, False when it has no meta row yet."""
+    from recordings.models import RecordingMeta
+
+    recording_ct = ContentType.objects.get_for_model(recording, for_concrete_model=False)
+    return RecordingMeta.objects.filter(
+        content_type=recording_ct, object_id=str(recording.pk), annotation_text_preserved=True
+    ).exists()
 
 
 def _hidden_for_caller(recording, user, fed, share_token: str | None = None) -> bool:
@@ -1214,6 +1257,8 @@ def _build_recording_out(
     trashed_collection_by_pk: dict | None = None,
     release_month_by_pk: dict | None = None,
     digest_withheld_ids: set | None = None,
+    share_token: str | None = None,
+    middleware_ids: set | None = None,
 ) -> dict:
     """Assemble a RecordingOut-compatible dict for a single Recording instance.
 
@@ -1226,6 +1271,10 @@ def _build_recording_out(
     supplied, ``original_name`` is omitted from the response — call sites
     that have already established authorship pass the *user* so the author
     sees their original filename.
+
+    *middleware_ids* is a listing's batch answer to which recordings the caller
+    reads under ``apply_middleware`` (string pks); without it the terms are
+    resolved per recording, with *share_token*, when ``stored_hash`` depends on them.
     """
     meta_obj = (meta_by_pk or {}).get(recording.pk)
     can_see_author_fields = _can_see_original_name(user, recording, fed)
@@ -1234,6 +1283,14 @@ def _build_recording_out(
     )
     digest_withheld = _stored_digest_withheld(
         recording, can_see_author_fields=can_see_author_fields, user=user, withheld_ids=digest_withheld_ids
+    ) or _text_digest_withheld(
+        meta_obj,
+        can_see_author_fields=can_see_author_fields,
+        under_middleware=lambda: (
+            str(recording.pk) in middleware_ids
+            if middleware_ids is not None
+            else _reads_under_middleware(recording, user=user, fed=fed, share_token=share_token)
+        ),
     )
     out = {
         "hash": recording.stored_name.split(".", 1)[0],
@@ -1562,7 +1619,7 @@ def upload_recording(
         "file_extension": recording.file_extension,
         "file_size": recording.file_size,
         "status": recording.status,
-        "warnings": name_warnings(display_name=normalized_display_name),
+        "warnings": name_warnings(display_name=normalized_display_name, public_source=normalized_public_source),
     }
 
 
@@ -1587,6 +1644,9 @@ def recording_status(request, hash: str):
     )
     if recording is None:
         raise HttpError(404, "Recording not found")
+    # Annotated before any refusal, so a 403 or 404 from the gate or the permission check
+    # lands on the same verb and target as a served read: the dataset access report counts both.
+    log_activity(verb="recordings.status", target=recording)
 
     if fed is not None:
         fed_peer, remote_user_id = fed
@@ -1776,8 +1836,16 @@ def list_recordings(
     # file_size at zero extra cost.  Signal pipelines require one EDF header disk
     # read per affected recording — see _compute_download_sizes_for_peer.
     download_sizes: dict | None = None
+    middleware_ids: set | None = None
     if fed is not None:
         download_sizes = _compute_download_sizes_for_peer(visible, fed_peer, remote_user_id, meta_by_pk)
+        middleware_ids = {
+            object_id
+            for object_id, terms in get_federated_access_terms(
+                fed_peer, remote_user_id, recording_ct, [r.pk for r in visible]
+            ).items()
+            if terms.apply_middleware
+        }
         # List endpoint discloses *existence* of visible recordings, not their
         # content — one summary row per call rather than one per recording
         # listed, to keep the audit table compact.  Forensics that needs the
@@ -1837,6 +1905,7 @@ def list_recordings(
             trashed_collection_by_pk=trashed_collection_by_pk,
             release_month_by_pk=release_month_by_pk,
             digest_withheld_ids=digest_withheld_ids,
+            middleware_ids=middleware_ids,
         )
         for r in visible
     ]
@@ -1885,6 +1954,9 @@ def recording_detail_slice(
     )
     if recording is None:
         raise HttpError(404, "Recording not found")
+    # Annotated before any refusal, so a 403 or 404 from the gate or the permission check
+    # lands on the same verb and target as a served read: the dataset access report counts both.
+    log_activity(verb="recordings.read.slice", target=recording)
 
     if fed is not None:
         fed_peer, remote_user_id = fed
@@ -2042,7 +2114,13 @@ def recording_detail_slice(
 
     can_see_author_fields = _can_see_original_name(user, recording, fed)
     release_month = _release_month_of(recording, can_see_author_fields=can_see_author_fields)
-    digest_withheld = _stored_digest_withheld(recording, can_see_author_fields=can_see_author_fields, user=user)
+    digest_withheld = _stored_digest_withheld(
+        recording, can_see_author_fields=can_see_author_fields, user=user
+    ) or _text_digest_withheld(
+        meta,
+        can_see_author_fields=can_see_author_fields,
+        under_middleware=lambda: text_terms is not None and text_terms.apply_middleware,
+    )
     return {
         "hash": recording.stored_name.split(".", 1)[0],
         "original_name": (recording.original_name if can_see_author_fields else None),
@@ -2107,6 +2185,9 @@ def list_recording_annotations(
     )
     if recording is None:
         raise HttpError(404, "Recording not found")
+    # Annotated before any refusal, so a 403 or 404 from the gate or the permission check
+    # lands on the same verb and target as a served read: the dataset access report counts both.
+    log_activity(verb="recordings.annotations.list", target=recording)
 
     if _hidden_for_caller(recording, user, None):
         raise HttpError(404, "Recording not found")
@@ -2282,6 +2363,9 @@ def recording_detail(request, hash: str, share_token: str | None = None):
     )
     if recording is None:
         raise HttpError(404, "Recording not found")
+    # Annotated before any refusal, so a 403 or 404 from the gate or the permission check
+    # lands on the same verb and target as a served read: the dataset access report counts both.
+    log_activity(verb="recordings.read", target=recording)
 
     if fed is not None:
         fed_peer, remote_user_id = fed
@@ -2341,7 +2425,7 @@ def recording_detail(request, hash: str, share_token: str | None = None):
         target=recording,
         metadata={"share_token_used": bool((share_token or "").strip())},
     )
-    return _build_recording_out(recording, meta_by_pk, user=user, fed=fed)
+    return _build_recording_out(recording, meta_by_pk, user=user, fed=fed, share_token=share_token)
 
 
 @api.get("/{hash}/file")
@@ -2390,6 +2474,9 @@ def download_recording(
         )
     if recording is None:
         raise HttpError(404, "Recording not found")
+    # Annotated before any refusal, so a 403 or 404 from the gate or the permission check
+    # lands on the same verb and target as a served read: the dataset access report counts both.
+    log_activity(verb="recordings.download", target=recording)
 
     # Determine apply_middleware from the appropriate access right.
     # Federated peers always go through their explicit grant — there is no
@@ -2470,8 +2557,11 @@ def download_recording(
         recording,
         expect_stored_hash,
         digest_withheld=expect_stored_hash is not None
-        and _stored_digest_withheld(
-            recording, can_see_author_fields=_can_see_original_name(user, recording, fed), user=user
+        and (
+            _stored_digest_withheld(
+                recording, can_see_author_fields=_can_see_original_name(user, recording, fed), user=user
+            )
+            or (apply_middleware and _annotation_text_preserved(recording))
         ),
     )
 
@@ -2563,6 +2653,9 @@ def slice_recording(
         )
     if recording is None:
         raise HttpError(404, "Recording not found")
+    # Annotated before any refusal, so a 403 or 404 from the gate or the permission check
+    # lands on the same verb and target as a served read: the dataset access report counts both.
+    log_activity(verb="recordings.download.slice", target=recording)
 
     apply_middleware = False
     if fed is not None:
@@ -2646,8 +2739,11 @@ def slice_recording(
         recording,
         expect_stored_hash,
         digest_withheld=expect_stored_hash is not None
-        and _stored_digest_withheld(
-            recording, can_see_author_fields=_can_see_original_name(user, recording, fed), user=user
+        and (
+            _stored_digest_withheld(
+                recording, can_see_author_fields=_can_see_original_name(user, recording, fed), user=user
+            )
+            or (apply_middleware and _annotation_text_preserved(recording))
         ),
     )
 
@@ -2808,9 +2904,15 @@ def update_recording(request, hash: str, payload: RecordingPatchIn):
             metadata={"fields_updated": fields_updated},
         )
 
-    # Warnings are for the label being written, so a modality-only patch
-    # reports nothing about a label it did not touch.
-    label_warnings = name_warnings(display_name=recording.display_name) if payload.display_name is not None else []
+    # Warnings are for the labels being written, so a modality-only patch
+    # reports nothing about a label it did not touch. ``public_source`` is served
+    # to every reader as typed, so it is checked as a display name is.
+    written_labels = {}
+    if payload.display_name is not None:
+        written_labels["display_name"] = recording.display_name
+    if payload.public_source is not None:
+        written_labels["public_source"] = recording.public_source
+    label_warnings = name_warnings(**written_labels)
     return {**_build_recording_out(recording, user=user), "warnings": label_warnings}
 
 
@@ -3128,6 +3230,7 @@ def submit_file(
         Violation,
         can_submit_to_dataset,
         get_ingest_profile,
+        parse_sidecar,
         submission_spool_root,
         validate_file,
         validate_submission,
@@ -3149,8 +3252,8 @@ def submit_file(
 
     data = file.read()
     try:
-        sidecar_document = json.loads(sidecar.read().decode("utf-8"))
-    except (UnicodeDecodeError, ValueError):
+        sidecar_document = parse_sidecar(sidecar.read())
+    except ValueError:  # UnicodeDecodeError, malformed JSON, NaN / Infinity, nesting past the parser
         violations = validate_file(profile, data)
         violations.append(Violation("sidecar_shape", "The sidecar is not valid JSON."))
     else:
@@ -3175,7 +3278,9 @@ def submit_file(
     while (spool / stored_name).exists():
         stored_name = f"{secrets.token_hex(16).upper()}{extension}"
     spool_path = spool / stored_name
-    spool_path.write_bytes(data)
+    # The bytes are written inside the transaction, after the row: a failure before the write leaves
+    # nothing, a failed write rolls the row back and unlinks, and only a worker dying between the write
+    # and the commit can leave bytes without a row, which the hourly sweep of the spool unlinks.
     try:
         with transaction.atomic():
             # The pool's row lock, the one its configuration writes take: a dissolve or a
@@ -3195,6 +3300,7 @@ def submit_file(
                 sidecar=sidecar_document,
             )
             log_activity(verb="recordings.submission.file.accept", target=ledger, metadata={"ledger_created": created})
+            spool_path.write_bytes(data)
     except Exception:
         spool_path.unlink(missing_ok=True)
         raise

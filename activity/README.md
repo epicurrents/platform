@@ -207,6 +207,10 @@ Note: there is no stored-`author_id` fallback. If the target object has been del
 
 The bulk endpoint does a **pre-flight pass**: every ID in `change_ids` is validated for existence and permission *before* any data is touched. A single 404 or 403 aborts the whole batch.
 
+### Rollback guards
+
+A rollback writes a row's audited state back directly, past every endpoint rule, so an app whose rows carry rules its endpoints enforce registers a guard with `register_rollback_guard(model_label, guard)` from its `AppConfig.ready()`. `guard(change, existing_obj)` returns a reason to refuse or `None`; `existing_obj` is the live row or `None`. `rollback_refusal(change)` is the first reason any guard gives. `can_rollback_change` answers `False` for a refused change whoever asks, superusers included, so the change listing for non-superusers and the bulk pre-flight (403) never offer it, and `rollback_change` raises `RollbackRefused`, a `ValueError`, which the single endpoint answers with 400 once the caller's access is established. Guards protect invariants, not access. The library registers guards for the pool and release models ([library/README.md → Gotchas](../library/README.md#gotchas)).
+
 ### Worked example — restore a recording from trash
 
 Soft-delete sets `Recording.deleted_at`, which the auto-signal records as a MODIFY. To restore:

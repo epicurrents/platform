@@ -31,8 +31,9 @@ Two kinds of mapper, tried in this order until one answers:
   length ships beside that converter without the platform importing it. The format is in :func:`load_table`.
 
 ``RECORDINGS_DISCARD_EMBEDDED_ANNOTATIONS`` keeps its meaning of writing nothing from the file that carries text or
-the vendor's vocabulary: under it the raw record and the placeholders are not written. Translated events are,
-because a translated event carries the platform's own term and a timestamp and nothing from the file besides.
+the vendor's vocabulary: under it the raw record and the placeholders are not written, and a translated event's
+code is written without ``meta``. Translated events are written, because such an event carries the platform's own
+term and a timestamp and nothing from the file besides.
 """
 
 from __future__ import annotations
@@ -44,7 +45,7 @@ import re
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from functools import cache
-from pathlib import Path
+from pathlib import Path, PurePath
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -162,14 +163,14 @@ class _Rule:
                 return None
             groups = match.groups()
 
-        def fill(value: Any) -> Any:
-            if not isinstance(value, str) or not groups:
-                return value
-            return _GROUP_REF.sub(
-                lambda m: groups[int(m.group(1)) - 1] if 0 < int(m.group(1)) <= len(groups) else "", value
+        code = self.code
+        if groups:
+            code = _GROUP_REF.sub(
+                lambda m: groups[int(m.group(1)) - 1] if 0 < int(m.group(1)) <= len(groups) else "", code
             )
-
-        return Translation(code=fill(self.code), meta={k: fill(v) for k, v in self.meta.items()} or None)
+        # ``meta`` is copied as the table gives it: a group reference there would copy the vendor's text onto the
+        # code, and ``load_table`` refuses one.
+        return Translation(code=code, meta=dict(self.meta) or None)
 
 
 @dataclass(frozen=True)
@@ -184,6 +185,17 @@ class Table:
     def literal_codes(self) -> list[str]:
         """The codes that carry no group reference, which is every code a check can resolve ahead of a match."""
         return [rule.code for rule in self.rules if not _GROUP_REF.search(rule.code)]
+
+
+def _carries_group_ref(value: Any) -> bool:
+    """True when a string anywhere in *value* holds a ``{n}`` group reference."""
+    if isinstance(value, str):
+        return bool(_GROUP_REF.search(value))
+    if isinstance(value, dict):
+        return any(_carries_group_ref(key) or _carries_group_ref(item) for key, item in value.items())
+    if isinstance(value, list):
+        return any(_carries_group_ref(item) for item in value)
+    return False
 
 
 def _parse_rule(raw: Any, index: int, path: Path) -> _Rule:
@@ -204,6 +216,10 @@ def _parse_rule(raw: Any, index: int, path: Path) -> _Rule:
             raise EventTranslationError(f"{where} key {key!r} must be a non-empty string.")
     if "meta" in raw and not isinstance(raw["meta"], dict):
         raise EventTranslationError(f"{where} key 'meta' must be an object.")
+    if "meta" in raw and _carries_group_ref(raw["meta"]):
+        raise EventTranslationError(
+            f"{where} key 'meta' holds a group reference; only the code may take text from the label."
+        )
     pattern = None
     if "pattern" in raw:
         try:
@@ -226,8 +242,9 @@ def load_table(path: Path) -> Table:
     specific rule goes before a general one. A rule carries ``code`` and at least one matcher: ``type`` and
     ``label`` compare to the source's fields casefolded with whitespace collapsed, ``pattern`` is a regular
     expression the whole label must match, case-insensitively. With ``pattern``, ``{1}``, ``{2}``, … in ``code``
-    and in string ``meta`` values are replaced by the groups, and a code assembled that way is checked against the
-    vocabularies at match time rather than at deploy, failing closed. ``meta`` is an object stored on the code.
+    are replaced by the groups, and a code assembled that way is checked against the vocabularies at match time
+    rather than at deploy, failing closed. ``meta`` is an object stored on the code as given; a group reference in
+    it is refused, since it would carry the vendor's label text onto the code.
 
         {"name": "Vendor X events",
          "rules": [{"type": "Eyes closed", "code": "EEG_ACT_EC"},
@@ -361,13 +378,22 @@ def translate_source_event(source: SourceEvent) -> ResolvedTerm | None:
 # ── Writing ───────────────────────────────────────────────────────────────────
 
 
-def annotation_hash(recording_pk: int, suffix: str) -> str:
+def annotation_hash(recording, suffix: str) -> str:
     """A 32-character uppercase hex ``object_hash`` for a server-generated annotation row.
 
-    Keyed on the recording's primary key rather than the file hash, so uploading the same file a second time yields
-    a different set of hashes. *suffix* distinguishes sibling rows on one recording.
+    Keyed on the stem of the recording's ``stored_name``, a random token minted per upload and already public as the
+    recording's URL identifier, so uploading the same file a second time yields a different set of hashes. The stem
+    survives a format conversion, which changes only the extension. *suffix* distinguishes sibling rows on one
+    recording.
+
+    Never key this on the primary key: the hash is served to every reader, and a sequential integer behind a fixed
+    public suffix is recovered by brute force in under a second, which hands out the arrival order that release months
+    and name ordering exist to hide. Rows written before the change keep their PK-derived hashes.
     """
-    key = f"{recording_pk}:{suffix}"
+    stem = PurePath(recording.stored_name).stem
+    if not stem:
+        raise ValueError("annotation_hash needs a recording with a stored_name")
+    key = f"{stem}:{suffix}"
     return hashlib.sha256(key.encode()).hexdigest()[:32].upper()
 
 
@@ -383,8 +409,10 @@ def write_source_events(
 
     *hash_prefix* keeps the two seams' rows apart: the row for the event at *index* carries the hash suffix
     ``"<hash_prefix>:<index>"``, so a seam called once per ingest writes distinct hashes. Under
-    ``RECORDINGS_DISCARD_EMBEDDED_ANNOTATIONS`` the placeholders are skipped and only translated events are written;
-    *discard_text* set to a bool decides it instead of the setting. Returns the number of translated events.
+    ``RECORDINGS_DISCARD_EMBEDDED_ANNOTATIONS`` the placeholders are skipped, only translated events are written and
+    their codes carry no ``meta``, which a Python mapper may have filled from the source's text; *discard_text* set
+    to a bool decides it instead of the setting, and the pooled ingest sets it. Returns the number of translated
+    events.
     """
     from django.conf import settings
     from django.contrib.contenttypes.models import ContentType
@@ -409,7 +437,7 @@ def write_source_events(
             author=system_user,
             target_content_type=recording_ct,
             target_object_id=str(recording.pk),
-            object_hash=annotation_hash(recording.pk, f"{hash_prefix}:{index}"),
+            object_hash=annotation_hash(recording, f"{hash_prefix}:{index}"),
             name=term.name if term else placeholder_name(source),
             event_class=term.event_class if term else "",
             timestamp=source.onset,
@@ -420,7 +448,11 @@ def write_source_events(
         if event_ct is None:
             event_ct = ContentType.objects.get_for_model(Event)
         Code.objects.create(
-            content_type=event_ct, object_id=str(event.pk), standard=term.standard, value=term.code, meta=term.meta
+            content_type=event_ct,
+            object_id=str(event.pk),
+            standard=term.standard,
+            value=term.code,
+            meta=None if discard else term.meta,
         )
         translated += 1
     return translated

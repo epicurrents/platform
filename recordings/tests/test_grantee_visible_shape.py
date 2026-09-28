@@ -244,3 +244,67 @@ class TestGranteeVisibleShape:
         body = _get(shape, reader, "detail").json()
         assert body["stored_hash"] == shape["recording"].stored_hash
         assert len(body["stored_hash"]) == 64
+
+
+@pytest.mark.django_db
+class TestStoredHashOfPreservedText:
+    """A deliberate change of this contract (2026-09-28): ``stored_hash`` is withheld from a de-identifying reader
+    of a recording stored with its annotation text.
+
+    Such a reader receives the file with the text stripped, so the stored file's digest covers bytes they never
+    receive. With every other byte in hand they could confirm a guessed annotation offline against it, and where
+    ingest changed nothing the digest is also the uploaded file's. The key stays in the response and is served
+    empty, as for a release-gated member's digest; the content pin answers 400. Authors and raw readers are
+    unaffected.
+    """
+
+    @pytest.fixture
+    def preserved(self, shape):
+        from recordings.models import RecordingMeta
+
+        RecordingMeta.objects.filter(object_id=str(shape["recording"].pk)).update(annotation_text_preserved=True)
+        return shape
+
+    @pytest.mark.parametrize(("route", "reader"), [*ROUTE_READERS, ("list", "grantee"), ("list", "peer")])
+    def test_withheld_from_every_de_identifying_reader(self, preserved, reader, route):
+        response = _get(preserved, reader, route)
+        assert response.status_code == 200, response.content
+        body = response.json()
+        if route == "list":
+            (body,) = [item for item in body if item["hash"] == _hash(preserved["recording"])]
+        assert body["stored_hash"] == ""
+
+    @pytest.mark.parametrize("route", ["detail", "slice"])
+    def test_served_to_the_author(self, preserved, route):
+        assert _get(preserved, "author", route).json()["stored_hash"] == preserved["recording"].stored_hash
+
+    def test_served_to_a_raw_grantee(self, preserved, make_user):
+        recording = preserved["recording"]
+        raw = make_user()
+        AccessRight.objects.create(
+            content_type=AccessRight.objects.filter(object_id=str(recording.pk)).first().content_type,
+            object_id=str(recording.pk),
+            access_giver=preserved["author"],
+            access_target=raw,
+            can_read=True,
+            apply_middleware=False,
+        )
+        preserved["raw"] = raw
+        assert _get(preserved, "raw", "detail").json()["stored_hash"] == recording.stored_hash
+
+    @pytest.mark.parametrize("path", ["file", "file/slice?t_start=0&t_end=1"])
+    def test_the_content_pin_is_refused_to_a_de_identifying_reader(self, preserved, path):
+        recording = preserved["recording"]
+        client = Client()
+        client.force_login(preserved["grantee"])
+        separator = "&" if "?" in path else "?"
+        url = f"/recordings/api/v1/{_hash(recording)}/{path}{separator}expect_stored_hash={recording.stored_hash}"
+        response = client.get(url)
+        assert response.status_code == 400, response.content
+
+    def test_the_content_pin_still_answers_the_author(self, preserved):
+        recording = preserved["recording"]
+        client = Client()
+        client.force_login(preserved["author"])
+        response = client.get(f"/recordings/api/v1/{_hash(recording)}/file?expect_stored_hash={recording.stored_hash}")
+        assert response.status_code == 200

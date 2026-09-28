@@ -100,6 +100,21 @@ class TestNormalisation:
         with pytest.raises(ValueError, match="DOI"):
             normalise_public_source(given)
 
+    @pytest.mark.parametrize(
+        "given",
+        [
+            "https://pacs.hospital-x.example/study?patient=Doe%20John&dob=1961-03-02",
+            "https://physionet.org/content/chbmit/1.0.0/#subject-jd",
+            "https://user:secret@physionet.org/content/chbmit/1.0.0/",
+            "https://jdoe@physionet.org/content/chbmit/",
+            f"https://doi.org/{DOI}?patient=1",
+            "https://example.org/data?",
+        ],
+    )
+    def test_a_url_with_a_login_a_query_or_a_fragment_is_refused(self, given):
+        with pytest.raises(ValueError, match="plain dataset address"):
+            normalise_public_source(given)
+
     def test_an_overlong_value_is_refused(self):
         with pytest.raises(ValueError, match="at most"):
             normalise_public_source("https://example.org/" + "x" * PUBLIC_SOURCE_MAX_LENGTH)
@@ -145,6 +160,27 @@ class TestPatch:
         assert "DOI" in response.json()["detail"]
         recording.refresh_from_db()
         assert recording.public_source == DOI
+
+    def test_a_url_with_a_query_is_400(self, auth_client):
+        client, user = auth_client
+        recording = _recording(user)
+        response = patch_json(
+            client, f"/recordings/api/v1/{_hash(recording)}", {"public_source": "https://pacs.example/s?pt=Doe"}
+        )
+        assert response.status_code == 400
+        assert "query string" in response.json()["detail"]
+        recording.refresh_from_db()
+        assert recording.public_source == ""
+
+    def test_an_accepted_value_is_checked_like_a_display_name(self, auth_client):
+        client, user = auth_client
+        recording = _recording(user)
+        url = f"/recordings/api/v1/{_hash(recording)}"
+        response = patch_json(client, url, {"public_source": "https://example.org/eeg/2019-04-12/1234567890/"})
+        assert response.status_code == 200, response.content
+        assert {row["field"] for row in response.json()["warnings"]} == {"public_source"}
+        response = patch_json(client, url, {"public_source": URL})
+        assert response.json()["warnings"] == []
 
     def test_the_write_is_audited_by_field_name_only(self, auth_client):
         client, user = auth_client

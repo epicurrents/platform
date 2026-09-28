@@ -44,6 +44,21 @@ class LibraryConfig(AppConfig):
         # from share-token callers so a join link lists no members either.
         register_read_visibility_gate("recordings.recording", member_hidden_from_reader)
         register_read_visibility_gate("library.dataset", dataset_hidden_from_reader)
+        # Media files are members a gated dataset accepts too, under the same
+        # rule keyed on the media file's author.
+        from django.apps import apps as django_apps
+
+        if django_apps.is_installed("media"):
+            register_read_visibility_gate("media.mediafile", member_hidden_from_reader)
+
+        # The pool rules are enforced by the endpoints; a rollback of the audit
+        # trail restores rows past them, so each pool-related model refuses the
+        # rollbacks that would.
+        from activity.audit import register_rollback_guard
+        from library.rollback_guards import ROLLBACK_GUARDS
+
+        for model_label, guard in ROLLBACK_GUARDS.items():
+            register_rollback_guard(model_label, guard)
 
         # A submission pool's group exists for the pool alone: registering it as
         # dedicated makes the grant, role and group-delete endpoints refuse it.
@@ -52,12 +67,21 @@ class LibraryConfig(AppConfig):
 
         register_dedicated_group_resolver(POOL_GROUP_KIND, resolve_pool_groups)
 
-        from django.db.models.signals import post_delete
+        from django.conf import settings
+        from django.db.models.signals import post_delete, pre_delete
 
         from library.models import Dataset
         from library.pools import remove_group_with_dataset
+        from library.release import clear_erased_assessment_references
 
         post_delete.connect(remove_group_with_dataset, sender=Dataset, dispatch_uid="library.pool_group_with_dataset")
+        # A release run's assessment reference is the runner's free text: it
+        # leaves the live row with their account, as it leaves the audit trail.
+        pre_delete.connect(
+            clear_erased_assessment_references,
+            sender=settings.AUTH_USER_MODEL,
+            dispatch_uid="library.release_reference_with_author",
+        )
 
         # Art. 15 subject export: snapshots a user authored are their activity
         # record. The manifest itself is deliberately NOT exported — it holds
@@ -71,12 +95,11 @@ class LibraryConfig(AppConfig):
             "author",
             fields=("label", "manifest_hash", "created_at"),
         )
-        # A release run a user performed is their activity record. The sign-off
-        # list holds primary keys, opaque on both subject surfaces; the
+        # A release run a user performed is their activity record. The
         # assessment reference is free text the runner typed, so it is theirs on
-        # both: exported under their runs, scrubbed from the permanent trail
-        # with their account, as AccessRight.assessment_reference is for the
-        # giver. The live row keeps the reference with a null author.
+        # both subject surfaces: exported under their runs, scrubbed from the
+        # permanent trail and cleared on the live row with their account, as
+        # AccessRight.assessment_reference is for the giver.
         register_export_relation(
             "library.datasetrelease",
             "author",
@@ -86,6 +109,10 @@ class LibraryConfig(AppConfig):
         # that they approved, never which recording, whose hash is another
         # subject's data. The row holds no free text, so nothing to scrub.
         register_export_relation("library.memberapproval", "reviewer", fields=("created_at",))
+        # Signing a release run off is the same kind of record: when, and the
+        # run's date, never which members it released. No free text, nothing to
+        # scrub; the link nulls with the account.
+        register_export_relation("library.datasetreleasesignoff", "user", fields=("release", "created_at"))
         from activity.erasure import register_subject_pii
 
         register_subject_pii(

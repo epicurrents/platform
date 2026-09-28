@@ -61,6 +61,16 @@ export interface CollectionItem {
     is_supported: boolean | null
 }
 
+/**
+ * A row of a dataset's item listing. `id` and `object_id` are null where the row must not be addressable by the
+ * caller: the members of a release-gated dataset as a reader who does not manage it sees them. Such a reader has no
+ * item controls; key and match rows on `object_hash` instead.
+ */
+export interface DatasetItem extends Omit<CollectionItem, 'id' | 'object_id'> {
+    id: number | null
+    object_id: string | null
+}
+
 /** A presentation-only folder in a dataset's tree. */
 export interface DatasetFolder {
     id: number
@@ -89,6 +99,8 @@ export interface AccessRight {
     /** The sharer's contextual assessment; null when none is recorded or the caller may not see it. */
     assessment_reference: string | null
     assessment_date: string | null
+    /** Whether the caller may record the assessment on this row: its giver, the object's author or a superuser. */
+    can_assess: boolean
 }
 
 export interface GrantAccessPayload {
@@ -309,11 +321,11 @@ export interface DatasetPool {
     /** Not a pool and empty, so it can become one. */
     configurable: boolean
     failed_count: number
-    /** A file has been accepted from a contributor: the profile, group and gate are fixed. */
     /** Active members of the contributor group. */
     contributor_count: number
     /** The profile's m: the contributor count intake needs before it opens; null when the profile sets none. */
     contributors_required: number | null
+    /** A file has been accepted from a contributor: the profile, group and gate are fixed. */
     filling: boolean
     group_id: number | null
     group_name: string | null
@@ -355,8 +367,8 @@ export async function dissolveDatasetPool(id: number | string): Promise<DatasetP
 // Dataset items
 // ---------------------------------------------------------------------------
 
-export async function listDatasetItems(datasetId: number | string, params?: { content_type_id?: number; limit?: number; offset?: number }, shareToken?: string): Promise<CollectionItem[]> {
-    const response = await http.get<CollectionItem[]>(`/api/v1/library/datasets/${datasetId}/items/`, {
+export async function listDatasetItems(datasetId: number | string, params?: { content_type_id?: number; limit?: number; offset?: number }, shareToken?: string): Promise<DatasetItem[]> {
+    const response = await http.get<DatasetItem[]>(`/api/v1/library/datasets/${datasetId}/items/`, {
         params: shareToken ? { ...params, share_token: shareToken } : params,
     })
     return response.data
@@ -425,6 +437,8 @@ export interface CollectionExportResult {
     exported_count: number
     skipped_count: number
     folder_count: number
+    /** Free-text warnings for the new dataset's `name` and `description`. */
+    warnings?: NameWarning[]
 }
 
 /**

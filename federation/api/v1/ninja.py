@@ -356,16 +356,19 @@ def patch_grant(request, grant_id: int, payload: FederatedGrantPatchIn):
     grant = _service_call(services.get_grant, grant_id)
     sent = payload.model_fields_set
     assessing = bool(sent & {"assessment_reference", "assessment_date"})
-    if assessing:
-        grant = _service_call(
-            services.record_assessment,
-            grant=grant,
-            actor=user,
-            reference=payload.assessment_reference or "",
-            assessment_date=payload.assessment_date,
-        )
-    if "expires_at" in sent or not assessing:
-        grant = _service_call(services.renew_grant, grant=grant, actor=user, expires_at=payload.expires_at)
+    # One transaction for both writes: a failed renewal must not leave the
+    # assessment recorded while the client sees an error and retries.
+    with transaction.atomic():
+        if assessing:
+            grant = _service_call(
+                services.record_assessment,
+                grant=grant,
+                actor=user,
+                reference=payload.assessment_reference or "",
+                assessment_date=payload.assessment_date,
+            )
+        if "expires_at" in sent or not assessing:
+            grant = _service_call(services.renew_grant, grant=grant, actor=user, expires_at=payload.expires_at)
     return grant
 
 

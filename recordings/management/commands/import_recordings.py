@@ -651,7 +651,7 @@ class Command(BaseCommand):
                         name="Import annotations",
                         target_content_type=recording_ct,
                         target_object_id=str(recording.pk),
-                        object_hash=_annotation_hash(recording.pk, "import-annotations"),
+                        object_hash=_annotation_hash(recording, "import-annotations"),
                         content=sidecar_content,
                     )
                 except Exception as exc:

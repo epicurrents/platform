@@ -83,6 +83,12 @@ MIDDLEWARE = [
     # gated by API_THROTTLE_ENABLED. See epicurrents/throttle.py.
     "epicurrents.middleware.ApiThrottleMiddleware",
     "epicurrents.middleware.ApiActivityLoggingMiddleware",
+    # Keeps a pool submission's body in memory: installs a memory-only upload
+    # handler on the submission route before anything parses the body, and
+    # answers 413 to a body too large for two submission parts. After the audit
+    # middleware so the 413 leaves an Activity row; nothing above reads the body.
+    # See recordings/upload_handlers.py.
+    "recordings.upload_handlers.SubmissionUploadMiddleware",
     # Sets COOP/COEP/CORP when ENABLE_CROSS_ORIGIN_ISOLATION is true so the
     # browser flips on crossOriginIsolated and SharedArrayBuffer becomes
     # available. No-op when the setting is false. Single platform-wide source
@@ -789,7 +795,8 @@ LIBRARY_TAG_CREATION_REQUIRES_STAFF = env_bool("LIBRARY_TAG_CREATION_REQUIRES_ST
 # originals volume is refused at boot while this is on (library/checks.py). Set by the project.
 LIBRARY_RELEASE_GATED_DEPLOYMENT = env_bool("LIBRARY_RELEASE_GATED_DEPLOYMENT", default=False)
 # The validating submission path (recordings/submissions.py). Inert without a registered
-# ingest profile. A submission is read into memory and checked before anything is written,
+# ingest profile. A submission is read into memory (recordings/upload_handlers.py keeps the
+# multipart parse off disk and caps each part at this size) and checked before anything is written,
 # so its own cap is small next to RECORDINGS_MAX_UPLOAD_SIZE: prepared excerpts, not whole
 # recordings. Accepted files wait in the spool (default: a directory under the staging path)
 # until the hourly ingest run takes every file older than the pooling delay.
@@ -806,6 +813,11 @@ RECORDINGS_SUBMISSION_FAILED_RETENTION_DAYS = config(
 # so a pool that never fills does not keep its contributors' files indefinitely.
 RECORDINGS_SUBMISSION_WAITING_RETENTION_DAYS = config(
     "RECORDINGS_SUBMISSION_WAITING_RETENTION_DAYS", default=180, cast=int
+)
+# A file in the spool that no submission row and no recording names, and older than this, is
+# unlinked by the hourly run: bytes left by a worker that died between writing and committing.
+RECORDINGS_SUBMISSION_SPOOL_SWEEP_GRACE_HOURS = config(
+    "RECORDINGS_SUBMISSION_SPOOL_SWEEP_GRACE_HOURS", default=24, cast=int
 )
 
 # ──────────────────────────────────────────────────────────────────────────────

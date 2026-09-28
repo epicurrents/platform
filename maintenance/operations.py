@@ -79,6 +79,9 @@ class Operation:
     the argv the management command gets. ``requires_step_up`` asks for a fresh
     credential confirmation at request time; the default is on, and an operation
     turns it off only when it changes nothing. ``soft_time_limit`` is seconds.
+    ``actor_arg`` names the command's option that records who acted; the
+    executor appends it with the requesting superuser's primary key
+    (:func:`command_argv`), so the request cannot name someone else.
     """
 
     key: str
@@ -90,6 +93,15 @@ class Operation:
     command_args: Callable[[Schema], list[str]] = field(default=_no_args)
     requires_step_up: bool = True
     soft_time_limit: int = 3600
+    actor_arg: str = ""
+
+
+def command_argv(operation: "Operation", args: Schema, *, requested_by_id: int | None) -> list[str]:
+    """The argv the executor passes the operation's command: its own argv plus the requester, when it records one."""
+    argv = list(operation.command_args(args))
+    if operation.actor_arg and requested_by_id is not None:
+        argv += [operation.actor_arg, str(requested_by_id)]
+    return argv
 
 
 _REGISTRY: dict[str, Operation] = {}
@@ -197,11 +209,9 @@ class ReleaseDatasetArgs(Schema):
     )
     k: int | None = Field(None, ge=1, description="The equivalence-class size applied, for the record.")
     m: int | None = Field(None, ge=1, description="The distinct-contributor minimum applied, for the record.")
-    assessment_reference: str | None = Field(
-        None,
-        pattern=r"^[^\r\n]{1,512}$",
-        description="A reference to the written assessment this run relies on, for the record.",
-    )
+    # No assessment reference: it is free text a person types, and a job's args
+    # are identifiers only, served to every staff caller and kept in the trail
+    # past every erasure path. A run needing one is run with the command.
 
 
 def _release_dataset_args(args: ReleaseDatasetArgs) -> list[str]:
@@ -216,8 +226,6 @@ def _release_dataset_args(args: ReleaseDatasetArgs) -> list[str]:
         argv += ["--k", str(args.k)]
     if args.m is not None:
         argv += ["--m", str(args.m)]
-    if args.assessment_reference:
-        argv += ["--assessment-reference", args.assessment_reference]
     return argv
 
 
@@ -357,12 +365,14 @@ def register_core_operations() -> None:
             description=(
                 "Run a release on a release-gated dataset: publish the eligible members (uploaded in month M, "
                 "eligible from the start of M+2, subset decided by the project's selector) and record the run with "
-                "the profile version, the k and m conditions and the assessment reference given here. A dry run "
-                "reports the eligible and selected members and writes nothing."
+                "the profile version and the k and m conditions given here, attributed to the requester. The run "
+                "date may not lie in the future or before the dataset's latest release. A dry run reports the "
+                "eligible and selected members and writes nothing."
             ),
             args_schema=ReleaseDatasetArgs,
             command="release_dataset",
             command_args=_release_dataset_args,
+            actor_arg="--actor-id",
         )
     )
     register_operation(

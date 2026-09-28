@@ -58,7 +58,7 @@ Core registrations, made from `MaintenanceConfig.ready`:
 | `recordings.refresh_signal_metadata` | celery | `refresh_signal_metadata [--dry-run]` | yes |
 | `recordings.deidentification_report` | celery | `deidentification_report --format json` | no |
 | `epicurrents.grant_assessments` | celery | `grant_assessments --format json` | no |
-| `library.release_dataset` | celery | `release_dataset <hash> --format json [--as-of D] [--dry-run] [--profile-version V] [--k N] [--m N] [--assessment-reference R]` | yes |
+| `library.release_dataset` | celery | `release_dataset <hash> --format json [--as-of D] [--dry-run] [--profile-version V] [--k N] [--m N] --actor-id <requester>` | yes |
 | `library.dataset_access_report` | celery | `dataset_access_report <hash> --format json --days N` | no |
 | `library.dataset_anonymity_report` | celery | `dataset_anonymity_report <hash> --format json [--release ID]` | no |
 | `mail.send_test` | celery | `send_test_email` | no |
@@ -67,6 +67,8 @@ Core registrations, made from `MaintenanceConfig.ready`:
 | `platform.rollback` | host | the agent restores the named snapshot, the database too unless `restore_database` is off | yes |
 
 Projects and plugins register their own from `AppConfig.ready()`. A read-only operation may turn `requires_step_up` off; anything that writes keeps it.
+
+An operation whose command records who acted names that option in `actor_arg`; `operations.command_argv(operation, args, requested_by_id=...)` appends it with the requesting superuser's primary key, so the attribution comes from the job row and never from the request body. `library.release_dataset` uses it to attribute the release run, and takes no assessment reference: that is free text, and `args` carries identifiers only.
 
 `platform.rollback` names its snapshot with a string, and the string is bounded the way a package hash is: the schema pins it to the `<label>-<date>-<time>` shape `update.sh` writes, the agent checks the same shape and that the directory exists, and the request endpoint refuses a name the agent's heartbeat does not list. The name is an identifier the agent produced, never a path, which is what keeps it inside the rule that `args` carries identifiers only. `restore_database` off asks the agent to keep the database, which `update.sh` allows only while the migrations the database records as applied are the ones the snapshot recorded; otherwise the job fails as `refused_code_only` and nothing changes. [tests/test_no_host_execution.py](tests/test_no_host_execution.py) refuses any string argument without a pattern, on any operation.
 

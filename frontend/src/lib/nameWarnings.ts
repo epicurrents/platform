@@ -40,12 +40,36 @@ function reason (kind: string): string {
     }
 }
 
+/** The field a warning names, in the user's language; an unknown field token is shown with its underscores spaced. */
+export function fieldLabel (field: string): string {
+    switch (field) {
+        case 'description': {
+            return t('description', SCOPE)
+        }
+        case 'display_name': {
+            return t('display name', SCOPE)
+        }
+        case 'name': {
+            return t('name', SCOPE)
+        }
+        case 'prefix': {
+            return t('name prefix', SCOPE)
+        }
+        case 'public_source': {
+            return t('published source', SCOPE)
+        }
+        default: {
+            return field.replace(/_/g, ' ')
+        }
+    }
+}
+
 /** Show one warning toast per flagged field; a no-op when there are none. */
 export function toastNameWarnings (warnings: NameWarning[] | undefined): void {
     for (const warning of warnings ?? []) {
         showToast(
             t('The {field} {reason}. Everyone you share with sees it as typed.', SCOPE, {
-                field: warning.field.replace(/_/g, ' '),
+                field: fieldLabel(warning.field),
                 reason: reason(warning.kind),
             }),
             'warning',

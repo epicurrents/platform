@@ -21,11 +21,17 @@ A release-gated dataset (``Dataset.release_gated``) is a pool whose members must
 by one as they arrive. Four rules follow, all enforced here and registered from
 ``library.apps.LibraryConfig.ready()``:
 
+- **The gate acts only on what the gating party controls.** A membership counts when the
+  dataset's author authored the member, or when the dataset is a submission pool and the member
+  is a pooled (system-authored) recording (:func:`controls_membership`). Gating a dataset, and
+  adding to a gated one, is refused for anything else (:func:`gate_refusal`,
+  :func:`membership_refusal`), and a membership that got in regardless hides nothing.
 - **Unreleased members are hidden.** A member with no ``DatasetItem.release`` resolves for the
   dataset's managers only: the dataset author, a holder of a ``can_write`` grant on the dataset,
   the member's own author and superusers (who never reach a gate). Everyone else, a direct
   grantee included, is denied before any grant is read, through the read-visibility gate
-  :func:`member_hidden_from_reader` registered for ``recordings.recording``.
+  :func:`member_hidden_from_reader` registered for ``recordings.recording`` and
+  ``media.mediafile``.
 - **No member resolves for a request carrying a share token**, released or not, whoever holds
   the token. A forwardable link fails the onward-transfer test the gate exists for, and the
   accountability argument needs an individual account. The dataset itself is hidden from
@@ -33,10 +39,12 @@ by one as they arrive. Four rules follow, all enforced here and registered from
 - **A member's stored digest is served to managers only.** ``stored_hash`` and the content pin
   on the byte-serving endpoints are withheld from every other reader through
   :func:`stored_digest_withheld_ids`, because the digest could equal the hash on a contributor's
-  receipt.
+  receipt. A pooled recording is withheld whatever has become of its pool.
 - **A released member is dated by its release month.** ``DatasetRelease.release_month`` replaces
   the upload time on every surface that serves a time to a reader who is not a manager, and
-  listings of members order by name rather than by any time.
+  listings of members order by name rather than by any time. A pooled recording keeps its
+  latest release month after its pool is trashed or ungated, and one never released is dated
+  :data:`WITHHELD_DATE`.
 
 Releases run on a monthly cadence: a member uploaded in month M is eligible from the run at the
 start of M+2, so every member waits between one and two months and a month's submissions from
@@ -54,11 +62,11 @@ from __future__ import annotations
 
 from collections.abc import Callable, Hashable
 from dataclasses import dataclass, field
-from datetime import date, datetime
+from datetime import UTC, date, datetime
 from typing import Any
 
 from django.contrib.contenttypes.models import ContentType
-from django.db.models import BigIntegerField, Case, CharField, OuterRef, Q, Subquery, Value, When
+from django.db.models import BigIntegerField, Case, CharField, DateTimeField, OuterRef, Q, Subquery, Value, When
 from django.db.models.functions import Cast, Coalesce, Lower, NullIf
 
 from library.models import Dataset, DatasetItem, DatasetRelease, month_start
@@ -122,20 +130,107 @@ def is_dataset_manager(user: Any, dataset: Dataset) -> bool:
     )
 
 
+#: The date served in place of a pooled recording's upload time when no release has ever published it.
+#: A pooled recording that is not a live released member is dated by its latest release; one never
+#: released has no date a reader may see, and the ingest month would be the arrival time the pool hides.
+WITHHELD_DATE = datetime(1970, 1, 1, tzinfo=UTC)
+
+
+def system_user_id() -> int | None:
+    """Primary key of the system user, or None when it does not exist yet; never creates it.
+
+    Only the pooled ingest (``recordings.tasks``) creates recordings the system user owns, so a
+    system-authored recording is a pooled one, whatever has happened to its pool since.
+    """
+    from django.contrib.auth import get_user_model
+
+    from epicurrents.system_user import _SYSTEM_USERNAME
+
+    return get_user_model().objects.filter(username=_SYSTEM_USERNAME).values_list("pk", flat=True).first()
+
+
+def is_pooled_recording(obj: Any) -> bool:
+    """True for a recording the pooled ingest created: a system-authored recording."""
+    from recordings.models import Recording
+
+    if not isinstance(obj, Recording):
+        return False
+    system_id = system_user_id()
+    return system_id is not None and obj.author_id == system_id
+
+
+def controls_membership(dataset: Any, member_author_id: int | None, system_id: int | None = None) -> bool:
+    """True when *dataset*'s gate may act on a member authored by *member_author_id*.
+
+    A gate hides, dates and withholds on behalf of whoever put the member there, so it acts only
+    on memberships the gating party legitimately controls: members its author authored, and in a
+    submission pool the system-authored recordings the pooled ingest put there. A third party who
+    gates a dataset holding someone else's recording hides nothing of it.
+    """
+    from library.pools import is_pool
+
+    if member_author_id is None:
+        return False
+    if dataset.author_id == member_author_id:
+        return True
+    return system_id is not None and member_author_id == system_id and is_pool(dataset)
+
+
+def _author_ids(content_type: ContentType, object_ids) -> dict[str, int | None]:
+    """``author_id`` per object of *content_type* among *object_ids*, keyed by the string pk."""
+    model = content_type.model_class()
+    pks = [int(pk) for pk in object_ids if str(pk).isdigit()]
+    if model is None or not pks or not any(f.attname == "author_id" for f in model._meta.concrete_fields):
+        return {}
+    rows = model._default_manager.filter(pk__in=pks).values_list("pk", "author_id")
+    return {str(pk): author_id for pk, author_id in rows}
+
+
+def _controlled_rows(content_type: ContentType, object_ids=None, **filters) -> list[tuple[str, int, int | None]]:
+    """``(object_id, dataset_id, release_id)`` of the live gated memberships the gate controls.
+
+    *object_ids* limits the lookup; ``None`` reads every gated membership of the content type.
+    """
+    rows = DatasetItem.objects.filter(
+        content_type=content_type,
+        dataset__release_gated=True,
+        dataset__deleted_at__isnull=True,
+        **filters,
+    )
+    if object_ids is not None:
+        rows = rows.filter(object_id__in=[str(pk) for pk in object_ids])
+    rows = list(
+        rows.values_list("object_id", "dataset_id", "release_id", "dataset__author_id", "dataset__submission_profile")
+    )
+    if not rows:
+        return []
+    authors = _author_ids(content_type, {object_id for object_id, *_rest in rows})
+    system_id = system_user_id()
+    controlled = []
+    for object_id, dataset_id, release_id, dataset_author_id, profile in rows:
+        author_id = authors.get(str(object_id))
+        if author_id is None:
+            continue
+        if author_id == dataset_author_id or (system_id is not None and author_id == system_id and profile):
+            controlled.append((str(object_id), dataset_id, release_id))
+    return controlled
+
+
 def gated_memberships(obj: Any) -> list[DatasetItem]:
-    """The rows placing *obj* in a live release-gated dataset."""
+    """The rows placing *obj* in a live release-gated dataset whose gate controls it (:func:`controls_membership`)."""
     object_pk = getattr(obj, "pk", None)
     if object_pk is None:
         return []
     ct = ContentType.objects.get_for_model(obj, for_concrete_model=False)
-    return list(
-        DatasetItem.objects.filter(
-            content_type=ct,
-            object_id=str(object_pk),
-            dataset__release_gated=True,
-            dataset__deleted_at__isnull=True,
-        ).select_related("dataset", "release")
-    )
+    items = DatasetItem.objects.filter(
+        content_type=ct,
+        object_id=str(object_pk),
+        dataset__release_gated=True,
+        dataset__deleted_at__isnull=True,
+    ).select_related("dataset", "release")
+    author_id = getattr(obj, "author_id", None)
+    system_id = system_user_id()
+    return [item for item in items if controls_membership(item.dataset, author_id, system_id)]
 
 
 def member_hidden_from_reader(user: Any, obj: Any, share_token: str | None = None) -> bool:
@@ -145,7 +240,8 @@ def member_hidden_from_reader(user: Any, obj: Any, share_token: str | None = Non
     caller is anonymous; and when the member is unreleased in any gated dataset the caller does
     not manage. ``user=None`` is the federated shape and sees released members only. The
     member's own author keeps seeing it, as with FAILED uploads: what a user uploaded is theirs
-    to see regardless of where it was filed.
+    to see regardless of where it was filed. Only memberships the dataset's gate controls count
+    (:func:`controls_membership`), so a third party's gated dataset hides nothing it does not own.
     """
     memberships = gated_memberships(obj)
     if not memberships:
@@ -166,44 +262,127 @@ def dataset_hidden_from_reader(user: Any, obj: Any, share_token: str | None = No
     return bool(getattr(obj, "release_gated", False)) and bool((share_token or "").strip())
 
 
+def gate_refusal(dataset: Dataset) -> str | None:
+    """Why the gate may not be turned on for *dataset*, or None when it may.
+
+    Every recording and media member must be the dataset author's own, or a pooled recording of
+    a pool: a gate on anyone else's member would hide it from its own readers.
+    """
+    from recordings.models import Recording
+
+    system_id = system_user_id()
+    member_types = [Recording]
+    from django.apps import apps
+
+    if apps.is_installed("media"):
+        member_types.append(apps.get_model("media", "MediaFile"))
+    for model in member_types:
+        ct = ContentType.objects.get_for_model(model, for_concrete_model=False)
+        ids = DatasetItem.objects.filter(dataset=dataset, content_type=ct).values_list("object_id", flat=True)
+        for author_id in _author_ids(ct, ids).values():
+            if not controls_membership(dataset, author_id, system_id):
+                return "Only a dataset whose members are all its author's own can be release-gated."
+    return None
+
+
+def membership_refusal(dataset: Dataset, obj: Any) -> str | None:
+    """Why *obj* may not be added to the gated *dataset*, or None when it may (always None for an ungated one).
+
+    A gated dataset takes only its author's own objects, whoever adds them, superusers included:
+    what the gate hides must be the gating party's to hide.
+    """
+    if not dataset.release_gated:
+        return None
+    author_id = getattr(obj, "author_id", None)
+    if author_id is None or author_id != dataset.author_id:
+        return "A release-gated dataset takes only its author's own objects."
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Batch helpers for listings
 # ---------------------------------------------------------------------------
 
 
 def unreleased_member_ids(content_type: ContentType) -> set[str]:
-    """``object_id`` values of *content_type* that are unreleased members of a live gated dataset."""
-    return set(
-        DatasetItem.objects.filter(
-            content_type=content_type,
-            dataset__release_gated=True,
-            dataset__deleted_at__isnull=True,
-            release__isnull=True,
-        ).values_list("object_id", flat=True)
-    )
+    """``object_id`` values of *content_type* that are unreleased, gate-controlled members of a live gated dataset."""
+    return {object_id for object_id, _dataset_id, release_id in _controlled_rows(content_type) if release_id is None}
+
+
+def hidden_member_ids(user: Any, content_type: ContentType, object_ids, share_token: str | None = None) -> set[str]:
+    """The batch form of :func:`member_hidden_from_reader`: ids among *object_ids* the gate hides from this caller."""
+    rows = _controlled_rows(content_type, object_ids)
+    if not rows:
+        return set()
+    if (share_token or "").strip():
+        return {object_id for object_id, _dataset_id, _release_id in rows}
+    unreleased = [(object_id, dataset_id) for object_id, dataset_id, release_id in rows if release_id is None]
+    if not unreleased:
+        return set()
+    if user is None or not getattr(user, "is_authenticated", False):
+        return {object_id for object_id, _dataset_id in unreleased}
+    if getattr(user, "is_superuser", False):
+        return set()
+    authors = _author_ids(content_type, {object_id for object_id, _dataset_id in unreleased})
+    datasets = Dataset.objects.in_bulk({dataset_id for _object_id, dataset_id in unreleased})
+    managed = {pk for pk, dataset in datasets.items() if is_dataset_manager(user, dataset)}
+    return {
+        object_id
+        for object_id, dataset_id in unreleased
+        if dataset_id not in managed and authors.get(object_id) != user.pk
+    }
+
+
+def pooled_ids(content_type: ContentType, object_ids) -> set[str]:
+    """The system-authored recordings among *object_ids*; empty for any other content type."""
+    from recordings.models import Recording
+
+    if content_type.model_class() is not Recording:
+        return set()
+    system_id = system_user_id()
+    if system_id is None:
+        return set()
+    return {
+        object_id for object_id, author_id in _author_ids(content_type, object_ids).items() if author_id == system_id
+    }
 
 
 def release_months_by_id(content_type: ContentType, object_ids) -> dict[str, datetime]:
-    """Release month per released member among *object_ids*, the earliest where a member was released twice."""
-    months: dict[str, datetime] = {}
-    rows = (
-        DatasetItem.objects.filter(
-            content_type=content_type,
-            object_id__in=[str(pk) for pk in object_ids],
-            dataset__release_gated=True,
-            dataset__deleted_at__isnull=True,
-            release__isnull=False,
+    """Release month per member among *object_ids* that a reader who is not its author sees in place of its upload time.
+
+    A gate-controlled released member of a live gated dataset takes the earliest release month of
+    its memberships. A pooled recording is dated by its latest release whatever has become of its
+    pool since, trashed or no longer gated, and one never released by :data:`WITHHELD_DATE`: its
+    ingest month is the arrival time the pool hides.
+    """
+    object_ids = [str(pk) for pk in object_ids]
+    rows = _controlled_rows(content_type, object_ids, release__isnull=False)
+    release_months = dict(
+        DatasetRelease.objects.filter(pk__in={release_id for _o, _d, release_id in rows}).values_list(
+            "pk", "release_month"
         )
-        .values_list("object_id", "release__release_month")
-        .order_by("release__release_month")
     )
-    for object_id, month in rows:
-        months.setdefault(str(object_id), month)
+    months: dict[str, datetime] = {}
+    for object_id, _dataset_id, release_id in rows:
+        month = release_months.get(release_id)
+        if month is not None and (object_id not in months or month < months[object_id]):
+            months[object_id] = month
+    pooled = pooled_ids(content_type, object_ids)
+    if pooled:
+        latest: dict[str, datetime] = {}
+        for object_id, month in DatasetItem.objects.filter(
+            content_type=content_type, object_id__in=pooled, release__isnull=False
+        ).values_list("object_id", "release__release_month"):
+            key = str(object_id)
+            if key not in latest or month > latest[key]:
+                latest[key] = month
+        for object_id in pooled:
+            months[object_id] = latest.get(object_id, WITHHELD_DATE)
     return months
 
 
 def release_month_for(obj: Any) -> datetime | None:
-    """The release month of *obj* as a member of a gated dataset, or None when it is not a released member."""
+    """The release month *obj* is dated by for a reader, or None when it is neither a released member nor pooled."""
     object_pk = getattr(obj, "pk", None)
     if object_pk is None:
         return None
@@ -214,33 +393,30 @@ def release_month_for(obj: Any) -> datetime | None:
 def stored_digest_withheld_ids(user: Any, content_type: ContentType, object_ids) -> set[str]:
     """``object_id`` values among *object_ids* whose stored digest this caller must not receive.
 
-    A member of a live release-gated dataset serves its ``stored_hash`` only to a manager of one
-    of its gated datasets and to superusers; the recording's author is exempted by the caller,
-    which already knows it. A pooled contributor holds a receipt naming the submitted bytes by
-    their SHA-256, and nothing guarantees the ingest pass changes every file, so a served digest
-    could equal a receipt and let whoever holds one find the member in a listing. Withholding it
-    also closes the content pin to the same readers, since a pin answers whether a guessed digest
-    matches. ``user=None`` is the federated shape and receives none.
+    A gate-controlled member of a live release-gated dataset serves its ``stored_hash`` only to a
+    manager of one of its gated datasets and to superusers; the recording's author is exempted by
+    the caller, which already knows it. A pooled recording is withheld the same way whether or not
+    its pool is still live and gated, since a trashed or ungated pool does not make its digest safe
+    to serve. A pooled contributor holds a receipt naming the submitted bytes by their SHA-256, and
+    nothing guarantees the ingest pass changes every file, so a served digest could equal a receipt
+    and let whoever holds one find the member in a listing. Withholding it also closes the content
+    pin to the same readers, since a pin answers whether a guessed digest matches. ``user=None`` is
+    the federated shape and receives none.
     """
-    rows = list(
-        DatasetItem.objects.filter(
-            content_type=content_type,
-            object_id__in=[str(pk) for pk in object_ids],
-            dataset__release_gated=True,
-            dataset__deleted_at__isnull=True,
-        ).values_list("object_id", "dataset_id")
-    )
-    if not rows:
+    object_ids = [str(pk) for pk in object_ids]
+    member_of: dict[str, set[int]] = {}
+    for object_id, dataset_id, _release_id in _controlled_rows(content_type, object_ids):
+        member_of.setdefault(object_id, set()).add(dataset_id)
+    for object_id in pooled_ids(content_type, object_ids):
+        member_of.setdefault(object_id, set())
+    if not member_of:
         return set()
     if user is not None and getattr(user, "is_superuser", False):
         return set()
     managed: set[int] = set()
     if user is not None and getattr(user, "is_authenticated", False):
-        datasets = Dataset.objects.filter(pk__in={dataset_id for _object_id, dataset_id in rows})
+        datasets = Dataset.objects.filter(pk__in=set().union(*member_of.values()))
         managed = {dataset.pk for dataset in datasets if is_dataset_manager(user, dataset)}
-    member_of: dict[str, set[int]] = {}
-    for object_id, dataset_id in rows:
-        member_of.setdefault(str(object_id), set()).add(dataset_id)
     return {object_id for object_id, dataset_ids in member_of.items() if not dataset_ids & managed}
 
 
@@ -253,25 +429,43 @@ def stored_digest_withheld(user: Any, obj: Any) -> bool:
     return str(object_pk) in stored_digest_withheld_ids(user, ct, [object_pk])
 
 
-def release_month_subquery(model) -> Subquery:
-    """A subquery annotation giving each row of *model* its release month, null for non-members.
+def release_month_subquery(model):
+    """An annotation giving each row of *model* the release month it is dated by, null for non-members.
 
-    For ordering a listing so that a released member sorts by its release month in place of
-    its upload time; pair it with a name key so members released in the same month do not fall
-    back to arrival order.
+    For ordering a listing so that a released member sorts by its release month in place of its
+    upload time; pair it with a name key so members released in the same month do not fall back
+    to arrival order. The same rule as :func:`release_months_by_id`: a gate-controlled membership
+    of a live gated dataset whose author authored the member, and for a pooled recording its
+    latest release anywhere, else :data:`WITHHELD_DATE`.
     """
     ct = ContentType.objects.get_for_model(model, for_concrete_model=False)
-    return Subquery(
+    object_ref = Cast(OuterRef("pk"), CharField())
+    controlled = Subquery(
         DatasetItem.objects.filter(
             content_type=ct,
-            object_id=Cast(OuterRef("pk"), CharField()),
+            object_id=object_ref,
             dataset__release_gated=True,
             dataset__deleted_at__isnull=True,
+            dataset__author_id=OuterRef("author_id"),
             release__isnull=False,
         )
         .order_by("release__release_month")
-        .values("release__release_month")[:1]
+        .values("release__release_month")[:1],
+        output_field=DateTimeField(),
     )
+    system_id = system_user_id()
+    if system_id is None:
+        return controlled
+    pooled = Coalesce(
+        Subquery(
+            DatasetItem.objects.filter(content_type=ct, object_id=object_ref, release__isnull=False)
+            .order_by("-release__release_month")
+            .values("release__release_month")[:1],
+            output_field=DateTimeField(),
+        ),
+        Value(WITHHELD_DATE, output_field=DateTimeField()),
+    )
+    return Case(When(author_id=system_id, then=pooled), default=controlled, output_field=DateTimeField())
 
 
 def _named_subquery(model, name_expression) -> Subquery:
@@ -436,18 +630,23 @@ def eligible_items(dataset: Dataset, *, as_of: date) -> list[DatasetItem]:
     return eligible
 
 
-def deidentification_versions_of(items: list[DatasetItem]) -> list[int]:
-    """Distinct de-identification pass versions of the recording members among *items*, sorted."""
+def deidentification_version_by_id(items: list[DatasetItem]) -> dict[str, int]:
+    """The de-identification pass version stamped on each recording member among *items*, keyed by object id."""
     from recordings.models import Recording, RecordingMeta
 
     recording_ct = ContentType.objects.get_for_model(Recording, for_concrete_model=False)
     pks = [item.object_id for item in items if item.content_type_id == recording_ct.pk]
     if not pks:
-        return []
-    versions = RecordingMeta.objects.filter(content_type=recording_ct, object_id__in=pks).values_list(
-        "deidentification_version", flat=True
+        return {}
+    rows = RecordingMeta.objects.filter(content_type=recording_ct, object_id__in=pks).values_list(
+        "object_id", "deidentification_version"
     )
-    return sorted({int(v) for v in versions if v is not None})
+    return {str(object_id): int(version) for object_id, version in rows if version is not None}
+
+
+def deidentification_versions_of(items: list[DatasetItem]) -> list[int]:
+    """Distinct de-identification pass versions of the recording members among *items*, sorted."""
+    return sorted(set(deidentification_version_by_id(items).values()))
 
 
 def select_by_class_size(dataset: Dataset, eligible: list[DatasetItem], *, k: int) -> list[DatasetItem]:
@@ -499,63 +698,81 @@ def select_by_class_size(dataset: Dataset, eligible: list[DatasetItem], *, k: in
     return selected
 
 
-def approval_counts(items: list[DatasetItem]) -> dict[int, int]:
-    """The number of curator approvals each of *items* holds, keyed by item primary key."""
-    from django.db.models import Count
+def _standing_approvals(items: list[DatasetItem]) -> list[tuple[int, int | None]]:
+    """``(item_id, reviewer_id)`` of the approvals of *items* that still count.
+
+    An approval counts while its curator is still a manager of the member's dataset: a curator
+    whose write grant was revoked or expired no longer releases anything, nor signs a run off.
+    An approval whose curator's account has since been deleted (null reviewer) still counts: it
+    was given by a distinct curator when it was made, which the per-reviewer constraint
+    guaranteed.
+    """
+    from django.contrib.auth import get_user_model
 
     from library.models import MemberApproval
 
-    counted = (
-        MemberApproval.objects.filter(item__in=[item.pk for item in items])
-        .values("item_id")
-        .annotate(n=Count("pk"))
-        .values_list("item_id", "n")
-    )
-    return {item.pk: 0 for item in items} | dict(counted)
+    by_pk = {item.pk: item for item in items}
+    rows = list(MemberApproval.objects.filter(item__in=list(by_pk)).values_list("item_id", "reviewer_id"))
+    reviewers = get_user_model().objects.in_bulk({reviewer_id for _item, reviewer_id in rows if reviewer_id})
+    datasets = Dataset.objects.in_bulk({item.dataset_id for item in items})
+    managing: dict[tuple[int, int], bool] = {}
+    standing = []
+    for item_id, reviewer_id in rows:
+        if reviewer_id is None:
+            standing.append((item_id, None))
+            continue
+        dataset_id = by_pk[item_id].dataset_id
+        key = (reviewer_id, dataset_id)
+        if key not in managing:
+            reviewer = reviewers.get(reviewer_id)
+            managing[key] = reviewer is not None and is_dataset_manager(reviewer, datasets[dataset_id])
+        if managing[key]:
+            standing.append((item_id, reviewer_id))
+    return standing
+
+
+def approval_counts(items: list[DatasetItem]) -> dict[int, int]:
+    """The number of standing curator approvals each of *items* holds, keyed by item primary key."""
+    counts = {item.pk: 0 for item in items}
+    for item_id, _reviewer_id in _standing_approvals(items):
+        counts[item_id] += 1
+    return counts
 
 
 def approved_items(items: list[DatasetItem], *, required: int) -> list[DatasetItem]:
-    """The members of *items* approved by at least *required* distinct curators, in their given order.
-
-    An approval whose curator's account has since been deleted still counts: it was given by a
-    distinct curator when it was made, which the per-reviewer constraint guaranteed.
-    """
+    """The members of *items* approved by at least *required* distinct curators still managing their dataset."""
     counts = approval_counts(items)
     return [item for item in items if counts[item.pk] >= required]
 
 
 def approvers_of(items: list[DatasetItem]) -> list[int]:
-    """Primary keys of the curators who approved any of *items*, sorted: the sign-off of a run releasing them."""
-    from library.models import MemberApproval
-
-    ids = MemberApproval.objects.filter(item__in=[item.pk for item in items], reviewer__isnull=False).values_list(
-        "reviewer_id", flat=True
-    )
-    return sorted(set(ids))
+    """Primary keys of the curators with a standing approval of any of *items*, sorted: the sign-off of a run."""
+    return sorted({reviewer_id for _item, reviewer_id in _standing_approvals(items) if reviewer_id is not None})
 
 
 def veto_member(item: DatasetItem) -> str:
     """Remove a vetoed recording member, and return what went: ``"recording"`` or ``"membership"``.
 
-    A recording the system user owns, which is how every pooled submission is stored, is removed
-    whole: its file is unlinked, then the recording is deleted and with it the membership. The
-    file goes first, as in the purge: a row outliving its bytes is a dead pointer, while bytes
-    outliving their row are what a veto exists to prevent, and an unlink failure raises and
-    deletes nothing. A recording a platform user owns loses only its membership: a curator is a
-    dataset manager, and managing a dataset confers no right to delete another user's data.
+    A pooled recording vetoed in its pool, a system-authored recording in a dataset configured as
+    a submission pool, is removed whole: its file is unlinked, then the recording is deleted and
+    with it the membership. The file goes first, as in the purge: a row outliving its bytes is a
+    dead pointer, while bytes outliving their row are what a veto exists to prevent, and an unlink
+    failure raises and deletes nothing. Anywhere else only the membership goes: a curator is a
+    dataset manager, and managing a dataset confers no right to delete another user's data, nor
+    a pooled recording someone placed in a dataset of their own.
 
     Must be called inside an audited scope and a transaction, so each deletion is recorded. Only
     recording members are vetoed; another member type raises ``ValueError``.
     """
     from pathlib import Path
 
-    from epicurrents.system_user import get_system_user
+    from library.pools import is_pool
     from recordings.models import Recording
 
     if item.content_type_id != ContentType.objects.get_for_model(Recording, for_concrete_model=False).pk:
         raise ValueError("Only a recording member can be vetoed")
     recording = Recording.objects.filter(pk=int(item.object_id)).first()
-    if recording is None or recording.author_id != get_system_user().pk:
+    if recording is None or not is_pool(item.dataset) or not is_pooled_recording(recording):
         item.delete()
         return "membership"
     if recording.file_path:
@@ -588,30 +805,75 @@ def run_release(
 ) -> tuple[DatasetRelease, list[DatasetItem], list[DatasetItem]]:
     """Perform a release run on *dataset* and return the run, the eligible set and the released members.
 
-    Must be called inside an audited scope and a transaction: the run row is created, each
-    released item is saved with its release pointer so the audit signal records the change,
-    and nothing else moves. Command-line values fill whichever record fields the selector left
-    blank, except the sign-off, which is the union of the selector's and the command line's: the
-    curators who approved the members and anyone who signed the run off as a whole. A run that
-    releases nothing still leaves a row, since a run with an empty eligible set or a selector
-    that withheld everything is a fact worth dating.
+    Must be called inside an audited scope and a transaction: the dataset row and its unreleased
+    items are locked first, so two runs cannot select the same members; the run row is created,
+    each released item is saved with its release pointer and the pass version it carried, so the
+    audit signal records the change, and nothing else moves. Command-line values fill whichever
+    record fields the selector left blank, except the sign-off, which is the union of the
+    selector's and the command line's: the curators who approved the members and anyone who
+    signed the run off as a whole, one ``DatasetReleaseSignOff`` row per existing account. A run
+    that releases nothing still leaves a row, since a run with an empty eligible set or a
+    selector that withheld everything is a fact worth dating.
+
+    *as_of* may not lie after today (UTC), which would move the cadence forward and stamp a
+    release month that has not happened, nor before the dataset's latest release, which would
+    date members earlier than members already published. Both raise ``ValueError``.
     """
+    from django.contrib.auth import get_user_model
+    from django.utils import timezone
+
+    from library.models import DatasetReleaseSignOff
+
+    Dataset.objects.select_for_update().filter(pk=dataset.pk).first()
+    dataset.refresh_from_db()
     if not dataset.release_gated:
         raise ValueError("Dataset is not release-gated")
+    today = timezone.now().astimezone(UTC).date()
+    if as_of > today:
+        raise ValueError(f"A release cannot be dated after today ({today.isoformat()})")
+    latest = (
+        DatasetRelease.objects.filter(dataset=dataset).order_by("-released_on").values_list("released_on", flat=True)
+    )
+    latest = latest.first()
+    if latest is not None and as_of < latest:
+        raise ValueError(f"A release cannot be dated before the dataset's latest release ({latest.isoformat()})")
+    list(DatasetItem.objects.select_for_update().filter(dataset=dataset, release__isnull=True).values_list("pk"))
     eligible, decision = decide_release(dataset, as_of=as_of)
+    versions = deidentification_version_by_id(decision.items)
     release = DatasetRelease.objects.create(
         dataset=dataset,
         author=actor if getattr(actor, "pk", None) is not None else None,
         released_on=as_of,
         profile_version=decision.profile_version or profile_version,
-        deidentification_versions=deidentification_versions_of(decision.items),
+        deidentification_versions=sorted(set(versions.values())),
         k=decision.k if decision.k is not None else k,
         m=decision.m if decision.m is not None else m,
-        sign_off_user_ids=sorted(set(decision.sign_off_user_ids or []) | set(sign_off_user_ids or [])),
         assessment_reference=decision.assessment_reference or assessment_reference,
         member_count=len(decision.items),
     )
+    signers = set(decision.sign_off_user_ids or []) | set(sign_off_user_ids or [])
+    for user_pk in sorted(get_user_model().objects.filter(pk__in=signers).values_list("pk", flat=True)):
+        DatasetReleaseSignOff.objects.create(release=release, user_id=user_pk)
     for item in decision.items:
         item.release = release
-        item.save(update_fields=["release"])
+        item.released_deidentification_version = versions.get(str(item.object_id))
+        item.save(update_fields=["release", "released_deidentification_version"])
     return release, eligible, decision.items
+
+
+def sign_off_user_ids(release: DatasetRelease) -> list[int]:
+    """Primary keys of the accounts that signed *release* off and still exist, sorted."""
+    return sorted(release.sign_offs.filter(user__isnull=False).values_list("user_id", flat=True))
+
+
+def clear_erased_assessment_references(sender, instance, **kwargs) -> None:
+    """``pre_delete`` receiver on the user model: clear the assessment reference of the runs the user authored.
+
+    The reference is free text the runner typed, registered as their personal data; it is scrubbed
+    from the audit trail by ``erase_subject`` and must not outlive the account on the live row
+    either. Saved per row, so the change is audited inside the erasure's scope and that audit row,
+    which names the runner as author, is scrubbed with the rest.
+    """
+    for release in DatasetRelease.objects.filter(author_id=instance.pk).exclude(assessment_reference=""):
+        release.assessment_reference = ""
+        release.save(update_fields=["assessment_reference"])

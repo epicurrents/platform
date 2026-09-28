@@ -25,7 +25,15 @@ from library.release import (
     run_release,
     veto_member,
 )
-from library.tests.test_release import HASHES, _add, _gated_dataset, _grant, _recording, _release
+from library.tests.test_release import (  # noqa: F401
+    HASHES,
+    _add,
+    _gated_dataset,
+    _grant,
+    _recording,
+    _release,
+    frozen_today,
+)
 from recordings.models import Recording
 from recordings.submissions import IngestProfile, register_ingest_profile, reset_ingest_profiles
 
@@ -59,9 +67,10 @@ def _member_url(dataset, index: int, action: str) -> str:
 
 @pytest.fixture
 def pool(make_user, tmp_path):
-    """A release-gated dataset with two pooled recording members whose files exist; returns (dataset, author, items).
+    """A submission pool with two pooled recording members whose files exist; returns (dataset, author, items).
 
     The recordings belong to the system user, as every pooled submission does; the dataset to *author*.
+    The profile key is left unregistered, so the pool asks for no number of approvals.
     """
     author = make_user()
     members = []
@@ -70,6 +79,8 @@ def pool(make_user, tmp_path):
         path.write_bytes(b"0" * 16)
         members.append(_recording(get_system_user(), index=index, file_path=str(path)))
     dataset, items = _gated_dataset(author, *members)
+    Dataset.objects.filter(pk=dataset.pk).update(submission_profile="test.pool")
+    dataset.refresh_from_db()
     return dataset, author, items
 
 
@@ -85,10 +96,21 @@ class TestWhoReviews:
         reader = make_user()
         _grant(dataset, author, target=reader)
         client = _client(reader)
-        assert client.get(_reviews_url(dataset)).status_code == 403
-        assert post_json(client, _member_url(dataset, 0, "approval"), {}).status_code == 403
-        assert post_json(client, _member_url(dataset, 0, "veto"), {"reason": "device"}).status_code == 403
+        # A non-manager learns nothing, not even whether the dataset is gated.
+        assert client.get(_reviews_url(dataset)).status_code == 404
+        assert post_json(client, _member_url(dataset, 0, "approval"), {}).status_code == 404
+        assert post_json(client, _member_url(dataset, 0, "veto"), {"reason": "device"}).status_code == 404
         assert Recording.objects.count() == 2
+
+    def test_a_non_manager_gets_the_same_404_for_gated_and_ungated_datasets(self, pool, make_user):
+        dataset, author, _items = pool
+        stranger = make_user()
+        plain = Dataset.objects.create(author=author, name="plain")
+        client = _client(stranger)
+        assert client.get(_reviews_url(dataset)).status_code == 404
+        assert client.get(_reviews_url(plain)).status_code == 404
+        assert client.get(f"{DATASETS}/{plain.pk}/reviews/").status_code == 404
+        assert _client(author).get(_reviews_url(plain)).status_code == 409
 
     def test_a_dataset_that_is_not_gated_has_no_review(self, pool):
         dataset, author, _items = pool
@@ -206,6 +228,22 @@ class TestVeto:
         assert response.status_code == 500
         assert Recording.objects.filter(pk=int(items[0].object_id)).exists()
 
+    def test_a_pooled_recording_outside_its_pool_only_leaves_the_dataset(self, pool, make_user, tmp_path):
+        """The reproduction of the review finding: a reader who gates their own dataset holding a released pool member."""
+        dataset, author, items = pool
+        _release(dataset, *items)
+        reader, other = make_user(), make_user()
+        _grant(dataset, author, target=reader)
+        _grant(dataset, author, target=other)
+        mine = Dataset.objects.create(author=reader, name="mine", release_gated=True)
+        mine_item = _add(mine, Recording.objects.get(pk=int(items[0].object_id)))
+        response = post_json(_client(reader), _member_url(mine, 0, "veto"), {"reason": "other"})
+        assert response.status_code == 204
+        assert Recording.objects.filter(pk=int(items[0].object_id)).exists()
+        assert (tmp_path / "0.edf").exists()
+        assert not DatasetItem.objects.filter(pk=mine_item.pk).exists()
+        assert DatasetItem.objects.filter(pk=items[0].pk).exists()
+
     def test_a_users_own_recording_only_leaves_the_dataset(self, make_user, tmp_path):
         author = make_user()
         uploader = make_user()
@@ -230,8 +268,9 @@ class TestVeto:
 
 class TestSelectorHelpers:
     def test_approved_items_counts_distinct_curators(self, pool, make_user):
-        _dataset, author, items = pool
+        dataset, author, items = pool
         other = make_user()
+        _grant(dataset, author, target=other, can_write=True)
         MemberApproval.objects.create(item=items[0], reviewer=author)
         MemberApproval.objects.create(item=items[0], reviewer=other)
         MemberApproval.objects.create(item=items[1], reviewer=author)
@@ -247,13 +286,26 @@ class TestSelectorHelpers:
         assert approvers_of(items) == []
 
     def test_approvers_of_is_the_distinct_sorted_curators(self, pool, make_user):
-        _dataset, author, items = pool
+        dataset, author, items = pool
         other = make_user()
+        _grant(dataset, author, target=other, can_write=True)
         MemberApproval.objects.create(item=items[0], reviewer=other)
         MemberApproval.objects.create(item=items[1], reviewer=other)
         MemberApproval.objects.create(item=items[1], reviewer=author)
         assert approvers_of(items) == sorted({author.pk, other.pk})
 
+    def test_an_approval_from_a_curator_who_lost_the_grant_no_longer_counts(self, pool, make_user):
+        dataset, author, items = pool
+        curator = make_user()
+        grant = _grant(dataset, author, target=curator, can_write=True)
+        MemberApproval.objects.create(item=items[0], reviewer=curator)
+        assert approved_items(items, required=1) == [items[0]]
+        assert approvers_of(items) == [curator.pk]
+        grant.delete()
+        assert approved_items(items, required=1) == []
+        assert approvers_of(items) == []
+
+    @pytest.mark.usefixtures("frozen_today")
     def test_the_run_signs_off_with_the_selectors_approvers_and_the_command_line(self, make_user):
         author = make_user()
         officer = make_user()
@@ -264,4 +316,5 @@ class TestSelectorHelpers:
             lambda _dataset, eligible, as_of: ReleaseDecision(items=eligible, sign_off_user_ids=[curator.pk])
         )
         release, _eligible, _released = run_release(dataset, as_of=date(2026, 10, 1), sign_off_user_ids=[officer.pk])
-        assert DatasetRelease.objects.get(pk=release.pk).sign_off_user_ids == sorted({curator.pk, officer.pk})
+        signed = DatasetRelease.objects.get(pk=release.pk).sign_offs.values_list("user_id", flat=True)
+        assert sorted(signed) == sorted({curator.pk, officer.pk})

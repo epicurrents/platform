@@ -23,6 +23,7 @@ import {
     uploadRecording,
     type SubmissionPool,
     type SubmissionProfile,
+    type SubmissionViolation,
 } from '#api/recordings'
 import { t } from '#i18n'
 import { errorDetail } from '#lib/http'
@@ -46,6 +47,58 @@ export interface SubmissionTargetOptions {
     extendSidecar?: (sidecar: Record<string, unknown>) => Record<string, unknown> | Promise<Record<string, unknown>>
     /** User-facing label of the target. */
     label?: string
+}
+
+/**
+ * A gate violation in the user's language. The gate's `message` is English and often names the offending value, so
+ * a known `code` is shown as a translated sentence and the message only for a code this client does not know.
+ * @param violation - One violation from the gate's refusal.
+ */
+export function violationText(violation: SubmissionViolation): string {
+    switch (violation.code) {
+        case 'annotations': {
+            return t('The file carries an annotation channel; export it without annotations.', SCOPE)
+        }
+        case 'channels': {
+            return t('The channels differ from those the pool asks for.', SCOPE)
+        }
+        case 'duration': {
+            return t('The length of the excerpt is not one the pool accepts.', SCOPE)
+        }
+        case 'format': {
+            return t('The file is not a readable EDF or BDF file.', SCOPE)
+        }
+        case 'identification': {
+            return t('The file still carries identification in its header.', SCOPE)
+        }
+        case 'range': {
+            return t('The signal range differs from the one the pool asks for.', SCOPE)
+        }
+        case 'sampling_rate': {
+            return t('The sampling rate differs from the one the pool asks for.', SCOPE)
+        }
+        case 'sidecar_forbidden_key': {
+            return t('The sidecar carries a key the pool forbids.', SCOPE)
+        }
+        case 'sidecar_hash': {
+            return t('The declared hash does not match the file that arrived.', SCOPE)
+        }
+        case 'sidecar_missing_key': {
+            return t('The sidecar lacks a key the pool requires.', SCOPE)
+        }
+        case 'sidecar_shape': {
+            return t('The sidecar is not in the shape the viewer writes.', SCOPE)
+        }
+        case 'truncated': {
+            return t('The file is shorter or longer than its header says.', SCOPE)
+        }
+        case 'unit': {
+            return t('The physical unit differs from the one the pool asks for.', SCOPE)
+        }
+        default: {
+            return violation.message
+        }
+    }
 }
 
 /** Hex SHA-256 of `data`. */
@@ -172,21 +225,30 @@ export function createSubmissionTarget(
             let sha256 = ''
             try {
                 sidecar = file.sidecar ? JSON.parse(file.sidecar) : {}
-                if (options.extendSidecar) {
+            } catch {
+                return { message: t('The viewer produced a sidecar that could not be read.', SCOPE), success: false }
+            }
+            if (options.extendSidecar) {
+                try {
                     sidecar = await options.extendSidecar(sidecar)
-                }
-                // Inside the guard: `crypto.subtle` exists only in a secure context, so on a
-                // deployment served over plain HTTP the hash cannot be declared.
-                sha256 = await sha256Hex(file.data)
-                sidecar[DECLARED_HASH_KEY] = sha256
-            } catch (error) {
-                return {
-                    message: t('The sidecar could not be prepared: {reason}', SCOPE, {
-                        reason: error instanceof Error ? error.message : String(error),
-                    }),
-                    success: false,
+                } catch (error) {
+                    // The host's own reason, which it writes for the user.
+                    return {
+                        message: t('The sidecar could not be prepared: {reason}', SCOPE, {
+                            reason: error instanceof Error ? error.message : String(error),
+                        }),
+                        success: false,
+                    }
                 }
             }
+            try {
+                // `crypto.subtle` exists only in a secure context, so on a deployment served over plain HTTP the
+                // hash cannot be declared.
+                sha256 = await sha256Hex(file.data)
+            } catch {
+                return { message: t('Submitting needs a secure (https) connection.', SCOPE), success: false }
+            }
+            sidecar[DECLARED_HASH_KEY] = sha256
             const missing = profile.required_sidecar_keys.filter((key) => !(key in sidecar))
             if (missing.length) {
                 return {
@@ -209,7 +271,7 @@ export function createSubmissionTarget(
                 }
                 return {
                     message: t('Refused: {reasons}', SCOPE, {
-                        reasons: result.violations.map((violation) => violation.message).join(' '),
+                        reasons: [...new Set(result.violations.map(violationText))].join(' '),
                     }),
                     success: false,
                 }

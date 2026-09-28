@@ -33,8 +33,11 @@ export interface Recording {
     processing_error: string | null
     file_extension: string
     file_size: number
-    /** SHA-256 of the file as stored, after de-identification; empty until processing completes. */
-    stored_hash: string
+    /**
+     * SHA-256 of the file as stored, after de-identification. Empty until processing completes, and null or empty
+     * for a reader it is withheld from, such as a reader of a release-gated member they do not manage.
+     */
+    stored_hash: string | null
     content_hash: string
     status: 'pending' | 'processing' | 'ready' | 'failed'
     modality: string
@@ -53,7 +56,7 @@ export interface Recording {
      * collection is restored. Null for genuinely uncollected recordings.
      */
     trashed_collection: { id: number; name: string } | null
-    /** PATCH responses only: free-text warnings for `display_name`. */
+    /** PATCH responses only: free-text warnings for `display_name` and `public_source`. */
     warnings?: NameWarning[]
 }
 

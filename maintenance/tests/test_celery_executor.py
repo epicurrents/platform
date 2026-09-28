@@ -33,8 +33,11 @@ class EchoCommand(BaseCommand):
     def add_arguments(self, parser):
         parser.add_argument("--count", type=int, default=1)
         parser.add_argument("--fail", action="store_true")
+        parser.add_argument("--actor-id", type=int, default=None)
 
     def handle(self, *args, **options):
+        if options["actor_id"] is not None:
+            self.stdout.write(f"actor {options['actor_id']}")
         for i in range(options["count"]):
             self.stdout.write(f"line {i}")
         if options["fail"]:
@@ -64,6 +67,15 @@ def echo(monkeypatch):
     return fresh
 
 
+@pytest.fixture
+def echo_with_actor(echo):
+    """``tests.echo`` registered to receive its requester through ``--actor-id``."""
+    import dataclasses
+
+    echo["tests.echo"] = dataclasses.replace(echo["tests.echo"], actor_arg="--actor-id")
+    return echo
+
+
 def _job(**fields):
     defaults = {"operation": "tests.echo", "executor": "celery", "args": {"count": 3}}
     defaults.update(fields)
@@ -78,6 +90,18 @@ class TestRunJob:
         job.refresh_from_db()
         assert job.state == "succeeded" and not job.in_flight
         assert job.output == "line 0\nline 1\nline 2\n"
+
+    def test_an_operation_with_an_actor_argument_is_told_who_requested_it(self, echo_with_actor, user):
+        job = _job(requested_by=user, args={"count": 1})
+        run_job(job.pk)
+        job.refresh_from_db()
+        assert job.output == f"actor {user.pk}\nline 0\n"
+
+    def test_an_operation_without_one_is_not(self, echo, user):
+        job = _job(requested_by=user, args={"count": 1})
+        run_job(job.pk)
+        job.refresh_from_db()
+        assert job.output == "line 0\n"
         assert job.started_at is not None and job.finished_at is not None
 
     def test_a_failing_command_marks_the_job_failed_with_its_output(self, echo):

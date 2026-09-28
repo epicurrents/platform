@@ -80,7 +80,7 @@ def run_job(self, job_pk: int):
     from activity.system_activity import with_system_activity
     from maintenance.lock import read_lock
     from maintenance.models import MaintenanceJob
-    from maintenance.operations import get_operation
+    from maintenance.operations import command_argv, get_operation
 
     job = MaintenanceJob.objects.filter(pk=job_pk).first()
     if job is None or job.executor != MaintenanceJob.Executor.CELERY:
@@ -107,7 +107,8 @@ def run_job(self, job_pk: int):
         interrupted = None
         try:
             args = operation.args_schema(**(job.args or {}))
-            call_command(operation.command, *operation.command_args(args), stdout=buffer, stderr=buffer)
+            argv = command_argv(operation, args, requested_by_id=job.requested_by_id)
+            call_command(operation.command, *argv, stdout=buffer, stderr=buffer)
         except SoftTimeLimitExceeded:
             state, reason = MaintenanceJob.State.FAILED, "timeout"
             buffer.write("\nThe command exceeded its time limit and was stopped.\n")

@@ -60,6 +60,9 @@ class Command(BaseCommand):
         parser.add_argument("--dry-run", action="store_true", help="Report the eligible and selected members only")
         parser.add_argument("--actor", help="Username recorded as the run's author")
         parser.add_argument(
+            "--actor-id", type=int, help="Primary key of the user recorded as the run's author (the maintenance tier)"
+        )
+        parser.add_argument(
             "--profile-version", default="", help="Preparation profile version the members were checked against"
         )
         parser.add_argument("--k", type=int, help="Equivalence-class size in force")
@@ -80,10 +83,16 @@ class Command(BaseCommand):
             raise CommandError(f"Dataset {dataset.object_hash} is not release-gated")
         as_of = self._parse_date(options.get("as_of"))
         actor = None
+        if options.get("actor") and options.get("actor_id") is not None:
+            raise CommandError("Give --actor or --actor-id, not both")
         if options.get("actor"):
             actor = get_user_model().objects.filter(username=options["actor"]).first()
             if actor is None:
                 raise CommandError(f"No user named {options['actor']!r}")
+        if options.get("actor_id") is not None:
+            actor = get_user_model().objects.filter(pk=options["actor_id"]).first()
+            if actor is None:
+                raise CommandError(f"No user with id {options['actor_id']}")
 
         if options["dry_run"]:
             eligible, decision = decide_release(dataset, as_of=as_of)
@@ -91,26 +100,29 @@ class Command(BaseCommand):
             self._emit(report, options["format"], dry_run=True)
             return
 
-        with (
-            with_system_activity(
-                "library.dataset.release",
-                interface=Activity.Interface.COMMAND,
-                target=dataset,
-                actor=actor,
-                metadata={"as_of": as_of.isoformat()},
-            ),
-            transaction.atomic(),
-        ):
-            release, eligible, released = run_release(
-                dataset,
-                as_of=as_of,
-                actor=actor,
-                profile_version=options["profile_version"],
-                k=options.get("k"),
-                m=options.get("m"),
-                sign_off_user_ids=options["sign_off"],
-                assessment_reference=options["assessment_reference"],
-            )
+        try:
+            with (
+                with_system_activity(
+                    "library.dataset.release",
+                    interface=Activity.Interface.COMMAND,
+                    target=dataset,
+                    actor=actor,
+                    metadata={"as_of": as_of.isoformat()},
+                ),
+                transaction.atomic(),
+            ):
+                release, eligible, released = run_release(
+                    dataset,
+                    as_of=as_of,
+                    actor=actor,
+                    profile_version=options["profile_version"],
+                    k=options.get("k"),
+                    m=options.get("m"),
+                    sign_off_user_ids=options["sign_off"],
+                    assessment_reference=options["assessment_reference"],
+                )
+        except ValueError as exc:
+            raise CommandError(str(exc)) from exc
         report = self._report(dataset, as_of, eligible, released, release=release)
         self._emit(report, options["format"], dry_run=False)
 

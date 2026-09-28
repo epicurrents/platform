@@ -202,7 +202,7 @@ def save_sidecar_events(recording, sidecar_data: dict) -> None:
         name="Source events",
         target_content_type=recording_ct,
         target_object_id=str(recording.pk),
-        object_hash=annotation_hash(recording.pk, "source-events"),
+        object_hash=annotation_hash(recording, "source-events"),
         content={"events": events},
     )
 

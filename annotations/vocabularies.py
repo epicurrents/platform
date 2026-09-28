@@ -44,6 +44,7 @@ class Vocabulary:
     version: str
     validator: Callable[[str, Any], None]
     term_name: Callable[[str], str | None] | None = None
+    closed: bool = False
 
 
 _REGISTRY: dict[str, Vocabulary] = {}
@@ -56,6 +57,7 @@ def register_vocabulary(
     validator: Callable[[str, Any], None],
     version: str = "",
     term_name: Callable[[str], str | None] | None = None,
+    closed: bool = False,
 ) -> None:
     """Register a validator for ``standard``; call from the owning ``AppConfig.ready()``.
 
@@ -64,9 +66,14 @@ def register_vocabulary(
     Re-registering the same ``standard`` replaces the earlier entry, which keeps ``ready()`` idempotent
     across repeated app loading in tests. ``term_name`` returns a term's display name, which ingest writes as the
     name of a row it creates from a code; without it the code itself is the name.
+
+    ``closed`` declares that the validator accepts only an enumerated set of terms, never a placeholder a value can
+    fill (HED's ``Description/<text>`` is the counter-example). Ingest accepts a code a file declares only under a
+    closed vocabulary, because under an open one the file chooses the value, and code values are exempt from the
+    annotation-text rule.
     """
     _REGISTRY[standard] = Vocabulary(
-        standard=standard, label=label, version=version, validator=validator, term_name=term_name
+        standard=standard, label=label, version=version, validator=validator, term_name=term_name, closed=closed
     )
 
 

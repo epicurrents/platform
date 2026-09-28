@@ -196,16 +196,16 @@ class TestTables:
             assert translate_source_event(SourceEvent(1.0, None, type="Photic", label="12 Hz")) is None
             assert translate_source_event(SourceEvent(1.0, None, type="Flash", label="10 Hz")) is None
 
-    def test_a_pattern_fills_the_code_and_the_meta_from_its_groups(self, table):
+    def test_a_pattern_fills_the_code_and_the_meta_is_copied_as_given(self, table):
         rules = [
             {"type": "Photic", "pattern": r"(\d+) ?hz", "code": "EEG_ACT_PHOTIC_{1}HZ"},
-            {"pattern": r"trig(?:ger)? (\d+)", "code": "BIO_TECH_TRIGGER", "meta": {"number": "{1}", "kind": "tal"}},
+            {"pattern": r"trig(?:ger)? (\d+)", "code": "BIO_TECH_TRIGGER", "meta": {"kind": "tal"}},
         ]
         with table(rules):
             term = translate_source_event(SourceEvent(1.0, None, type="Photic", label="15Hz"))
             assert (term.code, term.standard) == ("EEG_ACT_PHOTIC_15HZ", "epicurrents.eeg")
             term = translate_source_event(SourceEvent(1.0, None, label="Trigger 42"))
-            assert (term.code, term.meta) == ("BIO_TECH_TRIGGER", {"number": "42", "kind": "tal"})
+            assert (term.code, term.meta) == ("BIO_TECH_TRIGGER", {"kind": "tal"})
 
     def test_a_code_assembled_from_a_pattern_fails_closed_when_no_term_has_it(self, table, caplog):
         with (
@@ -260,6 +260,8 @@ class TestTables:
             ({"label": 3, "code": "C"}, "'label' must be a non-empty string"),
             ({"pattern": "(", "code": "C"}, "does not compile"),
             ({"type": "x", "code": "C", "meta": "text"}, "'meta' must be an object"),
+            ({"pattern": "Note: (.*)", "code": "C", "meta": {"note": "{1}"}}, "'meta' holds a group reference"),
+            ({"pattern": "(.*)", "code": "C", "meta": {"a": {"b": ["{1}"]}}}, "'meta' holds a group reference"),
         ],
     )
     def test_each_rule_malformation_is_named(self, tmp_path, rule, message):
@@ -359,6 +361,36 @@ class TestWriter:
         assert write_source_events(recording, sources, hash_prefix="t") == 1
         (event,) = _events(recording)
         assert (event.name, event.timestamp) == ("Recording paused", 2.0)
+
+    @override_settings(RECORDINGS_DISCARD_EMBEDDED_ANNOTATIONS=True)
+    def test_under_the_discard_setting_a_translated_code_carries_no_meta(self, recording):
+        register_event_translation(lambda s: Translation("EEG_ACT_EC", {"note": s.label}), name=MAPPER)
+        write_source_events(recording, [SourceEvent(1.0, None, type=VENDOR_TYPE, label=VENDOR_LABEL)], hash_prefix="t")
+        (event,) = _events(recording)
+        (code,) = _codes(event)
+        assert (code.value, code.meta) == ("EEG_ACT_EC", None)
+        assert VENDOR_LABEL not in _row_text(recording)
+
+    def test_discard_text_drops_meta_whatever_the_setting(self, recording):
+        register_event_translation(lambda s: Translation("EEG_ACT_EC", {"note": s.label}), name=MAPPER)
+        with override_settings(RECORDINGS_DISCARD_EMBEDDED_ANNOTATIONS=False):
+            write_source_events(
+                recording,
+                [SourceEvent(1.0, None, type=VENDOR_TYPE, label=VENDOR_LABEL)],
+                hash_prefix="t",
+                discard_text=True,
+            )
+        (code,) = _codes(_events(recording)[0])
+        assert code.meta is None
+
+    def test_a_server_generated_hash_is_keyed_on_the_stored_name_not_the_primary_key(self, recording):
+        import hashlib
+
+        write_source_events(recording, [SourceEvent(1.0, None, label="a")], hash_prefix="t")
+        (event,) = _events(recording)
+        stem = recording.stored_name.rsplit(".", 1)[0]
+        assert event.object_hash == hashlib.sha256(f"{stem}:t:0".encode()).hexdigest()[:32].upper()
+        assert event.object_hash != hashlib.sha256(f"{recording.pk}:t:0".encode()).hexdigest()[:32].upper()
 
 
 @pytest.mark.django_db
@@ -522,6 +554,48 @@ class TestServing:
             ("epicurrents.eeg", "EEG_ACT_EC", None)
         ]
         assert (placeholder["name"], placeholder["codes"], placeholder["timestamp"]) == ("", [], 2.0)
+
+    def test_no_served_object_hash_is_derivable_from_the_primary_key(self, client, scene):
+        # The hashes go to every reader and peer; a PK behind a fixed public suffix is recovered by
+        # brute force in under a second and hands out the arrival order release months hide.
+        import hashlib
+
+        from recordings.container import save_viewer_sidecar
+
+        recording = scene["recording"]
+        save_viewer_sidecar(
+            recording,
+            {
+                "events": [
+                    {
+                        "class": "event",
+                        "start": 3.0,
+                        "duration": 0,
+                        "value": "",
+                        "codes": {"epicurrents.eeg": "EEG_ACT_HV"},
+                    }
+                ],
+                "interruptions": [[4, 1]],
+                "labels": [{"class": "label", "value": "", "codes": {"epicurrents.eeg": "EEG_ACT_EC"}}],
+            },
+            discard_text=True,
+        )
+        self._grant(scene, apply_middleware=True)
+        client.force_login(scene["reader"])
+        response = client.get(f"/recordings/api/v1/{STORED_HASH}")
+        assert response.status_code == 200, response.content
+        body = response.json()
+        served = [row["object_hash"] for key in ("events", "interruptions", "labels") for row in body[key]]
+        assert len(served) >= 5
+
+        def digest(key: str) -> str:
+            return hashlib.sha256(key.encode()).hexdigest()[:32].upper()
+
+        suffixes = ["t:0", "t:1", "footer-event:0", "footer-events", "footer-interruption:0", "footer-label:0"]
+        from_pk = {digest(f"{recording.pk}:{suffix}") for suffix in suffixes}
+        from_stem = {digest(f"{STORED_HASH}:{suffix}") for suffix in suffixes}
+        assert not from_pk & set(served)
+        assert set(served) <= from_stem
 
     def test_a_raw_reader_receives_the_terms_name_and_the_placeholder_name(self, client, scene):
         self._grant(scene, apply_middleware=False)
