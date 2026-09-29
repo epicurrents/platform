@@ -249,7 +249,9 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--min-updater-version", required=True, type=int)
     p.add_argument("--agent-version", default=0, type=int, help="the host agent the package ships; 0 for none")
     p.add_argument("--key-id", default="")
-    p.add_argument("--successor-key", default="", help="PEM public key of the next signing key, announced by this release")
+    p.add_argument(
+        "--successor-key", default="", help="PEM public key of the next signing key, announced by this release"
+    )
     p.add_argument("--built-at", default="")
     p.add_argument("--out")
     p.set_defaults(func=cmd_manifest)

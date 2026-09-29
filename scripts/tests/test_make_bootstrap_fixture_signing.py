@@ -187,7 +187,12 @@ class TestSignedPackage:
         # The current key still signs; the successor rides inside the signed bytes.
         pub = key.with_name("release.key.pub")
         signature = archive.with_name(archive.name + ".manifest.sig")
-        assert _helper("verify", str(pub), str(archive.with_name(archive.name + ".manifest.json")), str(signature)).returncode == 0
+        assert (
+            _helper(
+                "verify", str(pub), str(archive.with_name(archive.name + ".manifest.json")), str(signature)
+            ).returncode
+            == 0
+        )
         assert (dest / "RELEASE_KEY.next.pub").read_bytes() == nxt.read_bytes()
         assert (dest / "RELEASE_KEY.pub").read_bytes() == pub.read_bytes()
         with tarfile.open(archive) as tf:

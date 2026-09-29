@@ -180,7 +180,8 @@ class TestStageLayout:
         matching pattern wins.
         """
         patterns = [
-            line.strip() for line in (REPO / ".dockerignore").read_text().splitlines()
+            line.strip()
+            for line in (REPO / ".dockerignore").read_text().splitlines()
             if line.strip() and not line.startswith("#")
         ]
         assert "frontend/" in patterns, "the frontend tree is no longer excluded from the image"
@@ -196,7 +197,8 @@ class TestStageLayout:
         image, a dump outlives every erasure the platform performs.
         """
         patterns = [
-            line.strip() for line in (REPO / ".dockerignore").read_text().splitlines()
+            line.strip()
+            for line in (REPO / ".dockerignore").read_text().splitlines()
             if line.strip() and not line.startswith("#")
         ]
         for pattern in ("backups/", "update/", ".epicurrents-files", ".env", ".env.*", "**/.env", "**/.env.*"):

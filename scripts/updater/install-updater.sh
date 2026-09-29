@@ -82,8 +82,9 @@ done
 
 # ── The host ──────────────────────────────────────────────────────────────────
 
-command -v systemctl >/dev/null 2>&1 && [ -d "$UNIT_DIR" ] \
-    || die "This host has no systemd, which the agent's timer needs. Remote updates are not supported here; the Maintenance tab's other operations still work without the agent."
+if ! command -v systemctl >/dev/null 2>&1 || [ ! -d "$UNIT_DIR" ]; then
+    die "This host has no systemd, which the agent's timer needs. Remote updates are not supported here; the Maintenance tab's other operations still work without the agent."
+fi
 for tool in python3 curl rsync tar; do
     command -v "$tool" >/dev/null 2>&1 || die "$tool is required on the host (the agent handles JSON with python3, probes with curl, and update.sh overlays with rsync)."
 done

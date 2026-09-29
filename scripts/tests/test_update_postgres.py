@@ -61,10 +61,18 @@ def postgres():
     name = f"epicurrents-update-test-{uuid.uuid4().hex[:8]}"
     subprocess.run(
         [
-            DOCKER, "run", "-d", "--rm", "--name", name,
-            "-e", f"POSTGRES_USER={DB_USER}",
-            "-e", "POSTGRES_PASSWORD=update-test",
-            "-e", f"POSTGRES_DB={DB_NAME}",
+            DOCKER,
+            "run",
+            "-d",
+            "--rm",
+            "--name",
+            name,
+            "-e",
+            f"POSTGRES_USER={DB_USER}",
+            "-e",
+            "POSTGRES_PASSWORD=update-test",
+            "-e",
+            f"POSTGRES_DB={DB_NAME}",
             _postgres_image(),
         ],
         check=True,
@@ -221,8 +229,17 @@ class TestRollbackRestore:
         _update_then_break(fakebin, tmp_path, postgres)
         subprocess.run(
             [
-                DOCKER, "exec", "-d", postgres, "psql", "-U", DB_USER, "-d", DB_NAME,
-                "-c", "SELECT (SELECT count(*) FROM app_row), pg_sleep(120);",
+                DOCKER,
+                "exec",
+                "-d",
+                postgres,
+                "psql",
+                "-U",
+                DB_USER,
+                "-d",
+                DB_NAME,
+                "-c",
+                "SELECT (SELECT count(*) FROM app_row), pg_sleep(120);",
             ],
             check=True,
             capture_output=True,
@@ -241,7 +258,10 @@ class TestRollbackRestore:
 
         started = time.monotonic()
         result = run_script(
-            "update.sh", fakebin, cwd=tmp_path, args=["--rollback", "--yes"],
+            "update.sh",
+            fakebin,
+            cwd=tmp_path,
+            args=["--rollback", "--yes"],
             extra_env={"UPDATE_RESTORE_LOCK_TIMEOUT": "2s"},
         )
         elapsed = time.monotonic() - started

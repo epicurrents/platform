@@ -680,6 +680,7 @@ class DeidentifyEDFHeader(EDFHeaderMiddleware):
 #: anonymising one). Kept importable so a project pipeline written against it keeps working.
 AnonymizeEDFHeader = DeidentifyEDFHeader
 
+
 class DropChannelsMiddleware(EDFSignalMiddleware):
     """Remove the specified signal channels from every data record.
 

@@ -57,11 +57,15 @@ def _docker_stub(*extra_cases):
     make one compose call misbehave — a service that is not running, a step that
     fails — while everything else keeps the running-stack answers.
     """
-    return "\ncase \"$*\" in\n" + "\n".join(extra_cases) + r"""
+    return (
+        '\ncase "$*" in\n'
+        + "\n".join(extra_cases)
+        + r"""
     *" ps "*) echo running ;;
     *" exec "*) cat >/dev/null 2>&1 || true ;;
 esac
 """
+    )
 
 
 #: Real hashing behind the harness's no-op sha256sum stub, so a package's hash
@@ -100,9 +104,7 @@ def _deploy(fakebin, tmp_path, *, installed_version="0.1.0", **env):
 
 def _helper(*args):
     """Run scripts/lib/release_sign.py with the suite's own interpreter, which has cryptography."""
-    return subprocess.run(
-        [sys.executable, str(RELEASE_SIGN), *args], check=True, capture_output=True, text=True
-    ).stdout
+    return subprocess.run([sys.executable, str(RELEASE_SIGN), *args], check=True, capture_output=True, text=True).stdout
 
 
 def _sign_key(tmp_path):
@@ -155,8 +157,14 @@ def _build_package(
         env={**os.environ, "COPYFILE_DISABLE": "1"},
     )
     if manifest:
-        _write_manifest(archive, version=version, project=project, plugins=plugins,
-                        min_updater_version=min_updater_version, sign_key=sign_key)
+        _write_manifest(
+            archive,
+            version=version,
+            project=project,
+            plugins=plugins,
+            min_updater_version=min_updater_version,
+            sign_key=sign_key,
+        )
     return archive
 
 
@@ -164,9 +172,25 @@ def _write_manifest(archive, *, version, project="", plugins="", min_updater_ver
     digest = sha256 or hashlib.sha256(archive.read_bytes()).hexdigest()
     manifest = archive.with_name(archive.name + ".manifest.json")
     _helper(
-        "manifest", "--package", archive.name, "--sha256", digest, "--size", str(archive.stat().st_size),
-        "--version", version, "--platform-compatible", ">=0.1,<0.2", "--project", project,
-        "--plugins", plugins, "--min-updater-version", str(min_updater_version), "--out", str(manifest),
+        "manifest",
+        "--package",
+        archive.name,
+        "--sha256",
+        digest,
+        "--size",
+        str(archive.stat().st_size),
+        "--version",
+        version,
+        "--platform-compatible",
+        ">=0.1,<0.2",
+        "--project",
+        project,
+        "--plugins",
+        plugins,
+        "--min-updater-version",
+        str(min_updater_version),
+        "--out",
+        str(manifest),
     )
     if sign_key is not None:
         signature = manifest.with_name(archive.name + ".manifest.sig")
@@ -607,7 +631,10 @@ class TestRollback:
         capture = tmp_path / "restore-stdin.sql"
         fakebin.stub("docker", body=_docker_stub(f'*" exec "*) cat > "{capture}" ;;'))
         run_script(
-            "update.sh", fakebin, cwd=tmp_path, args=["--rollback", "--yes"],
+            "update.sh",
+            fakebin,
+            cwd=tmp_path,
+            args=["--rollback", "--yes"],
             extra_env={"UPDATE_RESTORE_LOCK_TIMEOUT": "7s"},
         )
         assert "SET lock_timeout = '7s';" in capture.read_text()
@@ -785,7 +812,9 @@ class TestSnapshotOwnership:
         result = run_script("update.sh", fakebin, cwd=tmp_path, args=["--snapshot", "post-update"])
         assert result.returncode == 0, result.stderr
         calls = fakebin.calls()
-        assert _index_of(calls, "pg_dump") < max(i for i, c in enumerate(calls) if "chown -R" in c and "post-update-" in c)
+        assert _index_of(calls, "pg_dump") < max(
+            i for i, c in enumerate(calls) if "chown -R" in c and "post-update-" in c
+        )
 
     def test_an_unprivileged_run_does_not_chown(self, fakebin, tmp_path):
         _deploy(fakebin, tmp_path)
@@ -828,7 +857,9 @@ class TestRootFlag:
         fakebin.stub("docker", body=DOCKER_PS_RUNNING)
         fakebin.stub("cp", body=REAL_CP)
         result = run_script(
-            "update.sh", fakebin, cwd=agent,
+            "update.sh",
+            fakebin,
+            cwd=agent,
             args=["--root", str(deploy), "--from", "repo", "--no-pull", "--keep-lock"],
         )
         assert result.returncode == 0, result.stderr
@@ -1170,7 +1201,11 @@ class TestArchiveVerification:
     """
 
     def _signed(self, fakebin, tmp_path, **kwargs):
-        _deploy(fakebin, tmp_path, **{k: v for k, v in kwargs.items() if k in ("EPICURRENTS_PROJECT", "EPICURRENTS_PLUGINS")})
+        _deploy(
+            fakebin,
+            tmp_path,
+            **{k: v for k, v in kwargs.items() if k in ("EPICURRENTS_PROJECT", "EPICURRENTS_PLUGINS")},
+        )
         key, pub = _sign_key(tmp_path)
         shutil.copy(pub, tmp_path / "RELEASE_KEY.pub")
         build = {k: v for k, v in kwargs.items() if k not in ("EPICURRENTS_PROJECT", "EPICURRENTS_PLUGINS")}
@@ -1211,7 +1246,9 @@ class TestArchiveVerification:
     def test_a_package_that_is_not_newer_is_refused_by_name(self, fakebin, tmp_path):
         _deploy(fakebin, tmp_path, installed_version="0.2.0")
         archive = _build_package(tmp_path)
-        result = run_script("update.sh", fakebin, cwd=tmp_path, args=["--check-archive", str(archive), "--require-newer"])
+        result = run_script(
+            "update.sh", fakebin, cwd=tmp_path, args=["--check-archive", str(archive), "--require-newer"]
+        )
         assert result.returncode != 0
         assert "refused=version_not_newer" in _progress(result)
 
@@ -1341,8 +1378,12 @@ class TestArchiveVerification:
         result = run_script("update.sh", fakebin, cwd=tmp_path)
         assert result.returncode == 0, result.stderr
         shutil.rmtree(tmp_path / "pkg-tree")
-        _write_manifest(tmp_path / "update" / "epicurrents-test.tar.gz", version="0.2.0", plugins="dicom",
-                        sign_key=tmp_path / "keys" / "release.key")
+        _write_manifest(
+            tmp_path / "update" / "epicurrents-test.tar.gz",
+            version="0.2.0",
+            plugins="dicom",
+            sign_key=tmp_path / "keys" / "release.key",
+        )
         result = run_script("update.sh", fakebin, cwd=tmp_path)
         assert result.returncode != 0
         assert "carries plugins 'dicom'" in result.stderr
@@ -1361,8 +1402,9 @@ class TestArchiveVerification:
         assert "the same as the installed release" in result.stderr
         _nothing_touched(fakebin, tmp_path)
         shutil.rmtree(tmp_path / "pkg-tree")
-        _write_manifest(tmp_path / "update" / "epicurrents-test.tar.gz", version="0.0.9",
-                        sign_key=tmp_path / "keys" / "release.key")
+        _write_manifest(
+            tmp_path / "update" / "epicurrents-test.tar.gz", version="0.0.9", sign_key=tmp_path / "keys" / "release.key"
+        )
         result = run_script("update.sh", fakebin, cwd=tmp_path, args=["--require-newer"])
         assert result.returncode != 0
         assert "OLDER" in result.stderr
@@ -1560,8 +1602,8 @@ class TestOrphanPruning:
             "recordings/migrations/0009_removed.py",
             "docker-compose.yml",
         )
-        (tmp_path / "docker-compose.override.yml").write_text("operator")   # never listed
-        (tmp_path / "epicurrents" / "generated.bin").write_text("runtime")   # never listed
+        (tmp_path / "docker-compose.override.yml").write_text("operator")  # never listed
+        (tmp_path / "epicurrents" / "generated.bin").write_text("runtime")  # never listed
         _build_package(tmp_path, files={"recordings/migrations/0009_replacement.py": ""})
         fakebin.stub("rsync")
         result = run_script("update.sh", fakebin, cwd=tmp_path)
@@ -1649,8 +1691,17 @@ class TestProgressLines:
         lines = _progress(result)
         steps = [line for line in lines if line.startswith("step=")]
         assert steps == [
-            "step=check", "step=snapshot", "step=backup", "step=acquire", "step=build", "step=stop",
-            "step=migrate", "step=static", "step=vendor", "step=recreate", "step=health",
+            "step=check",
+            "step=snapshot",
+            "step=backup",
+            "step=acquire",
+            "step=build",
+            "step=stop",
+            "step=migrate",
+            "step=static",
+            "step=vendor",
+            "step=recreate",
+            "step=health",
         ], steps
         snapshot = next(line for line in lines if line.startswith("snapshot="))
         assert snapshot.startswith("snapshot=./backups/pre-update-")
@@ -1690,8 +1741,15 @@ class TestProgressLines:
         assert result.returncode == 0, result.stderr
         steps = [line for line in _progress(result) if line.startswith("step=")]
         assert steps == [
-            "step=stop", "step=restore-db", "step=restore-env", "step=restore-code", "step=build",
-            "step=static", "step=vendor", "step=recreate", "step=health",
+            "step=stop",
+            "step=restore-db",
+            "step=restore-env",
+            "step=restore-code",
+            "step=build",
+            "step=static",
+            "step=vendor",
+            "step=recreate",
+            "step=health",
         ], steps
         assert _progress(result)[-1] == "done"
 
@@ -1755,9 +1813,7 @@ class TestNamedSnapshots:
         (named / ".env").write_text("DJANGO_MODE=production\nHOST_PORT=8000\nNAMED=1\n")
         capture = tmp_path / "restore-stdin.sql"
         fakebin.stub("docker", body=_docker_stub(f'*" exec "*) cat > "{capture}" ;;'))
-        result = run_script(
-            "update.sh", fakebin, cwd=tmp_path, args=["--rollback", "--yes", "--snapshot", named.name]
-        )
+        result = run_script("update.sh", fakebin, cwd=tmp_path, args=["--rollback", "--yes", "--snapshot", named.name])
         assert result.returncode == 0, result.stderr
         assert "-- the named one" in capture.read_text()
         assert "NAMED=1" in (tmp_path / ".env").read_text()
@@ -1797,7 +1853,7 @@ class TestCodeOnlyRollback:
 
     def _psql_answers(self, lines: str):
         """A docker stub whose `exec … psql` prints ``lines`` (the applied migrations)."""
-        return _docker_stub(f'*" psql "*) cat >/dev/null 2>&1; printf \'{lines}\' ;;')
+        return _docker_stub(f"*\" psql \"*) cat >/dev/null 2>&1; printf '{lines}' ;;")
 
     def test_restores_the_code_and_leaves_the_database_and_env_alone(self, fakebin, tmp_path):
         _deploy(fakebin, tmp_path)
@@ -1822,7 +1878,9 @@ class TestCodeOnlyRollback:
         result = run_script("update.sh", fakebin, cwd=tmp_path, args=["--rollback", "--yes", "--code-only"])
         assert result.returncode != 0
         lines = _progress(result)
-        assert "refused=code_only" in lines and lines.index("refused=code_only") < lines.index(next(l for l in lines if l.startswith("failed=")))
+        assert "refused=code_only" in lines and lines.index("refused=code_only") < lines.index(
+            next(l for l in lines if l.startswith("failed="))
+        )
         assert "Migrations were applied since" in result.stderr
         assert not fakebin.has_call("stop web") and not fakebin.has_call("--force-recreate")
         assert not (tmp_path / "update" / "maintenance.json").exists()
@@ -1875,12 +1933,12 @@ class TestMigrationRecords:
         return _docker_stub(
             f'*" psql "*) cat >/dev/null 2>&1; n=$(cat "{counter}" 2>/dev/null || echo 0); n=$((n + 1)); '
             f'echo "$n" > "{counter}"; if [ "$n" -ge {changes_at} ]; then printf \'a.0001\\na.0002\\n\'; '
-            f'else printf \'a.0001\\n\'; fi ;;'
+            f"else printf 'a.0001\\n'; fi ;;"
         )
 
     def test_a_named_snapshot_records_the_applied_migrations_sorted(self, fakebin, tmp_path):
         _deploy(fakebin, tmp_path)
-        fakebin.stub("docker", body=_docker_stub('*" psql "*) cat >/dev/null 2>&1; printf \'b.0001\\na.0001\\n\' ;;'))
+        fakebin.stub("docker", body=_docker_stub("*\" psql \"*) cat >/dev/null 2>&1; printf 'b.0001\\na.0001\\n' ;;"))
         result = run_script("update.sh", fakebin, cwd=tmp_path, args=["--snapshot", "post-update"])
         assert result.returncode == 0, result.stderr
         snap = next((tmp_path / "backups").glob("post-update-*"))
@@ -1945,7 +2003,9 @@ class TestSeveralReleaseKeys:
         fakebin.stub("rsync")
         self._real_verification(fakebin)
         result = run_script(
-            "update.sh", fakebin, cwd=tmp_path,
+            "update.sh",
+            fakebin,
+            cwd=tmp_path,
             args=["--require-signature", "--release-key", str(wrong), "--release-key", str(pub)],
         )
         assert result.returncode == 0, result.stderr
@@ -1982,7 +2042,9 @@ class TestSeveralReleaseKeys:
         fakebin.stub("rsync")
         self._real_verification(fakebin)
         result = run_script(
-            "update.sh", fakebin, cwd=tmp_path,
+            "update.sh",
+            fakebin,
+            cwd=tmp_path,
             args=["--require-signature", "--release-key", str(tmp_path / "nope.pub"), "--release-key", str(pub)],
         )
         assert result.returncode == 0, result.stderr
@@ -2139,7 +2201,9 @@ class TestListingHardeningEdges:
         elsewhere.mkdir()
         _build_package(elsewhere, manifest=False)
         result = run_script(
-            "update.sh", fakebin, cwd=elsewhere,
+            "update.sh",
+            fakebin,
+            cwd=elsewhere,
             args=["--root", str(deployment), "--check-archive", "update/epicurrents-test.tar.gz"],
         )
         assert result.returncode == 0, result.stderr

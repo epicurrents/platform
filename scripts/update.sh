@@ -930,7 +930,9 @@ report_orphan_candidates() {
     tops="$(printf '%s\n' "$new" | grep '/' | sed 's|/.*||' | LC_ALL=C sort -u)"
     existing=""
     while IFS= read -r top; do
-        [ -n "$top" ] && [ -d "$ROOT/$top" ] || continue
+        if [ -z "$top" ] || [ ! -d "$ROOT/$top" ]; then
+            continue
+        fi
         # Run from the root so find prints relative paths and nothing has to
         # strip a prefix that could read as a pattern.
         existing="$existing$(cd "$ROOT" && find "$top" \( -name .git -o -name node_modules -o -name __pycache__ \

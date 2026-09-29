@@ -197,15 +197,43 @@ def test_a_packaged_archive_carries_no_member_update_sh_refuses(tmp_path):
 # succeeds, the caller just stops seeing the step — so the vocabulary is pinned
 # here, in source, as the target it is.
 PROGRESS_STEPS_UPDATE = [
-    "step=check", "step=snapshot", "step=acquire", "step=backup", "step=build", "step=stop",
-    "step=migrate", "step=static", "step=vendor", "step=recreate", "step=health",
+    "step=check",
+    "step=snapshot",
+    "step=acquire",
+    "step=backup",
+    "step=build",
+    "step=stop",
+    "step=migrate",
+    "step=static",
+    "step=vendor",
+    "step=recreate",
+    "step=health",
 ]
 PROGRESS_STEPS_ROLLBACK = [
-    "step=restore-db", "step=restore-env", "step=restore-code", "step=build",
+    "step=restore-db",
+    "step=restore-env",
+    "step=restore-code",
+    "step=build",
 ]
-PROGRESS_FACTS = ["snapshot=", "health=ok", "health=failed", "done", "failed=", "check=ok", "refused=",
-                  "archive=", "manifest=", "signature=", "sha256=", "version=", "installed=", "orphan_candidates=",
-                  "key=", "migrations=", "restored="]
+PROGRESS_FACTS = [
+    "snapshot=",
+    "health=ok",
+    "health=failed",
+    "done",
+    "failed=",
+    "check=ok",
+    "refused=",
+    "archive=",
+    "manifest=",
+    "signature=",
+    "sha256=",
+    "version=",
+    "installed=",
+    "orphan_candidates=",
+    "key=",
+    "migrations=",
+    "restored=",
+]
 
 # The reasons a refusal can name on a ::refused= line. The host agent turns the
 # token into the job's failure reason (refused_<token>), so its README and the
@@ -216,7 +244,8 @@ REFUSAL_TOKENS = ["signature", "hash", "manifest", "updater_too_old", "incompati
 def test_update_sh_emits_every_progress_line_a_caller_parses():
     body = (SCRIPTS_DIR / "update.sh").read_text()
     missing = [
-        token for token in (*PROGRESS_STEPS_UPDATE, *PROGRESS_STEPS_ROLLBACK, *PROGRESS_FACTS)
+        token
+        for token in (*PROGRESS_STEPS_UPDATE, *PROGRESS_STEPS_ROLLBACK, *PROGRESS_FACTS)
         if f'emit "{token}' not in body
     ]
     assert not missing, f"update.sh no longer emits: {missing}"

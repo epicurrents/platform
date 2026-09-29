@@ -93,4 +93,6 @@ class TestDeploymentPairing:
         # The code snapshot, the rollback's replace and the update's overlay,
         # each anchored at the root so an app directory of the same name is
         # still code.
-        assert '--exclude="./update"' in script and '--exclude="/update/"' in script and "--exclude='/update/'" in script
+        assert (
+            '--exclude="./update"' in script and '--exclude="/update/"' in script and "--exclude='/update/'" in script
+        )
