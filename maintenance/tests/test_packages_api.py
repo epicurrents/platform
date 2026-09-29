@@ -24,13 +24,23 @@ from django.core.files.uploadedfile import SimpleUploadedFile
 from django.test import override_settings
 
 from activity.models import Activity
-from epicurrents.version import __version__
+from epicurrents.version import VERSION_INFO, __version__
 from maintenance import packaging, spool
 from maintenance.models import MaintenanceJob, MaintenancePackage
 from maintenance.tests.conftest import PASSWORD, place_package_files
 
 BASE = "/api/v1/maintenance"
-NEWER = "0.1.2"
+
+
+def _patch_ahead(steps: int) -> str:
+    """The installed version with its patch number advanced by ``steps``."""
+    major, minor, patch = VERSION_INFO
+    return f"{major}.{minor}.{patch + steps}"
+
+
+# Relative to the installed version rather than written out: a release bump that
+# reaches a literal turns "newer" into "the same" and every upload into a refusal.
+NEWER, LATER, LATEST = (_patch_ahead(n) for n in (1, 2, 3))
 SECURITY = "epicurrents.security"
 
 
@@ -191,7 +201,7 @@ class TestUpload:
             pytest.param(lambda r, d: {"size": len(d) + 1}, 400, "hash", id="size-mismatch"),
             pytest.param(lambda r, d: {"manifest_version": 2}, 400, "manifest", id="newer-manifest-format"),
             pytest.param(lambda r, d: {"sha256": "nope"}, 400, "manifest", id="unusable-sha"),
-            pytest.param(lambda r, d: {"version": "0.1.2-rc1"}, 400, "manifest", id="prerelease-version"),
+            pytest.param(lambda r, d: {"version": f"{NEWER}-rc1"}, 400, "manifest", id="prerelease-version"),
             pytest.param(lambda r, d: {"version": __version__}, 400, "version_not_newer", id="same-version"),
             pytest.param(lambda r, d: {"version": "0.1.0"}, 400, "version_not_newer", id="older-version"),
             pytest.param(lambda r, d: {"project": "somecourse"}, 400, "incompatible", id="other-project"),
@@ -344,9 +354,9 @@ class TestListAndRemove:
     def test_packages_list_newest_first_with_pruned_ones_kept(self, ready):
         first, second = tarball(filler=b"1"), tarball(filler=b"2")
         assert upload(ready, first).status_code == 201
-        assert upload(ready, second, version="0.1.3").status_code == 201
+        assert upload(ready, second, version=LATER).status_code == 201
         rows = ready.client.get(f"{BASE}/packages").json()
-        assert [row["version"] for row in rows] == ["0.1.3", NEWER]
+        assert [row["version"] for row in rows] == [LATER, NEWER]
         assert Activity.objects.filter(verb="maintenance.package.list").exists()
 
     def test_remove_deletes_the_files_and_keeps_the_row_as_pruned(self, ready, caplog):
@@ -407,10 +417,10 @@ class TestPruning:
         caplog.set_level(logging.WARNING, logger=SECURITY)
         blobs = [tarball(filler=str(i).encode()) for i in range(3)]
         with override_settings(REMOTE_UPDATE_KEEP_PACKAGES=2):
-            for i, data in enumerate(blobs):
-                assert upload(ready, data, version=f"0.1.{2 + i}").status_code == 201
+            for version, data in zip((NEWER, LATER, LATEST), blobs, strict=True):
+                assert upload(ready, data, version=version).status_code == 201
         states = {row.version: row.state for row in MaintenancePackage.objects.all()}
-        assert states == {"0.1.2": "pruned", "0.1.3": "available", "0.1.4": "available"}
+        assert states == {NEWER: "pruned", LATER: "available", LATEST: "available"}
         assert not packaging.package_dir(sha_of(blobs[0])).exists()
         assert packaging.package_dir(sha_of(blobs[1])).is_dir() and packaging.package_dir(sha_of(blobs[2])).is_dir()
         assert security_events(caplog, "maintenance.package_uploaded")[-1].pruned == 1
@@ -423,7 +433,7 @@ class TestPruning:
             operation="platform.update", executor="host", requested_by=ready.user, package=row, state="running"
         )
         with override_settings(REMOTE_UPDATE_KEEP_PACKAGES=1):
-            assert upload(ready, tarball(filler=b"new"), version="0.1.3").status_code == 201
+            assert upload(ready, tarball(filler=b"new"), version=LATER).status_code == 201
         row.refresh_from_db()
         assert row.state == "available" and packaging.package_dir(row.sha256).is_dir()
 
@@ -435,7 +445,7 @@ class TestPruning:
 
         monkeypatch.setattr(packaging, "remove_files", refuse)
         with override_settings(REMOTE_UPDATE_KEEP_PACKAGES=1):
-            assert upload(ready, tarball(filler=b"new"), version="0.1.3").status_code == 201
+            assert upload(ready, tarball(filler=b"new"), version=LATER).status_code == 201
         assert MaintenancePackage.objects.filter(state="available").count() == 2
 
     def test_keep_zero_still_keeps_the_package_just_uploaded(self, ready):
