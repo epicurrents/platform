@@ -75,7 +75,7 @@ gap table that the row explains:
   `recordings/deidentification_record.py`, `epicurrents/text_hygiene.py`,
   `annotations/export.py`, `annotations/redaction.py`;
 - `library/management/commands/release_dataset.py`,
-  `library/management/commands/purge_dataset_recordings.py`,
+  `recordings/management/commands/purge_dataset_recordings.py`,
   `library/management/commands/dataset_access_report.py`,
   `library/management/commands/dataset_anonymity_report.py`,
   `recordings/management/commands/deidentification_report.py`,
