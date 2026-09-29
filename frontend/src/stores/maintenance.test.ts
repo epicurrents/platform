@@ -34,6 +34,7 @@ import { dismissToast, showToast } from '#lib/toast'
 import {
     codeChanged,
     RELEASE_POLL_MS,
+    reloadPage,
     RETRY_AFTER_MAX_MS,
     useMaintenanceStore,
     VERIFYING_POLL_MS,
@@ -294,5 +295,36 @@ describe('maintenance store', () => {
         await store.probeFeature()
         await store.probeFeature()
         expect(mockStatus).toHaveBeenCalledTimes(1)
+    })
+})
+
+describe('reloadPage', () => {
+    let order: string[]
+    let originalLocation: Location
+    beforeEach(() => {
+        order = []
+        originalLocation = window.location
+        Object.defineProperty(window, 'location', {
+            configurable: true,
+            value: { reload: () => order.push('reload') },
+        })
+    })
+    afterEach(() => {
+        Object.defineProperty(window, 'location', { configurable: true, value: originalLocation })
+        delete (window as unknown as { __EPICURRENTS__?: unknown }).__EPICURRENTS__
+    })
+
+    it('waives the viewer unload guard before reloading', () => {
+        // Without the waiver an update reload raises the browser's unsaved-changes prompt in a
+        // viewer tab, and a cancelled reload leaves the SPA running code the server has replaced.
+        ;(window as unknown as { __EPICURRENTS__: unknown }).__EPICURRENTS__ = {
+            APP: { allowUnload: () => order.push('allowUnload') },
+        }
+        reloadPage()
+        expect(order).toStrictEqual(['allowUnload', 'reload'])
+    })
+    it('reloads when no viewer is loaded in the document', () => {
+        reloadPage()
+        expect(order).toStrictEqual(['reload'])
     })
 })

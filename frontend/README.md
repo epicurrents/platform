@@ -147,6 +147,18 @@ Then choose variants in templates with the `library` attribute:
 This is backwards-compatible: existing icons that omit `library` continue to
 resolve through the default icon library.
 
+## Leaving the viewer
+
+Leaving the page ends the review session: what is open in the viewer closes, the position the user navigated to is lost, and any annotation edits go with it. None of it is recoverable — a recording opened from the platform can be reloaded, but relocating it and navigating back is the expensive part, and a file the user opened from their own disk cannot be reopened without them picking it again. So the viewer asks whenever anything is open, not only when annotations have been edited, and a viewer tab with a recording in it prompts on the way out by design. With nothing open, leaving is unremarkable and nothing is asked.
+
+Two guards cover the two kinds of exit, and they are separate because neither sees the other's.
+
+The viewer itself installs a `beforeunload` handler for the document-level exits — closing the tab, reloading, navigating away — and asks its own `unloadNeedsConfirmation`. [ViewerView.vue](src/views/ViewerView.vue) covers in-app navigation, the Back button included, with `onBeforeRouteLeave` and a dialog, because a route change never unloads the document and so never reaches the viewer's handler.
+
+**A programmatic reload has to waive the guard**, by calling `allowUnload()` on the viewer application immediately before navigating. [reloadPage](src/stores/maintenance.ts) does it for the update reload: without the waiver an update prompts the user about itself, and a cancelled reload leaves the SPA running code the server has already replaced. The method is optional on the type, since a vendored viewer edition may predate it, so the call is `?.allowUnload?.()`.
+
+The other caller is `ViewerView` itself. The viewer allows one application per document and the container div is destroyed when the view unmounts, so a remount — a route change away and back — cannot re-attach the existing application and reloads the document instead. That reload is programmatic, hence the same waiver.
+
 ## Viewer export targets
 
 The viewer's file menu offers "Send recording to" entries for a recording opened from a local file, one per export target the host registers with `registerSignalExportTarget`; a recording loaded from a URL is offered none, which core enforces. The viewer knows no platform endpoint, so each target's `submit` is platform code. [lib/exportTargets.ts](src/lib/exportTargets.ts) holds the templates:

@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { ref, computed, onMounted } from 'vue'
-import { useRoute } from 'vue-router'
+import { onBeforeRouteLeave, useRoute } from 'vue-router'
 import { t } from '#i18n'
 import { showToast } from '#lib/toast'
 import { useAuthStore } from '#stores/auth'
@@ -140,6 +140,10 @@ async function attachRecordingVideos(resource: DataResource, hash: string): Prom
 const SCOPE = 'ViewerView'
 const route = useRoute()
 
+/** Resolver for the in-flight route change the leave prompt is holding. */
+const pendingLeaveResolver = ref<((leave: boolean) => void) | null>(null)
+const showLeavePrompt = ref(false)
+
 let epic = null as null | EpicurrentsApp
 
 const auth = useAuthStore()
@@ -243,7 +247,47 @@ async function loadDatasetBundle(id: number | string, token: string | undefined)
     return { name: dataset.name, shareToken: token, items: bundleItems }
 }
 
+function cancelLeave () {
+    showLeavePrompt.value = false
+    pendingLeaveResolver.value?.(false)
+    pendingLeaveResolver.value = null
+}
+
+function confirmLeave () {
+    showLeavePrompt.value = false
+    // The application stays alive in this document after the route changes, so its own unload guard
+    // would ask again when the tab is closed, about a session the user has already given up.
+    window.__EPICURRENTS__?.APP?.allowUnload?.()
+    pendingLeaveResolver.value?.(true)
+    pendingLeaveResolver.value = null
+}
+
+// In-app navigation, the Back button included. The viewer installs its own `beforeunload` handler
+// for the document-level exits, which a route change never triggers.
+onBeforeRouteLeave(() => {
+    if (!window.__EPICURRENTS__?.APP?.unloadNeedsConfirmation) {
+        return true
+    }
+    return new Promise<boolean>(resolve => {
+        pendingLeaveResolver.value = resolve
+        showLeavePrompt.value = true
+    })
+})
+
 onMounted(async () => {
+    if (window.__EPICURRENTS__?.APP) {
+        // The viewer mounts its interface into the container div in this template, which Vue
+        // destroys when the view unmounts, and the framework allows one application per document
+        // with no way to re-attach the existing one. A remount — a route change away and back, or
+        // the browser Back button — therefore has to begin from a fresh document; rendering into
+        // the new container would show an empty viewer over a still-running application, and
+        // building a second one would leave the first holding its worker and its shared buffer for
+        // as long as the tab lives. The waiver is what keeps that application's own unload guard
+        // from prompting about a reload the user has already answered for.
+        window.__EPICURRENTS__.APP.allowUnload?.()
+        window.location.reload()
+        return
+    }
     try {
         if (sessionToken.value) {
             // Session mode: resolve the session token to its dataset list, then
@@ -587,6 +631,29 @@ onMounted(async () => {
             ></component>
         </template>
     </main>
+
+    <wa-dialog
+        :label="t('Leave the viewer?', SCOPE)"
+        :open="showLeavePrompt"
+        @wa-hide.self="cancelLeave"
+    >
+        <p>
+            {{
+                t(
+                    'Leaving this page ends the viewer session, closing any open recordings and losing unsaved changes. Leave anyway?',
+                    SCOPE,
+                )
+            }}
+        </p>
+        <div slot="footer" class="form-actions">
+            <wa-button appearance="filled-outlined" variant="neutral" @click="cancelLeave">
+                {{ t('Stay in the viewer', SCOPE) }}
+            </wa-button>
+            <wa-button appearance="filled-outlined" variant="danger" @click="confirmLeave">
+                {{ t('Leave anyway', SCOPE) }}
+            </wa-button>
+        </div>
+    </wa-dialog>
 </template>
 
 <style scoped>

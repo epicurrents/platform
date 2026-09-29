@@ -30,6 +30,18 @@ export {}
 declare module '@epicurrents/core/dist/types' {
     interface EpicurrentsApp {
         /**
+         * Waive the viewer's leave confirmation, for a reload or navigation the host is itself
+         * performing. Optional because the vendored viewer edition may predate it, so callers guard
+         * with `?.()`.
+         */
+        allowUnload?(): void
+        /**
+         * Whether the viewer holds a review session that leaving the document would end — anything
+         * open, or an annotation edit. Absent on an edition that predates it, which reads as nothing
+         * to confirm.
+         */
+        unloadNeedsConfirmation?: boolean
+        /**
          * The export targets offered for `resource`: every registered target for a resource opened
          * from local files, none otherwise.
          */

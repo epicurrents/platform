@@ -52,6 +52,10 @@ const CODE_CHANGING_PHASES = new Set(['updating', 'rolling_back'])
 
 /** Reload the document; a seam for tests, which cannot navigate jsdom. */
 export function reloadPage(): void {
+    // The viewer guards the document against an unload that would end a review session. An update
+    // reload is not the accident that guard exists for, and a prompt here would leave the SPA
+    // running code the server has already replaced.
+    window.__EPICURRENTS__?.APP?.allowUnload?.()
     window.location.reload()
 }
 
