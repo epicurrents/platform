@@ -8,6 +8,10 @@ Entries are written for the person deciding whether to upgrade, so the ones that
 
 ## [Unreleased]
 
+## [0.1.2] — 2026-09-29
+
+Includes the changes that builds numbered 0.1.1 carried; 0.1.1 was never released on its own.
+
 ### Fixed
 
 - **A package built on macOS extracts without warnings.** `COPYFILE_DISABLE` kept extended attributes out as `._*` members, but bsdtar still wrote them as `LIBARCHIVE.xattr` pax headers, and GNU tar warns once per member: a first extraction of a distribution printed 828 lines that read like a damaged archive. The packager now passes `--no-xattrs --no-mac-metadata` when the builder's tar is bsdtar, in `--tarball` and in the hand-packing command it prints. Found on a test deployment.
@@ -297,4 +301,4 @@ Started at 0.x rather than 1.0.0 deliberately. The code is not early — it is f
 - `recordings.processors.edf._build_header` is now `build_header`. It was private with sixteen call sites across the federation middleware, the FUSE filesystem and a project. Its de-identifying counterpart `_build_clean_header` stays private on purpose: its blanking values are a PHI contract, not parameters.
 - `pandas` and `PyWavelets` left the platform's dependency closure for the one project that used them. A deployment needing them gets them from that project.
 
-[Unreleased]: https://github.com/epicurrents/platform/compare/v0.1.0...HEAD [0.1.0]: https://github.com/epicurrents/platform/releases/tag/v0.1.0
+[Unreleased]: https://github.com/epicurrents/platform/compare/v0.1.2...HEAD [0.1.2]: https://github.com/epicurrents/platform/compare/v0.1.0...v0.1.2 [0.1.0]: https://github.com/epicurrents/platform/releases/tag/v0.1.0
