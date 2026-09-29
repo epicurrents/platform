@@ -354,6 +354,17 @@ def validate_file(profile: IngestProfile, data: bytes) -> list[Violation]:
     if any(s.is_annotation_channel for s in signals):
         violations.append(Violation("annotations", "The file carries an annotation channel; export without TALs."))
 
+    # One-second records, whatever the profile says. The ingest normalises every other split it can, and
+    # the ones it cannot are the odd splits a particular writer chose, so an unusual record duration
+    # would survive into the pool as that writer's signature.
+    if header.data_record_duration != 1.0:
+        violations.append(
+            Violation(
+                "record_duration",
+                f"Data records are {header.data_record_duration:g} s long; a submission uses one-second records.",
+            )
+        )
+
     expected_size = header.header_record_bytes + header.record_byte_size * header.data_record_count
     if header.data_record_count < 0 or expected_size != len(data):
         violations.append(Violation("truncated", "The file length does not match its header."))

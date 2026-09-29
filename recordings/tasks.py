@@ -887,7 +887,9 @@ def ingest_pooled_submissions() -> dict:
     One audited scope covers the run (``recordings.submission.ingest``, no target, the counts
     in the metadata); each recording's creation is recorded under it. Processing is queued
     per recording after the commit, as the upload does, so the de-identification pass runs
-    on the submitted bytes as defence in depth. A file that fails to ingest keeps its row as
+    on the submitted bytes as defence in depth. Every file is re-dithered first
+    (:mod:`recordings.processors.redither`, its version in the run's metadata), so no stored
+    member is byte-identical to what its contributor sent. A file that fails to ingest keeps its row as
     ``failed`` with the error for the operator and is not retried.
 
     A pool whose profile sets ``m`` is held until it has that many contributors: its files stay
@@ -909,6 +911,7 @@ def ingest_pooled_submissions() -> dict:
     from activity.models import Activity
     from activity.system_activity import with_system_activity
     from recordings.models import SubmissionFile
+    from recordings.processors.redither import REDITHER_VERSION
 
     _purge_failed_submissions()
     sweep_spool()
@@ -936,7 +939,7 @@ def ingest_pooled_submissions() -> dict:
     with with_system_activity(
         "recordings.submission.ingest",
         interface=Activity.Interface.CELERY,
-        metadata={"file_count": len(pending), "ledger_count": ledger_count},
+        metadata={"file_count": len(pending), "ledger_count": ledger_count, "redither_version": REDITHER_VERSION},
     ):
         # Two phases, so the trail cannot pair a recording with its file row. The first writes
         # only recordings, in the shuffled order; the second writes every file row and ledger
@@ -1184,6 +1187,7 @@ def _ingest_submission_file(item) -> str | None:
     from library.models import DatasetItem
     from recordings.container import save_viewer_sidecar
     from recordings.models import Recording, SubmissionFile, stored_original_name
+    from recordings.processors.redither import redither_edf
     from recordings.submissions import get_ingest_profile
 
     pool = item.ledger.dataset
@@ -1207,6 +1211,11 @@ def _ingest_submission_file(item) -> str | None:
         # A rename keeps the old mtime; refreshed, so an overlapping run's spool sweep does not take
         # the file for an orphan before this run's recording row commits.
         os.utime(renamed)
+        # Before anything is created, so no recording ever points at the submitted bytes. A file
+        # already in canonical form passes every later pass unchanged, and without this its stored
+        # digest would be the contributor's receipt. A file that then fails goes back to the spool
+        # re-dithered: it is not retried, and the row keeps the received digest withdrawal keys on.
+        redither_edf(renamed)
         with transaction.atomic():
             if not SubmissionFile.objects.select_for_update().filter(pk=item.pk).exists():
                 raise _Withdrawn()

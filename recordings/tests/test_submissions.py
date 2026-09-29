@@ -34,6 +34,7 @@ from maintenance.operations import get_operation
 from recordings import tasks
 from recordings.models import Recording, SubmissionFile, SubmissionLedger
 from recordings.processors.edf import _build_clean_header, parse_edf_header, parse_signal_infos
+from recordings.processors.redither import REDITHER_VERSION
 from recordings.submissions import (
     BLANK_PATIENT,
     BLANK_RECORDING,
@@ -231,6 +232,14 @@ class TestGate:
         assert "duration" in _codes(validate_submission(_profile(), data, _sidecar(data)))
         assert "duration" not in _codes(
             validate_submission(_profile(durations_seconds=(2.0, 3.0)), data, _sidecar(data))
+        )
+
+    def test_records_must_be_one_second_long_whatever_the_profile(self):
+        signals = [{**s, "sample_count": 512} for s in SIGNALS]
+        data = _edf(n_records=1, rec_duration=2.0, signals=signals)
+        assert "record_duration" in _codes(validate_submission(IngestProfile(key="loose"), data, _sidecar(data)))
+        assert "record_duration" not in _codes(
+            validate_submission(IngestProfile(key="loose"), _edf(), _sidecar(_edf()))
         )
 
     def test_unpinned_profile_checks_nothing_about_the_file(self):
@@ -757,7 +766,7 @@ class TestPooledIngest:
         assert SubmissionLedger.objects.get().ingested_count == 1
         assert not any(f.name in ("ledger", "batch", "submission") for f in Recording._meta.get_fields())
         activity = Activity.objects.get(verb="recordings.submission.ingest")
-        assert activity.metadata == {"file_count": 1, "ledger_count": 1}
+        assert activity.metadata == {"file_count": 1, "ledger_count": 1, "redither_version": REDITHER_VERSION}
         assert activity.actor is None
         assert activity.target_content_type is None
 
@@ -1221,13 +1230,12 @@ class TestFailureRetention:
 
 
 class TestStoredBytesOfACanonicalSubmission:
-    """Residual, not a guarantee: a submission already in the platform's canonical form is stored unchanged.
+    """A submission already in the platform's canonical form is not stored as sent.
 
     The ingest pass rewrites the header into the canonical form and moves channels into canonical order;
-    it does not touch samples. A preparation tool that writes that form produces a file the pass leaves
-    byte-identical, so the stored file's digest is the submitted file's, which is the contributor's
-    receipt hash. Withholding ``stored_hash`` does not close that join for a reader with byte access:
-    such a reader can hash the bytes. These tests pin the equality so the assessment records it.
+    it does not touch samples, so a file already in that form would pass it byte-identical, and the stored
+    file's digest would be the contributor's receipt. The re-dither ahead of the pass is what prevents it.
+    A reader with byte access hashes what they download, so ``stored_hash`` being withheld is not enough.
     """
 
     def _ingest(self, pool, spool, data, capture):
@@ -1242,11 +1250,15 @@ class TestStoredBytesOfACanonicalSubmission:
         recording = self._ingest(pool, spool, _edf(), django_capture_on_commit_callbacks)
         assert recording.stored_hash != recording.file_hash
 
-    def test_a_canonical_submission_is_stored_byte_identical(self, pool, spool, django_capture_on_commit_callbacks):
+    def test_a_canonical_submission_is_not_stored_as_sent(self, pool, spool, django_capture_on_commit_callbacks):
         first = self._ingest(pool, spool, _edf(), django_capture_on_commit_callbacks)
         canonical = Path(first.file_path).read_bytes()
         assert validate_file(_profile(), canonical) == []
         second = self._ingest(pool, spool, canonical, django_capture_on_commit_callbacks)
+        stored = Path(second.file_path).read_bytes()
+        # The received digest stays on the recording, where withdrawal looks for it.
         assert second.file_hash == hashlib.sha256(canonical).hexdigest()
-        assert second.stored_hash == second.file_hash
-        assert Path(second.file_path).read_bytes() == canonical
+        assert second.stored_hash != second.file_hash
+        assert hashlib.sha256(stored).hexdigest() != second.file_hash
+        assert len(stored) == len(canonical)
+        assert stored[:256] == canonical[:256]
