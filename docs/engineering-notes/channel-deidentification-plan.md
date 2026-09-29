@@ -8,7 +8,7 @@
 
 ## Threat model and framing
 
-Recording start dates are already anonymised at ingest, so site identification matters here as a **k-anonymity reducer**, not as direct identification: knowing "this file came from institution X's EMU, on vendor Y hardware" shrinks the candidate subject pool that other quasi-identifiers (age, recording length, pathology visible in the signal) then cut further. The control is worth building, but it must not be oversold — see [Residual risk](#residual-risk-what-this-plan-does-not-close).
+Recording start dates are already removed at ingest, so site identification matters here as a **k-anonymity reducer**, not as direct identification: knowing "this file came from institution X's EMU, on vendor Y hardware" shrinks the candidate subject pool that other quasi-identifiers (age, recording length, pathology visible in the signal) then cut further. The control is worth building, but it must not be oversold — see [Residual risk](#residual-risk-what-this-plan-does-not-close).
 
 Ranking the leaking fields by pool-shrinking power, which is what justifies the phase order:
 
@@ -81,7 +81,7 @@ Contract tests: [recordings/tests/test_channel_layout.py](../../recordings/tests
 
 ## Phase 2 — federation middleware parity (defense-in-depth)
 
-`AnonymizeEDFHeader` ([federation/middleware.py](../../federation/middleware.py)) parses the raw header, runs `deidentify_signal_infos` over the parsed infos, and delegates to `_build_clean_header` — the serve-time layer applies the same channel cleaning as ingest, with no separate middleware class and no pipeline-shape change. Because the cleaning lives on the class itself, the FUSE default — which instantiates `AnonymizeEDFHeader` directly — carries it with no separate wiring; the HTTP and FUSE surfaces cannot diverge. For locally ingested files this is a no-op — the stored file is already clean — which is precisely the role the middleware already plays for subject PHI. It exists for the margins: files ingested before Phase 1 (none in the sandbox; margin note above) and any future path that serves bytes not produced by this platform's ingest.
+`DeidentifyEDFHeader` ([federation/middleware.py](../../federation/middleware.py)) parses the raw header, runs `deidentify_signal_infos` over the parsed infos, and delegates to `_build_clean_header` — the serve-time layer applies the same channel cleaning as ingest, with no separate middleware class and no pipeline-shape change. Because the cleaning lives on the class itself, the FUSE default — which instantiates `DeidentifyEDFHeader` directly — carries it with no separate wiring; the HTTP and FUSE surfaces cannot diverge. For locally ingested files this is a no-op — the stored file is already clean — which is precisely the role the middleware already plays for subject PHI. It exists for the margins: files ingested before Phase 1 (none in the sandbox; margin note above) and any future path that serves bytes not produced by this platform's ingest.
 
 The middleware layer keeps its deliberate fail-open-on-parse-error behaviour; with ingest as the primary control, that trade now bounds only the defense-in-depth layer, not the control itself.
 

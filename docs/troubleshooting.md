@@ -294,7 +294,7 @@ Django's `DATA_UPLOAD_MAX_MEMORY_SIZE` is a separate, much smaller ceiling and d
 
 ### "I re-uploaded a file and now I have two sets of annotations"
 
-Working as designed. `_annotation_hash(recording.pk, suffix)` is keyed on the recording PK, and re-upload creates a new Recording row with a new PK. The annotations from the previous upload are still attached to the previous Recording.
+Working as designed. `annotation_hash(recording, suffix)` is keyed on the recording's random `stored_name`, and re-upload creates a new Recording row with a new stored name. The annotations from the previous upload are still attached to the previous Recording.
 
 If you want a single set, delete the previous Recording (soft-delete via `DELETE /recordings/api/v1/{hash}`); annotations cascade-delete with their target. See [annotations/README.md](../annotations/README.md#gotchas).
 

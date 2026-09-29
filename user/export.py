@@ -188,8 +188,18 @@ RELATION_HANDLING: dict[str, _Handling] = {
     # this subject's export, and identifying the object would often mean naming a
     # recording that belongs to someone else again. Art. 15(1)(c) is satisfied by
     # the recipients section of the privacy notice rather than row by row here.
+    # The assessment pair is the giver's own record (epicurrents.assessment), so
+    # it travels with the grants the subject gave and not with the ones they
+    # received, where it would be a note about them written by someone else.
     "epicurrents.accessright:access_giver": _export(
-        "can_read", "can_write", "can_share", "expires_at", "created_at", title="Access you granted to others"
+        "can_read",
+        "can_write",
+        "can_share",
+        "expires_at",
+        "created_at",
+        "assessment_reference",
+        "assessment_date",
+        title="Access you granted to others",
     ),
     "epicurrents.accessright:access_target": _export(
         "can_read", "can_write", "can_share", "expires_at", "created_at", title="Access others granted to you"

@@ -15,7 +15,7 @@ The platform supports three preservation modes (``RECORDINGS_PRESERVE_MODE``):
 ``"all"``
     The platform copies the upload to the originals volume **before
     processing runs** — the only correct time, since processing rewrites the
-    file in place for header anonymisation.
+    file in place for header de-identification.
 
 The originals volume is **strictly write-only from the platform's
 perspective**.  No code path in this module or anywhere else reads from
@@ -33,7 +33,7 @@ On-disk layout::
 where ``stored_name_prefix`` is the 32-character random hex prefix of
 ``Recording.stored_name`` — unique per upload and stable across the
 recording's lifetime (independent of ``content_hash``, which the platform
-rewrites during anonymisation).
+rewrites during de-identification).
 """
 
 from __future__ import annotations
@@ -315,10 +315,18 @@ def _stash_path_for(recording_id: int) -> Path:
 
 
 def _on_pre_convert(recording, source_path: Path, ext: str) -> None:
-    """pre_convert handler — stash source bytes when mode is ``"failed"``.
+    """pre_convert handler — stash source bytes when mode is ``"failed"``."""
+    stash_source_bytes(recording, source_path)
 
-    Skipped for mode ``"all"`` (the staging-file preservation at task start
-    already covers it) and mode ``"none"`` (nothing to preserve at all).
+
+def stash_source_bytes(recording, source_path: Path) -> None:
+    """Stash a copy of *source_path* for the failure path when mode is ``"failed"``.
+
+    Called before any step that rewrites the stored file in place and may be
+    followed by a processing failure: the conversion of a vendor format, and
+    the detaching of a container's footer. Skipped for mode ``"all"`` (the
+    staging-file preservation at task start already covers it) and mode
+    ``"none"`` (nothing to preserve at all).
     """
     if _current_mode() != MODE_FAILED:
         return

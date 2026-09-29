@@ -1,6 +1,9 @@
 <script setup lang="ts">
+import axios from 'axios'
 import { reactive, ref, watch } from 'vue'
 import { t } from '#i18n'
+import { errorDetail } from '#lib/http'
+import { toastNameWarnings } from '#lib/nameWarnings'
 import { showToast } from '#lib/toast'
 import { updateRecording, type Recording } from '#api/recordings'
 
@@ -18,7 +21,7 @@ const emit = defineEmits<{
     (e: 'close'): void
 }>()
 
-const input = reactive({ name: '', modality: '' })
+const input = reactive({ name: '', modality: '', publicSource: '' })
 const loading = ref(false)
 const error = ref<string | null>(null)
 
@@ -33,6 +36,7 @@ watch(
         // into the grantee-visible display name.
         input.name = rec.has_custom_name ? rec.display_name : ''
         input.modality = rec.modality
+        input.publicSource = rec.public_source
         error.value = null
     },
 )
@@ -51,12 +55,18 @@ async function submit () {
         const updated = await updateRecording(props.recording.hash, {
             display_name: input.name,
             modality: input.modality,
+            public_source: input.publicSource,
         })
         emit('updated', updated)
         showToast(t('Recording updated.', SCOPE), 'success')
+        toastNameWarnings(updated.warnings)
         emit('close')
-    } catch {
-        error.value = t('Failed to update recording. Please try again.', SCOPE)
+    } catch (err) {
+        // A 400 is the published-source check, whose message says what is wrong with the value: not a DOI or URL,
+        // or a URL carrying credentials, a query or a fragment.
+        error.value = axios.isAxiosError(err) && err.response?.status === 400
+            ? errorDetail(err, t('The published source must be a DOI or an http(s) URL.', SCOPE))
+            : errorDetail(err, t('Failed to update recording. Please try again.', SCOPE))
     } finally {
         loading.value = false
     }
@@ -95,6 +105,15 @@ async function submit () {
                 <wa-option value="seeg">{{ t('sEEG', SCOPE) }}</wa-option>
                 <wa-option value="acc">{{ t('Accelerometry', SCOPE) }}</wa-option>
             </wa-select>
+            <wa-input
+                :disabled="loading"
+                :hint="t('DOI or URL of the published dataset this recording was taken from, if any, without a query or login details. Shown to every reader.', SCOPE)"
+                :label="t('Published source', SCOPE)"
+                placeholder="10.xxxx/... or https://..."
+                size="s"
+                type="text"
+                v-wa="[input, 'publicSource']"
+            ></wa-input>
         </div>
         <div slot="footer" class="form-actions">
             <wa-button

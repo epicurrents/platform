@@ -18,6 +18,8 @@
     One job per import run; one file row per discovered file.
 """
 
+import secrets
+
 from django.conf import settings
 from django.contrib.contenttypes.fields import GenericForeignKey, GenericRelation
 from django.contrib.contenttypes.models import ContentType
@@ -69,8 +71,18 @@ class Recording(models.Model):
     file_extension = models.CharField(max_length=32, blank=True, default="")
     file_size = models.BigIntegerField()
     file_path = models.CharField(max_length=1024)
+    # SHA-256 of the bytes as uploaded, before any de-identification. Never served: it is a
+    # bit-exact link to the original held by whoever acquired the recording, and an endpoint that
+    # answers whether a given hash exists is a membership oracle for anyone holding a copy (see
+    # docs/anonymisation-compliance.md). Internal uses only: the preservation manifest, content_hash,
+    # and the dataset withdrawal path a project runs as a management command.
     file_hash = models.CharField(max_length=64, blank=True, default="")
     content_hash = models.CharField(max_length=64, blank=True, default="")
+    # SHA-256 of the file as stored, computed after the last ingest rewrite and again whenever the
+    # platform rewrites the file (``recordings.metadata.refresh_signal_metadata``). The one digest
+    # the API serves: a hash of already-de-identified bytes links to nothing outside the platform.
+    # Empty for a recording that never reached READY.
+    stored_hash = models.CharField(max_length=64, blank=True, default="")
 
     class Status(models.TextChoices):
         PENDING = "pending", "Pending"
@@ -101,6 +113,12 @@ class Recording(models.Model):
     # notch and BIDS ``PowerLineFrequency`` via
     # ``compute.mains.resolve_recording_notch_hz``.
     power_line_frequency = models.FloatField(null=True, blank=True, default=None)
+    # The published dataset this recording's data was taken from, as a DOI or URL, or empty
+    # for data acquired here. The author's assertion, validated for shape only by
+    # ``recordings.public_source``; served to every reader, since it names a public dataset
+    # rather than a person. Lives here for the same reason as ``power_line_frequency``:
+    # a reprocess rebuilds ``RecordingMeta`` and would drop it.
+    public_source = models.CharField(max_length=512, blank=True, default="")
 
     # Reverse GenericRelations so hard-delete (purge) cascades cleanly through
     # every reference row that targets this recording via a GenericForeignKey.
@@ -213,6 +231,19 @@ class RecordingMeta(models.Model):
     # canonical ordering was applied. Stamped at ingest, never re-derived — a
     # refresh cannot know which spec wrote the bytes.
     channel_order_version = models.PositiveSmallIntegerField(default=0)
+    # Version of the header and channel-block de-identification pass that wrote
+    # the stored file (processors.edf.DEIDENTIFICATION_VERSION); 0 means the file
+    # was processed before the record existed. Stamped at ingest, never
+    # re-derived, for the same reason as channel_order_version. Together with
+    # the flag below and the READY audit row's payload, this is the per-recording
+    # process record EDPB Guidelines 02/2026 paragraph 41 asks for.
+    deidentification_version = models.PositiveSmallIntegerField(default=0)
+    # Whether the stored file keeps the annotation text it arrived with. Stamped
+    # from the resolved strip decision at ingest; meaningful only when
+    # deidentification_version is non-zero, since older rows were never stamped.
+    # Content-free and served to every reader: a de-identifying grant strips the
+    # text on the wire regardless, and a raw grant's reader is entitled to know.
+    annotation_text_preserved = models.BooleanField(default=False)
 
     created_at = models.DateTimeField(auto_now_add=True)
     modified_at = models.DateTimeField(auto_now=True)
@@ -411,3 +442,125 @@ class ImportJobFile(models.Model):
         indexes = [
             models.Index(fields=["job", "status"]),
         ]
+
+
+class SubmissionLedger(models.Model):
+    """One contributor's record for one submission pool: who submitted there, and how many of their files ingested.
+
+    The ledger is the audit target of every accepted submission, so the trail names
+    the contributor and the pool without naming a recording. It stores nothing:
+    accepted files wait in the spool (``SubmissionFile``) and then as unreleased
+    members of the pool. The server creates a contributor's ledger with their first
+    accepted file and never shows it to them; one per contributor per pool.
+
+    A recording ingested from the spool carries no reference back to the ledger: the
+    pooled ingest task (``recordings.tasks.ingest_pooled_submissions``) creates the
+    recording under the system user and deletes the file row, leaving the ledger
+    with counts only. What remains is the correlation between a ledger's timestamps
+    and the recordings that appeared a pooling delay later, inside the operator's
+    own database; the compliance document records that as an operator-level
+    residual.
+
+    ``contributor`` is nullable so that erasing the account clears the one link a
+    ledger holds to a person; the ledger itself is not personal data once that link
+    is gone. The profile is the pool's (``Dataset.submission_profile``), which
+    cannot change once a ledger exists.
+    """
+
+    dataset = models.ForeignKey(
+        "library.Dataset",
+        on_delete=models.CASCADE,
+        related_name="submission_ledgers",
+    )
+    contributor = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="submission_ledgers",
+    )
+    # A locator for the audit trail, mirroring Dataset.object_hash: random, never sequential.
+    object_hash = models.CharField(max_length=32, unique=True, editable=False)
+    # Files that finished ingest are deleted rather than kept, so the count is the
+    # ledger's only record of them.
+    ingested_count = models.PositiveIntegerField(default=0)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        indexes = [
+            models.Index(fields=["dataset", "created_at"], name="recordings__dataset_8f664b_idx"),
+        ]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["dataset", "contributor"],
+                condition=models.Q(contributor__isnull=False),
+                name="submission_ledger_one_per_contributor",
+            ),
+        ]
+
+    def save(self, *args, **kwargs):
+        if not self.object_hash:
+            self.object_hash = secrets.token_hex(16).upper()
+        super().save(*args, **kwargs)
+
+    def __str__(self) -> str:
+        return f"SubmissionLedger({self.object_hash} dataset={self.dataset_id})"
+
+
+class SubmissionFile(models.Model):
+    """A validated submission waiting in the spool for the pooled ingest run.
+
+    Written only after the whole submission passed the profile's gate, so a row
+    never describes bytes that might carry identifying content. No client
+    filename is kept: ``stored_name`` is a random token, as for an upload.
+    ``sidecar`` is the validated sidecar document, handed to the profile's
+    ``ingest`` callable when the recording is created. ``file_hash`` is the
+    digest the sidecar declared and the server verified; it is also
+    ``Recording.file_hash`` after ingest, as ``file_size`` is the recording's
+    size. The four values that recur on the recording's side (the hash, the
+    size, the sidecar and its hash) are withheld from the audit trail
+    (``recordings.apps``), the recording is given a fresh stored name, and the
+    row is deleted once ingested: kept, any of them would be a join from a
+    recording back to its ledger.
+
+    A row that fails ingest stays, with ``status`` ``failed``, the error text
+    and ``failed_at``, for the operator; no recording is left, since the ingest
+    rolls back. Its retention window runs from ``failed_at``, not from receipt,
+    so a file held for months before failing still gets the whole window.
+    Deleting a row unlinks its spooled bytes once the deletion commits
+    (``recordings.submissions.unlink_spooled_bytes``), whichever path deletes it.
+    """
+
+    class Status(models.TextChoices):
+        PENDING = "pending", "Pending"
+        FAILED = "failed", "Failed"
+
+    ledger = models.ForeignKey(
+        SubmissionLedger,
+        on_delete=models.CASCADE,
+        related_name="files",
+    )
+    stored_name = models.CharField(max_length=255, unique=True)
+    file_extension = models.CharField(max_length=32)
+    file_path = models.CharField(max_length=1024)
+    file_size = models.BigIntegerField()
+    file_hash = models.CharField(max_length=64)
+    sidecar_hash = models.CharField(max_length=64)
+    sidecar = models.JSONField(default=dict)
+    status = models.CharField(
+        max_length=16,
+        choices=Status.choices,
+        default=Status.PENDING,
+        db_index=True,
+    )
+    error = models.TextField(blank=True, default="")
+    received_at = models.DateTimeField(auto_now_add=True)
+    failed_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        indexes = [
+            models.Index(fields=["status", "received_at"]),
+        ]
+
+    def __str__(self) -> str:
+        return f"SubmissionFile({self.stored_name} [{self.status}] ledger={self.ledger_id})"

@@ -13,7 +13,7 @@ Three silent-failure classes are in scope:
 3. **`apply_middleware` propagation.** The extension reads
    ``apply_middleware`` from the matching ``AccessRight`` and returns it
    in ``ReadAccessTerms``; dropping that propagation silently switches
-   EDF serving from anonymised to raw (or vice versa).
+   EDF serving from de-identified to raw (or vice versa).
 
 See AGENTS.md → *Load-bearing files* before modifying. Contract tests
 in `library/tests/test_permissions.py` cover all three classes,
@@ -92,8 +92,11 @@ def can_read_via_dataset(user, obj, share_token: str | None = None):
     Write access is never granted through Datasets.
 
     ``apply_middleware`` in the returned ``ReadAccessTerms`` reflects the matching
-    Dataset ``AccessRight`` row, so EDF content is anonymised (or not) according
+    Dataset ``AccessRight`` row, so EDF content is de-identified (or not) according
     to the sharer's choice — consistent with direct-right behaviour.
+
+    A release-gated dataset conveys nothing to a request carrying a share token, so no
+    member of one resolves through it for a forwardable link, whoever controls the member.
     """
     from django.contrib.contenttypes.models import ContentType
     from django.db.models import Q
@@ -114,14 +117,17 @@ def can_read_via_dataset(user, obj, share_token: str | None = None):
 
     obj_ct = ContentType.objects.get_for_model(obj, for_concrete_model=False)
 
-    # Reverse lookup: which active datasets contain this object?
-    dataset_ids = list(
-        DatasetItem.objects.filter(
-            content_type=obj_ct,
-            object_id=str(object_pk),
-            dataset__deleted_at__isnull=True,
-        ).values_list("dataset_id", flat=True)
+    # Reverse lookup: which active datasets contain this object? A release-gated
+    # dataset conveys nothing to a request carrying a share token, whoever
+    # controls its members: no gated member resolves for a forwardable link.
+    memberships = DatasetItem.objects.filter(
+        content_type=obj_ct,
+        object_id=str(object_pk),
+        dataset__deleted_at__isnull=True,
     )
+    if token_value:
+        memberships = memberships.exclude(dataset__release_gated=True)
+    dataset_ids = list(memberships.values_list("dataset_id", flat=True))
     if not dataset_ids:
         return ReadAccessTerms(granted=False)
 

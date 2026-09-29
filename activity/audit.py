@@ -88,11 +88,17 @@ def _json_safe(value):
 # apps register their own fields from AppConfig.ready() — see
 # user/apps.py and notifications/apps.py for the core registrations.
 _MASKED_FIELDS: dict[str, frozenset[str]] = {}
+# Fields replaced by one constant rather than a digest of their value. A digest is
+# recomputable by anyone holding the value, so it hides a value only from someone
+# who does not already have it; these fields are ones whose value exists elsewhere
+# in the trail, where a digest of it would be a join.
+_WITHHELD_FIELDS: dict[str, frozenset[str]] = {}
 
 MASK_PREFIX = "<masked:"
+WITHHELD_SENTINEL = f"{MASK_PREFIX}withheld>"
 
 
-def register_masked_fields(model_label: str, fields) -> None:
+def register_masked_fields(model_label: str, fields, *, withhold: bool = False) -> None:
     """Register credential fields of *model_label* for write-time masking.
 
     ``model_label`` is the lowercase ``app_label.model_name`` pair. Masking
@@ -100,8 +106,17 @@ def register_masked_fields(model_label: str, fields) -> None:
     reaches ``before_state`` / ``changes`` / the integrity hash, so secrets
     (password hashes, push-encryption keys) never persist in the audit trail
     while unequal secrets still produce a visible diff.
+
+    With ``withhold`` the fields are written as the constant
+    ``WITHHELD_SENTINEL`` instead. The digest is an unsalted hash of the value,
+    so it can be recomputed from a copy of the value held anywhere else, the
+    trail included; withhold a field whose value is also recorded under another
+    row that must not be joinable to this one. A change to a withheld field
+    leaves no diff. The two registrations are kept apart, so a model may mask
+    some fields and withhold others.
     """
-    _MASKED_FIELDS[model_label] = frozenset(fields)
+    registry = _WITHHELD_FIELDS if withhold else _MASKED_FIELDS
+    registry[model_label] = frozenset(fields)
 
 
 def registered_masked_fields(model_label: str) -> frozenset[str]:
@@ -114,9 +129,11 @@ def registered_masked_fields(model_label: str) -> frozenset[str]:
     covers both — a project registering a new credential field is excluded from
     the export without having to know the export exists.
 
+    Withheld fields are included, since they are the same class of field.
+
     Read-only; registration stays with :func:`register_masked_fields`.
     """
-    return _MASKED_FIELDS.get(model_label, frozenset())
+    return _MASKED_FIELDS.get(model_label, frozenset()) | _WITHHELD_FIELDS.get(model_label, frozenset())
 
 
 def _mask_value(value) -> str:
@@ -136,16 +153,20 @@ def serialize_instance(instance) -> dict:
     """Serialize concrete model fields to a dict suitable for audit storage.
 
     Fields registered via ``register_masked_fields`` are replaced by a masked
-    digest sentinel; empty values (``None``, ``""``) pass through unmasked
+    digest sentinel, or by ``WITHHELD_SENTINEL`` where registered with
+    ``withhold``; empty values (``None``, ``""``) pass through unmasked
     because they carry no secret material.
     """
 
     label = f"{instance._meta.app_label}.{instance._meta.model_name}"
     masked = _MASKED_FIELDS.get(label, frozenset())
+    withheld = _WITHHELD_FIELDS.get(label, frozenset())
     data = {}
     for field in instance._meta.concrete_fields:
         value = getattr(instance, field.attname)
-        if field.attname in masked and value:
+        if field.attname in withheld and value not in (None, ""):
+            data[field.attname] = WITHHELD_SENTINEL
+        elif field.attname in masked and value:
             data[field.attname] = _mask_value(value)
         else:
             data[field.attname] = _json_safe(value)
@@ -1141,8 +1162,64 @@ def _has_write_access_for_ref(user, change: ObjectChangeLog) -> bool:
     )
 
 
+class RollbackRefused(ValueError):
+    """A registered rollback guard refused the rollback: restoring the state would bypass a rule of the owning app."""
+
+
+# model label (lowercase ``app_label.model_name``) -> guards; see register_rollback_guard.
+_ROLLBACK_GUARDS: dict[str, list] = {}
+
+
+def register_rollback_guard(model_label: str, guard) -> None:
+    """Register a guard consulted before any rollback of a change on *model_label*.
+
+    Signature: ``guard(change, existing_obj) -> str | None``; return a reason to refuse, or
+    ``None`` to allow. ``existing_obj`` is the live row or ``None`` when it is gone. A rollback
+    writes rows directly, past every endpoint rule, so an app whose rows carry rules the
+    endpoints enforce (a pool's configuration, a release record) registers a guard from its
+    ``AppConfig.ready()`` refusing the rollbacks that would break them. Guards apply to
+    superusers too: they protect invariants, not access. Idempotent per callable.
+    """
+    guards = _ROLLBACK_GUARDS.setdefault(model_label.lower(), [])
+    if guard not in guards:
+        guards.append(guard)
+
+
+def rollback_refusal(change: ObjectChangeLog, existing_obj=None) -> str | None:
+    """The first reason a registered guard gives for refusing to roll back *change*, or ``None``.
+
+    ``existing_obj`` is fetched when not supplied, so a pre-flight check and the execution path
+    decide on the same row.
+    """
+    label = f"{change.content_type.app_label}.{change.content_type.model}".lower()
+    guards = _ROLLBACK_GUARDS.get(label, ())
+    if not guards:
+        return None
+    if existing_obj is None:
+        model_class = change.content_type.model_class()
+        if model_class is not None:
+            existing_obj = model_class._default_manager.filter(pk=change.object_id).first()
+    for guard in guards:
+        reason = guard(change, existing_obj)
+        if reason:
+            return reason
+    return None
+
+
 def can_rollback_change(user, change: ObjectChangeLog, existing_obj=None) -> bool:
-    """Return True when user may rollback the given change log entry.
+    """Return True when user may rollback the given change log entry and no registered guard refuses it.
+
+    The access half is :func:`_may_rollback_by_access`; a guard refusal (:func:`rollback_refusal`)
+    makes the answer False for every caller, superusers included, so a listing of rollbackable
+    changes and a bulk pre-flight never offer what execution would refuse.
+    """
+    if not _may_rollback_by_access(user, change, existing_obj):
+        return False
+    return rollback_refusal(change, existing_obj) is None
+
+
+def _may_rollback_by_access(user, change: ObjectChangeLog, existing_obj=None) -> bool:
+    """Return True when user holds the access to rollback the given change log entry.
 
     Checks (in order):
     1. Superuser — always allowed.
@@ -1273,8 +1350,11 @@ def rollback_change(*, user, change_id: int):
         raise ValueError("Target model for change log no longer exists")
 
     existing_obj = model_class._default_manager.filter(pk=change.object_id).first()
-    if not can_rollback_change(user=user, change=change, existing_obj=existing_obj):
+    if not _may_rollback_by_access(user, change, existing_obj):
         raise PermissionError("You do not have permission to rollback this object state")
+    refusal = rollback_refusal(change, existing_obj)
+    if refusal:
+        raise RollbackRefused(refusal)
 
     # Refuse to apply before_state from a row whose integrity hash no longer
     # matches its contents. A tampered row that silently rolls back would

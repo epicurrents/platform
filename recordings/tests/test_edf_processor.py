@@ -820,6 +820,19 @@ class TestReadRecordGaps:
 # ---------------------------------------------------------------------------
 
 
+_EEG_AND_ANNOTATION_SIGNALS = [
+    {"label": "EEG Fp1", "sample_count": 256, "phys_min": -100, "phys_max": 100, "dig_min": -32768, "dig_max": 32767},
+    {
+        "label": "EDF Annotations",
+        "sample_count": 60,
+        "phys_min": -1,
+        "phys_max": 1,
+        "dig_min": -32768,
+        "dig_max": 32767,
+    },
+]
+
+
 class TestRewriteEdfHeader:
     def _roundtrip(self, header_bytes: bytes, data_bytes: bytes = b"") -> bytes:
         """Write file to disk, rewrite header, return full file content."""
@@ -845,7 +858,7 @@ class TestRewriteEdfHeader:
         recording_field = result[88:168].decode("ascii").strip()
         assert recording_field == "Startdate X X X X"
 
-    def test_start_date_anonymised(self):
+    def test_start_date_replaced(self):
         raw = _make_edf_header(startdate="15.06.24")
         result = self._roundtrip(raw)
         assert result[168:176] == b"01.01.85"
@@ -855,18 +868,25 @@ class TestRewriteEdfHeader:
         result = self._roundtrip(raw)
         assert result[176:184] == b"00.00.00"
 
-    def test_reserved_set_to_edf_plus_c(self):
-        raw = _make_edf_header(reserved="")  # plain EDF
-        result = self._roundtrip(raw)
+    @staticmethod
+    def _reserved(result: bytes) -> str:
         # Reserved field: offset 192, width 44 (after version+patient+recording+date+time+hdr_bytes)
-        reserved_field = result[192:236].decode("ascii").strip()
-        assert reserved_field == "EDF+C"
+        return result[192:236].decode("ascii").strip()
 
-    def test_reserved_preserves_edf_plus_d(self):
-        raw = _make_edf_header(reserved="EDF+D")
-        result = self._roundtrip(raw)
-        reserved_field = result[192:236].decode("ascii").strip()
-        assert reserved_field == "EDF+D"
+    def test_plain_edf_stays_plain(self):
+        raw = _make_edf_header(reserved="")
+        assert self._reserved(self._roundtrip(raw)) == ""
+
+    def test_plus_marker_without_annotation_signal_is_dropped(self):
+        # The plus formats require an annotation signal; a file claiming EDF+ without one
+        # is written as the plain EDF it is, which strict readers accept.
+        raw = _make_edf_header(reserved="EDF+C")
+        assert self._reserved(self._roundtrip(raw)) == ""
+
+    @pytest.mark.parametrize("marker", ["EDF+C", "EDF+D"])
+    def test_plus_marker_kept_with_annotation_signal(self, marker):
+        raw = _make_edf_header(reserved=marker, signals=_EEG_AND_ANNOTATION_SIGNALS)
+        assert self._reserved(self._roundtrip(raw)) == marker
 
     def test_bdf_version_byte_preserved(self):
         bdf_version = bytes([0xFF]) + b"BIOSEMI"
@@ -965,13 +985,11 @@ class TestProcessEdfFile:
         path = self._write_file(data, suffix=".bdf")
         try:
             result = process_edf_file(path)
-            # result.header reflects the original file format before rewriting;
-            # plain BDF → 'bdf'.  The rewritten file on disk will have 'BDF+C' in reserved.
             assert result.header.data_format == "bdf"
-            # Confirm the on-disk header was rewritten to BDF+C.
+            # A plain BDF has no annotation signal, so the rewritten header stays plain.
             rewritten = path.read_bytes()
-            reserved_on_disk = rewritten[192:236].decode("ascii").strip()
-            assert reserved_on_disk == "BDF+C"
+            assert rewritten[0] == 0xFF
+            assert rewritten[192:236].decode("ascii").strip() == ""
         finally:
             path.unlink(missing_ok=True)
 

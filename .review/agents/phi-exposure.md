@@ -26,7 +26,7 @@ identifiers, free-text clinician notes). AGENTS.md → "De-identification",
 strictly write-only" codify the rules; the LOAD-BEARING contracts on
 `federation/middleware.py`, `recordings/processors/edf.py`, and
 `recordings/api/v1/ninja.py` (`_build_serve_pipeline`) enforce
-specific instances. You check eight concrete invariants:
+specific instances. You check nine concrete invariants:
 
 ### C1 — Opaque hashes in URL kwargs for PHI-bearing objects
 
@@ -167,7 +167,7 @@ the preservation tier exists to bound.
 only place a non-empty `MiddlewarePipeline` may be constructed in
 serving code. The
 hazard this rule exists for is divergence, not absence: a serving path
-that hand-rolls its own pipeline (e.g. header-only) anonymises the
+that hand-rolls its own pipeline (e.g. header-only) de-identifies the
 header while leaking clinical annotation text, and every test written
 locally for that path still passes. Two concrete checks:
 
@@ -181,6 +181,35 @@ locally for that path still passes. Two concrete checks:
   [recordings/tests/test_serve_pipeline_parity.py](../../recordings/tests/test_serve_pipeline_parity.py)
   is a finding — the parity contract test must cover every serving
   shape end-to-end.
+
+### C9 — The assessment's given-data tables move with the surface
+
+[docs/anonymisation-compliance.md](../../docs/anonymisation-compliance.md)
+classifies the served output against the EDPB anonymisation guidelines
+from tables of what each reader is given. A field added to a recording
+`Out` schema, a change to what an annotation serialiser or the export
+writes, or a new serving surface changes that input, and the assessment
+is then wrong in a way no test can see. The load-bearing shape test in
+`recordings/tests/test_grantee_visible_shape.py` catches the recording
+side mechanically; this check catches the rest, and the recording side
+as well when the shape test was edited to match.
+
+A diff that touches any of the following must also touch
+`docs/anonymisation-compliance.md`:
+
+- the fields of `RecordingOut`, `RecordingMetaOut` or `SignalInfoOut`
+  in `recordings/api/v1/ninja.py`, or the slice response's row shape;
+- `_serialize_event`, `_serialize_label`, `_serialize_annotation` or
+  `_serialize_interruption` in `annotations/api/v1/ninja.py`, or the
+  redaction decision in `annotations/redaction.py`;
+- `_serialise_row`, `_COLUMNS`, `build_metadata` or `FORMAT_VERSION` in
+  `annotations/export.py`;
+- a new byte-serving or export endpoint (per C6), or a new grant surface.
+
+The document does not have to change its conclusion; a diff that re-reads
+the tables and finds them still true records that in the assessment log
+table. A diff that changes one of the surfaces above and leaves the
+document untouched is the finding.
 
 ## Procedure
 
@@ -199,7 +228,11 @@ complete PHI serving surface against all eight invariants —
 - every `Out` schema in those modules,
 - every project-plugin URL handler that serves recording-derived bytes,
 - every `MiddlewarePipeline` construction site (C8),
-- every `RECORDINGS_ORIGINALS_PATH` reference (C7).
+- every `RECORDINGS_ORIGINALS_PATH` reference (C7),
+- for C9, whether the given-data tables in
+  [docs/anonymisation-compliance.md](../../docs/anonymisation-compliance.md)
+  name every field the recording `Out` schemas, the annotation
+  serialisers and the export currently write.
 
 In full-surface mode the exemption registry (Step 3) still applies, the
 report format (Step 5) is unchanged except `Diff range:` reads
@@ -212,7 +245,7 @@ not the per-commit hook.
 Run from the repository root:
 
 ```bash
-git diff main...HEAD --name-only -- '*/api/v1/*.py' 'projects/*/urls.py' 'projects/*/api/*.py' 'recordings/preservation.py' 'recordings/processors/edf.py' 'federation/middleware.py'
+git diff main...HEAD --name-only -- '*/api/v1/*.py' 'projects/*/urls.py' 'projects/*/api/*.py' 'recordings/preservation.py' 'recordings/processors/edf.py' 'federation/middleware.py' 'annotations/export.py' 'annotations/redaction.py' 'docs/anonymisation-compliance.md'
 ```
 
 (Substitute `--staged` if auditing staged-but-uncommitted changes, or
@@ -240,6 +273,11 @@ The reviewer enforces the invariants only on:
 4. **New code paths under `RECORDINGS_ORIGINALS_PATH`.** Any new
    reference to the setting outside `recordings/preservation.py` or
    `recordings/management/commands/validate_originals.py`.
+5. **Given-data surfaces (C9).** The diff touches the body of
+   `RecordingOut`, `RecordingMetaOut`, `SignalInfoOut`, one of the four
+   annotation serialisers, `annotations/redaction.py`, or the row /
+   metadata writers in `annotations/export.py`, or adds an endpoint
+   that serves recording bytes, annotation rows or an export.
 
 **Out of scope explicitly:** an endpoint whose body was modified for
 unrelated reasons (a different bugfix, a refactor, a permission tighten,
@@ -358,6 +396,20 @@ endpoint (per the C6 detection) without a matching entry in
 `_SERVING_SHAPES` in `recordings/tests/test_serve_pipeline_parity.py`,
 record as **C8 — serving shape missing from parity contract test**.
 
+**C9 (given-data currency).** If Step 2 found any item of kind 5, check
+whether `docs/anonymisation-compliance.md` is in the diff:
+
+```bash
+git diff main...HEAD --name-only -- docs/anonymisation-compliance.md
+```
+
+Empty output with a kind-5 item in the audit set is **C9 — given-data
+surface changed without the assessment**, one line per surface touched.
+The check is presence in the diff, not content: judging whether the
+edit is adequate is the human reviewer's, and an edit that only appends
+an assessment-log row saying the tables were re-read and still hold
+passes.
+
 ### Step 5 — Compose the report
 
 Use exactly this structure (the pre-commit hook only checks file size,
@@ -399,6 +451,9 @@ C7 — originals volume read:
 C8 — serving-pipeline divergence:
   - <file>:<line> <function> — MiddlewarePipeline constructed outside _build_serve_pipeline, or serving shape missing from parity test
 
+C9 — given-data surface changed without the assessment:
+  - <file>:<line> <schema or function> — changed in this diff; docs/anonymisation-compliance.md is not
+
 What to do (skip blocks whose list above is empty):
 
   C1 — Replace the integer-PK placeholder with `{content_hash}`
@@ -439,6 +494,13 @@ What to do (skip blocks whose list above is empty):
   byte-serving endpoint, add its request shape to `_SERVING_SHAPES` in
   [recordings/tests/test_serve_pipeline_parity.py](../../recordings/tests/test_serve_pipeline_parity.py)
   so parity is asserted end-to-end.
+
+  C9 — Re-read the given-data tables in
+  [docs/anonymisation-compliance.md](../../docs/anonymisation-compliance.md)
+  against the changed surface, update the row that describes it, and add
+  an assessment-log row dated today saying what changed and whether the
+  classification moved. If nothing in the tables changes, the log row
+  alone is the record that they were re-read.
 
 Verdict:
   phi-exposure: PASS|FAIL

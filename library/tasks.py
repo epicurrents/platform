@@ -33,7 +33,14 @@ def purge_deleted_library():
     Live children of a purged collection re-parent to root via the
     ``parent`` FK's ``SET_NULL`` — purging a trashed parent never removes
     a live descendant.
+
+    Each row is deleted in its own savepoint, and a row whose delete raises
+    is logged and left for the next run rather than stopping the purge: one
+    row that cannot go must not keep every row after it past the window.
+    The count of such rows is returned under ``failed``.
     """
+    from django.db import transaction
+
     from activity.models import Activity
     from activity.system_activity import with_system_activity
     from library.models import Collection, CollectionItem, Dataset
@@ -47,13 +54,24 @@ def purge_deleted_library():
         metadata={"retention_days": retention_days},
     ):
         purged = {}
+        failed = 0
         for model in (CollectionItem, Collection, Dataset):
             count = 0
             queryset = model.objects.filter(deleted_at__isnull=False, deleted_at__lt=cutoff)
-            for row in queryset.iterator():
-                row.delete()
+            for pk in list(queryset.values_list("pk", flat=True)):
+                try:
+                    with transaction.atomic():
+                        row = model.objects.filter(pk=pk).first()
+                        if row is None:
+                            continue
+                        row.delete()
+                except Exception:
+                    failed += 1
+                    logger.exception("purge_deleted_library: could not purge %s %s", model.__name__, pk)
+                    continue
                 count += 1
             purged[model.__name__] = count
+        purged["failed"] = failed
 
     logger.info(
         "purge_deleted_library: items=%d collections=%d datasets=%d cutoff=%s",

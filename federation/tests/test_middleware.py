@@ -7,7 +7,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from federation.middleware import (
-    AnonymizeEDFHeader,
+    DeidentifyEDFHeader,
     DownsampleMiddleware,
     DropChannelsMiddleware,
     EDFFullFileMiddleware,
@@ -75,11 +75,11 @@ def test_empty_pipeline_is_empty():
 
 
 def test_non_empty_pipeline_is_not_empty():
-    assert not MiddlewarePipeline([AnonymizeEDFHeader()]).is_empty
+    assert not MiddlewarePipeline([DeidentifyEDFHeader()]).is_empty
 
 
 def test_header_only_pipeline_is_isometric():
-    assert MiddlewarePipeline([AnonymizeEDFHeader()]).is_isometric
+    assert MiddlewarePipeline([DeidentifyEDFHeader()]).is_isometric
 
 
 def test_full_file_pipeline_is_not_isometric():
@@ -87,23 +87,23 @@ def test_full_file_pipeline_is_not_isometric():
 
 
 def test_mixed_pipeline_is_not_isometric():
-    assert not MiddlewarePipeline([AnonymizeEDFHeader(), _HalfSignalMiddleware()]).is_isometric
+    assert not MiddlewarePipeline([DeidentifyEDFHeader(), _HalfSignalMiddleware()]).is_isometric
 
 
 def test_strip_annotation_pipeline_is_not_isometric():
     """StripAnnotationTextMiddleware is EDFSignalMiddleware → not isometric."""
-    p = MiddlewarePipeline([AnonymizeEDFHeader(), StripAnnotationTextMiddleware()])
+    p = MiddlewarePipeline([DeidentifyEDFHeader(), StripAnnotationTextMiddleware()])
     assert not p.is_isometric
 
 
 def test_strip_annotation_pipeline_is_size_preserving():
     """StripAnnotationTextMiddleware is size_invariant → pipeline is size-preserving."""
-    p = MiddlewarePipeline([AnonymizeEDFHeader(), StripAnnotationTextMiddleware()])
+    p = MiddlewarePipeline([DeidentifyEDFHeader(), StripAnnotationTextMiddleware()])
     assert p.is_size_preserving
 
 
 def test_header_only_pipeline_is_size_preserving():
-    assert MiddlewarePipeline([AnonymizeEDFHeader()]).is_size_preserving
+    assert MiddlewarePipeline([DeidentifyEDFHeader()]).is_size_preserving
 
 
 def test_full_file_pipeline_is_not_size_preserving():
@@ -148,7 +148,7 @@ def test_for_scope_api_excludes_fuse_only_full_middleware():
 
 
 def test_for_scope_returns_new_pipeline_instance():
-    pipeline = MiddlewarePipeline([AnonymizeEDFHeader()])
+    pipeline = MiddlewarePipeline([DeidentifyEDFHeader()])
     assert pipeline.for_scope("fuse") is not pipeline
 
 
@@ -158,7 +158,7 @@ def test_for_scope_returns_new_pipeline_instance():
 
 
 def test_isometric_pipeline_size_unchanged():
-    pipeline = MiddlewarePipeline([AnonymizeEDFHeader()])
+    pipeline = MiddlewarePipeline([DeidentifyEDFHeader()])
     assert pipeline.compute_output_size(file_size=100_000, header_size=8448) == 100_000
 
 
@@ -251,17 +251,17 @@ def test_apply_full_transforms_signals():
 
 
 # ---------------------------------------------------------------------------
-# AnonymizeEDFHeader
+# DeidentifyEDFHeader
 # ---------------------------------------------------------------------------
 
 
-def test_anonymize_targets_fuse_and_api():
-    assert "fuse" in AnonymizeEDFHeader.targets
-    assert "api" in AnonymizeEDFHeader.targets
+def test_deidentify_targets_fuse_and_api():
+    assert "fuse" in DeidentifyEDFHeader.targets
+    assert "api" in DeidentifyEDFHeader.targets
 
 
-def test_anonymize_returns_same_length_on_garbage_input():
-    anon = AnonymizeEDFHeader()
+def test_deidentify_returns_same_length_on_garbage_input():
+    anon = DeidentifyEDFHeader()
     raw = b"\x00" * 256
     assert len(anon.transform_header(raw)) == len(raw)
 
@@ -288,37 +288,37 @@ def _make_fingerprinted_header():
     )
 
 
-def test_anonymize_cleans_channel_labels():
+def test_deidentify_cleans_channel_labels():
     from recordings.processors.edf import parse_edf_header, parse_signal_infos
 
-    out = AnonymizeEDFHeader().transform_header(_make_fingerprinted_header())
+    out = DeidentifyEDFHeader().transform_header(_make_fingerprinted_header())
     infos = parse_signal_infos(out, parse_edf_header(out))
     assert [si.label for si in infos] == ["Fp1", "MISC_1"]
 
 
-def test_anonymize_blanks_transducer_and_reconstructs_prefiltering():
+def test_deidentify_blanks_transducer_and_reconstructs_prefiltering():
     from recordings.processors.edf import parse_edf_header, parse_signal_infos
 
-    out = AnonymizeEDFHeader().transform_header(_make_fingerprinted_header())
+    out = DeidentifyEDFHeader().transform_header(_make_fingerprinted_header())
     infos = parse_signal_infos(out, parse_edf_header(out))
     assert all(si.transducer_type == "" for si in infos)
     assert infos[0].prefiltering == "HP:0.1Hz LP:75Hz"
     assert infos[1].prefiltering == ""
 
 
-def test_anonymize_removes_raw_channel_fingerprints_from_bytes():
-    out = AnonymizeEDFHeader().transform_header(_make_fingerprinted_header())
+def test_deidentify_removes_raw_channel_fingerprints_from_bytes():
+    out = DeidentifyEDFHeader().transform_header(_make_fingerprinted_header())
     assert b"VendorCorp" not in out
     assert b"XYZ99" not in out
     assert b"0.53-70" not in out
 
 
-def test_anonymize_channel_cleaning_is_isometric():
+def test_deidentify_channel_cleaning_is_isometric():
     raw = _make_fingerprinted_header()
-    assert len(AnonymizeEDFHeader().transform_header(raw)) == len(raw)
+    assert len(DeidentifyEDFHeader().transform_header(raw)) == len(raw)
 
 
-def test_anonymize_preserves_annotation_channel_label():
+def test_deidentify_preserves_annotation_channel_label():
     from recordings.processors.edf import parse_edf_header, parse_signal_infos
     from recordings.tests.test_edf_processor import _make_edf_header
 
@@ -329,7 +329,7 @@ def test_anonymize_preserves_annotation_channel_label():
             {"label": "EDF Annotations", "sample_count": 16},
         ],
     )
-    out = AnonymizeEDFHeader().transform_header(raw)
+    out = DeidentifyEDFHeader().transform_header(raw)
     infos = parse_signal_infos(out, parse_edf_header(out))
     assert infos[1].label == "EDF Annotations"
     assert infos[1].is_annotation_channel
@@ -375,11 +375,11 @@ def test_signal_middleware_pipeline_has_signal_middleware():
 
 
 def test_header_only_pipeline_has_no_signal_middleware():
-    assert not MiddlewarePipeline([AnonymizeEDFHeader()]).has_signal_middleware
+    assert not MiddlewarePipeline([DeidentifyEDFHeader()]).has_signal_middleware
 
 
 def test_mixed_header_and_signal_has_signal_middleware():
-    assert MiddlewarePipeline([AnonymizeEDFHeader(), _DropFirstChannel()]).has_signal_middleware
+    assert MiddlewarePipeline([DeidentifyEDFHeader(), _DropFirstChannel()]).has_signal_middleware
 
 
 def test_full_file_middleware_not_counted_as_signal_middleware():
@@ -406,7 +406,7 @@ def _make_two_channel_edf():
 
 def test_build_signal_context_no_signal_mw_preserves_sizes():
     header, data, signals = _make_two_channel_edf()
-    pipeline = MiddlewarePipeline([AnonymizeEDFHeader()])
+    pipeline = MiddlewarePipeline([DeidentifyEDFHeader()])
     ctx = pipeline.build_signal_context(header, n_records=2)
     # No signal middleware — input == output sizes.
     assert ctx.input_record_size == ctx.output_record_size
@@ -807,14 +807,14 @@ class TestStripAnnotationTextMiddleware:
         # No timekeeping TAL → channel bytes left unchanged.
         assert result == record
 
-    def test_build_signal_context_with_strip_and_anonymize(self):
-        """Pipeline with AnonymizeEDFHeader + StripAnnotationTextMiddleware builds correctly."""
+    def test_build_signal_context_with_strip_and_deidentify(self):
+        """Pipeline with DeidentifyEDFHeader + StripAnnotationTextMiddleware builds correctly."""
         from recordings.processors.edf import parse_edf_header
 
         hdr = _make_edf_plus_header(n_eeg_samples=16, anno_sample_count=40)
         pipeline = MiddlewarePipeline(
             [
-                AnonymizeEDFHeader(),
+                DeidentifyEDFHeader(),
                 StripAnnotationTextMiddleware(),
             ]
         )
@@ -822,7 +822,7 @@ class TestStripAnnotationTextMiddleware:
 
         # File size must be unchanged.
         assert ctx.input_record_size == ctx.output_record_size
-        # new_header is the anonymized version.
+        # new_header is the de-identified version.
         anon_hdr = parse_edf_header(ctx.new_header)
         assert "X X X X" in anon_hdr.patient_id
 
@@ -835,12 +835,12 @@ class TestStripAnnotationTextMiddleware:
 
         pipeline = MiddlewarePipeline(
             [
-                AnonymizeEDFHeader(),
+                DeidentifyEDFHeader(),
                 StripAnnotationTextMiddleware(),
             ]
         )
 
-        with patch.object(AnonymizeEDFHeader, "transform_header", return_value=sentinel):
+        with patch.object(DeidentifyEDFHeader, "transform_header", return_value=sentinel):
             ctx = pipeline.build_signal_context(hdr, n_records=1)
 
         # new_header is the sentinel (mock output threaded through).
@@ -965,7 +965,7 @@ class TestBuildSignalContextFromInfos:
         n_records = 3
         header_size = 256 * (1 + len(infos))
 
-        pipeline = MiddlewarePipeline([AnonymizeEDFHeader()])
+        pipeline = MiddlewarePipeline([DeidentifyEDFHeader()])
         ctx = pipeline.build_signal_context_from_infos(infos, bps, n_records, header_size)
 
         expected_rec_size = (4 + 8) * bps
@@ -1048,7 +1048,7 @@ class TestBuildSignalContextFromInfos:
         n_records = 2
         header_size = len(raw_header)
 
-        pipeline = MiddlewarePipeline([AnonymizeEDFHeader()])
+        pipeline = MiddlewarePipeline([DeidentifyEDFHeader()])
         ctx_from_bytes = pipeline.build_signal_context(raw_header, n_records)
         ctx_from_infos = pipeline.build_signal_context_from_infos(
             infos, bps, n_records, header_size, raw_header=raw_header

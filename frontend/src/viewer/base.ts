@@ -10,7 +10,7 @@
  * (or `viewer-dist/base/` when no project is active).
  *
  * Registers only the stable modalities — the EEG module with the EDF and DICOM
- * readers. acc / htm / pdf / pyodide are intentionally left out so the bundle
+ * readers and the EDF exporter. acc / htm / pdf / pyodide are intentionally left out so the bundle
  * stays small. Project-specific readers are NOT registered here: the active
  * project contributes them through its own overlay, resolved at build time by
  * `vite.config.base.ts` from `VITE_PROJECT`.
@@ -31,7 +31,7 @@ import { leadFieldProvider } from './leadFields'
 // Core (modality) module.
 import * as eegModule from '@epicurrents/eeg-module'
 // Readers / importers.
-import { EdfImporter, EdfWorkerSubstitute } from '@epicurrents/edf-reader'
+import { EdfExporter, EdfImporter, EdfWorkerSubstitute } from '@epicurrents/edf-reader'
 import { DicomImporter, DicomWorkerSubstitute } from '@epicurrents/dicom-reader'
 // The active project's module overlay, resolved at build time by
 // `vite.config.base.ts` (the no-op `overlays/none.ts` when no project is active).
@@ -45,6 +45,8 @@ import dcmWorkerSrc from '@epicurrents/dicom-reader/workers/dicom.worker.js?raw'
 const dcmWorker = () => inlineWorker('DicomWorker', dcmWorkerSrc).create()
 import edfWorkerSrc from '@epicurrents/edf-reader/workers/edf.worker.js?raw'
 const edfWorker = () => inlineWorker('EdfWorker', edfWorkerSrc).create()
+import edfWriterWorkerSrc from '@epicurrents/edf-reader/workers/edf.writer.worker.js?raw'
+const edfWriterWorker = () => inlineWorker('EdfWriterWorker', edfWriterWorkerSrc).create()
 
 /**
  * Register the EEG module with the EDF and DICOM readers. Worker overrides
@@ -61,10 +63,15 @@ const registerBaseModules = ({ app, useSAB, setup, registerInterfaceModule }: Se
         const eegSAB = window.__EPICURRENTS__.RUNTIME!.SETTINGS.getFieldValue('eeg.useMemoryManager')
         return useSAB && eegSAB ? edfWorker() : new EdfWorkerSubstitute()
     })
-    const eegEdfLoader = new eegModule.EegStudyLoader('EegEdfLoader', ['eeg'], edfLoader)
+    // The exporter encodes in the writer worker and transfers the finished file back to the main
+    // thread. The file menu's export and every export target the host registers go through it.
+    const edfExporter = new EdfExporter()
+    edfExporter.setWorkerOverride(edfWriterWorker)
+    const eegEdfLoader = new eegModule.EegStudyLoader('EegEdfLoader', ['eeg'], edfLoader, edfExporter)
     app.registerStudyImporter('eeg/edf-file', 'Open EDF file', 'file', eegEdfLoader)
     app.registerStudyImporter('eeg/edf-folder', 'Open EDF files from folder', 'folder', eegEdfLoader)
     app.registerStudyImporter('eeg/edf-url', 'Open EDF from URL', 'url', eegEdfLoader)
+    app.registerStudyExporter('eeg/edf-export', 'Export as de-identified EDF', 'file', eegEdfLoader)
     const dcmLoader = new DicomImporter()
     dcmLoader.setWorkerOverride('eeg', () => {
         const eegSAB = window.__EPICURRENTS__.RUNTIME!.SETTINGS.getFieldValue('eeg.useMemoryManager')

@@ -23,6 +23,7 @@ import { waitForEventBus } from '#projects/eventBus'
 import { getViewerConfig } from '#api/viewerConfig'
 import { applyViewerSettingsOverrides, VIEWER_USER_SETTINGS_PATH } from '#lib/viewerConfig'
 import { leadFieldProvider } from '#viewer/leadFields'
+import { createUploadTarget } from '#lib/exportTargets'
 
 // The overlay panel comes from the active project if it defines one, otherwise
 // from the first enabled plugin that does. A page hosts a single overlay.
@@ -265,7 +266,7 @@ onMounted(async () => {
             // Single-dataset mode.
             bundles.value = [await loadDatasetBundle(datasetId.value, shareToken.value)]
         } else if (hashes.value.length || mediaHashes.value.length) {
-            // Individual items mode — one anonymous bundle that mixes
+            // Individual items mode — one unauthenticated bundle that mixes
             // recordings (`?files=`) and media (`?media=`) in the order they
             // were declared in the URL.
             const recordingItems = await Promise.all(
@@ -328,7 +329,7 @@ onMounted(async () => {
                 isProduction: !import.meta.hot,
                 user: auth.user ? `${auth.user.first_name} ${auth.user.last_name}` : null,
                 // Only for a signed-in session — the endpoint is session-authenticated, so a
-                // share-token or anonymous viewer would collect 401s for no benefit.
+                // share-token or unauthenticated viewer would collect 401s for no benefit.
                 userSettingsBackend: auth.user ? VIEWER_USER_SETTINGS_PATH : '',
             },
             // Plugins first, then the active project — the project has the last
@@ -409,6 +410,14 @@ onMounted(async () => {
                 applyViewerSettingsOverrides(epic, overrides)
             } catch (err) {
                 console.warn('[viewer-config] could not load deployment overrides:', err)
+            }
+            // A recording the person opened from their own disk can be uploaded to
+            // their recordings from the viewer's file menu; the viewer offers it for
+            // nothing it loaded from a URL. Signed-in sessions only, since the upload is
+            // session-authenticated, and never under a share token, whose holder has no
+            // recordings of their own here.
+            if (auth.user && !shareToken.value) {
+                epic.registerSignalExportTarget('platform/upload', createUploadTarget())
             }
             // Wait for the event bus to be live (may resolve asynchronously after
             // createEpicurrentsApp), then give the plugin a chance to configure
@@ -506,7 +515,7 @@ onMounted(async () => {
                             // Media download endpoint is session-authenticated — the
                             // browser sends cookies on the worker fetch. Share-token
                             // access for media is a phase-4 follow-up; until then
-                            // anonymous dataset shares won't render media items.
+                            // unauthenticated dataset shares won't render media items.
                             //
                             // The relative path is bound to a local before the
                             // ``new URL(...)`` call because Vite's minifier mis-handles

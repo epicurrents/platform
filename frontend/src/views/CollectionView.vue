@@ -31,6 +31,7 @@ import { getRecordingDetail, recordingName, type Recording } from '#api/recordin
 import MediaPickerDialog from '#components/MediaPickerDialog.vue'
 import { useRecordingsStore } from '#stores/recordings'
 import { useLibraryStore } from '#stores/library'
+import { toastNameWarnings } from '#lib/nameWarnings'
 import { showToast } from '#lib/toast'
 
 const SCOPE = 'CollectionView'
@@ -138,9 +139,10 @@ async function submitNumber () {
     numberLoading.value = true
     numberError.value = null
     try {
-        const { renamed, skipped } = await bulkRenameCollectionRecordings(collectionId.value, prefix)
+        const { renamed, skipped, warnings } = await bulkRenameCollectionRecordings(collectionId.value, prefix)
         showNumber.value = false
         await loadCollection()
+        toastNameWarnings(warnings)
         if (skipped > 0) {
             showToast(
                 t('Renamed {renamed}; skipped {skipped} you cannot edit.', SCOPE, { renamed, skipped }),
@@ -416,6 +418,7 @@ async function submitEdit () {
         })
         showEdit.value = false
         showToast(t('Collection updated.', SCOPE), 'success')
+        toastNameWarnings(collection.value?.warnings)
     } catch {
         editError.value = t('Failed to update collection.', SCOPE)
     } finally {
@@ -459,6 +462,7 @@ async function submitCreateCollection () {
         )
         showCreateCollection.value = false
         showToast(t('Subcollection created.', SCOPE), 'success')
+        toastNameWarnings(created.warnings)
     } catch {
         createCollectionError.value = t('Failed to create subcollection.', SCOPE)
     } finally {
@@ -717,6 +721,7 @@ async function submitExport () {
         } else {
             showToast(t('Dataset created with {count} item(s).', SCOPE, { count: result.exported_count }), 'success')
         }
+        toastNameWarnings(result.warnings)
         router.push({ name: 'dataset', params: { id: result.dataset.object_hash ?? result.dataset.id } })
     } catch {
         exportError.value = t('Failed to export the collection.', SCOPE)

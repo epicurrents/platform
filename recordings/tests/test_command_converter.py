@@ -84,7 +84,7 @@ class TestAvailability:
         """Locating a converter must not execute it.
 
         A converter for a proprietary format may be licensed on terms the platform must not
-        take on — the Nicolet one is GPLv3 — and running it as a separate process is what
+        take on — one of the known ones is GPLv3 — and running it as a separate process is what
         keeps the two at arm's length. A probe that imported the module would pull that code
         into the platform's own process and undo the separation, so it resolves the spec
         without loading it.

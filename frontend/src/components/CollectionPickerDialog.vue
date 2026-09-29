@@ -8,6 +8,7 @@ import {
     type Collection,
     type CollectionItem,
 } from '#api/library'
+import { toastNameWarnings } from '#lib/nameWarnings'
 
 const SCOPE = 'CollectionPickerDialog'
 
@@ -212,6 +213,7 @@ async function confirmCreate () {
         const created = await createCollection({ name, parent_id: currentParentId.value })
         const siblings = loadedChildren.get(currentParentId.value) ?? []
         loadedChildren.set(currentParentId.value, [...siblings, created])
+        toastNameWarnings(created.warnings)
         isCreating.value = false
         input.name = ''
     } catch {

@@ -13,7 +13,7 @@ agents audit against; it is expected to iterate.
 ## Anchor: this is the federation-serving flow, pointed at a local container
 
 The platform already de-identifies a recording when it leaves the trust boundary
-to a federated peer: anonymised EDF header + stripped annotation text,
+to a federated peer: de-identified EDF header + stripped annotation text,
 "de-identified by default" (`docs/gdpr-compliance.md` → processor flows;
 `federation/README.md` → middleware). A detector-container export is the **same
 operation with a different consumer** — a local container instead of a remote
@@ -22,10 +22,10 @@ boundary; do not invent a second PHI path.** Everything below follows from that.
 
 Two facts from the codebase make it tractable:
 
-1. **The stored file is already header-anonymised.** Ingest rewrites the EDF
+1. **The stored file is already header-de-identified.** Ingest rewrites the EDF
    header in place during processing (`recordings/preservation.py` preserves the
    raw upload precisely because "processing rewrites the file in place for header
-   anonymisation"). `to_bids` therefore sources the **processed** recording
+   de-identification"). `to_bids` therefore sources the **processed** recording
    (`Recording.file_path`), which is already de-identified — never the raw upload.
 2. **The originals volume is write-only.** No code reads `RECORDINGS_ORIGINALS_PATH`.
    `to_bids` must not be the first — it never touches raw originals.
@@ -36,7 +36,7 @@ Every place PHI could enter the BIDS tree, and the rule for each:
 
 | Surface | Risk | Rule |
 |---|---|---|
-| **EDF header** (patient name / id / birthdate / recording date) | The classic leak — a raw EDF header is full PHI | Source the already-anonymised stored file; **assert** the header is scrubbed before writing; never re-inject from `original_name`/metadata. |
+| **EDF header** (patient name / id / birthdate / recording date) | The classic leak — a raw EDF header is full PHI | Source the already-de-identified stored file; **assert** the header is scrubbed before writing; never re-inject from `original_name`/metadata. |
 | **`sub-<label>`** in paths/filenames | BIDS bakes a subject id into every path | Pseudonym = `stored_name[:8].upper()`, the platform's existing public handle (the `display_name` fallback); uppercased-alphanumeric, a valid BIDS label as-is (assert `^[A-Za-z0-9]+$`). **Never** `original_name` or any clinical id. |
 | **`participants.tsv`** | Canonical BIDS PHI sink (age, sex, id) | Omit it, or emit a single pseudonymous row with no direct identifiers and no birth date. No demographics today; a future detector needing age gets a minimisation-preserving hook (a coarse band, not a birthdate) — a new personal-data flow that re-enters this design and the GDPR inventory, never a silent raw field. |
 | **`_scans.tsv` / `_eeg.json` acquisition time** | Reintroduces the recording date | Omit `acq_time`; `recording_date` is already nulled after de-id — do not read it back in. |

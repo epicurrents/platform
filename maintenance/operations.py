@@ -79,6 +79,9 @@ class Operation:
     the argv the management command gets. ``requires_step_up`` asks for a fresh
     credential confirmation at request time; the default is on, and an operation
     turns it off only when it changes nothing. ``soft_time_limit`` is seconds.
+    ``actor_arg`` names the command's option that records who acted; the
+    executor appends it with the requesting superuser's primary key
+    (:func:`command_argv`), so the request cannot name someone else.
     """
 
     key: str
@@ -90,6 +93,15 @@ class Operation:
     command_args: Callable[[Schema], list[str]] = field(default=_no_args)
     requires_step_up: bool = True
     soft_time_limit: int = 3600
+    actor_arg: str = ""
+
+
+def command_argv(operation: "Operation", args: Schema, *, requested_by_id: int | None) -> list[str]:
+    """The argv the executor passes the operation's command: its own argv plus the requester, when it records one."""
+    argv = list(operation.command_args(args))
+    if operation.actor_arg and requested_by_id is not None:
+        argv += [operation.actor_arg, str(requested_by_id)]
+    return argv
 
 
 _REGISTRY: dict[str, Operation] = {}
@@ -174,6 +186,74 @@ def _refresh_signal_metadata_args(args: RefreshSignalMetadataArgs) -> list[str]:
     return ["--dry-run"] if args.dry_run else []
 
 
+def _deidentification_report_args(args: NoArgs) -> list[str]:
+    return ["--format", "json"]
+
+
+def _grant_assessments_args(args: NoArgs) -> list[str]:
+    return ["--format", "json"]
+
+
+class ReleaseDatasetArgs(Schema):
+    """Arguments of ``library.release_dataset``: which dataset, as of when, and the run's record fields."""
+
+    dataset: str = Field(..., pattern=r"^[0-9A-Fa-f]{32}$", description="The dataset's public hash.")
+    as_of: str | None = Field(
+        None,
+        pattern=r"^\d{4}-\d{2}-\d{2}$",
+        description="Run as of this date (YYYY-MM-DD); today when omitted. Members uploaded in month M are eligible from M+2.",
+    )
+    dry_run: bool = Field(False, description="Report the eligible and selected members without publishing anything.")
+    profile_version: str | None = Field(
+        None, pattern=r"^[A-Za-z0-9._-]{1,64}$", description="The preparation profile version in force, for the record."
+    )
+    k: int | None = Field(None, ge=1, description="The equivalence-class size applied, for the record.")
+    m: int | None = Field(None, ge=1, description="The distinct-contributor minimum applied, for the record.")
+    # No assessment reference: it is free text a person types, and a job's args
+    # are identifiers only, served to every staff caller and kept in the trail
+    # past every erasure path. A run needing one is run with the command.
+
+
+def _release_dataset_args(args: ReleaseDatasetArgs) -> list[str]:
+    argv = [args.dataset, "--format", "json"]
+    if args.as_of:
+        argv += ["--as-of", args.as_of]
+    if args.dry_run:
+        argv.append("--dry-run")
+    if args.profile_version:
+        argv += ["--profile-version", args.profile_version]
+    if args.k is not None:
+        argv += ["--k", str(args.k)]
+    if args.m is not None:
+        argv += ["--m", str(args.m)]
+    return argv
+
+
+class DatasetAccessReportArgs(Schema):
+    """Arguments of ``library.dataset_access_report``: which dataset and how long a window."""
+
+    dataset: str = Field(..., pattern=r"^[0-9A-Fa-f]{32}$", description="The dataset's public hash.")
+    days: int = Field(183, ge=1, le=3660, description="Window length in days, ending now; half a year by default.")
+
+
+def _dataset_access_report_args(args: DatasetAccessReportArgs) -> list[str]:
+    return [args.dataset, "--format", "json", "--days", str(args.days)]
+
+
+class DatasetAnonymityReportArgs(Schema):
+    """Arguments of ``library.dataset_anonymity_report``: which dataset, and optionally which release."""
+
+    dataset: str = Field(..., pattern=r"^[0-9A-Fa-f]{32}$", description="The dataset's public hash.")
+    release: int | None = Field(None, ge=1, description="One release, by its id; every release when omitted.")
+
+
+def _dataset_anonymity_report_args(args: DatasetAnonymityReportArgs) -> list[str]:
+    argv = [args.dataset, "--format", "json"]
+    if args.release is not None:
+        argv += ["--release", str(args.release)]
+    return argv
+
+
 class PlatformUpdateArgs(Schema):
     """Arguments of ``platform.update``: an already-uploaded package, by hash."""
 
@@ -243,6 +323,89 @@ def register_core_operations() -> None:
             args_schema=RefreshSignalMetadataArgs,
             command="refresh_signal_metadata",
             command_args=_refresh_signal_metadata_args,
+        )
+    )
+    register_operation(
+        Operation(
+            key="recordings.deidentification_report",
+            executor=CELERY,
+            label="De-identification report",
+            description=(
+                "List, per recording, which de-identification pass wrote the stored file, whether its annotation "
+                "text was kept, and the ingest settings recorded at the time; flags recordings behind the current "
+                "pass. Reads only."
+            ),
+            args_schema=NoArgs,
+            command="deidentification_report",
+            command_args=_deidentification_report_args,
+            requires_step_up=False,
+        )
+    )
+    register_operation(
+        Operation(
+            key="epicurrents.grant_assessments",
+            executor=CELERY,
+            label="Grant assessments",
+            description=(
+                "List every active grant with the state of its sharer's contextual assessment: none, current, "
+                "older than half a year, or older than the pass that last wrote a recording it covers. The "
+                "six-monthly sweep and the after-incident step. Reads only."
+            ),
+            args_schema=NoArgs,
+            command="grant_assessments",
+            command_args=_grant_assessments_args,
+            requires_step_up=False,
+        )
+    )
+    register_operation(
+        Operation(
+            key="library.release_dataset",
+            executor=CELERY,
+            label="Release dataset members",
+            description=(
+                "Run a release on a release-gated dataset: publish the eligible members (uploaded in month M, "
+                "eligible from the start of M+2, subset decided by the project's selector) and record the run with "
+                "the profile version and the k and m conditions given here, attributed to the requester. The run "
+                "date may not lie in the future or before the dataset's latest release. A dry run reports the "
+                "eligible and selected members and writes nothing."
+            ),
+            args_schema=ReleaseDatasetArgs,
+            command="release_dataset",
+            command_args=_release_dataset_args,
+            actor_arg="--actor-id",
+        )
+    )
+    register_operation(
+        Operation(
+            key="library.dataset_access_report",
+            executor=CELERY,
+            label="Dataset access report",
+            description=(
+                "Count requests and distinct readers per member of a release-gated dataset over a window, from the "
+                "activity trail, archived rows included: the evidence for the access-control argument and the input "
+                "to the six-monthly sweep. Counts only; no reader is named."
+            ),
+            args_schema=DatasetAccessReportArgs,
+            command="dataset_access_report",
+            command_args=_dataset_access_report_args,
+            requires_step_up=False,
+        )
+    )
+    register_operation(
+        Operation(
+            key="library.dataset_anonymity_report",
+            executor=CELERY,
+            label="Dataset anonymity report",
+            description=(
+                "Per release of a release-gated dataset, the record the run stored, the members still present and "
+                "any re-written since, and the equivalence-class sizes over the pool as released up to that run "
+                "(minimum k, fraction below the recorded k, prosecutor risk, entropy) from the project's registered "
+                "class function. Re-run after every release and every profile change."
+            ),
+            args_schema=DatasetAnonymityReportArgs,
+            command="dataset_anonymity_report",
+            command_args=_dataset_anonymity_report_args,
+            requires_step_up=False,
         )
     )
     register_operation(

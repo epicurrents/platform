@@ -147,6 +147,7 @@ class EpicurrentsConfig(AppConfig):
         # which is exactly what the check needs to read.
         from . import checks  # noqa: F401
 
+        self._register_erasure()
         self._validate_plugins()
         self._guard_placeholder_db_password()
         self._guard_placeholder_borg_passphrase()
@@ -162,6 +163,24 @@ class EpicurrentsConfig(AppConfig):
         self._warn_unbounded_workers()
         self._warn_unbounded_worker_pool()
         self._warn_debug_mode()
+
+    def _register_erasure(self):
+        """Put the sharer's assessment reference in scope for Art. 17 scrubbing.
+
+        ``AccessRight.assessment_reference`` is free text the giver typed and
+        shown to nobody but them, so it is their data on both subject surfaces:
+        the Art. 15 export carries it under the grants they gave, and erasing
+        their account scrubs it from the audit rows of those grants. The live
+        rows go with the account through the ``access_giver`` cascade; the
+        permanent trail is what this registration reaches.
+        """
+        from activity.erasure import register_subject_pii
+
+        register_subject_pii(
+            "epicurrents.accessright",
+            owner_field="access_giver_id",
+            pii_fields={"assessment_reference"},
+        )
 
     def _validate_plugins(self):
         """Validate enabled plugins now that the app registry is populated.

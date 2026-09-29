@@ -148,6 +148,56 @@ journalctl -t epicurrents-updater -n 50
 A request made while the agent is not running waits as `requested`; cancel it
 from the job page or let the agent pick it up once it is back.
 
+## After a security incident
+
+If an incident touched the originals volume, a backup, the database, a
+federation peer's credentials or a share token in circulation, two things
+follow once the service itself is safe. Both are the data controller's, not
+the software's; the runbook's part is to make sure they happen.
+
+**Reassess any shared data.** Some sharers may have documented that a
+particular recipient cannot identify anyone from what they receive. An
+incident can hand someone exactly the information that finding assumed they
+lacked, so every such finding has to be re-run. List them:
+
+```bash
+scripts/manage.sh grant_assessments
+```
+
+Every grant with an assessment date is one to hand back to whoever made it,
+whatever its status column says; the `--due` filter is for the routine
+six-monthly sweep, not for this. The second line of the output says which
+version of the guidelines the platform's own assessment is written against
+and whether its half-yearly reading is overdue; after an incident that
+reading is due whatever the date says. The output names grantees by kind and id
+only, and the reference column is whatever the sharer wrote. The PUBLIC
+column counts how many of the recordings a grant covers are recorded as
+taken from a published dataset, the case where the finding can rest on the
+publisher's own statement. The same listing is the "Grant assessments"
+operation on the Maintenance tab for a deployment without a shell.
+
+**Re-run the dataset reports.** A deployment with a release-gated dataset
+re-runs its anonymity report for every release, and its access report for
+the window the incident may have covered:
+
+```bash
+scripts/manage.sh dataset_anonymity_report <dataset-hash>
+scripts/manage.sh dataset_access_report <dataset-hash> --days 183
+```
+
+Both are on the Maintenance tab as well. A manifest compromise at a
+contributing centre is an incident for that centre's contributions even
+when nothing on this deployment was touched; the participation agreement
+carries the duty to report it, and the reports are what the reassessment
+starts from.
+
+**Consider notification.** An incident of this kind may also engage the
+breach-notification duties in the deployment's data-protection documentation.
+That decision is not made from this runbook; hand the timeline to the person
+responsible for it, along with the grant list.
+
+Background for the developer who is asked why: [anonymisation-compliance.md → Reassessment](anonymisation-compliance.md#reassessment).
+
 ## Escalate to a developer
 
 Hand off when the problem is **not** "a service is down":

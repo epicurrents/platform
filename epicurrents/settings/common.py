@@ -83,6 +83,12 @@ MIDDLEWARE = [
     # gated by API_THROTTLE_ENABLED. See epicurrents/throttle.py.
     "epicurrents.middleware.ApiThrottleMiddleware",
     "epicurrents.middleware.ApiActivityLoggingMiddleware",
+    # Keeps a pool submission's body in memory: installs a memory-only upload
+    # handler on the submission route before anything parses the body, and
+    # answers 413 to a body too large for two submission parts. After the audit
+    # middleware so the 413 leaves an Activity row; nothing above reads the body.
+    # See recordings/upload_handlers.py.
+    "recordings.upload_handlers.SubmissionUploadMiddleware",
     # Sets COOP/COEP/CORP when ENABLE_CROSS_ORIGIN_ISOLATION is true so the
     # browser flips on crossOriginIsolated and SharedArrayBuffer becomes
     # available. No-op when the setting is false. Single platform-wide source
@@ -166,6 +172,14 @@ CELERY_BEAT_SCHEDULE = {
         "task": "recordings.tasks.purge_deleted_recordings",
         # Runs every 3 hours. Adjust via django-celery-beat admin if needed.
         "schedule": 3 * 60 * 60,
+    },
+    "ingest-pooled-submissions": {
+        "task": "recordings.tasks.ingest_pooled_submissions",
+        # Hourly. Takes every accepted submission older than
+        # RECORDINGS_SUBMISSION_POOLING_DELAY_HOURS across all ledgers, in
+        # random order. Returns at once where nothing is waiting, which is
+        # every deployment without a registered ingest profile.
+        "schedule": 60 * 60,
     },
     "purge-deleted-media": {
         "task": "media.tasks.purge_deleted_media",
@@ -283,7 +297,7 @@ TWO_FACTOR_REQUIRED_FOR_ALL = env_bool("TWO_FACTOR_REQUIRED_FOR_ALL", default=Fa
 # ── Ingest privacy overrides ─────────────────────────────────────────────────
 # Both default off, because they discard information the author may legitimately
 # want, and both exist for projects whose data-protection position is that no
-# patient personal data reaches the platform at all. Such a project anonymises
+# patient personal data reaches the platform at all. Such a project de-identifies
 # in the client before upload; these settings make the platform stop retaining
 # the two things that would otherwise preserve what the client was supposed to
 # have removed. A project turns them on in its own settings.py.
@@ -296,7 +310,7 @@ TWO_FACTOR_REQUIRED_FOR_ALL = env_bool("TWO_FACTOR_REQUIRED_FOR_ALL", default=Fa
 RECORDINGS_DISCARD_ORIGINAL_NAME = env_bool("RECORDINGS_DISCARD_ORIGINAL_NAME", default=False)
 
 # Drop annotation content that came out of the uploaded file — the embedded
-# text events of an EDF and the sidecar events of a converted Nicolet .e — so
+# text events of an EDF and the sidecar events of a converted vendor file — so
 # that everything annotating a recording was written on the platform. Vendor
 # event vocabularies identify the acquisition software and through it the
 # acquiring laboratory, and free-text events carry whatever the file carried.
@@ -328,6 +342,16 @@ RECORDINGS_ALLOW_PRESERVE_ANNOTATIONS = env_bool("RECORDINGS_ALLOW_PRESERVE_ANNO
 # cleaned values anyway — but holding nothing is the difference between that
 # being true and being merely likely.
 RECORDINGS_DISCARD_SOURCE_CHANNEL_METADATA = env_bool("RECORDINGS_DISCARD_SOURCE_CHANNEL_METADATA", default=False)
+
+# Translation tables for the events a file arrives with: JSON files, each a list
+# of rules from a vendor's event type or label to a term of the platform's own
+# vocabularies (annotations/vocabulary/), read at manage.py check. Paths are
+# absolute or relative to BASE_DIR. An event no table or registered mapper
+# translates is written as a placeholder that carries no text; the vendor
+# string stays only in the raw record. The format is documented on
+# recordings.event_translation.load_table, the mechanism in
+# recordings/README.md → Event translation.
+RECORDING_EVENT_TRANSLATIONS: list[str] = []
 
 #   RECORDING_PIPELINES = {
 #       "web":    {"header": {"strip_annotation_text": False}},
@@ -647,7 +671,9 @@ REMOTE_UPDATE_ENABLED = env_bool("REMOTE_UPDATE_ENABLED", default=False)
 # Minutes an applied update waits for a superuser's confirmation before the
 # agent rolls it back. A request may name its own window; both are clamped to
 # 5–1440 by the agent as well as here.
-REMOTE_UPDATE_VERIFY_WINDOW_MINUTES = min(1440, max(5, config("REMOTE_UPDATE_VERIFY_WINDOW_MINUTES", default=30, cast=int)))
+REMOTE_UPDATE_VERIFY_WINDOW_MINUTES = min(
+    1440, max(5, config("REMOTE_UPDATE_VERIFY_WINDOW_MINUTES", default=30, cast=int))
+)
 # Largest package the upload endpoint accepts, in bytes; also declared to the
 # proxy's body limit guard.
 REMOTE_UPDATE_MAX_PACKAGE_SIZE = config("REMOTE_UPDATE_MAX_PACKAGE_SIZE", default=1024 * 1024 * 1024, cast=int)
@@ -745,6 +771,53 @@ SESSION_CSRF_ENFORCED = env_bool("SESSION_CSRF_ENFORCED", default=True)
 ANNOTATION_EXPORT_ALL_ANNOTATORS_REQUIRES_SUPERUSER = env_bool(
     "ANNOTATION_EXPORT_ALL_ANNOTATORS_REQUIRES_SUPERUSER",
     default=True,
+)
+
+# ── Free-text hygiene ────────────────────────────────────────────────────────
+# Regular expressions, keyed by a short kind name, that a deployment adds to the
+# built-in identifier heuristic in epicurrents/text_hygiene.py: a local record
+# number format, a study code, anything a label typed by an uploader should not
+# carry. The write endpoints for display names, collection, dataset, folder and
+# tag names return a warning per match beside their result; nothing is refused.
+# A project settings module extends this mapping (the project loader merges
+# dict settings), and manage.py check refuses a pattern that does not compile.
+TEXT_HYGIENE_PATTERNS: dict[str, str] = {}
+
+# Whether creating a tag is reserved for staff. Tags are a shared vocabulary:
+# a tag a staff member creates is curated and listed to every authenticated
+# user, a tag anyone else creates is listed only to its author and to readers
+# of the objects it decorates. Reserving creation keeps the vocabulary a
+# deployment decision rather than whatever each user types; a deployment that
+# wants user-defined tags turns this off and gets the reach-scoped listing.
+LIBRARY_TAG_CREATION_REQUIRES_STAFF = env_bool("LIBRARY_TAG_CREATION_REQUIRES_STAFF", default=True)
+# A deployment whose datasets are release-gated (a multi-centre pool released to readers by
+# release runs) keeps no copy of a submission its contributor does not also hold, so the
+# originals volume is refused at boot while this is on (library/checks.py). Set by the project.
+LIBRARY_RELEASE_GATED_DEPLOYMENT = env_bool("LIBRARY_RELEASE_GATED_DEPLOYMENT", default=False)
+# The validating submission path (recordings/submissions.py). Inert without a registered
+# ingest profile. A submission is read into memory (recordings/upload_handlers.py keeps the
+# multipart parse off disk and caps each part at this size) and checked before anything is written,
+# so its own cap is small next to RECORDINGS_MAX_UPLOAD_SIZE: prepared excerpts, not whole
+# recordings. Accepted files wait in the spool (default: a directory under the staging path)
+# until the hourly ingest run takes every file older than the pooling delay.
+RECORDINGS_SUBMISSION_MAX_SIZE = config("RECORDINGS_SUBMISSION_MAX_SIZE", default=64 * 1024 * 1024, cast=int)
+RECORDINGS_SUBMISSION_POOLING_DELAY_HOURS = config("RECORDINGS_SUBMISSION_POOLING_DELAY_HOURS", default=24, cast=int)
+RECORDINGS_SUBMISSION_SPOOL_PATH = config("RECORDINGS_SUBMISSION_SPOOL_PATH", default="")
+# A submission that failed ingest keeps its row and spooled bytes this long for the operator
+# to read the error, then the hourly run unlinks and deletes both.
+RECORDINGS_SUBMISSION_FAILED_RETENTION_DAYS = config(
+    "RECORDINGS_SUBMISSION_FAILED_RETENTION_DAYS", default=30, cast=int
+)
+# A pool whose profile sets m holds its files in the spool until m contributors have one ingested
+# or waiting. A file of a pool still short of m after this long is unlinked and its row deleted,
+# so a pool that never fills does not keep its contributors' files indefinitely.
+RECORDINGS_SUBMISSION_WAITING_RETENTION_DAYS = config(
+    "RECORDINGS_SUBMISSION_WAITING_RETENTION_DAYS", default=180, cast=int
+)
+# A file in the spool that no submission row and no recording names, and older than this, is
+# unlinked by the hourly run: bytes left by a worker that died between writing and committing.
+RECORDINGS_SUBMISSION_SPOOL_SWEEP_GRACE_HOURS = config(
+    "RECORDINGS_SUBMISSION_SPOOL_SWEEP_GRACE_HOURS", default=24, cast=int
 )
 
 # ──────────────────────────────────────────────────────────────────────────────

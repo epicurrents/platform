@@ -51,6 +51,7 @@ from epicurrents.auth import enforce_session_csrf
 from epicurrents.models import AccessRight
 from epicurrents.security_log import get_client_ip, log_security_event
 from user.audit_digests import GROUP_MEMBERSHIP_DIGEST_KEY, compute_group_membership_digest
+from user.dedicated_groups import dedicated_group, dedicated_groups
 from user.identity import is_externally_authenticated, provider_label
 from user.roles import get_role_providers, read_group_roles, read_roles, write_group_role
 from user.stepup import confirm_step_up
@@ -196,14 +197,27 @@ class GroupUpdateIn(StepUpIn):
     roles: dict[str, str | None] | None = None
 
 
+class DedicatedGroupOut(Schema):
+    """What owns a dedicated group: a kind token and the owning object's hash and name."""
+
+    kind: str
+    object_hash: str
+    name: str
+
+
 class GroupDetailOut(Schema):
-    """A group with its project roles and the two counts that decide whether it can be deleted."""
+    """A group with its project roles and the two counts that decide whether it can be deleted.
+
+    ``dedicated_to`` names the feature that owns the group (``user.dedicated_groups``); such a group carries no
+    grant or role and is not deleted here.
+    """
 
     id: int
     name: str
     member_count: int
     grant_count: int
     roles: dict[str, str | None]
+    dedicated_to: DedicatedGroupOut | None = None
 
 
 class RoleProviderOut(Schema):
@@ -283,6 +297,12 @@ def _refuse_self(actor, account, what: str) -> None:
         )
 
 
+def _dedicated_out(owner) -> dict | None:
+    if owner is None:
+        return None
+    return {"kind": owner.kind, "object_hash": owner.object_hash, "name": owner.name}
+
+
 def _serialize_group(group, *, member_count: int, grant_count: int) -> dict:
     """Serialize one group to a ``GroupDetailOut`` dict."""
     return {
@@ -291,6 +311,7 @@ def _serialize_group(group, *, member_count: int, grant_count: int) -> dict:
         "member_count": member_count,
         "grant_count": grant_count,
         "roles": read_group_roles([group])[group.pk],
+        "dedicated_to": _dedicated_out(dedicated_group(group.pk)),
     }
 
 
@@ -788,6 +809,7 @@ def list_group_details(request):
     # Batched through the registry so the listing costs one provider query,
     # not one per group.
     roles = read_group_roles(groups)
+    owners = dedicated_groups(group.pk for group in groups)
     log_activity(verb="user.group.list", metadata={"returned_count": len(groups)})
     return [
         {
@@ -796,6 +818,7 @@ def list_group_details(request):
             "member_count": group.members,
             "grant_count": grants.get(group.pk, 0),
             "roles": roles[group.pk],
+            "dedicated_to": _dedicated_out(owners.get(group.pk)),
         }
         for group in groups
     ]
@@ -837,6 +860,11 @@ def update_group(request, group_id: int, payload: GroupUpdateIn):
         raise HttpError(404, "Group not found.")
 
     granted_roles = sorted(key for key, value in (payload.roles or {}).items() if value is not None)
+    # A dedicated group means one thing; a role would give its members another.
+    # Clearing stays allowed, so a role that predates the group's owner can go.
+    # Refused before step-up, so a request that cannot succeed spends no attempt.
+    if granted_roles and dedicated_group(group.pk) is not None:
+        raise HttpError(409, "This group exists for one purpose and carries no project role.")
     if granted_roles:
         _step_up(request, actor, password=payload.password, totp_code=payload.totp_code)
 
@@ -896,6 +924,8 @@ def delete_group(request, group_id: int):
     group = Group.objects.filter(pk=group_id).first()
     if group is None:
         raise HttpError(404, "Group not found.")
+    if dedicated_group(group.pk) is not None:
+        raise HttpError(409, "This group belongs to another feature and is removed with it, not here.")
 
     grant_count = AccessRight.objects.filter(access_target_group=group).count()
     if grant_count:

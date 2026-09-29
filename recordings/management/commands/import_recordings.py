@@ -7,19 +7,22 @@ Usage
     python manage.py import_recordings <source_path> --username <owner>
         [--pipeline import]
         [--structure recursive|recursive-flat|flat]
+        [--preserve-annotations]
+        [--public-source DOI_OR_URL]
         [--reprocess]
         [--resume | --discard]
 
 ``source_path``
-    Directory containing EDF/BDF files (and optional ``.json`` sidecars).
+    Directory containing EDF/BDF files (and optional ``.json`` sidecars). A file the viewer exported as a
+    container has its footer detached and stored as rows, as on the upload path.
 
 ``--username``
-    Username of the user who will own all imported recordings.  The user must
+    Username of the user who will own all imported recordings. The user must
     already exist.
 
 ``--pipeline``
     Named pipeline label defined in ``RECORDING_PIPELINES`` or one of the
-    built-ins (``"web"``, ``"import"``).  Defaults to ``"import"``.
+    built-ins (``"web"``, ``"import"``). Defaults to ``"import"``.
 
 ``--structure``
     How subdirectories are handled:
@@ -32,12 +35,17 @@ Usage
     ``flat``
         Only process files in the top-level directory.
 
+``--public-source``
+    Record every imported recording as taken from this published dataset, as
+    a DOI or an http(s) URL (``Recording.public_source``). Refused when the
+    value is neither.
+
 ``--reprocess``
     Re-process files already marked ``DONE`` in the current (resumed) job.
     Skipped by default.
 
 ``--resume`` / ``--discard``
-    Required when an ``IN_PROGRESS`` job already exists.  ``--resume``
+    Required when an ``IN_PROGRESS`` job already exists. ``--resume``
     continues from where the last run stopped; ``--discard`` marks the old
     job ``ABORTED`` and starts a fresh one (the already-copied files are
     *not* deleted).
@@ -45,7 +53,7 @@ Usage
 Progress
 --------
 Each file's outcome is persisted in :class:`ImportJobFile` so that interrupted
-imports can be resumed.  Only one job may be ``IN_PROGRESS`` at a time.
+imports can be resumed. Only one job may be ``IN_PROGRESS`` at a time.
 """
 
 from __future__ import annotations
@@ -64,6 +72,8 @@ from django.core.management.base import BaseCommand, CommandError
 from django.db import transaction
 from django.utils import timezone
 
+from recordings.public_source import normalise_public_source
+
 logger = logging.getLogger(__name__)
 
 # The formats read without conversion. Everything else this command imports is whatever the
@@ -74,7 +84,7 @@ _EDF_EXTENSIONS = {".edf", ".bdf"}
 
 
 class Command(BaseCommand):
-    help = "Import EDF/BDF (and convertible, e.g. Nicolet .e) files from a directory into Epicurrents."
+    help = "Import EDF/BDF files, and any format a registered converter handles, from a directory into Epicurrents."
 
     def add_arguments(self, parser):
         parser.add_argument(
@@ -126,6 +136,15 @@ class Command(BaseCommand):
                 "(they are always saved to the database regardless)."
             ),
         )
+        parser.add_argument(
+            "--public-source",
+            default="",
+            metavar="DOI_OR_URL",
+            help=(
+                "Record every imported recording as taken from this published dataset, "
+                "given as a DOI or an http(s) URL. Refused when it is neither."
+            ),
+        )
 
     # ------------------------------------------------------------------
     # Entry point
@@ -161,6 +180,10 @@ class Command(BaseCommand):
                     "(RECORDINGS_ALLOW_PRESERVE_ANNOTATIONS is off)."
                 )
             pipeline.header.strip_annotation_text = False
+        try:
+            public_source = normalise_public_source(options["public_source"])
+        except ValueError as exc:
+            raise CommandError(str(exc))
 
         structure_map = {
             "recursive": ImportJob.Structure.RECURSIVE,
@@ -200,13 +223,13 @@ class Command(BaseCommand):
             )
             self.stdout.write(f"Created import job {job.pk}.")
 
-        self._run_job(job, source_path, pipeline, owner, options["reprocess"])
+        self._run_job(job, source_path, pipeline, owner, options["reprocess"], public_source=public_source)
 
     # ------------------------------------------------------------------
     # Job execution
     # ------------------------------------------------------------------
 
-    def _run_job(self, job, source_path, pipeline, owner, reprocess: bool) -> None:
+    def _run_job(self, job, source_path, pipeline, owner, reprocess: bool, *, public_source: str = "") -> None:
         from activity.models import Activity
         from activity.system_activity import with_system_activity
 
@@ -227,9 +250,9 @@ class Command(BaseCommand):
                 "reprocess": bool(reprocess),
             },
         ):
-            self._run_job_body(job, source_path, pipeline, owner, reprocess)
+            self._run_job_body(job, source_path, pipeline, owner, reprocess, public_source=public_source)
 
-    def _run_job_body(self, job, source_path, pipeline, owner, reprocess: bool) -> None:
+    def _run_job_body(self, job, source_path, pipeline, owner, reprocess: bool, *, public_source: str = "") -> None:
         from recordings.models import ImportJob, ImportJobFile
 
         edf_files = self._collect_files(source_path, job.structure)
@@ -274,7 +297,9 @@ class Command(BaseCommand):
                 continue
 
             try:
-                recording = self._process_file(abs_path, job, source_path, owner, pipeline, collection_map)
+                recording = self._process_file(
+                    abs_path, job, source_path, owner, pipeline, collection_map, public_source=public_source
+                )
                 job_file.status = ImportJobFile.Status.DONE
                 job_file.recording = recording
                 job_file.error = ""
@@ -417,6 +442,8 @@ class Command(BaseCommand):
         owner,
         pipeline,
         collection_map: dict,
+        *,
+        public_source: str = "",
     ):
         from django.conf import settings
         from django.contrib.contenttypes.models import ContentType
@@ -426,7 +453,8 @@ class Command(BaseCommand):
         from epicurrents.models import AccessRight
         from epicurrents.system_user import get_system_user
         from library.models import CollectionItem
-        from recordings.converters.sidecar import save_sidecar_events
+        from recordings.converters.sidecar import save_sidecar_events, sidecar_carries_events
+        from recordings.metadata import stored_hash_of
         from recordings.models import ImportJob, Recording, stored_original_name
         from recordings.processors.edf import process_edf_file
         from recordings.tasks import (
@@ -501,7 +529,11 @@ class Command(BaseCommand):
             shutil.rmtree(source_for_edf.parent, ignore_errors=True)
 
         # ── EDF processing ────────────────────────────────────────────────────
+        from recordings.container import detach_footer, footer_carries_events, save_viewer_sidecar
+
         try:
+            # A container exported by the viewer: the footer is detached first, as on the upload path.
+            footer = detach_footer(permanent_path)
             result = process_edf_file(
                 permanent_path,
                 strip_annotation_text=pipeline.header.strip_annotation_text,
@@ -509,12 +541,15 @@ class Command(BaseCommand):
         except Exception:
             permanent_path.unlink(missing_ok=True)
             raise
+        # The digest of the file as served, taken after process_edf_file's in-place rewrites.
+        stored_hash = stored_hash_of(permanent_path)
 
         # ── Persist to DB (atomic) ────────────────────────────────────────────
         with transaction.atomic():
             recording = Recording.objects.create(
                 author=owner,
                 original_name=stored_original_name(original_name_for_db, suffix),
+                public_source=public_source,
                 stored_name=stored_name,
                 file_extension=suffix,
                 file_size=permanent_path.stat().st_size,
@@ -523,7 +558,18 @@ class Command(BaseCommand):
                 status=Recording.Status.PROCESSING,
             )
 
-            _save_edf_results(recording, result)
+            _save_edf_results(
+                recording,
+                result,
+                events_from_sidecar=sidecar_carries_events(sidecar_data_from_converter)
+                or footer_carries_events(footer),
+            )
+            if footer is not None:
+                try:
+                    save_viewer_sidecar(recording, footer)
+                except ValueError as exc:
+                    # Source path logged deliberately; see the failure log in handle().
+                    logger.warning("import_recordings: footer rows of %s not saved: %s", abs_path, exc)
 
             if sidecar_data_from_converter is not None:
                 try:
@@ -531,7 +577,7 @@ class Command(BaseCommand):
                 except Exception as exc:
                     # Source path logged deliberately; see the failure log in handle().
                     logger.warning(
-                        "import_recordings: failed to save Nicolet sidecar events for %s: %s",
+                        "import_recordings: failed to save sidecar events for %s: %s",
                         abs_path,
                         exc,
                     )
@@ -554,6 +600,7 @@ class Command(BaseCommand):
                 update_fields={
                     "status": Recording.Status.READY,
                     "content_hash": content_hash,
+                    "stored_hash": stored_hash,
                     "modality": modality,
                 },
             )
@@ -573,8 +620,8 @@ class Command(BaseCommand):
             # ── Preserve original (mode "all") ────────────────────────────
             # Imports never reach the FAILED-status path — EDF parse errors
             # re-raise above and the row is never persisted — so only mode
-            # ``"all"`` needs to write here.  Source is the as-uploaded
-            # file at ``abs_path``.  When a converter has run, the
+            # ``"all"`` needs to write here. Source is the as-uploaded
+            # file at ``abs_path``. When a converter has run, the
             # recording's ``original_name`` was rewritten to the converted
             # extension; pass the actual source filename via
             # ``original_name_override`` so the preserved file is stored
@@ -604,7 +651,7 @@ class Command(BaseCommand):
                         name="Import annotations",
                         target_content_type=recording_ct,
                         target_object_id=str(recording.pk),
-                        object_hash=_annotation_hash(recording.pk, "import-annotations"),
+                        object_hash=_annotation_hash(recording, "import-annotations"),
                         content=sidecar_content,
                     )
                 except Exception as exc:

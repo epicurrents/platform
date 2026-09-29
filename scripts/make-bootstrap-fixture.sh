@@ -150,6 +150,21 @@ tar_ownership_flags() {
     esac
 }
 
+# COPYFILE_DISABLE stops macOS writing extended attributes as ._* members, but
+# bsdtar still records them as LIBARCHIVE.xattr.* pax headers, and macOS stamps
+# com.apple.provenance on most files a checkout holds. GNU tar ignores each header
+# with a warning, so a recipient's first extraction prints hundreds of lines that
+# read like a damaged archive. GNU tar stores no xattrs unless asked, so only bsdtar
+# needs telling.
+tar_metadata_flags() {
+    local version
+    version="$(tar --version 2>/dev/null | awk 'NR == 1 { v = $0 } END { print v }')"
+    case "$version" in
+        *bsdtar*) printf '%s' "--no-xattrs --no-mac-metadata" ;;
+        *)        printf '%s' "" ;;
+    esac
+}
+
 # ── Provenance of the prebuilt bundle ────────────────────────────────────────
 # Vite bakes VITE_PROJECT and VITE_PLUGINS into the SPA at build time, so a
 # package assembled from a prebuilt frontend/dist inherits whatever the builder's
@@ -2089,10 +2104,10 @@ if [ "$TARBALL" = true ]; then
     ARCHIVE="$DEST.tar.gz"
     # COPYFILE_DISABLE keeps macOS from storing extended attributes as ._* members,
     # which GNU tar materialises as real files on the target — enough to make the
-    # archive unrecognisable to update.sh. The ownership flags are the other half:
-    # see tar_ownership_flags.
-    # shellcheck disable=SC2046  # the flag list is meant to word-split.
-    COPYFILE_DISABLE=1 tar -czf "$ARCHIVE" $(tar_ownership_flags) \
+    # archive unrecognisable to update.sh; tar_metadata_flags keeps them out of the
+    # pax headers too. The ownership flags are the other half: see tar_ownership_flags.
+    # shellcheck disable=SC2046  # the flag lists are meant to word-split.
+    COPYFILE_DISABLE=1 tar -czf "$ARCHIVE" $(tar_ownership_flags) $(tar_metadata_flags) \
         -C "$(dirname "$DEST")" "$(basename "$DEST")"
     ok "$ARCHIVE ($(du -h "$ARCHIVE" | cut -f1))"
 
@@ -2145,13 +2160,14 @@ if [ "$DEMO" = true ] || [ "$DIST" = true ]; then
     else
         echo "  To ship it as an archive that update.sh can apply, re-run with --tarball,"
         echo "  or pack it by hand with the ownership flags this platform needs:"
-        echo "    COPYFILE_DISABLE=1 tar -czf $(basename "$DEST").tar.gz $(tar_ownership_flags) \\"
+        echo "    COPYFILE_DISABLE=1 tar -czf $(basename "$DEST").tar.gz $(tar_ownership_flags) $(tar_metadata_flags) \\"
         echo "        -C $(dirname "$DEST") $(basename "$DEST")"
         echo
-        echo "  Both parts matter. COPYFILE_DISABLE keeps macOS extended attributes"
-        echo "  out of the archive, where GNU tar would materialise them as real"
-        echo "  files. The ownership flags stamp the tree as uid 1000, the account"
-        echo "  the containers run as, instead of whoever happened to build it."
+        echo "  Both parts matter. COPYFILE_DISABLE and the metadata flags keep macOS"
+        echo "  extended attributes out of the archive, where GNU tar would materialise"
+        echo "  them as real files or warn about each one. The ownership flags stamp"
+        echo "  the tree as uid 1000, the account the containers run as, instead of"
+        echo "  whoever happened to build it."
     fi
 else
     echo "  cd $DEST && ./bootstrap-smoke.sh"

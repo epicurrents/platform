@@ -30,7 +30,7 @@ Two consequences worth stating because they are easy to assume wrongly:
   project that must never offload sets it ``False`` in its own ``settings.py``.
 
 Why the middleware interlock is absolute: with ``apply_middleware=True`` the bytes
-that should reach the caller are *computed* — an anonymised header, and under a
+that should reach the caller are *computed* — a de-identified header, and under a
 signal pipeline every data record transformed individually. There is no file on
 disk that holds them. Handing the proxy a path in that case would serve the
 original recording, patient-identifying header and clinical annotation text

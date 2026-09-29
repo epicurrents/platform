@@ -43,10 +43,10 @@ through :mod:`recordings.converters.command`. Override or extend via
         # An in-process converter for another format:
         ".ncs": "mysite.converters.ncs.convert",
         # An external program, described rather than imported:
-        ".e": {
-            "command": ["{python}", "-m", "nicolet_e2edf.nicolet.cli",
+        ".vnd": {
+            "command": ["{python}", "-m", "vendor2edf",
                         "--in", "{input}", "--out", "{output}", "--json-sidecar"],
-            "requires": "nicolet_e2edf",
+            "requires": "vendor2edf",
         },
     }
 
@@ -116,7 +116,7 @@ class HeaderPipelineOptions:
     # When True, text TALs are stripped from EDF+/BDF+ annotation channels and
     # only the mandatory timekeeping TALs are preserved in the stored file.
     # Annotation text is always extracted and stored in the database regardless
-    # of this setting.  Defaults to True so that stored files are anonymised by
+    # of this setting.  Defaults to True so that stored files are de-identified by
     # default; set to False only when the original annotations must be kept in
     # the file (e.g. research pipelines where the caller explicitly opts in).
     strip_annotation_text: bool = True

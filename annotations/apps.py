@@ -15,3 +15,6 @@ class AnnotationsConfig(AppConfig):
 
     def ready(self):
         import annotations.signals  # noqa: F401
+        from annotations.core_vocabularies import register_core_vocabularies
+
+        register_core_vocabularies()

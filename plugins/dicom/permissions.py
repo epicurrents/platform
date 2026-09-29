@@ -20,7 +20,7 @@ def can_read_via_attachment(user, obj, share_token: str | None = None):
     ``granted=False`` so other extensions and the default deny still apply.
     Returns default metadata (``apply_middleware=False``) because DICOM bytes
     never pass through the EDF sanitization pipeline — the parent's
-    header-anonymisation flag has no meaning for them.
+    header-de-identification flag has no meaning for them.
     """
     from epicurrents.permissions import can_read_object
     from plugins.dicom.models import DicomStudy

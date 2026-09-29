@@ -20,18 +20,23 @@ class RecordingsConfig(AppConfig):
 
         The conversion-hook handlers close the Phase 3 ``"failed"``
         preservation gap for converter-bound formats — see
-        ``recordings/preservation.py`` for the stash mechanism. The Nicolet
+        ``recordings/preservation.py`` for the stash mechanism. The built-in
         sidecar handler is registered the same way and is the worked
         example for plugin authors writing format-specific post_convert
         handlers.
         """
-        from activity.derived_state import register_derived_state_digester
+        from activity.derived_state import register_derived_state_digester, register_derived_state_record
         from epicurrents.permissions import register_read_visibility_gate
+
+        # Imported for the @register side effect, as activity.checks is: the
+        # event-translation tables are read at `manage.py check`.
+        from recordings import checks  # noqa: F401
         from recordings.audit_digests import (
             SIGNAL_INFO_DIGEST_KEY,
             compute_signal_info_digest,
         )
         from recordings.converters.sidecar import handle_post_convert
+        from recordings.deidentification_record import DEIDENTIFICATION_RECORD_KEY
         from recordings.models import Recording
         from recordings.pipelines import (
             register_convert_failed,
@@ -63,6 +68,28 @@ class RecordingsConfig(AppConfig):
         # writing to the permanent trail what a single upload does not.
         register_masked_fields("recordings.importjob", {"source_path"})
         register_masked_fields("recordings.importjobfile", {"relative_path", "error"})
+        # A submission file's declared hash becomes Recording.file_hash at ingest,
+        # its size is the recording's size and its sidecar is what the recording's
+        # labels are written from, so any of them in the permanent trail joins a
+        # recording back to the ledger and its contributor. The live row is deleted
+        # once ingested; the trail must not keep what the row gives up. They are
+        # withheld rather than masked: the recording's own trail rows carry the
+        # hash and the size in the clear, and a mask is a digest recomputable from
+        # them. `error` may quote paths and joins nothing, so a mask does.
+        register_masked_fields(
+            "recordings.submissionfile", {"file_hash", "file_size", "sidecar", "sidecar_hash"}, withhold=True
+        )
+        register_masked_fields("recordings.submissionfile", {"error"})
+        # Art. 15: a ledger is the contributor's own activity record. It carries
+        # the pool and the count; the sidecars and hashes are gone with the
+        # file rows, so nothing of another subject is in it.
+        from user.export import register_export_relation
+
+        register_export_relation(
+            "recordings.submissionledger",
+            "contributor",
+            fields=("ingested_count", "created_at"),
+        )
         # The read-visibility gate is what makes FAILED / trashed hiding hold
         # on surfaces that resolve recordings through the generic permission
         # resolver rather than the recordings API — see recordings/permissions.py.
@@ -76,4 +103,18 @@ class RecordingsConfig(AppConfig):
             target_model=Recording,
             key=SIGNAL_INFO_DIGEST_KEY,
             digester=compute_signal_info_digest,
+        )
+        # The de-identification record on the same row is documentary — it holds
+        # the settings in force at ingest, which nothing can recompute — so the
+        # verifier is told to count it as sealed rather than unknown.
+        register_derived_state_record(target_model=Recording, key=DEIDENTIFICATION_RECORD_KEY)
+        # Deleting a submission row, by whichever path, takes its spooled bytes with it; the
+        # hourly spool sweep covers bytes a crash left without a row. See recordings/submissions.py.
+        from django.db.models.signals import pre_delete
+
+        from recordings.models import SubmissionFile
+        from recordings.submissions import unlink_spooled_bytes
+
+        pre_delete.connect(
+            unlink_spooled_bytes, sender=SubmissionFile, dispatch_uid="recordings.submissionfile.unlink_spooled_bytes"
         )

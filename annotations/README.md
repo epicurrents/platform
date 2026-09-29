@@ -25,7 +25,7 @@ All four extend the abstract `AnnotationBase`, which provides the generic FK tar
 
 Convention: stored uppercase. The `save()` method uppercases the value before writing.
 
-For server-generated annotations created during recording ingest, [recordings/tasks.py](../recordings/tasks.py) `_annotation_hash(recording_pk, suffix)` derives a deterministic hash from the recording PK + a per-annotation suffix (`"original-annotations"`, `"interruption:<position>"`, `"source-events"`). Keyed on the PK so re-uploading the same file produces a fresh set of hashes against the new Recording row.
+For server-generated annotations created during recording ingest, `annotation_hash(recording, suffix)` in [recordings/event_translation.py](../recordings/event_translation.py) derives a deterministic hash from the stem of the recording's random `stored_name` + a per-annotation suffix (`"original-annotations"`, `"interruption:<position>"`, `"source-events"`, `"original-annotation:<index>"` and `"source-event:<index>"` for the translated rows). Keyed on the stored name, which is fresh per upload, so re-uploading the same file produces a fresh set of hashes against the new Recording row. Never keyed on the PK: the hash is served to every reader, and a sequential PK behind a fixed suffix is brute-forced in under a second. Rows written before the change keep their PK-derived hashes.
 
 ### `content_hash`
 
@@ -69,6 +69,7 @@ List endpoints accept `target_content_type_id` + `target_object_id` (required) a
 | `annotator_id` | Annotator user id. Repeat the parameter for several. Staff only. |
 | `since` / `until` | Inclusive bounds on `created_at`. |
 | `version_id` | Restrict to annotations bound to one signal version. |
+| `withhold_text` | `true` withholds the text of every row the caller did not write, as a de-identifying grant would. See [the withholding mode](#bulk-export) below. |
 
 **Access follows the staff tier.** A staff or superuser caller exports across all annotators; every other caller is restricted to their own rows. The restriction is applied to the queryset rather than checked afterwards, so no filter combination widens it, and a non-staff caller naming anyone but themselves in `annotator_id` gets a 403 plus a `permission.denied` security-log entry. Passing `recording` and `dataset_id` together intersects them.
 
@@ -96,7 +97,13 @@ Registered types are additive and do not bump `format_version`; a parser meets t
 
 **JSON is the lossless format.** `Event.value`, `Label.value`, and `Code.meta` are `JSONField`s whose shape varies per annotation, so a fixed column set cannot hold them; the CSV path serialises each into one cell instead. CSV also carries one type per file — the types have different columns — so `format=csv` with several types is a 422 rather than a silently truncated file.
 
-Both formats open with a metadata header: the exporter's user id, when, which filters were applied, and the roster of annotator ids whose rows are present with a per-type count for each. In JSON it is a `metadata` object; in CSV it is a block of leading `#` comment lines, which a reader has to be told to skip (`pandas.read_csv(path, comment='#')`). `format_version` in the header is bumped when the field set changes in a way a downstream parser could trip over; version 2 replaced `author_username` with `author_id` and stripped names and usernames from the header.
+Both formats open with a metadata header: the exporter's user id, when, which filters were applied, and the roster of annotator ids whose rows are present with a per-type count for each. In JSON it is a `metadata` object; in CSV it is a block of leading `#` comment lines, which a reader has to be told to skip (`pandas.read_csv(path, comment='#')`). `format_version` in the header is bumped when the field set changes in a way a downstream parser could trip over; version 2 replaced `author_username` with `author_id` and stripped names and usernames from the header, and version 3 added the labelling below and the `text_withheld` column.
+
+### What the file is
+
+**Every export is pseudonymised personal data of the recording subjects, and the header says so.** `data_classification` carries the fixed token `pseudonymised_personal_data`, so a recipient's tooling can refuse to treat the file as anonymous by checking one key; `deidentification_versions` carries the pass currently in force (`current`) and the distinct `RecordingMeta.deidentification_version` values found on the exported recordings (`exported_recordings`, where `0` is a recording processed before the record existed), so the file names the process that produced the recordings it describes, per [docs/anonymisation-compliance.md](../docs/anonymisation-compliance.md). No user-facing string may call the file anonymous; [test_export.py](tests/test_export.py) checks both formats for the word.
+
+**The withholding mode narrows an export for a recipient under a de-identifying arrangement.** `withhold_text=true` applies the [annotation-text rule](#permission-model) to the export by choice rather than by grant: every core row the caller did not write leaves without `name`, `value` and code `meta` and carries `text_withheld: true`; timing, hashes, author ids and classification codes stay, so attribution and agreement analysis still work on the file. "Text" here means what it means on every other surface of the rule: free-form content a person typed, string or JSON, as opposed to a value checked against a registered vocabulary, which is why a code's `standard` and `value` survive and its `meta` does not. The caller's own rows and machine-produced findings keep their text, exactly as under a de-identifying grant, because the decision is `withheld_under_deidentification` in [redaction.py](redaction.py) and not a second one. Registered row sources are omitted in this mode, since a registration declares columns and not which of them hold text, and omission is the safe direction; export extension columns pass through unchanged, since they describe the target rather than the annotation, and a resolver whose columns carry free text gates it itself. The mode never widens the tier: a caller outside it still gets only their own rows. The header's `text_withheld` and the `annotations.export` audit row record that the mode was on.
 
 ### What the rows deliberately omit
 
@@ -110,7 +117,7 @@ Targets are identified by the most opaque public identifier the target model off
 
 Every export writes an `annotations.export` Activity row recording the format, types, applied filters, returned counts, and `annotator_ids` — the user ids whose rows left the system. Every filter is either non-personal or an opaque user id, so the row carries no username or name: the audit trail is permanent, and the row targets no user, so `erase_subject` can never select it to scrub. A username written there would outlive the account it names. Roster reads write an `annotations.annotator.list` row with the annotator count only, for the same reason, and `GET /export/types` writes an `annotations.export.types` row with the type count.
 
-**Exports carry no personal data; the roster endpoint does, and stays inside.** Anything written into an exported file leaves the platform's erasure reach the moment it is saved — an erasure request under GDPR Art. 17 covers the audit trail and the database, not copies an operator has already distributed. Identifying annotators by bare user id keeps rater attribution intact while keeping names and usernames behind authentication, where erasure still works. Exported files remain PHI-adjacent (annotation text itself can carry anything a rater typed); govern them with the same retention policy as the recordings they describe, and treat any saved copy of the roster as personal data under that policy too.
+**Exports carry no annotator identity; the roster endpoint does, and stays inside.** Anything written into an exported file leaves the platform's erasure reach the moment it is saved — an erasure request under GDPR Art. 17 covers the audit trail and the database, not copies an operator has already distributed. Identifying annotators by bare user id keeps rater attribution intact while keeping names and usernames behind authentication, where erasure still works. The file is still personal data of the recording subjects, as its header states (annotation text can carry anything a rater typed, and the timing alone links to the recording); govern it with the same retention policy as the recordings it describes, and treat any saved copy of the roster as personal data under that policy too.
 
 ## Permission model
 
@@ -169,12 +176,14 @@ Use `Code` rather than adding fields to `AnnotationBase` when a project needs to
 ```python
 from annotations.vocabularies import register_vocabulary
 
-register_vocabulary("hed", label="HED", version="8.3.0", validator=my_validator)
+register_vocabulary("hed", label="HED", version="8.3.0", validator=my_validator, term_name=my_term_names)
 ```
 
-The validator receives `(value, meta)` and raises `ValueError` naming the offending term; `create_code` and `update_code` translate that into a 422 before opening their transaction. Update validation runs against the combined prospective row state, so patching only `meta` is still checked against the row's `standard` and `value`. A callable rather than a term list, because vocabulary rules are not always membership — HED has value placeholders and group structure, ICD-10 has check characters.
+The validator receives `(value, meta)` and raises `ValueError` naming the offending term; `create_code` and `update_code` translate that into a 422 before opening their transaction. Update validation runs against the combined prospective row state, so patching only `meta` is still checked against the row's `standard` and `value`. A callable rather than a term list, because vocabulary rules are not always membership — HED has value placeholders and group structure, ICD-10 has check characters. The optional `term_name` answers a value's display name, or `None`; ingest names a `Label` it writes from a footer code with it, and falls back to the code. The core vocabularies register one over their pinned terms.
 
-Core ships the mechanism with **zero vocabularies**; the contract is proven by a vocabulary registered inside the test suite ([tests/test_code_vocabulary.py](tests/test_code_vocabulary.py)). Two enforcement modes:
+Core registers two vocabularies of its own and no external one. `epicurrents.biosignal` is the shared set every biosignal event class in the viewer inherits, so far entirely acquisition-scoped (what was done, given and observed during a recording: calibration, impedance check, trigger, medication, procedures, body position, level of consciousness, noise and devices in the surroundings), and `epicurrents.eeg` is the EEG activation set (eyes closed and open, hyperventilation, photic stimulation per frequency, sensory stimuli) which delegates a value it does not know to the shared one. Both come from JSON files the viewer packages ship; [core_vocabularies.py](core_vocabularies.py) registers pinned copies under [vocabulary/](vocabulary/), and [tests/test_core_vocabularies.py](tests/test_core_vocabularies.py) fails when a copy drifts from its pinned version and digest or from the viewer's file. A term is added in the viewer first and copied here with the pin moved; the copy is never edited on its own. Ingest writes these terms too: the events a file arrives with are translated into them through mappers and tables, fail-closed, with the untranslated written as text-free placeholders ([recordings/README.md → Event translation](../recordings/README.md#event-translation)). Every category in a file carries a scope, and only `acquisition` categories are registered; the EEG file's finding categories are scoped `finding` and left out, because findings are standardised through an external vocabulary, and a shared finding category added later would be left out the same way. A code's `meta` is documented by the file (the keys a term expects) and validated by nothing. Design and term tables: [docs/engineering-notes/annotation-event-vocabulary.md](../docs/engineering-notes/annotation-event-vocabulary.md).
+
+The mechanism itself is proven by a vocabulary registered inside the test suite ([tests/test_code_vocabulary.py](tests/test_code_vocabulary.py)). Two enforcement modes:
 
 - Default: an unregistered `standard` is accepted unvalidated — existing rows and project-local codes keep working.
 - `ANNOTATION_CODE_STRICT_VOCABULARY = True` (a project-settings decision, not `common`): an unregistered `standard` is rejected with 422.
@@ -218,8 +227,9 @@ The previous `cascade_delete_annotations_for_target_object` `post_delete` signal
 | EDF+ TAL text events parsed from header | `Annotation` | `"Original annotations"` | `"original-annotations"` |
 | EDF+ data record gaps | `Interruption` (one per gap) | — | `"interruption:<data_pos>"` |
 | Converter sidecar (`.e` → EDF today; generic across future converters) | `Annotation` | `"Source events"` | `"source-events"` |
+| Each embedded text event and each sidecar item, through the [event translation](../recordings/README.md#event-translation) | `Event`, with a `Code` where the event translated | The term's name, or `"Source annotation"` / `"Source event"` for an untranslated one | `"original-annotation:<index>"` / `"source-event:<index>"` |
 
-All three use `_annotation_hash(recording.pk, suffix)` keyed on the recording PK. See [recordings/README.md](../recordings/README.md) for the ingest pipeline that produces them.
+All four use `annotation_hash(recording, suffix)` from [recordings/event_translation.py](../recordings/event_translation.py), keyed on the recording's `stored_name`. See [recordings/README.md](../recordings/README.md) for the ingest pipeline that produces them.
 
 ## Settings consumed
 
@@ -233,7 +243,7 @@ All three use `_annotation_hash(recording.pk, suffix)` keyed on the recording PK
 | Hook | How |
 |---|---|
 | Attach project-specific labels/scores to annotations | Use `Code` with `standard = "epicurrents.<project>.<concept>"`. Wrap the interaction in a project API endpoint that hides the `standard` string. |
-| Register a coding-standard vocabulary | `register_vocabulary(standard, label=..., validator=..., version=...)` from [vocabularies.py](vocabularies.py) in the owning `AppConfig.ready()`. |
+| Register a coding-standard vocabulary | `register_vocabulary(standard, label=..., validator=..., version=..., term_name=...)` from [vocabularies.py](vocabularies.py) in the owning `AppConfig.ready()`. |
 | Annotate project models | Project models can be annotation targets without any registration — the generic FK accepts any `(content_type, object_id)` pair. Just pass the model's content type ID to the create endpoint. |
 | Make a project model annotatable through the viewer UI | Frontend concern — see the viewer's `DatabaseAPIConnector` setup. |
 
@@ -246,7 +256,7 @@ pytest annotations/tests/
 ## Gotchas
 
 - **`object_hash` is caller-supplied, not generated.** The platform validates the format (32 alphanumeric chars) but doesn't generate it for you. Tests that create multiple annotations on the same target must use distinct hash values, or the unique constraint fires.
-- **Re-uploading a recording produces fresh annotation hashes.** `_annotation_hash` is keyed on the recording PK, and re-upload creates a new Recording row with a new PK. The annotations from the previous upload remain attached to the previous PK. This is the intended behaviour (file identity is per-row, not per-content), but worth knowing if you're chasing "why are there two sets of annotations on what looks like the same file".
+- **Re-uploading a recording produces fresh annotation hashes.** `annotation_hash` is keyed on the recording's random `stored_name`, and re-upload creates a new Recording row with a new stored name. The annotations from the previous upload remain attached to the previous row. This is the intended behaviour (file identity is per-row, not per-content), but worth knowing if you're chasing "why are there two sets of annotations on what looks like the same file".
 - **`AnnotationBase` is abstract — don't add fields there.** Every field on `AnnotationBase` participates in `content_hash` via subclass `_hash_fields()`, and adding a field requires a migration on all four concrete tables plus invalidates every stored hash. Use `Code` for project-specific labelling instead. The full rationale is in [Project-specific labelling via `Code`](#project-specific-labelling-via-code).
 - **`list_annotations` requires the recording author to have an explicit `AccessRight`.** `can_read_object` doesn't auto-grant on authorship for the read-list path — it goes through the standard `AccessRight` lookup. In tests, this means `baker.make(Recording, author=user)` is not enough on its own; create an `AccessRight` row for the author too if the test exercises a list endpoint. (Tests that target a single annotation directly aren't affected.)
 - **`Annotation` is the only type without `Code` support.** If a project needs to attach a code to a bundle-style annotation, the workaround is to use one `Event` (with `timestamp=0` if positional context doesn't matter) as the code carrier.

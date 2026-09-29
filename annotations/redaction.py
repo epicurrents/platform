@@ -20,6 +20,9 @@ A caller whose read terms carry ``apply_middleware`` receives no annotation text
 they did not write: ``Event.name`` / ``value``, ``Label.name`` / ``value`` and
 ``Annotation.content``. Timing, hashes, author ids, interruptions and
 classification codes are unaffected — they carry no free text from the source.
+"Text" throughout means free-form content a person typed, string or JSON, as
+opposed to a value checked against a registered vocabulary: a code's ``meta``
+is text in that sense, its ``standard`` and ``value`` are not.
 
 Two exemptions, both narrow:
 
@@ -37,6 +40,11 @@ A federated peer authors nothing locally, so under a sanitising grant every row 
 did not produce is withheld from it. The machine-produced exemption does not depend
 on the caller: a finding is computed from the de-identified signal whoever asks for
 it, so a peer receives those as a local grantee would.
+
+One surface applies the rule by choice rather than by grant: the annotation export's
+withholding mode (``?withhold_text=true``) prepares a file for a recipient under a
+de-identifying arrangement and calls :func:`withheld_under_deidentification`
+directly, so what it withholds is exactly what a de-identifying grant withholds.
 """
 
 from __future__ import annotations
@@ -84,7 +92,17 @@ def withheld_row_ids(rows: Iterable[Any], *, caller: Any, terms: Any) -> set:
     """
     if not getattr(terms, "apply_middleware", False):
         return set()
+    return withheld_under_deidentification(rows, caller=caller)
 
+
+def withheld_under_deidentification(rows: Iterable[Any], *, caller: Any) -> set:
+    """Return the primary keys of *rows* whose text a de-identifying reader may not receive.
+
+    The answer :func:`withheld_row_ids` gives once the terms are known to de-identify,
+    for a surface that applies the rule without a grant: the annotation export's
+    withholding mode. Exposing it keeps the two surfaces on one decision, the caller's
+    own rows and machine-produced findings excepted in both.
+    """
     rows = list(rows)
     if not rows:
         return set()

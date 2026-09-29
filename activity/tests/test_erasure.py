@@ -14,8 +14,12 @@ from django.contrib.contenttypes.models import ContentType
 from django.contrib.sessions.models import Session
 
 from activity.audit import (
+    _WITHHELD_FIELDS,
     MASK_PREFIX,
+    WITHHELD_SENTINEL,
+    registered_masked_fields,
     rollback_change,
+    serialize_instance,
     verify_chain,
     verify_change_hash,
 )
@@ -98,6 +102,25 @@ class TestCredentialMasking:
         # The endpoint is a per-device identifier, not a secret — it stays
         # readable for audit reconstruction and is scrubbed only on erasure.
         assert row.before_state["endpoint"] == "https://push.example/ep1"
+
+    def test_withheld_field_is_one_constant_whatever_its_value(self, make_user, monkeypatch):
+        # A mask is a digest of the value, so a copy of the value recomputes it; a withheld
+        # field must not be recomputable, and two different values must read the same.
+        from model_bakery import baker
+
+        monkeypatch.setitem(_WITHHELD_FIELDS, "notifications.pushsubscription", frozenset({"endpoint"}))
+        user = make_user()
+        first, second = (
+            baker.prepare("notifications.PushSubscription", user=user, endpoint=endpoint, p256dh="key", auth="secret")
+            for endpoint in ("https://push.example/a", "https://push.example/b")
+        )
+        assert serialize_instance(first)["endpoint"] == serialize_instance(second)["endpoint"] == WITHHELD_SENTINEL
+        # The masks registered for the same model still apply beside it.
+        assert serialize_instance(first)["auth"].startswith(MASK_PREFIX)
+        assert serialize_instance(first)["auth"] != WITHHELD_SENTINEL
+        first.endpoint = ""
+        assert serialize_instance(first)["endpoint"] == ""
+        assert {"endpoint", "auth", "p256dh"} <= registered_masked_fields("notifications.pushsubscription")
 
     def test_rollback_does_not_clobber_password_with_mask(self, make_user, superuser):
         user = make_user(username="maskroll")

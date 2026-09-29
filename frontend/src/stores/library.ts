@@ -7,6 +7,7 @@ import {
     createDataset,
     type Collection,
 } from '#api/library'
+import { toastNameWarnings } from '#lib/nameWarnings'
 
 /**
  * Pinia store for the user's Collections (Library) and Datasets.
@@ -35,6 +36,7 @@ export const useLibraryStore = defineStore('library', () => {
     async function addCollection(name: string, description = ''): Promise<Collection> {
         const created = await createCollection({ name, description })
         collections.value.push(created)
+        toastNameWarnings(created.warnings)
         return created
     }
 
@@ -63,6 +65,7 @@ export const useLibraryStore = defineStore('library', () => {
     async function addDataset(name: string, description = ''): Promise<Collection> {
         const created = await createDataset({ name, description })
         datasets.value.push(created)
+        toastNameWarnings(created.warnings)
         return created
     }
 

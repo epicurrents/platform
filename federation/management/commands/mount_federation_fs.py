@@ -31,7 +31,7 @@ class Command(BaseCommand):
     help = (
         "Mount a read-only FUSE virtual filesystem exposing recordings shared by "
         "trusted federated peers as ordinary local files.\n\n"
-        "Privacy / anonymization is controlled server-side via the apply_middleware "
+        "Privacy / de-identification is controlled server-side via the apply_middleware "
         "flag on the federation AccessRight grant.  An optional local post-processing "
         "pipeline can be passed programmatically to FederationOperations for "
         "analysis-specific transforms (channel dropping, downsampling, etc.).\n\n"

@@ -180,6 +180,21 @@ class TestReadAccessTerms:
         assert result.granted is True
         assert result.apply_middleware is True
 
+    def test_access_right_created_without_the_flag_de_identifies(self, user, make_user):
+        # The model default is True since 2026-09-22: a row created through the
+        # ORM with no decision serves de-identified bytes, and raw is the
+        # explicit choice. A project fixture or data migration that relied on
+        # the old default meaning raw notices here.
+        reader = make_user()
+        from model_bakery import baker
+
+        recording = baker.make("recordings.Recording", author=user)
+        row = _make_access_right(recording, user, target=reader, can_read=True)
+        assert row.apply_middleware is True
+        result = get_read_access_result(reader, recording)
+        assert result.granted is True
+        assert result.apply_middleware is True
+
     def test_group_access_right_with_middleware_flag(self, user, make_user):
         from django.contrib.auth.models import Group
         from model_bakery import baker

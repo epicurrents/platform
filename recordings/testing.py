@@ -29,7 +29,7 @@ def make_edf_bytes(n_channels: int = 1, n_records: int = 1) -> bytes:
     parse and meaningless to analyse — which is what a test asserting on
     structure wants and what a test asserting on signal content must not use.
 
-    The identification fields carry the already-anonymised values
+    The identification fields carry the already-de-identified values
     (``X X X X``), so this builds a file that has been through
     de-identification rather than one that needs it. A test exercising PHI
     removal has to construct its own header with real-looking values.

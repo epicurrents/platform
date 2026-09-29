@@ -62,3 +62,21 @@ export function errorDetail(error: unknown, fallback: string): string {
     const detail = (data as { detail?: unknown } | undefined)?.detail
     return typeof detail === 'string' && detail.length > 0 ? detail : fallback
 }
+
+/**
+ * Summarise the failures of a batch of requests settled with `Promise.allSettled`.
+ *
+ * Returns null when every request succeeded. Otherwise `count` is the number that failed and `reason` the first
+ * server explanation among them, or an empty string when none carried one, so a batch refused for one reason (a
+ * release-gated dataset turning away recordings its author did not make, say) says why instead of only how many.
+ *
+ * @param results - the settled outcomes, in request order.
+ */
+export function settledFailure(results: PromiseSettledResult<unknown>[]): { count: number, reason: string } | null {
+    const rejected = results.filter((result): result is PromiseRejectedResult => result.status === 'rejected')
+    if (!rejected.length) {
+        return null
+    }
+    const reason = rejected.map(result => errorDetail(result.reason, '')).find(detail => detail.length > 0) ?? ''
+    return { count: rejected.length, reason }
+}

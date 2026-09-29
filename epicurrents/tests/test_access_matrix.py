@@ -12,6 +12,8 @@ with a row when adding a caller class, a column when adding a surface — the re
 walks an app adds its combinations here.
 """
 
+from datetime import datetime
+
 import pytest
 from django.contrib.contenttypes.models import ContentType
 from django.test import Client
@@ -51,6 +53,16 @@ def matrix(db, user, make_user, make_superuser, tmp_path):
     raw_grantee = make_user()
     _grant(recording, author, target=raw_grantee, apply_middleware=False)
 
+    default_grantee = make_user()
+    ct = ContentType.objects.get_for_model(recording, for_concrete_model=False)
+    AccessRight.objects.create(  # no apply_middleware argument: the model default decides
+        content_type=ct,
+        object_id=str(recording.pk),
+        access_giver=author,
+        access_target=default_grantee,
+        can_read=True,
+    )
+
     _grant(recording, author, token=TOKEN, apply_middleware=True)
 
     dataset_grantee = make_user()
@@ -81,6 +93,7 @@ def matrix(db, user, make_user, make_superuser, tmp_path):
             "author": author,
             "grantee": grantee,
             "raw_grantee": raw_grantee,
+            "default_grantee": default_grantee,
             "dataset_grantee": dataset_grantee,
             "unrelated": unrelated,
             "staff": staff,
@@ -152,6 +165,7 @@ MATRIX = [
     ("detail", "ready", "author", 200),
     ("detail", "ready", "grantee", 200),
     ("detail", "ready", "raw_grantee", 200),
+    ("detail", "ready", "default_grantee", 200),
     ("detail", "ready", "dataset_grantee", 200),
     ("detail", "ready", "token", 200),
     ("detail", "ready", "unrelated", 403),
@@ -171,6 +185,7 @@ MATRIX = [
     # file
     ("file", "ready", "author", 200),
     ("file", "ready", "grantee", 200),
+    ("file", "ready", "default_grantee", 200),
     ("file", "ready", "dataset_grantee", 200),
     ("file", "ready", "token", 200),
     ("file", "ready", "unrelated", 403),
@@ -220,20 +235,40 @@ class TestAccessMatrix:
         )
 
     def test_author_private_fields_null_for_every_non_author_reader(self, matrix):
-        for caller in ("grantee", "raw_grantee", "dataset_grantee", "token"):
+        for caller in ("grantee", "raw_grantee", "default_grantee", "dataset_grantee", "token"):
             body = _get(matrix, caller, "detail").json()
             assert body.get("original_name") is None, f"original_name leaked to {caller}"
             assert body.get("processing_error") is None, f"processing_error leaked to {caller}"
         assert _get(matrix, "author", "detail").json().get("original_name") == "parity.edf"
 
+    def test_file_hash_is_served_to_nobody(self, matrix):
+        for caller in ("author", "grantee", "raw_grantee", "default_grantee", "dataset_grantee", "token", "superuser"):
+            body = _get(matrix, caller, "detail").json()
+            assert "file_hash" not in body, f"file_hash served to {caller}"
+
+    def test_created_at_is_month_truncated_for_every_non_author_reader(self, matrix):
+        exact = matrix["recording"].created_at
+        # The JSON encoder writes millisecond precision.
+        exact = exact.replace(microsecond=(exact.microsecond // 1000) * 1000)
+        truncated = exact.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        for caller in ("grantee", "raw_grantee", "default_grantee", "dataset_grantee", "token"):
+            served = datetime.fromisoformat(_get(matrix, caller, "detail").json()["created_at"])
+            assert served == truncated, f"{caller} received an upload time finer than the month"
+        for caller in ("author", "superuser"):
+            served = datetime.fromisoformat(_get(matrix, caller, "detail").json()["created_at"])
+            assert served == exact, f"{caller} should receive the exact upload time"
+
     def test_middleware_grants_receive_sanitised_bytes_raw_grants_do_not(self, matrix):
+        # default_grantee holds a row created with no apply_middleware argument:
+        # the model default is the de-identifying one, so it sits with the
+        # sanitised readers.
         raw = matrix["content"]
-        for caller in ("grantee", "token"):
+        for caller in ("grantee", "default_grantee", "token"):
             response = _get(matrix, caller, "file")
             assert response.status_code == 200
             body = b"".join(response.streaming_content)
             assert body != raw, f"{caller} with apply_middleware=True received the raw file"
-            assert b"X X X X" in body[:88], f"{caller}'s header is not anonymised"
+            assert b"X X X X" in body[:88], f"{caller}'s header is not de-identified"
         for caller in ("author", "raw_grantee"):
             response = _get(matrix, caller, "file")
             assert response.status_code == 200

@@ -1,0 +1,226 @@
+/**
+ * Tests for the viewer export-target templates: how a pool's published profile becomes export constraints, and what
+ * each target sends and reports back. The sidecar's declared hash is pinned against the bytes, since the submission
+ * gate refuses a file whose declared hash differs from what arrived.
+ */
+
+import { createHash } from 'node:crypto'
+import { beforeEach, describe, expect, it, vi } from 'vitest'
+
+vi.mock('#api/recordings', () => ({
+    submitFile: vi.fn(),
+    uploadRecording: vi.fn(),
+}))
+vi.mock('#i18n', () => ({
+    t: (key: string, _scope: string, params: Record<string, unknown> = {}) =>
+        key.replace(/\{(\w+)\}/g, (_match, name: string) => String(params[name])),
+}))
+
+import { submitFile, uploadRecording, type SubmissionPool, type SubmissionProfile } from '#api/recordings'
+import { createSubmissionTarget, createUploadTarget, profileConstraints, violationText } from './exportTargets'
+
+const mockSubmit = vi.mocked(submitFile)
+const mockUpload = vi.mocked(uploadRecording)
+
+function makeProfile(overrides: Partial<SubmissionProfile> = {}): SubmissionProfile {
+    return {
+        key: 'fictional.profile',
+        channels: ['Fp1', 'Fp2'],
+        sampling_rate: 128,
+        physical_unit: 'uV',
+        physical_min: -500,
+        physical_max: 500,
+        digital_min: -32768,
+        digital_max: 32767,
+        durations_seconds: [10, 20],
+        required_sidecar_keys: ['recording_sha256'],
+        forbidden_sidecar_keys: ['subject', 'text'],
+        ...overrides,
+    }
+}
+
+/** A pool as the platform lists it, with `profile` in place of its published profile. */
+function makePool(profile: SubmissionProfile = makeProfile()): SubmissionPool {
+    return { dataset_hash: 'f'.repeat(32), name: 'Fictional pool', profile }
+}
+
+const bytes = new Uint8Array([1, 2, 3, 4]).buffer
+const sha256 = createHash('sha256').update(new Uint8Array(bytes)).digest('hex')
+
+/** The sidecar the last submission sent, parsed. */
+async function sentSidecar(): Promise<Record<string, unknown>> {
+    const blob = mockSubmit.mock.calls.at(-1)![2]
+    return JSON.parse(await blob.text())
+}
+
+beforeEach(() => {
+    mockSubmit.mockReset()
+    mockUpload.mockReset()
+})
+
+describe('profileConstraints', () => {
+    it('carries every value the gate checks', () => {
+        expect(profileConstraints(makeProfile())).toEqual({
+            amplitudeRange: [-500, 500],
+            channels: ['Fp1', 'Fp2'],
+            durations: [10, 20],
+            forbiddenMetadataKeys: ['subject', 'text'],
+            samplingRate: 128,
+            unit: 'uV',
+        })
+    })
+
+    it('leaves out what the profile does not check', () => {
+        expect(profileConstraints(makeProfile({
+            channels: [],
+            sampling_rate: null,
+            physical_unit: null,
+            physical_min: -500,
+            physical_max: null,
+            digital_min: null,
+            digital_max: null,
+            durations_seconds: [],
+            forbidden_sidecar_keys: [],
+        }))).toEqual({})
+    })
+
+    it('refuses a digital range the encoder cannot write', () => {
+        expect(profileConstraints(makeProfile({ digital_min: -2048, digital_max: 2047 }))).toBeNull()
+        expect(profileConstraints(makeProfile({ digital_min: -32767 }))).toBeNull()
+    })
+})
+
+describe('createUploadTarget', () => {
+    it('sends the container to the upload and reports success', async () => {
+        mockUpload.mockResolvedValue({} as never)
+        const target = createUploadTarget()
+        expect(target.options).toMatchObject({ deidentify: true, embedFooter: true })
+        expect(target.sidecar).toBeFalsy()
+        const result = await target.submit({ data: bytes, sidecar: null })
+        expect(result.success).toBe(true)
+        const sent = mockUpload.mock.calls[0][0]
+        expect(new Uint8Array(await sent.arrayBuffer())).toEqual(new Uint8Array(bytes))
+    })
+
+    it('reports the refusal detail rather than throwing', async () => {
+        mockUpload.mockRejectedValue({ response: { data: { detail: 'Quota exceeded.' } } })
+        const result = await createUploadTarget().submit({ data: bytes, sidecar: null })
+        expect(result).toEqual({ message: 'Quota exceeded.', success: false })
+    })
+})
+
+describe('createSubmissionTarget', () => {
+    it('is null for a profile the viewer cannot meet', () => {
+        expect(createSubmissionTarget(makePool(makeProfile({ digital_max: 2047 })))).toBeNull()
+    })
+
+    it('asks for a plain de-identified file and its de-identified sidecar', () => {
+        const target = createSubmissionTarget(makePool())!
+        expect(target.format).toBe('edf')
+        expect(target.sidecar).toBe(true)
+        expect(target.options).toEqual({ deidentify: true, deidentifySidecar: true, dither: true, embedFooter: false })
+    })
+
+    it('is labelled by the pool unless the host names it', () => {
+        expect(createSubmissionTarget(makePool())!.label).toBe('Submission pool: Fictional pool')
+    })
+
+    it('lets the host replace a constraint and the label', () => {
+        const target = createSubmissionTarget(makePool(), {
+            constraints: { durations: [30] },
+            label: 'Fictional target',
+        })!
+        expect(target.label).toBe('Fictional target')
+        expect(target.constraints?.durations).toEqual([30])
+        expect(target.constraints?.samplingRate).toBe(128)
+    })
+
+    it('declares the hash of the bytes it sends, after the host extends the sidecar', async () => {
+        mockSubmit.mockResolvedValue({ accepted: true })
+        const target = createSubmissionTarget(makePool(), {
+            extendSidecar: (sidecar) => ({ ...sidecar, recording_sha256: 'forged', band: 'A2' }),
+        })!
+        const result = await target.submit({ data: bytes, sidecar: JSON.stringify({ version: '1.0' }) })
+        expect(result).toMatchObject({
+            message: 'Accepted. The recording joins the pool at the next pooled ingest.',
+            success: true,
+        })
+        expect(mockSubmit.mock.calls[0][0]).toBe('f'.repeat(32))
+        expect(await sentSidecar()).toEqual({ version: '1.0', band: 'A2', recording_sha256: sha256 })
+    })
+
+    it('hands back a receipt naming the file by the hash of the bytes sent', async () => {
+        // Withdrawal is keyed on this hash alone, and a dithered export cannot reproduce it.
+        mockSubmit.mockResolvedValue({ accepted: true })
+        const result = await createSubmissionTarget(makePool())!.submit({ data: bytes, sidecar: '{}' })
+        expect(result.receipt).toMatchObject({ fileName: `submission-receipt-${sha256.slice(0, 12)}.txt`, mimeType: 'text/plain' })
+        expect(result.receipt!.data).toContain(sha256)
+        expect(result.receipt!.data).toContain('f'.repeat(32))
+        // The day, never the time: a forwarded receipt must not carry a timestamp to match against a ledger.
+        expect(result.receipt!.data).not.toMatch(/\d{2}:\d{2}/)
+    })
+
+    it('hands back no receipt for a refused file', async () => {
+        mockSubmit.mockResolvedValue({ accepted: false, violations: [{ code: 'duration', message: 'Wrong length.' }] })
+        const result = await createSubmissionTarget(makePool())!.submit({ data: bytes, sidecar: '{}' })
+        expect(result.receipt).toBeUndefined()
+    })
+
+    it('sends nothing when the host declines to extend the sidecar, and reports its reason as written', async () => {
+        const target = createSubmissionTarget(makePool(), {
+            extendSidecar: () => {
+                throw new Error('The submission was cancelled.')
+            },
+        })!
+        const result = await target.submit({ data: bytes, sidecar: '{}' })
+        expect(result).toEqual({
+            message: 'The sidecar could not be prepared: The submission was cancelled.',
+            success: false,
+        })
+        expect(mockSubmit).not.toHaveBeenCalled()
+    })
+
+    it('refuses locally when the sidecar lacks a key the profile requires', async () => {
+        const profile = makeProfile({ required_sidecar_keys: ['recording_sha256', 'band'] })
+        const target = createSubmissionTarget(makePool(profile))!
+        const result = await target.submit({ data: bytes, sidecar: '{}' })
+        expect(result.success).toBe(false)
+        expect(result.message).toContain('band')
+        expect(mockSubmit).not.toHaveBeenCalled()
+    })
+
+    it('reports the gate\'s violations in translated sentences, once per code', async () => {
+        mockSubmit.mockResolvedValue({
+            accepted: false,
+            violations: [
+                { code: 'duration', message: 'Wrong length.' },
+                { code: 'range', message: 'Fp1: physical minimum -400 differs from the profile.' },
+                { code: 'range', message: 'Fp2: physical minimum -400 differs from the profile.' },
+            ],
+        })
+        const result = await createSubmissionTarget(makePool())!.submit({ data: bytes, sidecar: '{}' })
+        expect(result).toEqual({
+            message: 'Refused: The length of the excerpt is not one the pool accepts. '
+                + 'The signal range differs from the one the pool asks for.',
+            success: false,
+        })
+    })
+
+    it('falls back to the gate\'s message for a code it does not know', () => {
+        expect(violationText({ code: 'future_check', message: 'Something new.' })).toBe('Something new.')
+    })
+
+    it('reports a missing hash function as an insecure connection, not a script error', async () => {
+        const digest = vi.spyOn(crypto.subtle, 'digest').mockRejectedValue(new TypeError('reading \'digest\''))
+        const result = await createSubmissionTarget(makePool())!.submit({ data: bytes, sidecar: '{}' })
+        digest.mockRestore()
+        expect(result).toEqual({ message: 'Submitting needs a secure (https) connection.', success: false })
+        expect(mockSubmit).not.toHaveBeenCalled()
+    })
+
+    it('reports a sidecar that is not JSON without sending anything or showing the parser error', async () => {
+        const result = await createSubmissionTarget(makePool())!.submit({ data: bytes, sidecar: '{' })
+        expect(result).toEqual({ message: 'The viewer produced a sidecar that could not be read.', success: false })
+        expect(mockSubmit).not.toHaveBeenCalled()
+    })
+})

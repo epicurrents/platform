@@ -47,7 +47,7 @@ Tags
 
 import hashlib
 import json
-from datetime import datetime
+from datetime import date, datetime
 
 from django.conf import settings
 from django.contrib.auth import get_user_model
@@ -59,11 +59,16 @@ from ninja import NinjaAPI, Query, Schema
 from ninja.errors import HttpError
 
 from activity.audit import log_activity
-from epicurrents.api.schemas import AccessRightOut, access_right_out
+from epicurrents.api.schemas import AccessRightOut, AssessmentIn, access_right_out, apply_assessment, assessment_values
+from epicurrents.assessment import assessment_visible, ensure_can_assess
 from epicurrents.auth import enforce_session_csrf
 from epicurrents.granting import ensure_can_confer, ensure_can_manage_access, ensure_can_revoke
 from epicurrents.models import AccessRight
 from epicurrents.permissions import can_modify_object
+from epicurrents.security_log import log_security_event
+from epicurrents.text_hygiene import NameWarningOut, name_warnings
+from library import pools
+from library.item_access import user_can_read_item
 from library.models import (
     Collection,
     CollectionItem,
@@ -79,6 +84,8 @@ from library.permissions import (
     ensure_can_read_collection,
     ensure_can_write_collection,
 )
+from library.tag_scope import can_create_tag, tag_reachable, visible_tag_ids
+from user.dedicated_groups import dedicated_group
 
 api = NinjaAPI(
     title="Library API",
@@ -122,6 +129,10 @@ class CollectionPatchIn(Schema):
     # empty string clears a previously declared value.
     license_spdx: str | None = None
     license_url: str | None = None
+    # Datasets only — release gating (library/release.py). The author or a
+    # superuser may change it; turning it off publishes every unreleased member.
+    # A submission pool's gate is its configuration's (library/pools.py).
+    release_gated: bool | None = None
 
 
 class CollectionOut(Schema):
@@ -143,6 +154,19 @@ class CollectionOut(Schema):
     # for datasets with nothing declared.
     license_spdx: str | None = None
     license_url: str | None = None
+    # Datasets only — members are hidden until a release run publishes them.
+    release_gated: bool = False
+
+
+class CollectionWriteOut(CollectionOut):
+    """A create or update response: the collection or dataset plus free-text warnings.
+
+    ``warnings`` names each of ``name`` and ``description`` that looks like an
+    identifier (see ``epicurrents.text_hygiene``). The write has happened
+    regardless; the client surfaces the warning against the field.
+    """
+
+    warnings: list[NameWarningOut] = []
 
 
 class CollectionItemIn(Schema):
@@ -174,14 +198,22 @@ class CollectionItemOut(Schema):
     the file's extension is in the live ``MEDIA_ALLOWED_UPLOAD_EXTENSIONS``,
     so the frontend can grey out items the current project can no longer
     open without hiding them from the list.
+
+    ``id`` and ``object_id`` are null where they would give away arrival order: for a reader of a
+    release-gated dataset who does not manage it, and for a pooled recording listed to anyone but
+    a superuser or a manager of its pool. Both are sequential; ``object_hash`` names the member.
     """
 
-    id: int
+    id: int | None
     content_type_id: int
-    object_id: str
+    object_id: str | None
     added_at: datetime
     # Dataset items only — the containing folder, or null for the dataset root.
     folder_id: int | None = None
+    # Dataset items only — the month the item was published by a release run
+    # of a release-gated dataset; null in other datasets and for unreleased
+    # members, which only the dataset's managers are listed.
+    release_month: datetime | None = None
     object_name: str | None = None
     object_hash: str | None = None
     object_type: str | None = None
@@ -197,14 +229,22 @@ class BulkRenameRecordingsIn(Schema):
 
 
 class BulkRenameRecordingsOut(Schema):
-    """Result of the per-collection recording bulk-rename action."""
+    """Result of the per-collection recording bulk-rename action.
+
+    ``warnings`` covers the prefix, since every renamed recording carries it.
+    """
 
     renamed: int
     skipped: int
+    warnings: list[NameWarningOut] = []
 
 
 class GrantAccessIn(Schema):
-    """Payload for granting an access right on a collection or dataset."""
+    """Payload for granting an access right on a collection or dataset.
+
+    ``assessment_reference`` and ``assessment_date`` record the sharer's contextual
+    assessment for the grant where one already exists; both or neither.
+    """
 
     access_target_id: int | None = None
     access_target_group_id: int | None = None
@@ -214,6 +254,8 @@ class GrantAccessIn(Schema):
     can_share: bool = False
     apply_middleware: bool = True
     expires_at: datetime | None = None
+    assessment_reference: str = ""
+    assessment_date: date | None = None
 
 
 class TagIn(Schema):
@@ -233,24 +275,39 @@ class TagPatchIn(Schema):
 
 
 class TagOut(Schema):
-    """Tag response."""
+    """Tag response.
+
+    ``curated`` is stamped at creation from the author's staff flag and decides
+    whether the tag is listed to everyone or only to those who can reach it.
+    """
 
     id: int
     name: str
     description: str
     parent_id: int | None
     author_id: int
+    curated: bool = False
     created_at: datetime
     modified_at: datetime
 
 
-class TaggedItemOut(Schema):
-    """Tagged item response."""
+class TagWriteOut(TagOut):
+    """A tag create or update response plus free-text warnings for ``name`` and ``description``."""
 
-    id: int
+    warnings: list[NameWarningOut] = []
+
+
+class TaggedItemOut(Schema):
+    """Tagged item response.
+
+    ``id`` and ``object_id`` are null for a pooled recording listed to anyone but a superuser or a
+    manager of its pool: both are sequential and would give away the pool's arrival order.
+    """
+
+    id: int | None
     tag_id: int
     content_type_id: int
-    object_id: str
+    object_id: str | None
     tagged_at: datetime
 
 
@@ -447,6 +504,7 @@ def _enrich_collection_items(items: list, user) -> list[dict]:
             "object_id": item.object_id,
             "added_at": item.added_at,
             "folder_id": getattr(item, "folder_id", None),
+            "release_month": None,
             "object_name": None,
             "object_hash": None,
             "object_type": None,
@@ -477,13 +535,14 @@ def _enrich_collection_items(items: list, user) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 
-@api.post("/collections/", response={201: CollectionOut})
+@api.post("/collections/", response={201: CollectionWriteOut})
 def create_collection(request, payload: CollectionIn):
     """Create a new collection.
 
     Collections are author-private; the author's access is implicit and no
     AccessRight row is created. Set ``parent_id`` to nest the collection
-    inside an existing one.
+    inside an existing one. ``warnings`` flags a name or description that
+    looks like an identifier; the collection is created either way.
     """
     user = _require_auth(request)
     parent = _resolve_parent(payload.parent_id, user)
@@ -496,7 +555,7 @@ def create_collection(request, payload: CollectionIn):
             parent=parent,
         )
         log_activity(verb="library.collection.create", target=collection)
-        return 201, collection
+    return 201, _collection_write_out(collection, name_warnings(name=payload.name, description=payload.description))
 
 
 @api.get("/collections/", response=list[CollectionOut])
@@ -565,12 +624,13 @@ def get_collection(request, collection_id: int):
     return collection
 
 
-@api.patch("/collections/{collection_id}/", response=CollectionOut)
+@api.patch("/collections/{collection_id}/", response=CollectionWriteOut)
 def update_collection(request, collection_id: int, payload: CollectionPatchIn):
     """Update collection name, description, or parent.
 
     Requires write access (author, superuser, or can_write AccessRight).
     Moving a collection to a new parent requires read access to the new parent.
+    ``warnings`` flags a new name or description that looks like an identifier.
     """
     user = _require_auth(request)
     collection = _get_active_collection(collection_id)
@@ -597,7 +657,7 @@ def update_collection(request, collection_id: int, payload: CollectionPatchIn):
             target=collection,
             metadata={"fields_updated": fields_updated},
         )
-    return collection
+    return _collection_write_out(collection, name_warnings(name=payload.name, description=payload.description))
 
 
 def _check_no_cycle(collection: Collection, new_parent_id: int):
@@ -897,7 +957,9 @@ def bulk_rename_recordings(request, collection_id: int, payload: BulkRenameRecor
     its contents) and write access to each affected recording.  Other
     content-type items in the collection are ignored.
 
-    Returns the count of renamed and skipped recording items.
+    Returns the count of renamed and skipped recording items, and a warning
+    when the prefix itself looks like an identifier, since every renamed
+    recording now carries it.
     """
     from epicurrents.permissions import can_write_object
     from recordings.models import Recording
@@ -922,8 +984,9 @@ def bulk_rename_recordings(request, collection_id: int, payload: BulkRenameRecor
 
     recording_ct = ContentType.objects.get_for_model(Recording, for_concrete_model=False)
     items = list(CollectionItem.objects.filter(collection=collection, content_type=recording_ct).order_by("added_at"))
+    prefix_warnings = name_warnings(prefix=prefix)
     if not items:
-        return {"renamed": 0, "skipped": 0}
+        return {"renamed": 0, "skipped": 0, "warnings": prefix_warnings}
 
     object_ids = [item.object_id for item in items]
     recordings = {
@@ -955,6 +1018,8 @@ def bulk_rename_recordings(request, collection_id: int, payload: BulkRenameRecor
             renamed += 1
             renamed_pks.append(rec.pk)
 
+    # The prefix is user-typed text and stays out of the permanent metadata;
+    # the renamed rows' own change records carry the resulting names.
     log_activity(
         verb="library.collection.recordings.bulk_rename",
         target=collection,
@@ -962,11 +1027,10 @@ def bulk_rename_recordings(request, collection_id: int, payload: BulkRenameRecor
             "renamed_count": renamed,
             "skipped_count": skipped,
             "renamed_recording_pks": renamed_pks,
-            "prefix": prefix,
         },
     )
 
-    return {"renamed": renamed, "skipped": skipped}
+    return {"renamed": renamed, "skipped": skipped, "warnings": prefix_warnings}
 
 
 class CollectionExportIn(Schema):
@@ -978,12 +1042,17 @@ class CollectionExportIn(Schema):
 
 
 class CollectionExportOut(Schema):
-    """Result of a collection export: the created dataset plus copy counts."""
+    """Result of a collection export: the created dataset plus copy counts.
+
+    ``warnings`` flags a dataset name or description, or a materialised folder name, that looks
+    like an identifier: each becomes grantee-visible once the dataset is shared.
+    """
 
     dataset: CollectionOut
     exported_count: int
     skipped_count: int
     folder_count: int
+    warnings: list[NameWarningOut] = []
 
 
 @api.post("/collections/{collection_id}/export/", response={201: CollectionExportOut})
@@ -1099,45 +1168,16 @@ def export_collection_to_dataset(request, collection_id: int, payload: Collectio
             },
         )
 
+    warnings = name_warnings(name=dataset.name, description=dataset.description)
+    for folder in folder_by_collection.values():
+        warnings += name_warnings(folder_name=folder.name)
     return 201, {
         "dataset": _dataset_out(dataset),
         "exported_count": exported,
         "skipped_count": skipped,
         "folder_count": len(folder_by_collection),
+        "warnings": warnings,
     }
-
-
-def _user_can_read_item(user, ct: ContentType, object_id: str) -> bool:
-    """Return True if *user* may read the object referenced by *ct* + *object_id*.
-
-    Fast paths (no AccessRight query):
-    - superuser → always True
-    - object author → True
-
-    Falls back to ``can_read_object`` (which checks AccessRights and all
-    registered extensions including Dataset membership).  Soft-deleted or
-    missing objects are treated as unreadable and return False.
-    """
-    from epicurrents.permissions import can_read_object
-
-    if getattr(user, "is_superuser", False):
-        return True
-
-    model_class = ct.model_class()
-    if model_class is None:
-        return False
-
-    qs = model_class.objects.filter(pk=object_id)
-    if hasattr(model_class, "deleted_at"):
-        qs = qs.filter(deleted_at__isnull=True)
-    obj = qs.first()
-    if obj is None:
-        return False
-
-    if getattr(obj, "author_id", None) == user.pk:
-        return True
-
-    return can_read_object(user=user, obj=obj)
 
 
 def _filter_readable(user, qs, order_by: str, offset: int, limit: int) -> list:
@@ -1151,7 +1191,7 @@ def _filter_readable(user, qs, order_by: str, offset: int, limit: int) -> list:
     visible = []
     skipped = 0
     for item in qs.select_related("content_type").order_by(order_by).iterator():
-        if _user_can_read_item(user, item.content_type, item.object_id):
+        if user_can_read_item(user, item.content_type, item.object_id):
             if skipped < offset:
                 skipped += 1
                 continue
@@ -1253,13 +1293,14 @@ def _get_active_dataset(dataset_id: int | str) -> Dataset:
     return dataset
 
 
-@api.post("/datasets/", response={201: CollectionOut})
+@api.post("/datasets/", response={201: CollectionWriteOut})
 def create_dataset(request, payload: DatasetIn):
     """Create a new Dataset.
 
     The creator automatically receives full read/write/share access.
     If ``recording_hashes`` is provided, all recordings are added atomically —
     the dataset is not persisted at all if any hash is invalid or unreadable.
+    ``warnings`` flags a name or description that looks like an identifier.
     """
     from recordings.models import Recording
 
@@ -1300,16 +1341,10 @@ def create_dataset(request, payload: DatasetIn):
             target=dataset,
             metadata={"initial_item_count": len(payload.recording_hashes)},
         )
-        return 201, {
-            "id": dataset.pk,
-            "name": dataset.name,
-            "description": dataset.description,
-            "parent_id": None,
-            "author_id": dataset.author_id,
-            "created_at": dataset.created_at,
-            "modified_at": dataset.modified_at,
-            "deleted_at": dataset.deleted_at,
-        }
+    return 201, {
+        **_dataset_out(dataset),
+        "warnings": name_warnings(name=payload.name, description=payload.description),
+    }
 
 
 @api.get("/datasets/", response=list[CollectionOut])
@@ -1358,6 +1393,21 @@ def list_datasets(
     return visible
 
 
+def _collection_write_out(collection: Collection, warnings: list[dict]) -> dict:
+    """Serialise a collection for a create or update response, with the free-text warnings beside it."""
+    return {
+        "id": collection.pk,
+        "name": collection.name,
+        "description": collection.description,
+        "parent_id": collection.parent_id,
+        "author_id": collection.author_id,
+        "created_at": collection.created_at,
+        "modified_at": collection.modified_at,
+        "deleted_at": collection.deleted_at,
+        "warnings": warnings,
+    }
+
+
 def _dataset_out(dataset: Dataset) -> dict:
     try:
         meta = dataset.meta
@@ -1376,6 +1426,7 @@ def _dataset_out(dataset: Dataset) -> dict:
         "object_hash": dataset.object_hash,
         "license_spdx": meta.license_spdx if meta else None,
         "license_url": meta.license_url if meta else None,
+        "release_gated": dataset.release_gated,
     }
 
 
@@ -1407,12 +1458,13 @@ def get_dataset(request, dataset_id: str, share_token: str | None = None):
     return _dataset_out(dataset)
 
 
-@api.patch("/datasets/{dataset_id}/", response=CollectionOut)
+@api.patch("/datasets/{dataset_id}/", response=CollectionWriteOut)
 def update_dataset(request, dataset_id: str, payload: CollectionPatchIn):
     """Update dataset name or description.
 
     Requires write access (author, superuser, or can_write AccessRight).
-    ``parent_id`` in the payload is ignored.
+    ``parent_id`` in the payload is ignored. ``warnings`` flags a new name or
+    description that looks like an identifier.
     """
     from epicurrents.permissions import can_write_object
 
@@ -1421,29 +1473,50 @@ def update_dataset(request, dataset_id: str, payload: CollectionPatchIn):
     if not can_write_object(user=user, obj=dataset):
         raise HttpError(403, "You do not have permission to modify this dataset")
 
-    fields_updated: list[str] = []
-    if payload.name is not None:
-        dataset.name = payload.name
-        fields_updated.append("name")
-    if payload.description is not None:
-        dataset.description = payload.description
-        fields_updated.append("description")
-    if payload.viewer_config is not None:
-        # The CollectionPatchIn schema types this as a dict, and JSON object keys
-        # are always strings, so the flat-map shape is already guaranteed here.
-        dataset.viewer_config = payload.viewer_config
-        fields_updated.append("viewer_config")
-
-    meta_updates: dict[str, str] = {}
-    if payload.license_spdx is not None:
-        meta_updates["license_spdx"] = payload.license_spdx
-        fields_updated.append("license_spdx")
-    if payload.license_url is not None:
-        meta_updates["license_url"] = payload.license_url
-        fields_updated.append("license_url")
-
     with transaction.atomic():
-        dataset.save()
+        # Re-read under the row lock the pool writes take, and save only the
+        # fields this request sets: a whole-row save from an unlocked read would
+        # put back pool state a concurrent pool write had just changed.
+        dataset = Dataset.objects.select_for_update().get(pk=dataset.pk)
+        fields_updated: list[str] = []
+        if payload.name is not None:
+            dataset.name = payload.name
+            fields_updated.append("name")
+        if payload.description is not None:
+            dataset.description = payload.description
+            fields_updated.append("description")
+        if payload.viewer_config is not None:
+            # The CollectionPatchIn schema types this as a dict, and JSON object keys
+            # are always strings, so the flat-map shape is already guaranteed here.
+            dataset.viewer_config = payload.viewer_config
+            fields_updated.append("viewer_config")
+        if payload.release_gated is not None and payload.release_gated != dataset.release_gated:
+            # Turning the gate off publishes every unreleased member at once, and
+            # turning it on hides what readers could see: the author's decision, not
+            # a write grantee's.
+            from epicurrents.permissions import can_modify_object
+            from library.release import gate_refusal
+
+            if not can_modify_object(user=user, obj=dataset):
+                raise HttpError(403, "Only the dataset's author or a superuser may change release gating")
+            _pool_rule(pools.ensure_gate_unchanged, dataset, payload.release_gated)
+            if payload.release_gated:
+                refusal = gate_refusal(dataset)
+                if refusal:
+                    raise HttpError(409, refusal)
+            dataset.release_gated = payload.release_gated
+            fields_updated.append("release_gated")
+
+        meta_updates: dict[str, str] = {}
+        if payload.license_spdx is not None:
+            meta_updates["license_spdx"] = payload.license_spdx
+            fields_updated.append("license_spdx")
+        if payload.license_url is not None:
+            meta_updates["license_url"] = payload.license_url
+            fields_updated.append("license_url")
+
+        dataset_fields = [f for f in fields_updated if f in ("name", "description", "viewer_config", "release_gated")]
+        dataset.save(update_fields=[*dataset_fields, "modified_at"])
         if meta_updates:
             DatasetMeta.objects.update_or_create(dataset=dataset, defaults=meta_updates)
         log_activity(
@@ -1451,7 +1524,10 @@ def update_dataset(request, dataset_id: str, payload: CollectionPatchIn):
             target=dataset,
             metadata={"fields_updated": fields_updated},
         )
-    return _dataset_out(dataset)
+    return {
+        **_dataset_out(dataset),
+        "warnings": name_warnings(name=payload.name, description=payload.description),
+    }
 
 
 @api.delete("/datasets/{dataset_id}/")
@@ -1470,10 +1546,373 @@ def delete_dataset(request, dataset_id: str):
         raise HttpError(403, "You do not have permission to delete this dataset")
 
     with transaction.atomic():
+        # The row lock a submission takes: none can commit between the check and the trash.
+        dataset = Dataset.objects.select_for_update().get(pk=dataset.pk)
+        if dataset.deleted_at is not None:
+            raise HttpError(404, "Dataset not found")
+        _pool_rule(pools.ensure_deletable, dataset)
         dataset.deleted_at = timezone.now()
         dataset.save(update_fields=["deleted_at", "modified_at"])
         log_activity(verb="library.dataset.trash", target=dataset)
     return {"status": "ok"}
+
+
+# ---------------------------------------------------------------------------
+# Submission pools
+# ---------------------------------------------------------------------------
+#
+# The rules are in library/pools.py; these endpoints are the dataset page's
+# client for them. Every operation, reading included, is the author's or a
+# superuser's: the totals describe what contributors sent, and a write grantee
+# manages the dataset's contents, not who may feed it.
+
+
+def _pool_rule(rule, *args) -> None:
+    """Run a pool rule, answering its refusal with the status it names."""
+    try:
+        rule(*args)
+    except pools.PoolError as exc:
+        raise HttpError(exc.status, exc.message) from exc
+
+
+class PoolOut(Schema):
+    """A dataset's submission-pool state, as the dataset page shows it to the author."""
+
+    # The registered ingest profile's key; null when the dataset is not a pool.
+    profile: str | None
+    group_id: int | None
+    group_name: str | None
+    open: bool
+    # A file has been accepted into a ledger: the profile, group and gate are fixed.
+    filling: bool
+    # Not a pool and empty, so it can become one.
+    configurable: bool
+    # Totals over every contributor together, never per contributor.
+    pending_count: int
+    failed_count: int
+    ingested_count: int
+    # Active members of the contributor group, and the profile's m that intake needs before it opens (null: none).
+    contributor_count: int
+    contributors_required: int | None
+
+
+class PoolIn(Schema):
+    """Configure a dataset as a pool checked against a registered ingest profile."""
+
+    profile: str
+
+
+class PoolPatchIn(Schema):
+    """Open or close intake, or change the profile of a pool that has not filled."""
+
+    open: bool | None = None
+    profile: str | None = None
+
+
+def _get_managed_pool_dataset(user, dataset_id: str):
+    dataset = _get_active_dataset(dataset_id)
+    if not can_modify_object(user=user, obj=dataset):
+        raise HttpError(403, "Only the dataset's author or a superuser may manage its submission pool")
+    return dataset
+
+
+def _pool_out(dataset: Dataset) -> dict:
+    if not pools.is_pool(dataset):
+        return {
+            "profile": None,
+            "group_id": None,
+            "group_name": None,
+            "open": False,
+            "filling": False,
+            "configurable": not pools.has_members(dataset) and not pools.is_filling(dataset),
+            "pending_count": 0,
+            "failed_count": 0,
+            "ingested_count": 0,
+            "contributor_count": 0,
+            "contributors_required": None,
+        }
+    totals = pools.pool_totals(dataset)
+    group = dataset.submission_group
+    return {
+        "profile": dataset.submission_profile,
+        "group_id": group.pk if group else None,
+        "group_name": group.name if group else None,
+        "open": dataset.submissions_open,
+        "filling": pools.is_filling(dataset),
+        "configurable": False,
+        "pending_count": totals["pending"],
+        "failed_count": totals["failed"],
+        "ingested_count": totals["ingested"],
+        "contributor_count": pools.contributor_count(dataset),
+        "contributors_required": pools.required_contributors(dataset),
+    }
+
+
+@api.get("/datasets/{dataset_id}/pool/", response=PoolOut)
+def get_dataset_pool(request, dataset_id: str):
+    """The dataset's submission-pool state, for the author or a superuser."""
+    user = _require_auth(request)
+    dataset = _get_managed_pool_dataset(user, dataset_id)
+    log_activity(verb="library.dataset.pool.read", target=dataset)
+    return _pool_out(dataset)
+
+
+@api.post("/datasets/{dataset_id}/pool/", response={201: PoolOut})
+def configure_dataset_pool(request, dataset_id: str, payload: PoolIn):
+    """Make an empty dataset a submission pool: the profile, a new dedicated group, the gate on and intake closed."""
+    user = _require_auth(request)
+    dataset = _get_managed_pool_dataset(user, dataset_id)
+    with transaction.atomic():
+        _pool_rule(pools.configure_pool, dataset, payload.profile)
+        log_activity(verb="library.dataset.pool.create", target=dataset)
+    return 201, _pool_out(dataset)
+
+
+@api.patch("/datasets/{dataset_id}/pool/", response=PoolOut)
+def update_dataset_pool(request, dataset_id: str, payload: PoolPatchIn):
+    """Open or close intake, which a pool allows in every state, or change the profile before the pool fills."""
+    user = _require_auth(request)
+    dataset = _get_managed_pool_dataset(user, dataset_id)
+    fields_updated: list[str] = []
+    with transaction.atomic():
+        if payload.profile is not None:
+            _pool_rule(pools.change_profile, dataset, payload.profile)
+            fields_updated.append("submission_profile")
+        if payload.open is not None:
+            _pool_rule(pools.set_intake, dataset, payload.open)
+            fields_updated.append("submissions_open")
+        log_activity(
+            verb="library.dataset.pool.update",
+            target=dataset,
+            metadata={"fields_updated": fields_updated},
+        )
+    return _pool_out(dataset)
+
+
+@api.delete("/datasets/{dataset_id}/pool/", response=PoolOut)
+def dissolve_dataset_pool(request, dataset_id: str):
+    """Dissolve a pool that has not filled: its configuration and its group go, and the gate turns off."""
+    user = _require_auth(request)
+    dataset = _get_managed_pool_dataset(user, dataset_id)
+    with transaction.atomic():
+        try:
+            member_count = pools.dissolve_pool(dataset)
+        except pools.PoolError as exc:
+            raise HttpError(exc.status, exc.message) from exc
+        log_activity(
+            verb="library.dataset.pool.delete",
+            target=dataset,
+            metadata={"member_count": member_count},
+        )
+    return _pool_out(dataset)
+
+
+# ---------------------------------------------------------------------------
+# Curator review of a release-gated dataset's members
+# ---------------------------------------------------------------------------
+
+
+class MemberReviewOut(Schema):
+    """One recording member's review state, as a curator sees it."""
+
+    # The recording's 32-hex hash, as the item listing names it.
+    hash: str
+    released: bool
+    approvals: int
+    approved_by_me: bool
+
+
+class DatasetReviewOut(Schema):
+    """The review state of a release-gated dataset's recording members, for its managers."""
+
+    # Approvals from distinct curators the pool's profile asks for; null for a dataset that is not a pool, whose
+    # project selector decides.
+    approvals_required: int | None
+    members: list[MemberReviewOut]
+
+
+class VetoIn(Schema):
+    """Veto a member: one reason from the closed list, never free text."""
+
+    reason: str
+
+
+def _get_reviewed_dataset(user, dataset_id: str) -> Dataset:
+    from library.release import is_dataset_manager
+
+    dataset = _get_active_dataset(dataset_id)
+    # Managers first, answered as a missing dataset: which datasets are gated,
+    # and so which are pools, is not something a non-manager learns here.
+    if not is_dataset_manager(user, dataset):
+        raise HttpError(404, "Dataset not found")
+    if not dataset.release_gated:
+        raise HttpError(409, "Only a release-gated dataset's members are reviewed")
+    return dataset
+
+
+def _reviewable_recordings(user):
+    """The recordings a curator may see in a review: active, and not FAILED unless the curator is its author or a superuser.
+
+    The FAILED-hidden rule applies to curators as to any grantee; a pooled member that failed processing is the
+    operator's to deal with, and its existence is not a curator's to learn.
+    """
+    from django.db.models import Q
+
+    from recordings.models import Recording
+
+    recordings = Recording.objects.filter(deleted_at__isnull=True)
+    if not getattr(user, "is_superuser", False):
+        recordings = recordings.exclude(Q(status=Recording.Status.FAILED) & ~Q(author_id=user.pk))
+    return recordings
+
+
+def _recording_member(dataset: Dataset, recording_hash: str, user) -> tuple[DatasetItem, str]:
+    """The dataset's membership of the recording *recording_hash* names, and the normalised hash; 404 otherwise."""
+    from recordings.models import Recording
+
+    normalized = (recording_hash or "").strip().upper()
+    if len(normalized) != 32 or not normalized.isalnum():
+        raise HttpError(400, "Invalid recording hash. Use 32 alphanumeric characters.")
+    recording = _reviewable_recordings(user).filter(stored_name__startswith=f"{normalized}.").only("id").first()
+    item = None
+    if recording is not None:
+        item = DatasetItem.objects.filter(
+            dataset=dataset,
+            content_type=ContentType.objects.get_for_model(Recording, for_concrete_model=False),
+            object_id=str(recording.pk),
+        ).first()
+    if item is None:
+        raise HttpError(404, "No such member")
+    return item, normalized
+
+
+def _approvals_required(dataset: Dataset) -> int | None:
+    from recordings.submissions import get_ingest_profile
+
+    profile = get_ingest_profile(dataset.submission_profile) if pools.is_pool(dataset) else None
+    return profile.required_approvals if profile is not None else None
+
+
+def _member_review_out(item: DatasetItem, recording_hash: str, user) -> dict:
+    from library.models import MemberApproval
+
+    approvals = MemberApproval.objects.filter(item=item)
+    return {
+        "hash": recording_hash,
+        "released": item.release_id is not None,
+        "approvals": approvals.count(),
+        "approved_by_me": approvals.filter(reviewer=user).exists(),
+    }
+
+
+@api.get("/datasets/{dataset_id}/reviews/", response=DatasetReviewOut)
+def list_dataset_reviews(request, dataset_id: str):
+    """Every recording member's approvals and whether the caller gave one, for the dataset's managers.
+
+    Counts only: which curators approved a member is the run's sign-off record, not something one
+    curator reads about another.
+    """
+    from library.models import MemberApproval
+    from recordings.models import Recording
+
+    user = _require_auth(request)
+    dataset = _get_reviewed_dataset(user, dataset_id)
+    recording_ct = ContentType.objects.get_for_model(Recording, for_concrete_model=False)
+    items = list(DatasetItem.objects.filter(dataset=dataset, content_type=recording_ct))
+    names = dict(
+        _reviewable_recordings(user)
+        .filter(pk__in=[int(item.object_id) for item in items])
+        .values_list("pk", "stored_name")
+    )
+    counts: dict[int, int] = {}
+    mine: set[int] = set()
+    for item_id, reviewer_id in MemberApproval.objects.filter(item__in=items).values_list("item_id", "reviewer_id"):
+        counts[item_id] = counts.get(item_id, 0) + 1
+        if reviewer_id == user.pk:
+            mine.add(item_id)
+    members = [
+        {
+            "hash": names[int(item.object_id)].split(".", 1)[0],
+            "released": item.release_id is not None,
+            "approvals": counts.get(item.pk, 0),
+            "approved_by_me": item.pk in mine,
+        }
+        for item in items
+        if int(item.object_id) in names
+    ]
+    members.sort(key=lambda member: member["hash"])
+    log_activity(verb="library.dataset.review.read", target=dataset, metadata={"member_count": len(members)})
+    return {"approvals_required": _approvals_required(dataset), "members": members}
+
+
+@api.post("/datasets/{dataset_id}/reviews/{recording_hash}/approval", response={201: MemberReviewOut})
+def approve_dataset_member(request, dataset_id: str, recording_hash: str):
+    """Approve an unreleased member for release. Idempotent for the same curator; a released member answers 409."""
+    from library.models import MemberApproval
+
+    user = _require_auth(request)
+    dataset = _get_reviewed_dataset(user, dataset_id)
+    item, normalized = _recording_member(dataset, recording_hash, user)
+    if item.release_id is not None:
+        raise HttpError(409, "The member has already been released")
+    try:
+        with transaction.atomic():
+            MemberApproval.objects.get_or_create(item=item, reviewer=user)
+            log_activity(verb="library.dataset.member.approval.create", target=item)
+    except IntegrityError:
+        # A concurrent approval by the same curator landed first and the member is approved either way; the
+        # annotation rolled back with the block, so it is written again.
+        log_activity(verb="library.dataset.member.approval.create", target=item)
+    return 201, _member_review_out(item, normalized, user)
+
+
+@api.delete("/datasets/{dataset_id}/reviews/{recording_hash}/approval", response=MemberReviewOut)
+def withdraw_dataset_member_approval(request, dataset_id: str, recording_hash: str):
+    """Withdraw the caller's approval of an unreleased member; a released member answers 409."""
+    from library.models import MemberApproval
+
+    user = _require_auth(request)
+    dataset = _get_reviewed_dataset(user, dataset_id)
+    item, normalized = _recording_member(dataset, recording_hash, user)
+    if item.release_id is not None:
+        raise HttpError(409, "The member has already been released")
+    with transaction.atomic():
+        for approval in MemberApproval.objects.filter(item=item, reviewer=user):
+            approval.delete()
+        log_activity(verb="library.dataset.member.approval.delete", target=item)
+    return _member_review_out(item, normalized, user)
+
+
+@api.post("/datasets/{dataset_id}/reviews/{recording_hash}/veto", response={204: None})
+def veto_dataset_member(request, dataset_id: str, recording_hash: str, payload: VetoIn):
+    """Veto a member for identifying content: removed at once, released or not.
+
+    A pooled recording vetoed in its pool is deleted with its file; anything else leaves only this
+    dataset (``library.release.veto_member``). One curator's veto is
+    final and cannot be undone. The reason is a code from ``VetoReason`` and is the only thing
+    recorded about why; free text would describe the patient.
+    """
+    from library.models import VetoReason
+    from library.release import veto_member
+
+    user = _require_auth(request)
+    dataset = _get_reviewed_dataset(user, dataset_id)
+    if payload.reason not in VetoReason.values:
+        raise HttpError(400, "Unknown veto reason")
+    item, _normalized = _recording_member(dataset, recording_hash, user)
+    with transaction.atomic():
+        # Before the deletion, so the membership's key is still there to target; what went is added after.
+        log_activity(
+            verb="library.dataset.member.veto",
+            target=item,
+            metadata={"reason": payload.reason, "released": item.release_id is not None},
+        )
+        try:
+            removed = veto_member(item)
+        except OSError as exc:
+            raise HttpError(500, "The recording's file could not be removed; nothing was changed") from exc
+        log_activity(verb="library.dataset.member.veto", metadata={"removed": removed})
+    return 204, None
 
 
 # ---------------------------------------------------------------------------
@@ -1510,9 +1949,26 @@ def list_dataset_items(
     ):
         raise HttpError(403, "You do not have permission to view this dataset")
 
-    qs = DatasetItem.objects.filter(dataset=dataset).order_by("added_at")
+    from library.release import is_dataset_manager, member_name_subquery
+
+    qs = DatasetItem.objects.filter(dataset=dataset)
+    manager = True
+    if dataset.release_gated:
+        # A gated dataset lists unreleased members to its managers only, and
+        # orders by name: added_at is the arrival order the release month hides.
+        manager = is_dataset_manager(user, dataset)
+        if not manager:
+            qs = qs.filter(release__isnull=False)
+        qs = qs.select_related("release").annotate(sort_name=member_name_subquery()).order_by("sort_name", "object_id")
+    else:
+        qs = qs.order_by("added_at")
     if content_type_id is not None:
         qs = qs.filter(content_type_id=content_type_id)
+    # A member gated elsewhere is listed only to whom the gate would let read it:
+    # nothing gated to a share-token request, nothing unreleased to a
+    # non-manager, whichever dataset the listing is of.
+    for member_ct, hidden in _gate_hidden_members(dataset, user, share_token).items():
+        qs = qs.exclude(content_type=member_ct, object_id__in=hidden)
     items = list(qs[offset : offset + limit])
     log_activity(
         verb="library.dataset.item.list",
@@ -1525,7 +1981,85 @@ def list_dataset_items(
             "share_token_used": bool((share_token or "").strip()),
         },
     )
-    return _enrich_collection_items(items, user)
+    rows = _enrich_collection_items(items, user)
+    if dataset.release_gated:
+        month_by_item = {item.pk: (item.release.release_month if item.release_id else None) for item in items}
+        for row in rows:
+            row["release_month"] = month_by_item.get(row["id"])
+            if not manager:
+                # The time a member was added is its ingest time; a reader gets
+                # the release month here as everywhere else.
+                row["added_at"] = row["release_month"]
+    _null_sequential_ids(rows, user, all_rows=not manager)
+    return rows
+
+
+def _gate_hidden_members(dataset: Dataset, user, share_token: str | None) -> dict:
+    """Per gated member type, the ids among *dataset*'s items the release gate hides from this caller."""
+    from django.apps import apps
+
+    from library.release import hidden_member_ids
+    from recordings.models import Recording
+
+    models = [Recording]
+    if apps.is_installed("media"):
+        models.append(apps.get_model("media", "MediaFile"))
+    hidden = {}
+    for model in models:
+        member_ct = ContentType.objects.get_for_model(model, for_concrete_model=False)
+        ids = DatasetItem.objects.filter(dataset=dataset, content_type=member_ct).values_list("object_id", flat=True)
+        found = hidden_member_ids(user, member_ct, list(ids), share_token)
+        if found:
+            hidden[member_ct] = found
+    return hidden
+
+
+def _null_sequential_ids(rows: list[dict], user, *, all_rows: bool) -> None:
+    """Null ``id`` and ``object_id`` where they would give away arrival order.
+
+    Every row when *all_rows* (a reader of a gated dataset who does not manage it); otherwise the
+    rows of pooled recordings, unless the caller is a superuser or manages a pool holding them.
+    Both keys are sequential: the item id in add order, the object id in ingest order.
+    """
+    from library.release import pooled_ids
+    from recordings.models import Recording
+
+    if all_rows:
+        for row in rows:
+            row["id"] = None
+            row["object_id"] = None
+        return
+    if user is not None and getattr(user, "is_superuser", False):
+        return
+    recording_ct = ContentType.objects.get_for_model(Recording, for_concrete_model=False)
+    recording_ids = [row["object_id"] for row in rows if row["content_type_id"] == recording_ct.pk and row["object_id"]]
+    pooled = pooled_ids(recording_ct, recording_ids)
+    if not pooled:
+        return
+    concealed = pooled - _managed_pool_member_ids(user, recording_ct, pooled)
+    for row in rows:
+        if row["content_type_id"] == recording_ct.pk and row["object_id"] in concealed:
+            row["id"] = None
+            row["object_id"] = None
+
+
+def _managed_pool_member_ids(user, recording_ct, object_ids: set[str]) -> set[str]:
+    """The ids among *object_ids* that are members of a live pool *user* manages."""
+    from library.release import is_dataset_manager
+
+    if user is None or not getattr(user, "is_authenticated", False):
+        return set()
+    rows = DatasetItem.objects.filter(
+        content_type=recording_ct, object_id__in=object_ids, dataset__deleted_at__isnull=True
+    ).exclude(dataset__submission_profile="")
+    by_dataset: dict[int, set[str]] = {}
+    for object_id, dataset_id in rows.values_list("object_id", "dataset_id"):
+        by_dataset.setdefault(dataset_id, set()).add(str(object_id))
+    managed: set[str] = set()
+    for dataset in Dataset.objects.filter(pk__in=by_dataset):
+        if is_dataset_manager(user, dataset):
+            managed |= by_dataset[dataset.pk]
+    return managed
 
 
 @api.post("/datasets/{dataset_id}/items/", response={201: CollectionItemOut})
@@ -1533,7 +2067,8 @@ def add_dataset_item(request, dataset_id: str, payload: CollectionItemIn):
     """Add an object to the dataset.
 
     Requires write access to the dataset. The caller must also be able to
-    read the referenced object.
+    read the referenced object. A release-gated dataset takes only its author's
+    own objects, whoever adds them (409 otherwise).
     For ``recordings.Recording`` items the public hash (32-char hex) is also
     accepted and resolved to the internal primary key automatically.
     """
@@ -1543,6 +2078,7 @@ def add_dataset_item(request, dataset_id: str, payload: CollectionItemIn):
     dataset = _get_active_dataset(dataset_id)
     if not can_write_object(user=user, obj=dataset):
         raise HttpError(403, "You do not have permission to modify this dataset")
+    _pool_rule(pools.ensure_membership_editable, dataset)
 
     ct = ContentType.objects.filter(pk=payload.content_type_id).first()
     if ct is None:
@@ -1555,6 +2091,13 @@ def add_dataset_item(request, dataset_id: str, payload: CollectionItemIn):
         object_id = _resolve_media_object_id(object_id)
 
     _check_item_readable(user=user, ct=ct, object_id=object_id)
+    if dataset.release_gated:
+        from library.release import membership_refusal
+
+        member = ct.model_class()._default_manager.filter(pk=object_id).first()
+        refusal = membership_refusal(dataset, member)
+        if refusal:
+            raise HttpError(409, refusal)
 
     with transaction.atomic():
         item, created = DatasetItem.objects.get_or_create(
@@ -1566,7 +2109,9 @@ def add_dataset_item(request, dataset_id: str, payload: CollectionItemIn):
             raise HttpError(409, "This object is already in the dataset")
         log_activity(verb="library.dataset.item.add", target=item)
 
-    return 201, _enrich_collection_items([item], user)[0]
+    row = _enrich_collection_items([item], user)[0]
+    _null_sequential_ids([row], user, all_rows=False)
+    return 201, row
 
 
 @api.delete("/datasets/{dataset_id}/items/{item_id}/")
@@ -1585,6 +2130,7 @@ def remove_dataset_item(request, dataset_id: str, item_id: int):
     item = DatasetItem.objects.filter(pk=item_id, dataset=dataset).first()
     if item is None:
         raise HttpError(404, "Item not found in this dataset")
+    _pool_rule(pools.ensure_membership_editable, dataset)
 
     with transaction.atomic():
         log_activity(verb="library.dataset.item.remove", target=item)
@@ -1629,6 +2175,12 @@ class DatasetFolderOut(Schema):
     modified_at: datetime
 
 
+class DatasetFolderWriteOut(DatasetFolderOut):
+    """A folder create or update response plus free-text warnings for ``name``."""
+
+    warnings: list[NameWarningOut] = []
+
+
 class MoveDatasetItemIn(Schema):
     """Payload for placing a dataset item in a folder; null means the dataset root."""
 
@@ -1641,6 +2193,20 @@ def _get_dataset_folder(dataset: Dataset, folder_id: int) -> DatasetFolder:
     if folder is None:
         raise HttpError(404, "Folder not found in this dataset")
     return folder
+
+
+def _folder_write_out(folder: DatasetFolder, warnings: list[dict]) -> dict:
+    """Serialise a folder for a create or update response, with the free-text warnings beside it."""
+    return {
+        "id": folder.pk,
+        "dataset_id": folder.dataset_id,
+        "parent_id": folder.parent_id,
+        "name": folder.name,
+        "position": folder.position,
+        "created_at": folder.created_at,
+        "modified_at": folder.modified_at,
+        "warnings": warnings,
+    }
 
 
 def _subtree_folder_ids(root_id: int) -> set[int]:
@@ -1688,9 +2254,12 @@ def list_dataset_folders(request, dataset_id: str, share_token: str | None = Non
     return folders
 
 
-@api.post("/datasets/{dataset_id}/folders/", response={201: DatasetFolderOut})
+@api.post("/datasets/{dataset_id}/folders/", response={201: DatasetFolderWriteOut})
 def create_dataset_folder(request, dataset_id: str, payload: DatasetFolderIn):
-    """Create a folder in the dataset's tree. Requires write access to the dataset."""
+    """Create a folder in the dataset's tree. Requires write access to the dataset.
+
+    ``warnings`` flags a name that looks like an identifier.
+    """
     from epicurrents.permissions import can_write_object
 
     user = _require_auth(request)
@@ -1711,12 +2280,15 @@ def create_dataset_folder(request, dataset_id: str, payload: DatasetFolderIn):
             position=payload.position,
         )
         log_activity(verb="library.dataset.folder.create", target=folder)
-    return 201, folder
+    return 201, _folder_write_out(folder, name_warnings(name=name))
 
 
-@api.patch("/datasets/{dataset_id}/folders/{folder_id}/", response=DatasetFolderOut)
+@api.patch("/datasets/{dataset_id}/folders/{folder_id}/", response=DatasetFolderWriteOut)
 def update_dataset_folder(request, dataset_id: str, folder_id: int, payload: DatasetFolderPatchIn):
-    """Rename, move, or reposition a folder. Requires write access to the dataset."""
+    """Rename, move, or reposition a folder. Requires write access to the dataset.
+
+    ``warnings`` flags a new name that looks like an identifier.
+    """
     from epicurrents.permissions import can_write_object
 
     user = _require_auth(request)
@@ -1726,11 +2298,13 @@ def update_dataset_folder(request, dataset_id: str, folder_id: int, payload: Dat
     folder = _get_dataset_folder(dataset, folder_id)
 
     patch = payload.model_dump(exclude_unset=True)
+    warnings: list[dict] = []
     if "name" in patch:
         name = (patch["name"] or "").strip()
         if not name:
             raise HttpError(422, "Folder name cannot be empty")
         folder.name = name
+        warnings = name_warnings(name=name)
     if "parent_id" in patch:
         if patch["parent_id"] is None:
             folder.parent = None
@@ -1753,7 +2327,7 @@ def update_dataset_folder(request, dataset_id: str, folder_id: int, payload: Dat
             target=folder,
             metadata={"fields_updated": sorted(patch.keys())},
         )
-    return folder
+    return _folder_write_out(folder, warnings)
 
 
 @api.delete("/datasets/{dataset_id}/folders/{folder_id}/")
@@ -1862,6 +2436,10 @@ def _canonical_manifest(dataset: Dataset) -> list[dict]:
     # rewrite rides the ROADMAP's batched-permission-helper entry if it comes.
     items = DatasetItem.objects.filter(dataset=dataset).select_related("content_type")
     for item in items:
+        # An unreleased member of a gated dataset is on no serving surface yet,
+        # and a manifest naming it would tell a reader what is coming.
+        if dataset.release_gated and item.release_id is None:
+            continue
         obj = item.content_object
         if obj is None:
             continue
@@ -2021,7 +2599,7 @@ def list_dataset_access_rights(request, dataset_id: str):
         target=dataset,
         metadata={"returned_count": len(rights)},
     )
-    return [access_right_out(r) for r in rights]
+    return [access_right_out(r, assessment_visible=assessment_visible(r, user, dataset)) for r in rights]
 
 
 @api.post("/datasets/{dataset_id}/access/", response={201: AccessRightOut})
@@ -2069,6 +2647,7 @@ def grant_dataset_access(request, dataset_id: str, payload: GrantAccessIn):
     )
 
     UserModel = get_user_model()
+    assessment_reference, assessment_date = assessment_values(payload.assessment_reference, payload.assessment_date)
     kwargs: dict = {
         "content_type": dataset_ct,
         "object_id": str(dataset.pk),
@@ -2078,6 +2657,8 @@ def grant_dataset_access(request, dataset_id: str, payload: GrantAccessIn):
         "can_share": payload.can_share,
         "apply_middleware": payload.apply_middleware,
         "expires_at": payload.expires_at,
+        "assessment_reference": assessment_reference,
+        "assessment_date": assessment_date,
     }
 
     if payload.access_target_id is not None:
@@ -2088,6 +2669,8 @@ def grant_dataset_access(request, dataset_id: str, payload: GrantAccessIn):
     elif payload.access_target_group_id is not None:
         if not Group.objects.filter(pk=payload.access_target_group_id).exists():
             raise HttpError(400, f"Group {payload.access_target_group_id} not found")
+        if dedicated_group(payload.access_target_group_id) is not None:
+            raise HttpError(400, f"Group {payload.access_target_group_id} exists for one purpose and grants nothing")
         kwargs["access_target_group_id"] = payload.access_target_group_id
 
     else:
@@ -2118,7 +2701,40 @@ def grant_dataset_access(request, dataset_id: str, payload: GrantAccessIn):
         # loser, which is the same conflict the pre-check reports.
         raise HttpError(409, "This target already has an access right on the dataset. Revoke it first.") from exc
     right = AccessRight.objects.select_related("access_target", "access_target_group").get(pk=right.pk)
-    return 201, access_right_out(right)
+    return 201, access_right_out(right, assessment_visible=True)
+
+
+@api.patch("/datasets/{dataset_id}/access/{right_id}/", response=AccessRightOut)
+def assess_dataset_access(request, dataset_id: str, right_id: int, payload: AssessmentIn):
+    """Record, update or clear the sharer's contextual assessment on a grant.
+
+    The one editable part of a local grant. Requires the same authority as
+    managing access, and then the row's giver, the dataset's author or a
+    superuser: the assessment is the sharer's record, and a delegated sharer
+    edits their own grants only. Both fields or neither; an empty pair clears.
+    """
+    user = _require_auth(request)
+    dataset = _get_active_dataset(dataset_id)
+    ensure_can_manage_access(user, dataset, object_label="dataset", action="manage access for")
+
+    right = (
+        AccessRight.objects.filter(pk=right_id, content_type=_dataset_ct(), object_id=str(dataset.pk))
+        .select_related("access_target", "access_target_group")
+        .first()
+    )
+    if right is None:
+        raise HttpError(404, "Access right not found")
+    ensure_can_assess(request, user, dataset, right, object_label="dataset")
+
+    apply_assessment(right, payload)
+    with transaction.atomic():
+        right.save(update_fields=["assessment_reference", "assessment_date", "modified_at"])
+        log_activity(
+            verb="library.dataset.access.assess",
+            target=right,
+            metadata={"assessed": bool(right.assessment_reference)},
+        )
+    return access_right_out(right, assessment_visible=True)
 
 
 @api.delete("/datasets/{dataset_id}/access/{right_id}/")
@@ -2155,12 +2771,31 @@ def revoke_dataset_access(request, dataset_id: str, right_id: int):
 # ---------------------------------------------------------------------------
 
 
-def _get_tag(tag_id: int) -> Tag:
-    """Return tag or raise 404."""
+def _get_tag(tag_id: int, user=None) -> Tag:
+    """Return the tag or raise 404; with *user*, a tag outside the caller's reach is 404 as well.
+
+    The same answer for "no such tag" and "not yours to see", so the id space
+    cannot be walked to read tag names.
+    """
     tag = Tag.objects.filter(pk=tag_id).first()
-    if tag is None:
+    if tag is None or (user is not None and not tag_reachable(user, tag.pk)):
         raise HttpError(404, "Tag not found")
     return tag
+
+
+def _tag_write_out(tag: Tag, warnings: list[dict]) -> dict:
+    """Serialise a tag for a create or update response, with the free-text warnings beside it."""
+    return {
+        "id": tag.pk,
+        "name": tag.name,
+        "description": tag.description,
+        "parent_id": tag.parent_id,
+        "author_id": tag.author_id,
+        "curated": tag.curated,
+        "created_at": tag.created_at,
+        "modified_at": tag.modified_at,
+        "warnings": warnings,
+    }
 
 
 def _get_tag_subtree_ids(root_id: int) -> list[int]:
@@ -2206,18 +2841,24 @@ def list_tags(
     limit: int = Query(50, ge=1, le=200),
     offset: int = Query(0, ge=0),
 ):
-    """List tags.
+    """List the tags within the caller's reach.
 
     - Omit ``parent_id`` to list root-level tags (no parent).
     - Pass ``parent_id`` to list direct children of a tag.
+
+    Reach is ``library.tag_scope``: curated tags, the caller's own, the tags on
+    objects the caller can read, and their ancestors. Superusers see every tag.
     """
-    _require_auth(request)
+    user = _require_auth(request)
+    reachable = visible_tag_ids(user)
     if parent_id is not None:
-        if not Tag.objects.filter(pk=parent_id).exists():
+        if not Tag.objects.filter(pk=parent_id).exists() or (reachable is not None and parent_id not in reachable):
             raise HttpError(404, "Tag not found")
         qs = Tag.objects.filter(parent_id=parent_id).order_by("name")
     else:
         qs = Tag.objects.filter(parent__isnull=True).order_by("name")
+    if reachable is not None:
+        qs = qs.filter(pk__in=reachable)
     tags = list(qs[offset : offset + limit])
     log_activity(
         verb="library.tag.list",
@@ -2231,45 +2872,52 @@ def list_tags(
     return tags
 
 
-@api.post("/tags/", response={201: TagOut})
+@api.post("/tags/", response={201: TagWriteOut})
 def create_tag(request, payload: TagIn):
     """Create a new tag.
 
-    Any authenticated user may create tags. Optionally nest under an existing
-    tag by providing ``parent_id``.
+    Reserved for staff while ``LIBRARY_TAG_CREATION_REQUIRES_STAFF`` is on
+    (the default). A tag created by staff is curated and listed to everyone;
+    any other tag is listed by reach. Optionally nest under an existing tag
+    within the caller's reach by providing ``parent_id``. ``warnings`` flags
+    a name or description that looks like an identifier.
     """
     user = _require_auth(request)
+    if not can_create_tag(user):
+        log_security_event("permission.denied", permission="library.tag.create", actor_id=user.pk)
+        raise HttpError(403, "Creating tags is reserved for staff on this deployment.")
     parent = None
     if payload.parent_id is not None:
-        parent = Tag.objects.filter(pk=payload.parent_id).first()
-        if parent is None:
-            raise HttpError(404, f"Parent tag {payload.parent_id} not found")
+        parent = _get_tag(payload.parent_id, user=user)
     tag = Tag.objects.create(
         author=user,
         name=payload.name,
         description=payload.description,
         parent=parent,
+        curated=bool(user.is_staff or user.is_superuser),
     )
     log_activity(verb="library.tag.create", target=tag)
-    return 201, tag
+    return 201, _tag_write_out(tag, name_warnings(name=payload.name, description=payload.description))
 
 
 @api.get("/tags/{tag_id}/", response=TagOut)
 def get_tag_detail(request, tag_id: int):
-    """Retrieve a single tag by ID."""
-    _require_auth(request)
-    tag = _get_tag(tag_id)
+    """Retrieve a single tag by ID; a tag outside the caller's reach is 404."""
+    user = _require_auth(request)
+    tag = _get_tag(tag_id, user=user)
     log_activity(verb="library.tag.read", target=tag)
     return tag
 
 
-@api.patch("/tags/{tag_id}/", response=TagOut)
+@api.patch("/tags/{tag_id}/", response=TagWriteOut)
 def update_tag(request, tag_id: int, payload: TagPatchIn):
     """Update a tag's name, description, or parent.
 
-    Requires the caller to be the tag author or a superuser.
-    Moving a tag to a new parent triggers cycle detection to prevent loops.
-    Pass ``parent_id: null`` explicitly to promote a tag to root level.
+    Requires the caller to be the tag author or a superuser. Moving a tag to
+    a new parent triggers cycle detection to prevent loops, and the new parent
+    must be within the caller's reach. Pass ``parent_id: null`` explicitly to
+    promote a tag to root level. ``warnings`` flags a new name or description
+    that looks like an identifier.
     """
     user = _require_auth(request)
     tag = _get_tag(tag_id)
@@ -2285,9 +2933,7 @@ def update_tag(request, tag_id: int, payload: TagPatchIn):
         fields_updated.append("description")
     if "parent_id" in payload.model_fields_set:
         if payload.parent_id is not None:
-            parent = Tag.objects.filter(pk=payload.parent_id).first()
-            if parent is None:
-                raise HttpError(404, f"Parent tag {payload.parent_id} not found")
+            parent = _get_tag(payload.parent_id, user=user)
             _check_no_tag_cycle(tag, payload.parent_id)
             tag.parent = parent
         else:
@@ -2301,7 +2947,7 @@ def update_tag(request, tag_id: int, payload: TagPatchIn):
             target=tag,
             metadata={"fields_updated": fields_updated},
         )
-    return tag
+    return _tag_write_out(tag, name_warnings(name=payload.name, description=payload.description))
 
 
 @api.delete("/tags/{tag_id}/")
@@ -2336,9 +2982,10 @@ def list_tagged_items(
     By default (``include_children=true``) results include items tagged with
     any descendant tag, enabling hierarchical browsing of the taxonomy.
     Set ``include_children=false`` to retrieve items with this exact tag only.
+    A tag outside the caller's reach is 404.
     """
     user = _require_auth(request)
-    tag = _get_tag(tag_id)
+    tag = _get_tag(tag_id, user=user)
 
     if include_children:
         tag_ids = _get_tag_subtree_ids(tag_id)
@@ -2388,19 +3035,31 @@ def list_tagged_items(
             "returned_count": len(items),
         },
     )
-    return items
+    rows = [
+        {
+            "id": item.pk,
+            "tag_id": item.tag_id,
+            "content_type_id": item.content_type_id,
+            "object_id": item.object_id,
+            "tagged_at": item.tagged_at,
+        }
+        for item in items
+    ]
+    _null_sequential_ids(rows, user, all_rows=False)
+    return rows
 
 
 @api.post("/tags/{tag_id}/items/", response={201: TaggedItemOut})
 def tag_item(request, tag_id: int, payload: CollectionItemIn):
     """Apply a tag to an object.
 
-    The caller must have write access to the referenced object.
+    The caller must have write access to the referenced object, and the tag
+    must be within the caller's reach (404 otherwise, as everywhere else).
     ``content_type_id`` is a Django ``ContentType`` PK; ``object_id`` is the
     target object's PK as a string.
     """
     user = _require_auth(request)
-    tag = _get_tag(tag_id)
+    tag = _get_tag(tag_id, user=user)
 
     ct = ContentType.objects.filter(pk=payload.content_type_id).first()
     if ct is None:

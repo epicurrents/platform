@@ -141,13 +141,39 @@ class AccessRight(models.Model):
     can_read = models.BooleanField(default=True)
     can_write = models.BooleanField(default=False)
     can_share = models.BooleanField(default=False)
+    # Default True: a row created through the ORM without a decision serves
+    # de-identified bytes, and an explicit False is the deliberate act of
+    # granting the raw file. Every API and command path defaults the same way,
+    # so a project's fixture or data migration cannot create a raw grant by
+    # omission.
     apply_middleware = models.BooleanField(
-        default=False,
+        default=True,
         help_text=(
             "Pipe EDF/BDF file content through the configured middleware pipeline "
-            "when serving this access right. Has no effect on non-EDF files or when "
-            "the caller is the recording author or a superuser."
+            "when serving this access right. An explicit False grants the raw file. "
+            "Has no effect on non-EDF files or when the caller is the recording "
+            "author or a superuser."
         ),
+    )
+
+    # The sharer's contextual assessment for this grant, where one exists: a
+    # reference to the document and the date it was made. The platform holds
+    # the finding beside the grant and reports when it is due for re-checking;
+    # it never makes the finding. Shown to the giver, the object's author and
+    # superusers only; see epicurrents.assessment.
+    assessment_reference = models.CharField(
+        max_length=512,
+        blank=True,
+        default="",
+        help_text=(
+            "Reference to the sharer's documented contextual assessment for this grant (an identifier or a "
+            "URL), where one exists. Set together with assessment_date."
+        ),
+    )
+    assessment_date = models.DateField(
+        null=True,
+        blank=True,
+        help_text="Date the assessment named by assessment_reference was made or last re-run.",
     )
 
     created_at = models.DateTimeField(auto_now_add=True)
@@ -189,6 +215,15 @@ class AccessRight(models.Model):
             models.CheckConstraint(
                 condition=Q(can_read=True) | Q(can_write=True) | Q(can_share=True),
                 name="access_right_requires_some_permission",
+            ),
+            # An assessment is a dated reference: a date without a document,
+            # or a document without a date, is half a record and stays out.
+            models.CheckConstraint(
+                condition=(
+                    Q(assessment_reference="", assessment_date__isnull=True)
+                    | (~Q(assessment_reference="") & Q(assessment_date__isnull=False))
+                ),
+                name="access_right_assessment_dated",
             ),
             models.CheckConstraint(
                 condition=(

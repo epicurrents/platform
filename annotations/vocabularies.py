@@ -1,9 +1,10 @@
 """Vocabulary registry for standardised annotation codes.
 
-Core ships the mechanism only — the same registry pattern as ``register_read_permission_extension`` and
-``register_csv_subconverter`` — and contains zero vocabularies. A plugin or project that owns a coding
-standard registers a validator from its ``AppConfig.ready()``; a deployment with nothing registered
-validates nothing, unchanged from before the registry existed.
+The registry follows the same pattern as ``register_read_permission_extension`` and
+``register_csv_subconverter``. Core registers its own two vocabularies, the acquisition-scoped categories
+of the sets the viewer ships (``annotations/core_vocabularies.py``), and no external one: a plugin or
+project that owns a coding standard registers a validator from its ``AppConfig.ready()``, and a
+``standard`` nobody registered is validated by nobody.
 
 The validator is a callable rather than a term list because a vocabulary's rules are not always
 membership: HED has value placeholders and group structure, ICD-10 has check-character rules. A list would
@@ -32,12 +33,18 @@ from typing import Any
 
 @dataclass(frozen=True)
 class Vocabulary:
-    """A registered coding standard: identifier, display label, version, and its validator callable."""
+    """A registered coding standard: identifier, display label, version, its validator and its optional term names.
+
+    ``term_name`` answers the display name of a value the validator accepts, or ``None`` where the standard gives
+    none; a vocabulary registered without it names no terms.
+    """
 
     standard: str
     label: str
     version: str
     validator: Callable[[str, Any], None]
+    term_name: Callable[[str], str | None] | None = None
+    closed: bool = False
 
 
 _REGISTRY: dict[str, Vocabulary] = {}
@@ -49,20 +56,35 @@ def register_vocabulary(
     label: str,
     validator: Callable[[str, Any], None],
     version: str = "",
+    term_name: Callable[[str], str | None] | None = None,
+    closed: bool = False,
 ) -> None:
     """Register a validator for ``standard``; call from the owning ``AppConfig.ready()``.
 
     The validator receives ``(value, meta)`` for every API write carrying this ``standard`` and raises
     ``ValueError`` with a message naming the offending term when the pair violates the vocabulary.
     Re-registering the same ``standard`` replaces the earlier entry, which keeps ``ready()`` idempotent
-    across repeated app loading in tests.
+    across repeated app loading in tests. ``term_name`` returns a term's display name, which ingest writes as the
+    name of a row it creates from a code; without it the code itself is the name.
+
+    ``closed`` declares that the validator accepts only an enumerated set of terms, never a placeholder a value can
+    fill (HED's ``Description/<text>`` is the counter-example). Ingest accepts a code a file declares only under a
+    closed vocabulary, because under an open one the file chooses the value, and code values are exempt from the
+    annotation-text rule.
     """
-    _REGISTRY[standard] = Vocabulary(standard=standard, label=label, version=version, validator=validator)
+    _REGISTRY[standard] = Vocabulary(
+        standard=standard, label=label, version=version, validator=validator, term_name=term_name, closed=closed
+    )
 
 
 def unregister_vocabulary(standard: str) -> None:
     """Remove a registered vocabulary; primarily test cleanup."""
     _REGISTRY.pop(standard, None)
+
+
+def get_vocabulary(standard: str) -> Vocabulary | None:
+    """The vocabulary registered for ``standard``, or ``None``."""
+    return _REGISTRY.get(standard)
 
 
 def registered_vocabularies() -> list[Vocabulary]:

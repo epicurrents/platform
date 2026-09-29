@@ -160,11 +160,11 @@ Mounted at `/media/api/v1/`.
 
 | Method | Path | Auth | Description |
 |---|---|---|---|
-| `POST` | `/upload` | Authenticated | Upload a media file. Validates extension against `MEDIA_ALLOWED_UPLOAD_EXTENSIONS`; optional `attached_to_type` + `attached_to_id` attach to a parent object atomically; optional `time_offset` sets the timeline position |
+| `POST` | `/upload` | Authenticated | Upload a media file. Validates extension against `MEDIA_ALLOWED_UPLOAD_EXTENSIONS`; optional `attached_to_type` + `attached_to_id` attach to a parent object atomically; optional `time_offset` sets the timeline position. Returns `warnings` for a `display_name` that looks like an identifier |
 | `GET` | `/` | Authenticated | List media files visible to the caller. Optional filters: `media_type`, `attached_to_type` + `attached_to_id` |
 | `GET` | `/{content_hash}` | Authenticated | Detail. `original_name` is null for non-author / non-superuser callers (PHI policy mirrors `Recording`) |
 | `GET` | `/{content_hash}/file` | Authenticated | Stream the file bytes with HTTP Range support. Video is served inline so the browser can play and seek; other types download as an attachment. `410` when the extension is no longer in the live allowlist; `404` for missing on disk. See [Serving and Range requests](#serving-and-range-requests) |
-| `PATCH` | `/{content_hash}` | Author / superuser | Update `display_name`, `media_type`, `attached_to`, or `time_offset`. Pass `attached_to: {"type": "", "id": ""}` to detach; `time_offset: null` to clear the timeline position |
+| `PATCH` | `/{content_hash}` | Author / superuser | Update `display_name`, `media_type`, `attached_to`, or `time_offset`. Pass `attached_to: {"type": "", "id": ""}` to detach; `time_offset: null` to clear the timeline position. Returns `warnings` for a new `display_name` that looks like an identifier; the activity row's metadata names the fields changed, never the new label |
 | `DELETE` | `/{content_hash}` | Author / superuser | Soft-delete (sets `deleted_at`) |
 
 ## Serving and Range requests
@@ -226,6 +226,10 @@ Same rules as `Recording`:
 - URLs use `content_hash` rather than the integer PK.
 - The `Content-Disposition` filename on download is built from
   `display_name + file_extension`, never from `original_name`.
+- `display_name` is free text shown to every reader as typed, so the upload
+  and PATCH responses carry the `warnings` of `name_warnings` in
+  [epicurrents/text_hygiene.py](../epicurrents/text_hygiene.py) when it
+  looks like a personal name, an identifier or a date.
 
 ## Audit trail
 

@@ -78,6 +78,14 @@ export interface AccountUpdate extends StepUpCredentials {
     is_superuser?: boolean
 }
 
+/** What owns a dedicated group, which then carries no grant or role and is removed with its owner. */
+export interface DedicatedGroupOwner {
+    /** Stable token for the owning feature, e.g. `submission_pool`. */
+    kind: string
+    name: string
+    object_hash: string
+}
+
 /** A group with its roles and the two counts that decide whether it can be deleted. */
 export interface GroupDetail {
     id: number
@@ -85,6 +93,8 @@ export interface GroupDetail {
     member_count: number
     grant_count: number
     roles: Record<string, string | null>
+    /** Set when another feature owns the group; null for an ordinary group. */
+    dedicated_to: DedicatedGroupOwner | null
 }
 
 /** A project-supplied role and the values it accepts, as `[value, label]` pairs. */

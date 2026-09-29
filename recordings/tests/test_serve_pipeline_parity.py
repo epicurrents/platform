@@ -4,7 +4,7 @@ These back the ⚠️ LOAD-BEARING contract on ``_build_serve_pipeline`` in
 recordings/api/v1/ninja.py: every endpoint that streams recording bytes
 to an ``apply_middleware=True`` caller must serve through the one shared
 pipeline, and no serving path may construct its own non-empty
-``MiddlewarePipeline``. A path that quietly diverges serves anonymised
+``MiddlewarePipeline``. A path that quietly diverges serves de-identified
 headers while leaking clinical annotation text — the exact failure mode
 these tests pin down.
 """
@@ -130,7 +130,7 @@ class TestServePipelineParity:
         # Size-invariant transform.
         assert len(body) == len(content)
 
-        # Header anonymised.
+        # Header de-identified.
         hdr = parse_edf_header(body)
         assert hdr.patient_id == "X X X X"
 

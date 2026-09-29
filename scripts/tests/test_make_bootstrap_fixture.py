@@ -15,6 +15,8 @@ import subprocess
 import tarfile
 from pathlib import Path
 
+import pytest
+
 from scripts.tests.conftest import (
     REPO_ROOT,
     SCRIPTS_DIR,
@@ -480,6 +482,29 @@ class TestDistPackage:
         assert _run(dest, "--dist", "--tarball").returncode == 0
         with tarfile.open(tmp_path / "dist.tar.gz") as tf:
             assert not [n for n in tf.getnames() if Path(n).name.startswith("._")]
+
+    @pytest.mark.parametrize(
+        ("version", "expected"),
+        [("bsdtar 3.5.3 - libarchive 3.7.4", "--no-xattrs --no-mac-metadata"), ("tar (GNU tar) 1.35", "")],
+    )
+    def test_bsdtar_is_told_to_leave_extended_attributes_out(self, tmp_path, version, expected):
+        # bsdtar records extended attributes as pax headers even with COPYFILE_DISABLE,
+        # and GNU tar warns once per member on extraction — hundreds of lines on a
+        # tree that macOS has stamped with com.apple.provenance. Tested on the helper,
+        # because whether a test's own tree carries attributes depends on the host.
+        stubs = tmp_path / "bin"
+        stubs.mkdir()
+        (stubs / "tar").write_text(f"#!/bin/sh\necho '{version}'\n")
+        (stubs / "tar").chmod(0o755)
+        helper = re.search(r"^tar_metadata_flags\(\) \{.*?^\}", FIXTURE.read_text(), re.DOTALL | re.MULTILINE).group(0)
+        result = subprocess.run(
+            ["bash", "-c", f"{helper}\ntar_metadata_flags"],
+            check=False,
+            capture_output=True,
+            text=True,
+            env={**os.environ, "PATH": f"{stubs}:{os.environ['PATH']}"},
+        )
+        assert result.stdout == expected
 
     def test_demo_and_dist_mutually_exclusive(self, tmp_path):
         assert _run(tmp_path / "x", "--demo", "--dist").returncode != 0

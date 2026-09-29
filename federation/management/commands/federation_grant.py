@@ -4,7 +4,7 @@ import argparse
 
 from django.contrib.contenttypes.models import ContentType
 from django.core.management.base import BaseCommand, CommandError
-from django.utils.dateparse import parse_datetime
+from django.utils.dateparse import parse_date, parse_datetime
 
 from activity.models import Activity
 from activity.system_activity import with_system_activity
@@ -48,12 +48,21 @@ class Command(BaseCommand):
             ),
         )
         parser.add_argument("--expires", help="Expiry as an ISO 8601 datetime; omit for no expiry.")
+        parser.add_argument(
+            "--assessment-reference",
+            default="",
+            help="Reference to the giver's documented contextual assessment for this grant (with --assessment-date).",
+        )
+        parser.add_argument(
+            "--assessment-date", help="Date the assessment was made, as YYYY-MM-DD (with --assessment-reference)."
+        )
 
     def handle(self, *args, **options):
         peer = resolve_peer(options["peer"])
         giver = resolve_user(options["giver"])
         content_type, object_id = self._resolve_target(options)
         expires_at = self._parse_expires(options.get("expires"))
+        assessment_date = self._parse_date(options.get("assessment_date"))
 
         try:
             with with_system_activity("federation.grant.create", interface=Activity.Interface.COMMAND, actor=giver):
@@ -68,6 +77,8 @@ class Command(BaseCommand):
                     can_share=options["share"],
                     apply_middleware=options["apply_middleware"],
                     expires_at=expires_at,
+                    assessment_reference=options["assessment_reference"],
+                    assessment_date=assessment_date,
                 )
         except FederationServiceError as exc:
             raise CommandError(exc.message)
@@ -96,6 +107,15 @@ class Command(BaseCommand):
         if ct is None:
             raise CommandError(f"Content type not found: {options['content_type']}")
         return ct, options["object_id"]
+
+    @staticmethod
+    def _parse_date(value):
+        if not value:
+            return None
+        parsed = parse_date(value)
+        if parsed is None:
+            raise CommandError(f"Could not parse --assessment-date as YYYY-MM-DD: {value}")
+        return parsed
 
     @staticmethod
     def _parse_expires(value):

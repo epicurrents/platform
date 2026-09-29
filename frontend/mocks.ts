@@ -59,6 +59,7 @@
  *   GET    /api/v1/library/collections/{id}/items/
  *   POST   /api/v1/library/collections/{id}/items/
  *   DELETE /api/v1/library/collections/{id}/items/{itemId}/
+ *   POST   /api/v1/library/collections/{id}/export/  (flat copy; no folders)
  *
  *   GET    /api/v1/library/datasets/          (same shape as collections)
  *   POST   /api/v1/library/datasets/
@@ -68,6 +69,7 @@
  *   GET    /api/v1/library/datasets/{id}/items/
  *   POST   /api/v1/library/datasets/{id}/items/
  *   DELETE /api/v1/library/datasets/{id}/items/{itemId}/
+ *   GET    /api/v1/library/datasets/{id}/pool/        (never a pool: no ingest profiles)
  *   GET    /api/v1/library/datasets/{id}/access/
  *   POST   /api/v1/library/datasets/{id}/access/
  *   DELETE /api/v1/library/datasets/{id}/access/{rightId}/
@@ -97,7 +99,7 @@ interface MockRecording {
     original_name: string
     file_extension: string
     file_size: number
-    file_hash: string
+    stored_hash: string
     content_hash: string
     status: 'pending' | 'processing' | 'ready' | 'failed'
     modality: string
@@ -105,6 +107,8 @@ interface MockRecording {
     deleted_at: string | null
     /** Author-set grantee-visible label; empty means the hash-prefix fallback is used. */
     custom_name?: string
+    /** DOI or URL of the published dataset the data was taken from. */
+    public_source?: string
     /** Author-only failure detail, set when status is 'failed'. */
     processing_error?: string
     meta: {
@@ -149,6 +153,45 @@ interface MockGroup {
     created_at: string
     modified_at: string
     deleted_at: string | null
+    /** Datasets only. */
+    release_gated?: boolean
+}
+
+/**
+ * The stored form of a published-source locator, or an error sentence, mirroring recordings/public_source.py: a DOI
+ * (bare or under a doi: / doi.org prefix) is stored bare and lower-cased, anything else must be an http(s) URL with a
+ * host and no userinfo, query or fragment.
+ */
+function normalisePublicSource (text: string): { value: string } | { error: string } {
+    const value = text.trim()
+    if (!value) {
+        return { value: '' }
+    }
+    const doi = /^10\.\d{4,9}\/\S+$/i
+    const prefixes = ['doi:', 'https://doi.org/', 'http://doi.org/', 'https://dx.doi.org/', 'http://dx.doi.org/']
+    const refusal = { error: 'public_source must be a DOI (10.xxxx/...) or an http(s) URL of the published dataset, or empty to clear.' }
+    for (const prefix of prefixes) {
+        if (value.toLowerCase().startsWith(prefix)) {
+            const candidate = value.slice(prefix.length)
+            return doi.test(candidate) ? { value: candidate.toLowerCase() } : refusal
+        }
+    }
+    if (doi.test(value)) {
+        return { value: value.toLowerCase() }
+    }
+    let url: URL
+    try {
+        url = new URL(value)
+    } catch {
+        return refusal
+    }
+    if (!['http:', 'https:'].includes(url.protocol) || !url.host) {
+        return refusal
+    }
+    if (url.username || url.password || url.search || url.hash || value.includes('?') || value.includes('#')) {
+        return { error: 'public_source must not carry login details, a query or a fragment.' }
+    }
+    return { value }
 }
 
 /** One row of the administration account roster. */
@@ -429,7 +472,7 @@ function buildSeed(): MockState {
             custom_name: 'Baseline rest — P001',
             file_extension: '.edf',
             file_size: 12_345_678,
-            file_hash: 'sha256:aabbccddeeff0011',
+            stored_hash: 'sha256:aabbccddeeff0011',
             content_hash: 'sha256:001122334455aabb',
             status: 'ready',
             modality: 'eeg',
@@ -443,7 +486,7 @@ function buildSeed(): MockState {
             original_name: 'sub-002_ses-followup_task-rest_eeg.edf',
             file_extension: '.edf',
             file_size: 9_876_543,
-            file_hash: 'sha256:112233445566aabb',
+            stored_hash: 'sha256:112233445566aabb',
             content_hash: 'sha256:ccddee001122ff33',
             status: 'ready',
             modality: 'eeg',
@@ -457,7 +500,7 @@ function buildSeed(): MockState {
             original_name: 'sub-003_emg_forearm_right.edf',
             file_extension: '.edf',
             file_size: 4_200_000,
-            file_hash: 'sha256:556677889900aabb',
+            stored_hash: 'sha256:556677889900aabb',
             content_hash: 'sha256:aabbcc001122dd33',
             status: 'ready',
             modality: 'emg',
@@ -471,7 +514,7 @@ function buildSeed(): MockState {
             original_name: 'sub-004_ictal_ecog.edf',
             file_extension: '.edf',
             file_size: 33_000_000,
-            file_hash: 'sha256:9900aabbccddeeff',
+            stored_hash: 'sha256:9900aabbccddeeff',
             content_hash: 'sha256:ffee001122334455',
             status: 'ready',
             modality: 'ecog',
@@ -485,7 +528,7 @@ function buildSeed(): MockState {
             original_name: 'sub-005_sleep_psg.edf',
             file_extension: '.edf',
             file_size: 8_000_000,
-            file_hash: 'sha256:ddee001122ff3344',
+            stored_hash: 'sha256:ddee001122ff3344',
             content_hash: 'sha256:cc8899aabbdd1122',
             status: 'pending',
             modality: 'eeg',
@@ -499,7 +542,7 @@ function buildSeed(): MockState {
             original_name: 'sub-006_ses-baseline_task-p300_eeg.edf',
             file_extension: '.edf',
             file_size: 7_654_321,
-            file_hash: 'sha256:aabb0011ccdd2233',
+            stored_hash: 'sha256:aabb0011ccdd2233',
             content_hash: 'sha256:eeff4455aabb6677',
             status: 'ready',
             modality: 'eeg',
@@ -513,7 +556,7 @@ function buildSeed(): MockState {
             original_name: 'sub-007_ses-baseline_task-erp_eeg.edf',
             file_extension: '.edf',
             file_size: 5_432_100,
-            file_hash: 'sha256:8899aabbcc001122',
+            stored_hash: 'sha256:8899aabbcc001122',
             content_hash: 'sha256:3344eeff00112233',
             status: 'ready',
             modality: 'eeg',
@@ -527,7 +570,7 @@ function buildSeed(): MockState {
             original_name: 'sub-008_ses-followup_task-erp_eeg.edf',
             file_extension: '.edf',
             file_size: 6_100_000,
-            file_hash: 'sha256:ccddeeff00112233',
+            stored_hash: 'sha256:ccddeeff00112233',
             content_hash: 'sha256:44556677aabbccdd',
             status: 'ready',
             modality: 'eeg',
@@ -541,7 +584,7 @@ function buildSeed(): MockState {
             original_name: 'sub-009_ses-baseline_task-rest_eeg.edf',
             file_extension: '.edf',
             file_size: 11_200_000,
-            file_hash: 'sha256:eeff001122334455',
+            stored_hash: 'sha256:eeff001122334455',
             content_hash: 'sha256:6677889900aabbcc',
             status: 'ready',
             modality: 'eeg',
@@ -555,7 +598,7 @@ function buildSeed(): MockState {
             original_name: 'sub-010_ses-baseline_task-rest_eeg.edf',
             file_extension: '.edf',
             file_size: 10_900_000,
-            file_hash: 'sha256:1122334455667788',
+            stored_hash: 'sha256:1122334455667788',
             content_hash: 'sha256:99aabbccddeeff00',
             status: 'ready',
             modality: 'eeg',
@@ -569,7 +612,7 @@ function buildSeed(): MockState {
             original_name: 'sub-011_ses-followup_task-rest_eeg.edf',
             file_extension: '.edf',
             file_size: 9_300_000,
-            file_hash: 'sha256:aabbccdd00112233',
+            stored_hash: 'sha256:aabbccdd00112233',
             content_hash: 'sha256:4455667788990011',
             status: 'ready',
             modality: 'eeg',
@@ -583,7 +626,7 @@ function buildSeed(): MockState {
             original_name: 'sub-012_ses-followup_task-rest_eeg.edf',
             file_extension: '.edf',
             file_size: 8_750_000,
-            file_hash: 'sha256:22334455aabbccdd',
+            stored_hash: 'sha256:22334455aabbccdd',
             content_hash: 'sha256:eeff0011aabb2233',
             status: 'ready',
             modality: 'eeg',
@@ -597,7 +640,7 @@ function buildSeed(): MockState {
             original_name: 'sub-013_ses-baseline_task-n-back_eeg.edf',
             file_extension: '.edf',
             file_size: 14_500_000,
-            file_hash: 'sha256:6677889900aabbcc',
+            stored_hash: 'sha256:6677889900aabbcc',
             content_hash: 'sha256:ddeeff0011223344',
             status: 'ready',
             modality: 'eeg',
@@ -611,7 +654,7 @@ function buildSeed(): MockState {
             original_name: 'sub-014_ses-followup_task-n-back_eeg.edf',
             file_extension: '.edf',
             file_size: 13_800_000,
-            file_hash: 'sha256:aabbccddeeff0011',
+            stored_hash: 'sha256:aabbccddeeff0011',
             content_hash: 'sha256:22334455667788aa',
             status: 'ready',
             modality: 'eeg',
@@ -625,7 +668,7 @@ function buildSeed(): MockState {
             original_name: 'sub-015_ses-baseline_task-ssvep_eeg.edf',
             file_extension: '.edf',
             file_size: 4_800_000,
-            file_hash: 'sha256:bbc0d1e2f3a4b5c6',
+            stored_hash: 'sha256:bbc0d1e2f3a4b5c6',
             content_hash: 'sha256:d7e8f9a0b1c2d3e4',
             status: 'ready',
             modality: 'eeg',
@@ -639,7 +682,7 @@ function buildSeed(): MockState {
             original_name: 'sub-016_corrupt_headers_eeg.edf',
             file_extension: '.edf',
             file_size: 2_100_000,
-            file_hash: 'sha256:ccd1e2f3a4b5c6d7',
+            stored_hash: 'sha256:ccd1e2f3a4b5c6d7',
             content_hash: 'sha256:e8f9a0b1c2d3e4f5',
             status: 'failed',
             modality: '',
@@ -1187,6 +1230,7 @@ function groupOut(group: MockAuthGroup) {
         member_count: group.memberIds.length,
         grant_count: group.grantCount,
         roles: { ...group.roles },
+        dedicated_to: null,
     }
 }
 
@@ -1210,10 +1254,11 @@ function itemOut(item: MockItem) {
     return rest
 }
 
-/** Strip internal _parent_id before sending an access right to the client. */
+/** Strip internal _parent_id before sending an access right to the client. The mock caller is the author,
+ *  who may assess every grant. */
 function accessOut(access: MockAccess) {
     const { _parent_id: _, ...rest } = access
-    return rest
+    return { ...rest, can_assess: true }
 }
 
 /** The grantee-visible label: the custom name if set, else the hash-prefix fallback. */
@@ -1234,10 +1279,11 @@ function recordingOut(r: MockRecording) {
         processing_error: r.processing_error || null,
         file_extension: r.file_extension,
         file_size: r.file_size,
-        file_hash: r.file_hash,
+        stored_hash: r.stored_hash,
         content_hash: r.content_hash,
         status: r.status,
         modality: r.modality,
+        public_source: r.public_source ?? '',
         created_at: r.created_at,
         deleted_at: r.deleted_at,
         meta: r.meta,
@@ -2096,7 +2142,7 @@ export async function handleMock(
             original_name: 'uploaded_recording.edf',
             file_extension: '.edf',
             file_size: 1_000_000,
-            file_hash: `sha256:mock${pk}`,
+            stored_hash: `sha256:mock${pk}`,
             content_hash: `sha256:cnt${pk}`,
             status: 'pending',
             modality: '',
@@ -2112,7 +2158,6 @@ export async function handleMock(
             stored_name: `${hash.toUpperCase()}.edf`,
             file_extension: rec.file_extension,
             file_size: rec.file_size,
-            file_hash: rec.file_hash,
             status: rec.status,
         })
     }
@@ -2157,8 +2202,15 @@ export async function handleMock(
                         if (item.object_hash === hash) item.object_name = resolved
                     }
                 }
+                if (typeof body.public_source === 'string') {
+                    const source = normalisePublicSource(body.public_source)
+                    if ('error' in source) {
+                        return send(res, 400, { detail: source.error })
+                    }
+                    rec.public_source = source.value
+                }
                 if (typeof body.modality === 'string') rec.modality = body.modality.trim().toLowerCase()
-                return send(res, 200, recordingOut(rec))
+                return send(res, 200, { ...recordingOut(rec), warnings: [] })
             }
             if (method === 'DELETE') {
                 rec.deleted_at = new Date().toISOString()
@@ -2333,6 +2385,41 @@ export async function handleMock(
         }
     }
 
+    // POST /api/v1/library/collections/{id}/export/ — copies the collection's own items into a new dataset, without
+    // descending into sub-collections or materialising folders.
+    {
+        const m = path.match(/^\/api\/v1\/library\/collections\/(\d+)\/export\/$/)
+        if (m && method === 'POST') {
+            const collId = Number(m[1])
+            const coll = _state.collections.find(c => c.id === collId && !c.deleted_at)
+            if (!coll) return notFound(res)
+            const body = await readBody(req)
+            const now = new Date().toISOString()
+            const ds: MockGroup = {
+                id: _state.seq.ds++,
+                name: String(body.name || coll.name),
+                description: String(body.description ?? coll.description),
+                parent_id: null,
+                author_id: MOCK_USER_ID,
+                created_at: now,
+                modified_at: now,
+                deleted_at: null,
+            }
+            _state.datasets.push(ds)
+            const sources = _state.collectionItems.filter(i => i._parent_id === collId && !i.deleted_at)
+            for (const source of sources) {
+                _state.datasetItems.push({ ...source, id: _state.seq.item++, _parent_id: ds.id, added_at: now })
+            }
+            return send(res, 201, {
+                dataset: { ...ds, release_gated: false },
+                exported_count: sources.length,
+                skipped_count: 0,
+                folder_count: 0,
+                warnings: [],
+            })
+        }
+    }
+
     // ── Datasets (mirror of collections) ──────────────────────────────────────
 
     if (path === '/api/v1/library/datasets/') {
@@ -2368,8 +2455,11 @@ export async function handleMock(
                 const body = await readBody(req)
                 if (typeof body.name === 'string') ds.name = body.name
                 if (typeof body.description === 'string') ds.description = body.description
+                // Every mock recording is the mock user's own, so the server's 409 for members authored by someone
+                // other than the dataset's author never arises here.
+                if (typeof body.release_gated === 'boolean') ds.release_gated = body.release_gated
                 ds.modified_at = new Date().toISOString()
-                return send(res, 200, ds)
+                return send(res, 200, { ...ds, release_gated: ds.release_gated ?? false, warnings: [] })
             }
             if (method === 'DELETE') {
                 ds.deleted_at = new Date().toISOString()
@@ -2384,6 +2474,8 @@ export async function handleMock(
         if (m) {
             const dsId = Number(m[1])
             if (method === 'GET') {
+                // The mock caller manages every dataset, so ids are always served; a non-manager of a release-gated
+                // dataset receives `id` and `object_id` as null.
                 return send(res, 200, _state.datasetItems.filter(i => i._parent_id === dsId).map(itemOut))
             }
             if (method === 'POST') {
@@ -2404,6 +2496,27 @@ export async function handleMock(
                 _state.datasetItems.push(item)
                 return send(res, 201, itemOut(item))
             }
+        }
+    }
+
+    // GET /api/v1/library/datasets/{id}/pool/ — the mock has no ingest profiles, so no dataset is a pool
+    {
+        const m = path.match(/^\/api\/v1\/library\/datasets\/(\d+)\/pool\/$/)
+        if (m && method === 'GET') {
+            const dsId = Number(m[1])
+            return send(res, 200, {
+                configurable: !_state.datasetItems.some(i => i._parent_id === dsId),
+                failed_count: 0,
+                contributor_count: 0,
+                contributors_required: null,
+                filling: false,
+                group_id: null,
+                group_name: null,
+                ingested_count: 0,
+                open: false,
+                pending_count: 0,
+                profile: null,
+            })
         }
     }
 

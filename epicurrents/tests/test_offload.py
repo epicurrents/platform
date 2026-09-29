@@ -6,7 +6,7 @@ file to someone who should not have it, so the tests are written around the
 refusals rather than the happy path.
 
 The one that matters most is the ``apply_middleware`` interlock. A
-middleware-applied grant is a caller who may see an anonymised header and no
+middleware-applied grant is a caller who may see a de-identified header and no
 clinical annotation text; those bytes are computed per request and exist nowhere
 on disk. Handing the proxy a path for such a caller serves the original recording
 instead — patient identification and annotation text included — and does it with a

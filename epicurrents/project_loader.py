@@ -60,7 +60,7 @@ _LIST_KEYS: frozenset[str] = frozenset(
         "PASSWORD_HASHERS",
     }
 )
-_DICT_KEYS: frozenset[str] = frozenset({"CELERY_BEAT_SCHEDULE"})
+_DICT_KEYS: frozenset[str] = frozenset({"CELERY_BEAT_SCHEDULE", "TEXT_HYGIENE_PATTERNS"})
 
 
 def get_active_project() -> str:

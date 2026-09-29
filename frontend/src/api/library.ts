@@ -1,4 +1,5 @@
 import { http } from '#lib/http'
+import type { NameWarning } from '#lib/nameWarnings'
 import type { ViewerSettingsOverrides } from '#lib/viewerConfig'
 
 // ---------------------------------------------------------------------------
@@ -26,6 +27,10 @@ export interface Collection {
     license_spdx: string | null
     /** Datasets only — licence text URL from DatasetMeta; null for collections and undeclared datasets. */
     license_url: string | null
+    /** Datasets only — members stay hidden from readers until a release run publishes them. */
+    release_gated?: boolean
+    /** Create and update responses only: free-text warnings for `name` and `description`. */
+    warnings?: NameWarning[]
 }
 
 export interface CollectionItem {
@@ -35,6 +40,8 @@ export interface CollectionItem {
     added_at: string
     /** Dataset items only — the containing folder, or null for the dataset root. */
     folder_id: number | null
+    /** Dataset items only — the month a release run published the item; null in ungated datasets and for unreleased members. */
+    release_month?: string | null
     /** Resolved display name for known types (e.g. Recording.display_name). Null for unknown types. */
     object_name: string | null
     /** Stable public hash for known types (recording content hash, media content hash). Null for unknown types. */
@@ -54,6 +61,16 @@ export interface CollectionItem {
     is_supported: boolean | null
 }
 
+/**
+ * A row of a dataset's item listing. `id` and `object_id` are null where the row must not be addressable by the
+ * caller: the members of a release-gated dataset as a reader who does not manage it sees them. Such a reader has no
+ * item controls; key and match rows on `object_hash` instead.
+ */
+export interface DatasetItem extends Omit<CollectionItem, 'id' | 'object_id'> {
+    id: number | null
+    object_id: string | null
+}
+
 /** A presentation-only folder in a dataset's tree. */
 export interface DatasetFolder {
     id: number
@@ -63,6 +80,8 @@ export interface DatasetFolder {
     position: number
     created_at: string
     modified_at: string
+    /** Create and update responses only: free-text warnings for `name`. */
+    warnings?: NameWarning[]
 }
 
 export interface AccessRight {
@@ -77,6 +96,11 @@ export interface AccessRight {
     can_share: boolean
     apply_middleware: boolean
     expires_at: string | null
+    /** The sharer's contextual assessment; null when none is recorded or the caller may not see it. */
+    assessment_reference: string | null
+    assessment_date: string | null
+    /** Whether the caller may record the assessment on this row: its giver, the object's author or a superuser. */
+    can_assess: boolean
 }
 
 export interface GrantAccessPayload {
@@ -88,6 +112,14 @@ export interface GrantAccessPayload {
     can_share?: boolean
     apply_middleware?: boolean
     expires_at?: string | null
+    assessment_reference?: string
+    assessment_date?: string | null
+}
+
+/** Record, update or clear a grant's contextual assessment: both fields, or an empty reference and a null date. */
+export interface AssessmentPayload {
+    assessment_reference: string
+    assessment_date: string | null
 }
 
 export interface ContentTypeInfo {
@@ -154,8 +186,8 @@ export async function deleteCollection(id: number): Promise<void> {
 export async function bulkRenameCollectionRecordings(
     collectionId: number,
     prefix: string,
-): Promise<{ renamed: number; skipped: number }> {
-    const response = await http.post<{ renamed: number; skipped: number }>(
+): Promise<{ renamed: number; skipped: number; warnings: NameWarning[] }> {
+    const response = await http.post<{ renamed: number; skipped: number; warnings: NameWarning[] }>(
         `/api/v1/library/collections/${collectionId}/recordings/bulk-rename`,
         { prefix },
     )
@@ -215,7 +247,14 @@ export async function createDataset(payload: { name: string; description?: strin
 
 export async function updateDataset(
     id: number | string,
-    payload: { name?: string; description?: string; viewer_config?: ViewerSettingsOverrides; license_spdx?: string; license_url?: string },
+    payload: {
+        name?: string
+        description?: string
+        viewer_config?: ViewerSettingsOverrides
+        license_spdx?: string
+        license_url?: string
+        release_gated?: boolean
+    },
 ): Promise<Collection> {
     const response = await http.patch<Collection>(`/api/v1/library/datasets/${id}/`, payload)
     return response.data
@@ -226,11 +265,110 @@ export async function deleteDataset(id: number | string): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
+// Curator review of a release-gated dataset's members
+// ---------------------------------------------------------------------------
+
+/** One recording member's review state, as a curator sees it. */
+export interface DatasetMemberReview {
+    /** How many curators approved it; never who. */
+    approvals: number
+    approved_by_me: boolean
+    /** The recording's 32-hex hash, as the item listing names it. */
+    hash: string
+    released: boolean
+}
+
+/** The review state of a release-gated dataset's recording members, answered to its managers only. */
+export interface DatasetReview {
+    /** Approvals from distinct curators the pool's profile asks for; null when the dataset is not a pool. */
+    approvals_required: number | null
+    members: DatasetMemberReview[]
+}
+
+/** The closed list of veto reasons; free text is never recorded. */
+export const VETO_REASONS = ['rare_condition', 'skull_defect', 'device', 'unusual_protocol', 'other'] as const
+export type VetoReason = typeof VETO_REASONS[number]
+
+/** The review state; 403 for a caller who does not manage the dataset. */
+export async function getDatasetReview(id: number | string): Promise<DatasetReview> {
+    const response = await http.get<DatasetReview>(`/api/v1/library/datasets/${id}/reviews/`)
+    return response.data
+}
+
+/** Approve an unreleased member for release. */
+export async function approveDatasetMember(id: number | string, hash: string): Promise<DatasetMemberReview> {
+    const response = await http.post<DatasetMemberReview>(`/api/v1/library/datasets/${id}/reviews/${hash}/approval`)
+    return response.data
+}
+
+/** Withdraw the caller's approval of an unreleased member. */
+export async function withdrawDatasetMemberApproval(id: number | string, hash: string): Promise<DatasetMemberReview> {
+    const response = await http.delete<DatasetMemberReview>(`/api/v1/library/datasets/${id}/reviews/${hash}/approval`)
+    return response.data
+}
+
+/** Veto a member: the recording is removed at once and for good. */
+export async function vetoDatasetMember(id: number | string, hash: string, reason: VetoReason): Promise<void> {
+    await http.post(`/api/v1/library/datasets/${id}/reviews/${hash}/veto`, { reason })
+}
+
+// ---------------------------------------------------------------------------
+// Submission pools
+// ---------------------------------------------------------------------------
+
+/** A dataset's submission-pool state, as its author or a superuser sees it. */
+export interface DatasetPool {
+    /** Not a pool and empty, so it can become one. */
+    configurable: boolean
+    failed_count: number
+    /** Active members of the contributor group. */
+    contributor_count: number
+    /** The profile's m: the contributor count intake needs before it opens; null when the profile sets none. */
+    contributors_required: number | null
+    /** A file has been accepted from a contributor: the profile, group and gate are fixed. */
+    filling: boolean
+    group_id: number | null
+    group_name: string | null
+    ingested_count: number
+    /** Whether the pool accepts new submissions. */
+    open: boolean
+    pending_count: number
+    /** Key of the registered ingest profile; null when the dataset is not a pool. */
+    profile: string | null
+}
+
+export async function getDatasetPool(id: number | string): Promise<DatasetPool> {
+    const response = await http.get<DatasetPool>(`/api/v1/library/datasets/${id}/pool/`)
+    return response.data
+}
+
+/** Make an empty dataset a pool checked against `profile`: a new dedicated group, the gate on and intake closed. */
+export async function configureDatasetPool(id: number | string, profile: string): Promise<DatasetPool> {
+    const response = await http.post<DatasetPool>(`/api/v1/library/datasets/${id}/pool/`, { profile })
+    return response.data
+}
+
+/** Open or close intake, or change the profile of a pool that has not filled. */
+export async function updateDatasetPool(
+    id: number | string,
+    payload: { open?: boolean; profile?: string },
+): Promise<DatasetPool> {
+    const response = await http.patch<DatasetPool>(`/api/v1/library/datasets/${id}/pool/`, payload)
+    return response.data
+}
+
+/** Dissolve a pool that has not filled; its group is deleted and the gate turns off. */
+export async function dissolveDatasetPool(id: number | string): Promise<DatasetPool> {
+    const response = await http.delete<DatasetPool>(`/api/v1/library/datasets/${id}/pool/`)
+    return response.data
+}
+
+// ---------------------------------------------------------------------------
 // Dataset items
 // ---------------------------------------------------------------------------
 
-export async function listDatasetItems(datasetId: number | string, params?: { content_type_id?: number; limit?: number; offset?: number }, shareToken?: string): Promise<CollectionItem[]> {
-    const response = await http.get<CollectionItem[]>(`/api/v1/library/datasets/${datasetId}/items/`, {
+export async function listDatasetItems(datasetId: number | string, params?: { content_type_id?: number; limit?: number; offset?: number }, shareToken?: string): Promise<DatasetItem[]> {
+    const response = await http.get<DatasetItem[]>(`/api/v1/library/datasets/${datasetId}/items/`, {
         params: shareToken ? { ...params, share_token: shareToken } : params,
     })
     return response.data
@@ -299,6 +437,8 @@ export interface CollectionExportResult {
     exported_count: number
     skipped_count: number
     folder_count: number
+    /** Free-text warnings for the new dataset's `name` and `description`. */
+    warnings?: NameWarning[]
 }
 
 /**
@@ -333,4 +473,13 @@ export async function grantDatasetAccess(datasetId: number | string, payload: Gr
 
 export async function revokeDatasetAccess(datasetId: number | string, rightId: number): Promise<void> {
     await http.delete(`/api/v1/library/datasets/${datasetId}/access/${rightId}/`)
+}
+
+export async function assessDatasetAccess(
+    datasetId: number | string,
+    rightId: number,
+    payload: AssessmentPayload,
+): Promise<AccessRight> {
+    const response = await http.patch<AccessRight>(`/api/v1/library/datasets/${datasetId}/access/${rightId}/`, payload)
+    return response.data
 }

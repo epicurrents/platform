@@ -116,7 +116,7 @@ You can also complain to `[FILL: your supervisory authority and its website]`.
 - `[Conditional — delete if unused: Related media such as documents or video.]`
 - `[Conditional — delete unless the dicom plugin is enabled: Imaging data and the demographic fields stored inside it.]`
 
-Direct identifiers are removed from the recording file when it is uploaded: the patient and recording-identification fields in the file header are blanked, the start date is reset, and channel labels are rewritten to a standard set so the recording does not carry the naming conventions of the place it was made. The file name given by the uploading system is kept, because it is often the only way the uploading clinician can find the recording again. It is shown only to the person who uploaded it and to `[FILL: your term for system administrators]`, and never to anyone they share the recording with, to a holder of a sharing link, or to a federated peer.
+Direct identifiers are removed from the recording file when it is uploaded: the patient and recording-identification fields in the file header are blanked, the start date is reset, and channel labels are rewritten to a standard set so the recording does not carry the naming conventions of the place it was made. The file name given by the uploading system is kept, because it is often the only way the uploading clinician can find the recording again. It is shown only to the person who uploaded it and to `[FILL: your term for system administrators]`, and never to anyone they share the recording with, to a holder of a sharing link, or to a federated peer. Labels the uploader types, such as a recording's display name or the names of the sets and folders it is filed in, are shown to recipients exactly as typed; the platform warns the uploader when a label looks like a name, a number or a date, but does not change it.
 
 ## Why
 
@@ -129,7 +129,7 @@ Direct identifiers are removed from the recording file when it is uploaded: the 
 ## Who else sees it
 
 - The clinicians and researchers at `[FILL]` who have been granted access to your recording.
-- `[Conditional — delete unless federation is configured: Researchers at FILL: peer institutions, where a grant has been made. Recordings sent to a peer are de-identified in transit by default: the header is anonymised again and clinical note text is removed. Each institution is a separate controller for what it receives.]`
+- `[Conditional — delete unless federation is configured: Researchers at FILL: peer institutions, where a grant has been made. Recordings sent to a peer are pseudonymised by default: identifying header fields are blanked and clinical note text is removed, but the signal itself is unchanged and the recording remains personal data in the recipient's hands, and the recipient may not attempt to re-identify you. Each institution is a separate controller for what it receives.]`
 
 ## Your rights
 

@@ -80,10 +80,10 @@ class InstitutionWatermarkMiddleware(EDFHeaderMiddleware):
     Example pipeline (construct in ``apps.py`` once the registry exists)::
 
         from projects.example.middleware import InstitutionWatermarkMiddleware
-        from federation.middleware import AnonymizeEDFHeader, MiddlewarePipeline
+        from federation.middleware import DeidentifyEDFHeader, MiddlewarePipeline
 
         pipeline = MiddlewarePipeline([
-            AnonymizeEDFHeader(),           # anonymise patient / recording IDs first
+            DeidentifyEDFHeader(),           # de-identify patient / recording IDs first
             InstitutionWatermarkMiddleware(), # then stamp the institution name
         ])
     """

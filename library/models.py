@@ -26,6 +26,7 @@
 """
 
 import secrets
+from datetime import UTC, datetime
 
 from django.conf import settings
 from django.contrib.contenttypes.fields import GenericForeignKey, GenericRelation
@@ -204,6 +205,44 @@ class Dataset(models.Model):
     # on top of the deployment's project-level config when this dataset is opened
     # in the viewer. Same shape as epicurrents.ViewerConfigOverride.overrides.
     viewer_config = models.JSONField(default=dict, blank=True)
+    # Release gating. A member of a gated dataset is hidden from every reader
+    # but the dataset's managers until a release run publishes it, no member
+    # resolves for a request carrying a share token, and a released member
+    # is served by its release month in place of its upload time. The gate
+    # itself is in ``library.release``; the flag only says the rule applies.
+    release_gated = models.BooleanField(
+        default=False,
+        help_text=(
+            "Hide members until a release run publishes them, refuse share-token callers "
+            "and serve the release month in place of the upload time."
+        ),
+    )
+    # A submission pool is a release-gated dataset with a registered ingest
+    # profile: members of its dedicated group submit prepared recordings through
+    # the validating submission path (``recordings.submissions``). The rules on
+    # configuring, locking and dissolving a pool are in ``library.pools``.
+    # Contributors are not managers: they see nothing of the pool.
+    submission_profile = models.CharField(
+        max_length=64,
+        blank=True,
+        default="",
+        help_text="Key of the registered ingest profile submissions are checked against; empty when not a pool.",
+    )
+    # The group exists for the pool alone and is created and removed with it.
+    # PROTECT, because deleting it would silently close the pool: the admin
+    # endpoint refuses a pool group, and this keeps any other path from trying.
+    submission_group = models.OneToOneField(
+        "auth.Group",
+        null=True,
+        blank=True,
+        on_delete=models.PROTECT,
+        related_name="submission_pool",
+        help_text="The pool's dedicated group, whose members may submit prepared recordings.",
+    )
+    submissions_open = models.BooleanField(
+        default=False,
+        help_text="Whether the pool accepts new submissions; closing it leaves the spool and the ledgers alone.",
+    )
 
     # Reverse GenericRelations so hard-delete cascades cleanly through every
     # reference row that targets this dataset via a GenericForeignKey.
@@ -372,6 +411,92 @@ class DatasetFolder(models.Model):
         return f"DatasetFolder({self.name!r} in dataset={self.dataset_id})"
 
 
+class DatasetRelease(models.Model):
+    """One release run of a release-gated dataset, and the record the run leaves behind.
+
+    A run publishes the members it selected by pointing their ``DatasetItem.release`` at this
+    row. ``release_month`` is the first instant of the run's month in UTC and is what every
+    reader who is not a manager sees in place of a member's upload time, so the row is the
+    only source of that value. The remaining fields are the process record EDPB Guidelines
+    02/2026 ¶ 41 asks to be kept with a release: the preparation profile the members were
+    checked against, the de-identification pass versions of what was released, the
+    equivalence-class conditions in force, who signed the run off (``DatasetReleaseSignOff``
+    rows, never names) and a reference to the written assessment. The platform fills the
+    version range and the count; the rest comes from the project's release selector or the
+    command line.
+    """
+
+    dataset = models.ForeignKey(Dataset, on_delete=models.CASCADE, related_name="releases")
+    # Who ran the release; null for a scheduled run with no actor.
+    author = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="dataset_releases",
+    )
+    released_on = models.DateField()
+    release_month = models.DateTimeField(editable=False)
+    profile_version = models.CharField(max_length=64, blank=True, default="")
+    deidentification_versions = models.JSONField(default=list, blank=True)
+    k = models.PositiveIntegerField(null=True, blank=True)
+    m = models.PositiveIntegerField(null=True, blank=True)
+    # Free text the runner typed; cleared on the live row when the runner's account is erased
+    # (library.apps), and scrubbed from the audit trail with it.
+    assessment_reference = models.CharField(max_length=512, blank=True, default="")
+    member_count = models.PositiveIntegerField(default=0)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        indexes = [
+            models.Index(fields=["dataset", "released_on"]),
+        ]
+
+    def __str__(self) -> str:
+        return f"DatasetRelease({self.dataset_id} on {self.released_on})"
+
+    def save(self, *args, **kwargs):
+        if self.released_on and not self.release_month:
+            self.release_month = month_start(self.released_on)
+        super().save(*args, **kwargs)
+
+
+class DatasetReleaseSignOff(models.Model):
+    """One user's sign-off of one release run: a curator whose approvals it released, or an officer who signed it.
+
+    A row rather than a list of primary keys on the run, so the sign-off is a relation to the user
+    the Art. 15 subject export and ``user.checks`` can see. Null once the account is deleted; the
+    run keeps the count of who signed it.
+    """
+
+    release = models.ForeignKey(DatasetRelease, on_delete=models.CASCADE, related_name="sign_offs")
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="dataset_release_sign_offs",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["release", "user"],
+                condition=models.Q(user__isnull=False),
+                name="library_release_sign_off_one_per_user",
+            ),
+        ]
+
+    def __str__(self) -> str:
+        return f"DatasetReleaseSignOff(release={self.release_id} by={self.user_id})"
+
+
+def month_start(day) -> datetime:
+    """The first instant, in UTC, of the month *day* falls in."""
+    return datetime(day.year, day.month, 1, tzinfo=UTC)
+
+
 class DatasetItem(models.Model):
     """A generic object in a Dataset.
 
@@ -405,6 +530,22 @@ class DatasetItem(models.Model):
         on_delete=models.SET_NULL,
         related_name="items",
     )
+    # The release run that published this member; null means unreleased, which in
+    # a release-gated dataset hides the member from everyone but its managers.
+    # RESTRICT: deleting a release on its own would silently unpublish its members,
+    # while deleting the dataset (or its author) takes the release and the items
+    # together, which PROTECT would refuse.
+    release = models.ForeignKey(
+        DatasetRelease,
+        null=True,
+        blank=True,
+        on_delete=models.RESTRICT,
+        related_name="items",
+    )
+    # The de-identification pass version the member carried when a run released it, so
+    # the anonymity report can tell a member re-written since from one released at a
+    # newer version by the same run. Null for unreleased members and non-recordings.
+    released_deidentification_version = models.PositiveIntegerField(null=True, blank=True)
 
     added_at = models.DateTimeField(auto_now_add=True)
 
@@ -423,13 +564,61 @@ class DatasetItem(models.Model):
         ]
 
 
+class MemberApproval(models.Model):
+    """One curator's approval of one member of a release-gated dataset for release.
+
+    A curator is a dataset manager (``library.release.is_dataset_manager``). A project's release
+    selector asks for a number of approvals from distinct curators before a member is published
+    (``library.release.approved_items``), and the run records the approvers as its sign-off. A
+    veto is not a row: it removes the member at once, audited with its reason code, deleting a
+    pooled recording outright, since one a curator found identifying has no reason to stay. The
+    row holds no free text, because a typed reason tends to describe the feature that identifies
+    the patient.
+    """
+
+    item = models.ForeignKey(DatasetItem, on_delete=models.CASCADE, related_name="approvals")
+    # Null once the curator's account is deleted; the approval still counts for the member.
+    reviewer = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="member_approvals",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["item", "reviewer"],
+                condition=models.Q(reviewer__isnull=False),
+                name="library_approval_one_per_reviewer",
+            ),
+        ]
+
+    def __str__(self) -> str:
+        return f"MemberApproval(item={self.item_id} by={self.reviewer_id})"
+
+
+class VetoReason(models.TextChoices):
+    """Why a curator vetoed a member: a closed list, so no reason in the trail describes the patient."""
+
+    RARE_CONDITION = "rare_condition", "Rare condition or syndrome"
+    SKULL_DEFECT = "skull_defect", "Skull defect or breach rhythm"
+    DEVICE = "device", "Implanted or external device"
+    UNUSUAL_PROTOCOL = "unusual_protocol", "Unusual protocol"
+    OTHER = "other", "Other identifying content"
+
+
 class Tag(models.Model):
     """A hierarchical label that can be applied to any object.
 
-    Tags form a tree via the ``parent`` FK (adjacency list).  The tag
-    taxonomy is global — all authenticated users can browse and apply tags.
-    Only the tag author (or a superuser) may edit or delete the tag
-    definition itself.
+    Tags form a tree via the ``parent`` FK (adjacency list).  Creating one is
+    reserved for staff unless ``LIBRARY_TAG_CREATION_REQUIRES_STAFF`` is off,
+    and what a caller can list, read and apply is what ``library.tag_scope``
+    says they can reach: curated tags, their own, and the tags on objects they
+    can read.  Only the tag author (or a superuser) may edit or delete the
+    tag definition itself.
 
     Items are associated through ``TaggedItem``.  Querying items by tag
     optionally includes descendants (see ``_get_tag_subtree_ids`` in the
@@ -454,6 +643,13 @@ class Tag(models.Model):
         on_delete=models.SET_NULL,
         related_name="children",
     )
+    # Stamped at creation from the author's staff flag. A curated tag is the
+    # deployment's vocabulary and is listed to every authenticated user; an
+    # uncurated one is listed only to its author and to readers of the objects
+    # it decorates (library.tag_scope). Stamped rather than derived from the
+    # author's current flag so a later promotion or demotion does not silently
+    # change who sees what was typed.
+    curated = models.BooleanField(default=False)
 
     created_at = models.DateTimeField(auto_now_add=True)
     modified_at = models.DateTimeField(auto_now=True)

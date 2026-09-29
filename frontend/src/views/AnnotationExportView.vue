@@ -20,6 +20,7 @@ const form = reactive({
     since: '',
     until: '',
     versionId: '',
+    withholdText: false,
 })
 /**
  * Selectable types come from the server rather than a hard-coded pair: the active project can
@@ -159,6 +160,7 @@ async function onExport () {
             since: form.since || null,
             until: form.until || null,
             versionId: form.versionId.trim() || null,
+            withholdText: canExportAllAuthors.value && form.withholdText,
         })
         showToast(t('Export downloaded.', SCOPE), 'success')
     } catch (err) {
@@ -178,6 +180,9 @@ async function onExport () {
                 <h1>{{ t('Export annotations', SCOPE) }}</h1>
                 <p class="annotation-export-view__intro">
                     {{ t('Download events and labels as a file. Exported files identify annotators only by their user ID number — no names or usernames leave the platform — so the entries stay attributable through the annotator list held here.', SCOPE) }}
+                </p>
+                <p class="annotation-export-view__intro">
+                    {{ t('An exported file is pseudonymised personal data of the recording subjects, and its header says so. Handle it under the same policy as the recordings it describes.', SCOPE) }}
                 </p>
                 <p v-if="!canExportAllAuthors" class="annotation-export-view__intro">
                     {{ t('The export covers your own annotations, listed under annotator ID {id}. Exporting other annotators requires staff access.', SCOPE, { id: authStore.user?.id ?? '?' }) }}
@@ -288,6 +293,16 @@ async function onExport () {
                         :label="t('Version', SCOPE)"
                         v-wa="[form, 'versionId']"
                     ></wa-input>
+                </section>
+
+                <section v-if="canExportAllAuthors" class="annotation-export-section">
+                    <h2>{{ t('Text', SCOPE) }}</h2>
+                    <wa-switch
+                        :hint="t('Entries you did not write leave without their name, value and code notes; timing, codes and annotator IDs stay. For a recipient who may not read annotation text, as under a de-identifying share.', SCOPE)"
+                        v-wa="[form, 'withholdText']"
+                    >
+                        {{ t('Withhold text written by other annotators', SCOPE) }}
+                    </wa-switch>
                 </section>
 
                 <div class="annotation-export-view__actions">

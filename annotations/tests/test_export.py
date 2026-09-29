@@ -1383,3 +1383,200 @@ class TestWithheldColumns:
                 resolver=lambda *, caller, objects: {},
                 include_withheld=("created_at",),
             )
+
+
+@pytest.mark.django_db
+class TestEnvelopeLabelling:
+    """Format version 3: the header names what the file is and which pass wrote its recordings."""
+
+    def test_header_labels_the_file_as_pseudonymised_personal_data(self, client, make_user):
+        client.force_login(_staff(make_user))
+        meta = _json_body(client.get(EXPORT_URL))["metadata"]
+
+        assert meta["format_version"] == 3
+        assert meta["data_classification"] == "pseudonymised_personal_data"
+        assert meta["text_withheld"] is False
+
+    def test_csv_header_carries_the_classification_and_the_pass_versions(self, client, make_user):
+        client.force_login(_staff(make_user))
+        text = client.get(f"{EXPORT_URL}?format=csv&types=events").content.decode()
+        comments = [line for line in text.splitlines() if line.startswith("#")]
+
+        assert "# data_classification: pseudonymised_personal_data" in comments
+        assert any(line.startswith("# deidentification_versions: current ") for line in comments)
+
+    def test_header_lists_the_pass_versions_of_the_exported_recordings_only(self, client, make_user):
+        from recordings.models import RecordingMeta
+        from recordings.processors.edf import DEIDENTIFICATION_VERSION
+
+        staff = _staff(make_user)
+        rater = make_user()
+        current, legacy, excluded = (_make_recording(rater) for _ in range(3))
+        for recording, version in ((current, DEIDENTIFICATION_VERSION), (legacy, 0), (excluded, 97)):
+            baker.make(
+                RecordingMeta,
+                content_type=_recording_ct(recording),
+                object_id=str(recording.pk),
+                deidentification_version=version,
+            )
+            _make_event(rater, recording)
+
+        client.force_login(staff)
+        url = f"{EXPORT_URL}?recording={current.content_hash}&recording={legacy.content_hash}"
+        meta = _json_body(client.get(url))["metadata"]
+
+        assert meta["deidentification_versions"] == {
+            "current": DEIDENTIFICATION_VERSION,
+            "exported_recordings": [0, DEIDENTIFICATION_VERSION],
+        }
+
+    def test_versions_are_empty_when_no_exported_recording_carries_a_meta_row(self, client, make_user):
+        staff = _staff(make_user)
+        rater = make_user()
+        _make_event(rater, _make_recording(rater))
+
+        client.force_login(staff)
+        meta = _json_body(client.get(EXPORT_URL))["metadata"]
+
+        assert meta["deidentification_versions"]["exported_recordings"] == []
+
+    def test_neither_format_calls_the_file_anonymous(self, client, make_user):
+        staff = _staff(make_user)
+        rater = make_user()
+        _make_event(rater, _make_recording(rater))
+
+        client.force_login(staff)
+        for url in (EXPORT_URL, f"{EXPORT_URL}?format=csv&types=events"):
+            assert "anonym" not in client.get(url).content.decode().lower()
+
+
+@pytest.mark.django_db
+class TestWithholdText:
+    """``withhold_text=true``: the annotation-text rule applied to an export by choice."""
+
+    @staticmethod
+    def _scene(make_user):
+        from annotations.models import Code
+
+        staff = _staff(make_user)
+        rater = make_user()
+        recording = _make_recording(rater)
+        own = _make_event(staff, recording, name="own spike", value={"note": "mine"})
+        other = _make_event(rater, recording, name="SECRET-EVENT", value={"note": "SECRET-NOTE"})
+        Code.objects.create(
+            content_type=ContentType.objects.get_for_model(Event),
+            object_id=str(other.pk),
+            standard="epicurrents.test.kind",
+            value="k1",
+            meta={"free": "SECRET-META"},
+        )
+        other_label = _make_label(rater, recording, name="SECRET-LABEL", value={"x": 1})
+        return staff, rater, own, other, other_label
+
+    def test_rows_the_exporter_did_not_write_leave_without_text(self, client, make_user):
+        staff, rater, own, other, other_label = self._scene(make_user)
+
+        client.force_login(staff)
+        body = _json_body(client.get(f"{EXPORT_URL}?withhold_text=true"))
+        events = {row["object_hash"]: row for row in body["events"]}
+        withheld = events[other.object_hash]
+
+        assert withheld["name"] == ""
+        assert withheld["value"] is None
+        assert withheld["text_withheld"] is True
+        assert withheld["codes"] == [{"standard": "epicurrents.test.kind", "value": "k1", "meta": None}]
+        assert (withheld["timestamp"], withheld["duration"], withheld["author_id"]) == (12.5, 0.8, rater.pk)
+        label = body["labels"][0]
+        assert (label["name"], label["value"], label["text_withheld"]) == ("", None, True)
+        assert body["metadata"]["text_withheld"] is True
+        assert "SECRET" not in json.dumps(body)
+
+    def test_the_exporters_own_rows_keep_their_text(self, client, make_user):
+        staff, rater, own, other, other_label = self._scene(make_user)
+
+        client.force_login(staff)
+        body = _json_body(client.get(f"{EXPORT_URL}?withhold_text=true"))
+        mine = next(row for row in body["events"] if row["object_hash"] == own.object_hash)
+
+        assert (mine["name"], mine["value"], mine["text_withheld"]) == ("own spike", {"note": "mine"}, False)
+
+    def test_machine_produced_rows_keep_their_text(self, client, make_user, monkeypatch):
+        from annotations import redaction
+
+        staff, rater, own, other, other_label = self._scene(make_user)
+        monkeypatch.setattr(redaction, "_EXEMPT_ROW_PROVIDERS", [lambda rows: {other.pk}])
+
+        client.force_login(staff)
+        body = _json_body(client.get(f"{EXPORT_URL}?withhold_text=true"))
+        finding = next(row for row in body["events"] if row["object_hash"] == other.object_hash)
+
+        assert (finding["name"], finding["text_withheld"]) == ("SECRET-EVENT", False)
+        assert finding["codes"][0]["meta"] == {"free": "SECRET-META"}
+        assert body["labels"][0]["text_withheld"] is True
+
+    def test_without_the_flag_every_row_carries_its_text(self, client, make_user):
+        staff, rater, own, other, other_label = self._scene(make_user)
+
+        client.force_login(staff)
+        body = _json_body(client.get(EXPORT_URL))
+
+        assert all(row["text_withheld"] is False for row in body["events"] + body["labels"])
+        assert {row["name"] for row in body["events"]} == {"own spike", "SECRET-EVENT"}
+
+    def test_csv_carries_the_flag_per_row_and_in_the_header(self, client, make_user):
+        staff, rater, own, other, other_label = self._scene(make_user)
+
+        client.force_login(staff)
+        text = client.get(f"{EXPORT_URL}?withhold_text=true&format=csv&types=events").content.decode()
+        comments = [line for line in text.splitlines() if line.startswith("#")]
+        body = "\n".join(line for line in text.splitlines() if not line.startswith("#"))
+        rows = list(csv.DictReader(io.StringIO(body)))
+        by_hash = {row["object_hash"]: row for row in rows}
+
+        assert any(line.startswith("# text: withheld") for line in comments)
+        assert by_hash[other.object_hash]["text_withheld"] == "true"
+        assert by_hash[other.object_hash]["name"] == ""
+        assert by_hash[own.object_hash]["text_withheld"] == "false"
+        assert "SECRET" not in text
+
+    def test_row_sources_are_omitted(self, client, make_user, monkeypatch):
+        from annotations import export as annotation_export
+        from annotations.models import Interruption
+
+        staff = _staff(make_user)
+        rater = make_user()
+        _make_interruption(rater, _make_recording(rater))
+        source = _row_source(
+            "interruptions",
+            columns=("author_id", "object_hash"),
+            get_queryset=lambda: Interruption.objects.all(),
+            serialise=lambda obj: {"object_hash": obj.object_hash},
+        )
+        monkeypatch.setattr(annotation_export, "_ROW_SOURCES", {"interruptions": source})
+
+        client.force_login(staff)
+        assert len(_json_body(client.get(f"{EXPORT_URL}?types=interruptions"))["interruptions"]) == 1
+        assert _json_body(client.get(f"{EXPORT_URL}?types=interruptions&withhold_text=true"))["interruptions"] == []
+
+    def test_the_audit_row_records_the_mode(self, client, make_user):
+        staff, rater, own, other, other_label = self._scene(make_user)
+
+        client.force_login(staff)
+        client.get(f"{EXPORT_URL}?withhold_text=true")
+
+        activity = Activity.objects.filter(verb="annotations.export").latest("id")
+        assert activity.metadata["text_withheld"] is True
+
+    def test_the_mode_never_widens_the_tier(self, client, make_user, settings):
+        settings.ANNOTATION_EXPORT_ALL_ANNOTATORS_REQUIRES_SUPERUSER = True
+        staff, rater, own, other, other_label = self._scene(make_user)
+        # Outside the tier the caller also loses targets they cannot read, so the test grants
+        # the recording and asserts on the annotator restriction alone.
+        _grant_read(staff, own.target_object, rater)
+
+        client.force_login(staff)
+        body = _json_body(client.get(f"{EXPORT_URL}?withhold_text=true"))
+
+        assert body["metadata"]["restricted_to_own_annotations"] is True
+        assert [row["object_hash"] for row in body["events"]] == [own.object_hash]
+        assert client.get(f"{EXPORT_URL}?withhold_text=true&annotator_id={rater.pk}").status_code == 403

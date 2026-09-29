@@ -32,6 +32,8 @@ Nothing, for a base deployment. `npm run build` and `npm run test` need no `view
 
 `@epicurrents/core` is a dev dependency and pinned to an exact version, both deliberately. Dev, because every import of it is `import type` and its runtime closure is large; exact, because a published version does not currently identify a source state (see [ROADMAP.md](../ROADMAP.md)), so a range would let the types drift under the build without anything saying so.
 
+API newer than the pinned release is declared in [core-global-augment.ts](src/types/core-global-augment.ts) until a release carries it, mirroring the core declaration. Today that is the export-target registry: `EpicurrentsApp`'s three registry methods and the `SignalExport*` types a target is built from. The mirrored types are interfaces where core's are type aliases, so pinning a release that declares them fails the build at each one to delete.
+
 Two things still reach the checkout. An active project's frontend does: its `scoped-event-log` import is a single module, but a project that constructs annotations through a dynamic `#epicurrents/eeg-module` import pulls the core runtime into a lazily loaded chunk — the route [ROADMAP.md](../ROADMAP.md) plans to replace with the viewer's template methods. And the per-project viewer lib built by [vite.config.base.ts](vite.config.base.ts) bundles the interface from source. Both are why a deployment still needs the submodule even though the base SPA does not.
 
 ## Environment Variables
@@ -145,6 +147,17 @@ Then choose variants in templates with the `library` attribute:
 This is backwards-compatible: existing icons that omit `library` continue to
 resolve through the default icon library.
 
+## Viewer export targets
+
+The viewer's file menu offers "Send recording to" entries for a recording opened from a local file, one per export target the host registers with `registerSignalExportTarget`; a recording loaded from a URL is offered none, which core enforces. The viewer knows no platform endpoint, so each target's `submit` is platform code. [lib/exportTargets.ts](src/lib/exportTargets.ts) holds the templates:
+
+- `createUploadTarget` sends the de-identified container (the EDF with its sidecar embedded as a footer, so its event codes arrive) to the person's own recordings. [ViewerView.vue](src/views/ViewerView.vue) registers it as `platform/upload` for a signed-in session without a share token.
+- `createSubmissionTarget(pool, options)` turns the published ingest profile of a pool from `GET /recordings/api/v1/submissions/pools` into the export dialog's constraints, asks for a plain de-identified EDF and its de-identified sidecar, declares the file's SHA-256 in the sidecar as `recording_sha256`, and posts both to the pool, where the server records the file on the contributor's ledger without the client naming one. It returns null for a profile whose digital range is not the encoder's −32768 to 32767, which no export can meet. `options` carries what a project fine-tunes: the label, constraints replacing the profile's key by key, and `extendSidecar` for the sidecar keys a profile requires. The export is dithered, so re-encoding a copy of the original never reproduces the submitted bytes. An accepted submission therefore returns a receipt, built by `submissionReceipt`, which names the file by the SHA-256 of the bytes sent: withdrawal from a pool is keyed on that hash and nothing else, and only the contributor holds it. The viewer shows the receipt in a dialog that offers the download and a copy, and stays open until it is closed.
+
+Which pools become targets is the project's configuration, not the SPA's: a project calls the template from its `onAppReady`, so a profile can change without a platform release. The profile's forbidden sidecar keys become the constraint's `forbiddenMetadataKeys`, which the export dialog passes to the exporter to remove at any depth, since the gate refuses a sidecar carrying one even where the de-identification only blanks it (`subject`, `text`).
+
+A target reports its outcome as a message rather than throwing, and the gate's 422 is an outcome, not an error. The per-project viewer lib registers the EDF exporter the targets encode with, in [src/viewer/base.ts](src/viewer/base.ts).
+
 ## Routes
 
 | Path | View | Description |
@@ -153,7 +166,7 @@ resolve through the default icon library.
 | `/library` | `LibraryView` | Top-level collections list |
 | `/library/collections/:id` | `CollectionView` | Collection detail — items, access rights |
 | `/datasets` | `DatasetsView` | Dataset list |
-| `/datasets/:id` | `DatasetView` | Dataset detail — items, access rights |
+| `/datasets/:id` | `DatasetView` | Dataset detail — items, access rights, and the submission pool section (author, superuser); on a release-gated dataset, the curator review on each recording row (approval count, approve or withdraw, veto with a reason from a closed list) for whoever the review endpoint answers, which includes write grantees |
 | `/upload` | `UploadView` | Recording upload |
 | `/viewer` | `ViewerView` | Embedded signal viewer |
 | `/annotations/export` | `AnnotationExportView` | Annotation export (staff) |
@@ -179,6 +192,8 @@ There is no account deletion control anywhere in the surface. [`erase_user`](../
 **Membership is written from the account page only.** A deployment has far more users than groups, so assigning groups to a user is a short list of checkboxes while assigning users to a group is an unbounded one. The group page shows its members as a read-only roll linking back to each account. It is also the safer direction. Both membership endpoints take a whole-membership replacement, so a picker built from the capped account roster would drop every member past the cap — people the operator never saw listed — where the group list on an account page is never paged and cannot. [src/api/admin.ts](src/api/admin.ts) wraps only the account-side write for that reason.
 
 **Step-up confirmation.** The account API asks for the caller's own credentials (`password`, `totp_code`) before a change that leaves them holding a way in: a staff tier, a new address or an activation on `PATCH /admin/accounts/{id}`, a group added from either side, a role set to a value on a group, a password or a staff tier on account creation (sent there as `current_password`, since `password` is the new account's), every operator-set password and second-factor clear, and an address change on the caller's own profile. [src/lib/stepUp.ts](src/lib/stepUp.ts) mirrors each trigger, comparing against the values the page loaded, and `withStepUp` in [src/composables/useStepUpPrompt.ts](src/composables/useStepUpPrompt.ts) opens the one shared prompt ([src/components/StepUpDialog.vue](src/components/StepUpDialog.vue), mounted in `App.vue`) only when the rule says the request needs it, so a rename stays one click. When the rule and the server disagree, a 400 "Confirmation failed." to an unconfirmed request opens the prompt instead of failing. The group form sends only the roles that changed: the server asks whenever the payload carries a role value, changed or not, and the changed set is a subset of the rendered keys, so it cannot pad the map. Set-password and clear-second-factor always ask, inside their own dialogs, and are not offered on the caller's own account, which the server refuses. `authStore.stepUp` derives what the caller confirms with from `external_provider` and `is_2fa_enabled`.
+
+**A dedicated group shows its owner instead of its roles.** `GroupDetail.dedicated_to` names the feature that owns a group ([user/README.md → Dedicated groups](../user/README.md#dedicated-groups)); `AdminGroupView` then shows a banner, a submission pool's with a link to its dataset, and renders no role selector, so its save sends no role map. `AdminGroupsView` badges a pool group and offers no delete action on a dedicated one. Membership is managed as for any group.
 
 Two shapes to know before changing these views. `GET /admin/accounts` returns a bare list with no total, so paging can show "there is more" but not "N of M" — a full page is the entire signal. And there is no single-group read endpoint, so `AdminGroupView` resolves its group out of the group roster, and reads the account roster to name its members; the server caps that at 500, and the view says how many of the group's `member_count` it could show when the two disagree.
 
@@ -237,6 +252,7 @@ A rejected role value aborts the rename with it — the server writes both in on
 | `StepUpFields.vue` | The credential inputs of a step-up confirmation, rendered from the method the maintenance status (or `authStore.stepUp`) reports for the caller. Takes the parent's reactive `credentials` (`password`, `totp_code`), `stepUp`, and `passwordOnly` for an action the server confirms without the second factor. |
 | `StepUpDialog.vue` | The one step-up prompt, mounted in `App.vue` and driven by `useStepUpPrompt`. |
 | `ErasureAcknowledgement.vue` | The count of erased accounts a database restore brings back and the tick the resend waits for. Takes `count` and a reactive `state` (`acknowledged`). |
+| `DatasetPoolSection.vue` | The dataset page's "Submission pool" section for the author and superusers: the action that makes an empty dataset a pool (a profile picker with each profile's channels, rate and durations), the profile and group of a configured pool with its intake switch and dissolve action, and a filling pool's locked fields and file totals. Emits `change` with the pool state so the page drops the gate switch and the manual item actions a pool does not allow. |
 | `CollectionPickerDialog.vue` | Dialog for browsing the Collection hierarchy, creating new collections inline, and selecting a target. Controlled via `:open` prop; emits `select` (with a `PickerSelection`) and `close`. Use when any feature needs the user to pick a collection destination or browse library items. Two modes: `collection` (pick a folder) and `item` (pick a recording inside a folder). Breadcrumb navigation via `wa-breadcrumb`. |
 
 `CollectionPickerDialog` usage pattern:

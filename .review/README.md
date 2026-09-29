@@ -8,6 +8,7 @@ Tool-agnostic home for the project's automated review surface.
 .review/
 ├── README.md             # this file
 ├── agents/               # one markdown file per review agent
+│   ├── anonymisation.md
 │   ├── audit-trail-completeness.md
 │   ├── csrf-coverage.md
 │   ├── documentation-style.md
@@ -16,11 +17,13 @@ Tool-agnostic home for the project's automated review surface.
 │   └── phi-exposure.md
 ├── exemptions/           # per-agent exemption registries; one file per agent that has one
 │   ├── README.md
+│   ├── anonymisation.md
 │   ├── audit-trail-completeness.md
 │   ├── csrf-coverage.md
 │   ├── gdpr-compliance.md
 │   └── phi-exposure.md
 └── findings/             # one markdown file per agent; EMPTY when clean
+    ├── anonymisation.md
     ├── audit-trail-completeness.md
     ├── csrf-coverage.md
     ├── documentation-style.md
@@ -108,11 +111,12 @@ Required frontmatter:
 
 | File | Invariant |
 |---|---|
+| [agents/anonymisation.md](agents/anonymisation.md) | The platform never calls its output anonymous (C1), a change on the anonymisation path (the release gate, the submission gate, the dataset reports, the assessment record, the published-source field, the de-identification record, text hygiene, the export and redaction) moves the assessment log in [docs/anonymisation-compliance.md](../docs/anonymisation-compliance.md) (C2), every guidelines paragraph cited in code resolves to that document (C3), and its Currency block is in date and agrees with [epicurrents/assessment.py](../epicurrents/assessment.py) and the agent's own pin (C4). C4 is checked on every run, so an overdue review fails every commit until the document is re-read. Exemptions in [exemptions/anonymisation.md](exemptions/anonymisation.md). |
 | [agents/audit-trail-completeness.md](agents/audit-trail-completeness.md) | Every in-diff Ninja endpoint that is not on [exemptions/audit-trail-completeness.md](exemptions/audit-trail-completeness.md) annotates its `Activity` row with a verb in the established taxonomy and, where applicable, target + metadata. |
 | [agents/documentation-style.md](agents/documentation-style.md) | In-diff prose (Python docstrings + Markdown) follows the AGENTS.md style ruleset — no double-spaces after periods, no migration-state language, no per-parameter `:param` lines, no backtick-wrapped file paths in Markdown body, restrained prose bold, no restating or "draw a picture" codas. |
 | [agents/gdpr-compliance.md](agents/gdpr-compliance.md) | Every in-diff change keeps personal data erasable, minimized, and inventoried: new PII-bearing fields registered with `register_subject_pii` / `register_masked_fields` (C1), no raw identifiers in log or audit-metadata writes (C2), a retention or erasure path for every new persistent store (C3), no audit-row mutation outside the sanctioned erasure engine (C4), and the [docs/gdpr-compliance.md](../docs/gdpr-compliance.md) data / processor inventories extended in the same commit (C5). Exemptions in [exemptions/gdpr-compliance.md](exemptions/gdpr-compliance.md). |
 | [agents/load-bearing-diff-reviewer.md](agents/load-bearing-diff-reviewer.md) | When any ⚠️ LOAD-BEARING file (per AGENTS.md) appears in the diff, the file's contract test runs first; the agent refuses to bless the change if the test is red. Also flags input-filter tightening that requires the "enumerate prior matches" rule. |
-| [agents/phi-exposure.md](agents/phi-exposure.md) | Every in-diff endpoint, schema, and byte-serving path that is not on [exemptions/phi-exposure.md](exemptions/phi-exposure.md) honours the seven PHI-exposure invariants: opaque hashes in URLs (C1), forbidden fields absent from Out schemas (C2), `_can_see_original_name` gating original_name / processing_error (C3), `Content-Disposition` filename built from display_name (C4), `_failed_hidden_for_caller` applied to Recording lookups (C5), `apply_middleware` resolved on byte serving (C6), originals volume not read for content (C7). |
+| [agents/phi-exposure.md](agents/phi-exposure.md) | Every in-diff endpoint, schema, and byte-serving path that is not on [exemptions/phi-exposure.md](exemptions/phi-exposure.md) honours the nine PHI-exposure invariants: opaque hashes in URLs (C1), forbidden fields absent from Out schemas (C2), `_can_see_original_name` gating original_name / processing_error (C3), `Content-Disposition` filename built from display_name (C4), `_failed_hidden_for_caller` applied to Recording lookups (C5), `apply_middleware` resolved on byte serving (C6), originals volume not read for content (C7), a single serving-pipeline source (C8), and the anonymisation assessment's given-data tables touched in the same diff as any change to the recording Out schemas, the annotation serialisers or the export (C9). |
 
 ## Exemption registries
 

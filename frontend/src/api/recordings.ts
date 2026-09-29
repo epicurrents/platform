@@ -1,4 +1,5 @@
 import { http } from '#lib/http'
+import type { NameWarning } from '#lib/nameWarnings'
 
 export interface RecordingMeta {
     format: string
@@ -32,10 +33,17 @@ export interface Recording {
     processing_error: string | null
     file_extension: string
     file_size: number
-    file_hash: string
+    /**
+     * SHA-256 of the file as stored, after de-identification. Empty until processing completes, and null or empty
+     * for a reader it is withheld from, such as a reader of a release-gated member they do not manage.
+     */
+    stored_hash: string | null
     content_hash: string
     status: 'pending' | 'processing' | 'ready' | 'failed'
     modality: string
+    /** DOI or URL of the published dataset the data was taken from; empty for data acquired here. */
+    public_source: string
+    /** Exact for the author and superusers; truncated to the first of its month for every other reader. */
     created_at: string
     deleted_at: string | null
     meta: RecordingMeta | null
@@ -48,6 +56,8 @@ export interface Recording {
      * collection is restored. Null for genuinely uncollected recordings.
      */
     trashed_collection: { id: number; name: string } | null
+    /** PATCH responses only: free-text warnings for `display_name` and `public_source`. */
+    warnings?: NameWarning[]
 }
 
 export interface RecordingUpload {
@@ -56,8 +66,9 @@ export interface RecordingUpload {
     stored_name: string
     file_extension: string
     file_size: number
-    file_hash: string
     status: string
+    /** Free-text warnings for the `display_name` sent with the upload. */
+    warnings?: NameWarning[]
 }
 
 export interface RecordingStatus {
@@ -125,6 +136,8 @@ export interface RecordingPatch {
     /** Grantee-visible label. Send an empty string to clear it and fall back to the hash prefix. */
     display_name?: string
     modality?: string
+    /** DOI or http(s) URL of the published dataset the data was taken from; empty string clears it. */
+    public_source?: string
 }
 
 /**
@@ -145,5 +158,92 @@ export function recordingName(
 
 export async function updateRecording(hash: string, payload: RecordingPatch): Promise<Recording> {
     const response = await http.patch<Recording>(`/recordings/api/v1/${hash}`, payload)
+    return response.data
+}
+
+// ── Validating submissions to a submission pool ──────────────────────────────
+
+/**
+ * The public shape of an ingest profile: every value the gate checks a submission against. Null where the
+ * profile leaves a value unchecked.
+ */
+export interface SubmissionProfile {
+    key: string
+    /** Channel labels, in the order the file must carry them. */
+    channels: string[]
+    sampling_rate: number | null
+    physical_unit: string | null
+    physical_min: number | null
+    physical_max: number | null
+    digital_min: number | null
+    digital_max: number | null
+    /** The lengths a file may have, in seconds. Empty when any length passes. */
+    durations_seconds: number[]
+    /** Keys the sidecar must carry, `recording_sha256` first. */
+    required_sidecar_keys: string[]
+    /** Keys refused anywhere in the sidecar, at any depth. */
+    forbidden_sidecar_keys: string[]
+}
+
+/** An open pool the caller may submit to, with the profile a file is prepared against. */
+export interface SubmissionPool {
+    dataset_hash: string
+    name: string
+    profile: SubmissionProfile
+}
+
+/** One reason the gate refused a submitted file. */
+export interface SubmissionViolation {
+    code: string
+    message: string
+}
+
+export type SubmissionResult =
+    | { accepted: true }
+    | { accepted: false; violations: SubmissionViolation[] }
+
+/** The open pools the signed-in person may submit to, each with its published profile. */
+export async function listSubmissionPools(): Promise<SubmissionPool[]> {
+    const response = await http.get<SubmissionPool[]>('/recordings/api/v1/submissions/pools')
+    return response.data
+}
+
+/** Every ingest profile the deployment registers, for choosing one when configuring a pool. */
+export async function listSubmissionProfiles(): Promise<SubmissionProfile[]> {
+    const response = await http.get<SubmissionProfile[]>('/recordings/api/v1/submissions/profiles')
+    return response.data
+}
+
+/**
+ * Submit one prepared recording with its sidecar to a pool. A refused file resolves (not rejects) with
+ * `accepted: false` and the violations, since a 422 is the gate's ordinary answer; nothing was written. A pool the
+ * caller may no longer submit to answers 404.
+ * @param datasetHash - The pool's dataset hash.
+ * @param file - The prepared EDF or BDF excerpt.
+ * @param sidecar - The JSON sidecar as a Blob or File.
+ * @param onProgress - Upload progress callback in whole percent.
+ */
+export async function submitFile(
+    datasetHash: string,
+    file: File,
+    sidecar: Blob,
+    onProgress?: (percent: number) => void,
+): Promise<SubmissionResult> {
+    const formData = new FormData()
+    formData.append('file', file)
+    formData.append('sidecar', sidecar, 'sidecar.json')
+    const response = await http.post<SubmissionResult>(
+        `/recordings/api/v1/submissions/pools/${datasetHash}/files`,
+        formData,
+        {
+            headers: { 'Content-Type': 'multipart/form-data' },
+            validateStatus: (status) => status === 202 || status === 422,
+            onUploadProgress(event) {
+                if (onProgress && event.total) {
+                    onProgress(Math.round((event.loaded / event.total) * 100))
+                }
+            },
+        },
+    )
     return response.data
 }

@@ -25,7 +25,7 @@ def can_read_via_attachment(user, obj, share_token: str | None = None):
     Applies only to `MediaFile` instances attached to a parent the caller can
     read; everything else yields `granted=False` so other extensions and the
     default deny still apply. Returns default metadata (`apply_middleware=False`)
-    because media is never EDF — the parent's header-anonymisation flag is
+    because media is never EDF — the parent's header-de-identification flag is
     irrelevant to a media byte stream.
     """
     from epicurrents.permissions import can_read_object

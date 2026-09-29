@@ -1,7 +1,7 @@
 """Contract tests for the annotation vocabulary registry.
 
-Core ships the mechanism with zero vocabularies, so the vocabulary registered here — inside the test
-suite, never in production code — is what proves the contract: a registered validator gates API writes
+The vocabulary registered here — inside the test suite, never in production code — is what proves the
+contract independently of the two core registers in ``annotations.core_vocabularies``: a registered validator gates API writes
 for its standard, an unregistered standard passes untouched by default, and the strict setting flips that
 default. Enforcement is at the API layer only; the server-side ORM bypass at the end is deliberate
 behaviour, not a gap.
@@ -14,6 +14,7 @@ from model_bakery import baker
 
 from annotations.models import Code, Event
 from annotations.vocabularies import (
+    get_vocabulary,
     register_vocabulary,
     registered_vocabularies,
     unregister_vocabulary,
@@ -95,6 +96,19 @@ class TestRegistry:
     @override_settings(ANNOTATION_CODE_STRICT_VOCABULARY=True)
     def test_strict_mode_still_accepts_registered_standard(self, test_vocabulary):
         validate_code("test-vocab", "Artifact", None)
+
+    def test_a_vocabulary_names_no_terms_unless_it_registers_a_lookup(self, test_vocabulary):
+        assert get_vocabulary("test-vocab").term_name is None
+        assert get_vocabulary("nobody-registered-this") is None
+        register_vocabulary("named-vocab", label="Named", validator=_terms_validator, term_name=str.upper)
+        try:
+            assert get_vocabulary("named-vocab").term_name("spike") == "SPIKE"
+        finally:
+            unregister_vocabulary("named-vocab")
+
+    def test_the_core_vocabularies_name_their_terms(self):
+        assert get_vocabulary("epicurrents.eeg").term_name("EEG_ACT_HV") == "Hyperventilation"
+        assert get_vocabulary("epicurrents.eeg").term_name("NOT_A_TERM") is None
 
 
 @pytest.mark.django_db

@@ -142,6 +142,8 @@ The operator-facing entry point is the [`erase_user` management command](../user
 
 Complementing retroactive erasure, `serialize_instance` masks registered credential fields *before* they reach any audit payload: the value is replaced by `"<masked:<digest12>>"`, a truncated SHA-256 of the stored value. Equal secrets mask identically (no phantom diffs), changed secrets produce a visible-but-opaque diff. Registered via `register_masked_fields` from the owning app's `ready()`: the user's `password` hash and the push subscription's `p256dh` / `auth` keys. Rollback skips masked sentinels so restoring an old state never clobbers a live secret with the placeholder string.
 
+A digest hides a value only from someone who does not hold it. Where the same value is recorded elsewhere in the trail, a digest of it is a join, so `register_masked_fields(..., withhold=True)` writes the constant `"<masked:withheld>"` instead. A withheld field leaves no diff when it changes, which suits fields fixed at creation. `registered_masked_fields` answers for both. The submission file row is the one user: its hash and size are the pooled recording's own, which that recording's trail rows carry in the clear ([recordings/README.md](../recordings/README.md)).
+
 Session rows are excluded from audit tracking entirely (`EXCLUDED_MODELS` in [signals.py](signals.py)): auditing them would write `session_key` — a live bearer credential — into the permanent trail on every login.
 
 ## Derived-row digests
@@ -175,6 +177,8 @@ register_derived_state_digester(
 
 `verify_derived_state(change)` loops over each key in the row's `extra_payload`, looks up the registered digester, runs it against the live target, and compares the result to the stored hex. The result object reports per-key verdicts: `"ok"`, `"mismatch"`, or `"no_digester"` (the row carries a digest under a key no app has registered). The recompute path is on-demand; the future periodic-integrity Celery task will call it on a sliding window.
 
+**Documentary records.** A writer may seal a payload that describes a moment rather than live state — the settings in force when the row was written — and nothing can recompute such a value. Declare the key with `register_derived_state_record(target_model=..., key=...)` and the verifier reports it as `"record"`, which counts as intact: the row's `after_hash` covers it, so editing the column still breaks chain verification, and a declared key stays distinguishable from one no app knows, which is `"no_digester"` and what the integrity check logs. The recordings app's `deidentification_record` is the one registered today.
+
 **Two layers of detection.** The chain catches naive tampering with the stored digest column (recomputed `after_hash` no longer matches). The recompute catches tampering with the dependent rows themselves (live digest differs from stored). To hide a derived-row tamper an attacker would have to recompute the digest, update the audit row's column, recompute its `after_hash` — and *then* rewrite every subsequent row in the same chain shard so the link forward stays consistent.
 
 Canonical example: [recordings/audit_digests.py](../recordings/audit_digests.py) hashes all `SignalInfo` rows attached to a `Recording`; the digest rides on the final READY transition's audit row.
@@ -202,6 +206,10 @@ The permission check ([audit.py](audit.py) `can_rollback_change`) returns `True`
 Note: there is no stored-`author_id` fallback. If the target object has been deleted and no `AccessRight` row survives the deletion, only a superuser can rollback the DELETE entry. The fallback was removed because it implicitly trusted every tracked model to maintain `author_id` honestly against API write paths — see the ROADMAP item that drove this decision.
 
 The bulk endpoint does a **pre-flight pass**: every ID in `change_ids` is validated for existence and permission *before* any data is touched. A single 404 or 403 aborts the whole batch.
+
+### Rollback guards
+
+A rollback writes a row's audited state back directly, past every endpoint rule, so an app whose rows carry rules its endpoints enforce registers a guard with `register_rollback_guard(model_label, guard)` from its `AppConfig.ready()`. `guard(change, existing_obj)` returns a reason to refuse or `None`; `existing_obj` is the live row or `None`. `rollback_refusal(change)` is the first reason any guard gives. `can_rollback_change` answers `False` for a refused change whoever asks, superusers included, so the change listing for non-superusers and the bulk pre-flight (403) never offer it, and `rollback_change` raises `RollbackRefused`, a `ValueError`, which the single endpoint answers with 400 once the caller's access is established. Guards protect invariants, not access. The library registers guards for the pool and release models ([library/README.md → Gotchas](../library/README.md#gotchas)).
 
 ### Worked example — restore a recording from trash
 
@@ -430,6 +438,7 @@ To check the table against the tree, walk the AST for `log_activity` / `with_sys
 | Verb | Emitted by |
 |---|---|
 | `epicurrents.access_rights.purge` | `purge_expired_access_rights` † |
+| `epicurrents.grant_assessments` | `handle` † |
 | `epicurrents.viewer_config.read` | `get_viewer_config` |
 | `epicurrents.viewer_config.update` | `update_viewer_config` |
 
@@ -437,6 +446,7 @@ To check the table against the tree, walk the AST for `log_activity` / `with_sys
 
 | Verb | Emitted by |
 |---|---|
+| `federation.grant.assess` | `handle` †, `record_assessment` † |
 | `federation.grant.create` | `create_grant` †, `handle` † |
 | `federation.grant.list` | `list_grants` |
 | `federation.grant.renew` | `handle` †, `renew_grant` † |
@@ -467,9 +477,12 @@ To check the table against the tree, walk the AST for `log_activity` / `with_sys
 | `library.collection.restore` | `restore_collection` |
 | `library.collection.trash` | `delete_collection` |
 | `library.collection.update` | `update_collection` |
+| `library.dataset.access.assess` | `assess_dataset_access` |
 | `library.dataset.access.grant` | `grant_dataset_access` |
 | `library.dataset.access.list` | `list_dataset_access_rights` |
 | `library.dataset.access.revoke` | `revoke_dataset_access` |
+| `library.dataset.access_report` | `handle` † |
+| `library.dataset.anonymity_report` | `handle` † |
 | `library.dataset.create` | `create_dataset` |
 | `library.dataset.folder.create` | `create_dataset_folder` |
 | `library.dataset.folder.delete` | `delete_dataset_folder` |
@@ -480,7 +493,16 @@ To check the table against the tree, walk the AST for `log_activity` / `with_sys
 | `library.dataset.item.move` | `move_dataset_item` |
 | `library.dataset.item.remove` | `remove_dataset_item` |
 | `library.dataset.list` | `list_datasets` |
+| `library.dataset.member.approval.create` | `approve_dataset_member` |
+| `library.dataset.member.approval.delete` | `withdraw_dataset_member_approval` |
+| `library.dataset.member.veto` | `veto_dataset_member` |
+| `library.dataset.pool.create` | `configure_dataset_pool` |
+| `library.dataset.pool.delete` | `dissolve_dataset_pool` |
+| `library.dataset.pool.read` | `get_dataset_pool` |
+| `library.dataset.pool.update` | `update_dataset_pool` |
 | `library.dataset.read` | `get_dataset` |
+| `library.dataset.release` | `handle` † |
+| `library.dataset.review.read` | `list_dataset_reviews` |
 | `library.dataset.snapshot.create` | `create_dataset_snapshot` |
 | `library.dataset.snapshot.list` | `list_dataset_snapshots` |
 | `library.dataset.snapshot.read` | `get_dataset_snapshot` |
@@ -542,9 +564,11 @@ To check the table against the tree, walk the AST for `log_activity` / `with_sys
 
 | Verb | Emitted by |
 |---|---|
+| `recordings.access.assess` | `assess_recording_access` |
 | `recordings.access.list` | `list_recording_access` |
 | `recordings.access.revoke` | `revoke_recording_access` |
 | `recordings.annotations.list` | `list_recording_annotations` |
+| `recordings.deidentification_report` | `handle` † |
 | `recordings.download` | `download_recording` |
 | `recordings.download.slice` | `slice_recording` |
 | `recordings.import` | `_run_job` † |
@@ -552,10 +576,18 @@ To check the table against the tree, walk the AST for `log_activity` / `with_sys
 | `recordings.metadata.refresh` | `handle` † |
 | `recordings.process` | `process_recording` † |
 | `recordings.purge` | `purge_deleted_recordings` † |
+| `recordings.purge_dataset` | `handle` † |
 | `recordings.read` | `recording_detail` |
 | `recordings.read.slice` | `recording_detail_slice` |
 | `recordings.set_mains` | `bulk_set_mains` |
+| `recordings.stored_hash.backfill` | `handle` † |
 | `recordings.status` | `recording_status` |
+| `recordings.submission.file.accept` | `submit_file` |
+| `recordings.submission.file.reject` | `submit_file` |
+| `recordings.submission.ingest` | `ingest_pooled_submissions` † |
+| `recordings.submission.pool.list` | `list_submission_pools` |
+| `recordings.submission.profile.list` | `list_submission_profiles` |
+| `recordings.submission.purge` | `ingest_pooled_submissions` † |
 | `recordings.trash` | `delete_recording` |
 | `recordings.update` | `update_recording` |
 | `recordings.upload` | `upload_recording` |
@@ -680,7 +712,7 @@ If a project model needs to be excluded from auto-logging (e.g. an ephemeral cac
 Two registries exist for personal-data handling, both called from `AppConfig.ready()` (see [Subject erasure](#subject-erasure-gdpr-art-17)):
 
 - `activity.erasure.register_subject_pii` — declare which of the project model's audited fields carry a user's personal data, so `erase_subject` scrubs them on an Art. 17 request.
-- `activity.audit.register_masked_fields` — declare credential fields that must never reach the audit trail in the clear.
+- `activity.audit.register_masked_fields` — declare credential fields that must never reach the audit trail in the clear; `withhold=True` for fields whose digest would be a join.
 
 Field names in both are the **serialized attnames** `serialize_instance` writes, so a foreign key is `user_id` rather than `user`. Getting one wrong used to be free: a bad model label makes `erase_subject` skip the spec, a bad `owner_field` matches no rows, and a bad `pii_fields` entry is never found — all three leaving the erasure summary reporting zero for the model, which is what a legitimately clean run reports too. [activity/checks.py](checks.py) closes that with a Django system check validating every registration against the real model, so a typo fails `manage.py check` rather than surfacing as an unfulfillable erasure request months later.
 

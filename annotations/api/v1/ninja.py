@@ -980,6 +980,7 @@ def export_annotations(
     since: str | None = Query(None),
     until: str | None = Query(None),
     version_id: str | None = Query(None),
+    withhold_text: bool = Query(False),
 ):
     """Export events, labels and any registered project types as a downloadable JSON or CSV file.
 
@@ -992,6 +993,12 @@ def export_annotations(
     only — identity resolves via the roster endpoint below, inside the platform. CSV takes exactly
     one type per file — the types have different columns — so ``format=csv`` with several types is
     a 422.
+
+    Every file is labelled in its header as pseudonymised personal data, with the de-identification
+    pass versions of the recordings it describes. ``withhold_text=true`` prepares a narrower file for
+    a recipient under a de-identifying arrangement: rows the caller did not write leave without their
+    text, as they would under a de-identifying grant — see
+    :func:`~annotations.export.build_export`. The tier is unchanged by it.
 
     The response is an attachment rather than a JSON body, so the browser saves it directly; the
     ``no-store`` default from ``SecurityHeadersMiddleware`` still applies to it.
@@ -1006,6 +1013,7 @@ def export_annotations(
         since=since,
         until=until,
         version_id=version_id,
+        withhold_text=withhold_text,
     )
 
     exports_all_annotators = annotation_export.can_export_all_annotators(user)
@@ -1043,6 +1051,7 @@ def export_annotations(
             "types": list(filters.types),
             "filters": filters.as_metadata(),
             "restricted_to_own_annotations": result.restricted_to_self,
+            "text_withheld": filters.withhold_text,
             "returned_counts": metadata["counts"],
             "annotator_count": len(result.annotators),
             "annotator_ids": result.annotator_ids,

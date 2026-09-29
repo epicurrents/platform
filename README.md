@@ -72,6 +72,7 @@ See [docs/developing.md](docs/developing.md#testing) for fixtures, helpers, and 
 | Contributing to the platform | [docs/developing.md](docs/developing.md) |
 | Reporting a security vulnerability | [SECURITY.md](SECURITY.md) |
 | GDPR posture: data inventory, retention, erasure paths, processor flows | [docs/gdpr-compliance.md](docs/gdpr-compliance.md) — update in the same commit as any change to personal-data models, retention windows, or outbound flows (the `gdpr-compliance` review agent enforces the inventories); full re-audit before each production release or six-monthly |
+| Whether de-identified output counts as anonymous data (it does not), assessed against the EDPB anonymisation guidelines | [docs/anonymisation-compliance.md](docs/anonymisation-compliance.md) — the vocabulary rule, the per-recipient assessment a deployment would need to claim anonymity, and the design gaps the assessment found; reassess on any change to a recording `Out` schema or serving surface |
 | Telling data subjects what you do with their data (Art. 13/14) | [docs/privacy-notice-template.md](docs/privacy-notice-template.md) — a drafting template, not a notice; the software-determined facts are filled in and the rest is marked for the operator, who is the controller |
 | Known limitations + deferred improvements | [ROADMAP.md](ROADMAP.md) |
 | AI assistant behaviour rules | [AGENTS.md](AGENTS.md) |

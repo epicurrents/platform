@@ -3,7 +3,7 @@ identifiers out of the database.
 
 Both settings default off, and both exist for a project whose data-protection
 position is that no patient personal data reaches the platform at all. The
-position is not that these settings anonymise anything — the client does that
+position is not that these settings de-identify anything — the client does that
 before upload — but that the platform stops *retaining* what the client was
 supposed to have removed, so a recording arriving some other way does not
 silently falsify the claim.
@@ -52,6 +52,8 @@ class _Result:
         self.signal_infos = []
         self.annotations = annotations or []
         self.gaps = gaps or {}
+        # The persistence step stamps the strip decision from the result.
+        self.annotation_text_preserved = False
 
 
 @pytest.fixture
@@ -169,7 +171,7 @@ class TestDiscardEmbeddedAnnotations:
         assert interruptions.first().duration == 2.0
 
     # ── The converted-file route ──────────────────────────────────────────
-    # A Nicolet .e file carries its events in a sidecar rather than in the EDF
+    # A converted vendor file carries its events in a sidecar rather than in the EDF
     # the converter produces, so they reach the database through
     # save_sidecar_events and never through _save_edf_results. The setting is
     # documented as covering both; only the EDF one was tested, and deleting the

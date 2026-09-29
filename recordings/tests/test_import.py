@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 
@@ -146,6 +147,7 @@ class TestImportRecordingsCommand:
         rec = Recording.objects.get(author=user)
         assert rec.status == Recording.Status.READY
         assert rec.content_hash != ""
+        assert rec.stored_hash == hashlib.sha256(Path(rec.file_path).read_bytes()).hexdigest()
 
     def test_access_right_created(self, user, tmp_path):
         from epicurrents.models import AccessRight
@@ -593,7 +595,9 @@ class TestImportRecordingsAudit:
         )
         result = verify_derived_state(final)
         assert result.ok is True
-        assert result.digests == {"signal_info_digest": "ok"}
+        # An imported EDF has a meta row, so the READY row also seals the
+        # de-identification record; the .bin fixture in test_tasks has none.
+        assert result.digests == {"signal_info_digest": "ok", "deidentification_record": "record"}
 
 
 @pytest.mark.django_db
