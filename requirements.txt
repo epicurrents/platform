@@ -1,5 +1,5 @@
 -c constraints.txt
-Django==6.0.8
+Django==6.1.1
 argon2-cffi==25.1.0
 # The <51 cap is the usual next-major guard. The >=50.0.0 floor is a security
 # floor, not a preference: 48.0.1 carries PYSEC-2026-3552/3553/3554 — 3553/3554
