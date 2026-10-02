@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# commit-msg — refuse a commit whose message carries no Signed-off-by trailer.
+#
+# Every repository in the tree follows the DCO convention, so the trailer is the
+# record of who attests to a change. Merge commits are exempt: git composes
+# their message itself and a merge attests to nothing the merged commits did not
+# already carry.
+#
+# `git commit -s` adds the trailer. `npm version` does not, and npm offers no
+# switch for it, so a version bump aborts here and never reaches `git tag` —
+# which is why npm's `message` config has to carry the trailer itself. See
+# docs/developing.md → Signing.
+#
+# Skip with `git commit --no-verify` when knowingly mid-flight.
+
+set -euo pipefail
+
+if [ -e "$(git rev-parse --git-path MERGE_HEAD)" ]; then
+    exit 0
+fi
+
+if grep -qi "^Signed-off-by: " "$1"; then
+    exit 0
+fi
+
+echo "commit-msg: message has no Signed-off-by trailer." >&2
+echo "Commit with -s, or add the trailer. Use --no-verify to bypass." >&2
+exit 1

@@ -43,6 +43,8 @@ if [ ${#unresolved[@]} -gt 0 ]; then
     done
     printf '\n'
     printf 'Resolve each finding (or empty its file to acknowledge), then\n'
+    # The backticks are literal, quoting a command for the reader.
+    # shellcheck disable=SC2016
     printf 'retry the commit.  Bypass with `git commit --no-verify` only\n'
     printf 'when knowingly mid-flight.\n'
     printf '\n'

@@ -12,6 +12,10 @@ which fails this way reports nothing, so no other check would notice.
 They assert on the installed artifact rather than on a real commit: whether git
 then runs it is Tier 3, and the conftest docstring explains why that harness is
 out of scope here.
+
+The second subject is the nested-repository install, which copies instead of
+shimming. ``cp`` and ``chmod`` are fakebin stubs, so nothing lands on disk there
+and the call log is where the copy is observable.
 """
 
 from __future__ import annotations
@@ -159,3 +163,109 @@ def test_install_is_idempotent(checkout, fakebin):
     first = (checkout / ".git" / "hooks" / "pre-commit").read_text()
     _install(checkout, fakebin)
     assert (checkout / ".git" / "hooks" / "pre-commit").read_text() == first
+
+
+@pytest.fixture
+def nested(tmp_path: Path, fakebin) -> Path:
+    """A checkout holding the four nested-repository shapes that matter.
+
+    An ordinary nested clone, whose `.git` is a directory and whose hooks sit at
+    a path relative to it. A gitlink submodule, whose `.git` is a file and whose
+    hooks live under the superproject, so the answer is absolute and must be used
+    as given. A vendored tree, excluded by path. And a repository inside
+    `node_modules`, which the search must not reach — a dependency that ships its
+    own `.git` is not ours to put a hook in.
+    """
+    (tmp_path / ".git" / "hooks").mkdir(parents=True)
+    hooks_src = tmp_path / "scripts" / "git-hooks"
+    hooks_src.mkdir(parents=True)
+    for name in ("commit-msg", "pre-commit"):
+        (hooks_src / name).write_text("#!/usr/bin/env bash\nexit 0\n")
+        os.chmod(hooks_src / name, 0o755)
+    (tmp_path / ".review" / "agents").mkdir(parents=True)
+
+    (tmp_path / "packages" / "one" / ".git" / "hooks").mkdir(parents=True)
+    submodule = tmp_path / "docs" / "vendored-docs"
+    submodule.mkdir(parents=True)
+    (submodule / ".git").write_text("gitdir: ../../.git/modules/docs/vendored-docs\n")
+    (tmp_path / ".git" / "modules" / "docs" / "vendored-docs" / "hooks").mkdir(parents=True)
+    (tmp_path / "frontend" / "viewer" / "ohif" / ".git" / "hooks").mkdir(parents=True)
+    (tmp_path / "node_modules" / "dep" / ".git" / "hooks").mkdir(parents=True)
+
+    # The stub answers the two questions the script asks, and answers the second
+    # one differently for the submodule, which is the case a fixed
+    # `<repo>/.git/hooks` would get wrong.
+    fakebin.stub(
+        "git",
+        body=f"""
+case "$*" in
+    *show-toplevel*) echo "{tmp_path.as_posix()}" ;;
+    *"--git-path hooks"*)
+        case "$PWD" in
+            */docs/vendored-docs) echo "{tmp_path.as_posix()}/.git/modules/docs/vendored-docs/hooks" ;;
+            *) echo ".git/hooks" ;;
+        esac
+        ;;
+esac
+""",
+    )
+    return tmp_path
+
+
+def test_nested_repo_gets_a_copy_of_the_shared_hook(nested, fakebin):
+    # A copy, not a shim: the shim resolves the repo root at run time, which
+    # inside a nested repository is that repository, where scripts/git-hooks/
+    # does not exist.
+    _install(nested, fakebin)
+    src = nested / "scripts" / "git-hooks" / "commit-msg"
+    dst = nested / "packages" / "one" / ".git" / "hooks" / "commit-msg"
+    assert fakebin.has_call(f"cp {src} {dst}")
+    assert fakebin.has_call(f"chmod +x {dst}")
+
+
+def test_submodule_hooks_path_is_used_as_given(nested, fakebin):
+    # A submodule's `.git` is a file pointing into .git/modules, so the answer is
+    # absolute. Prefixing it with the submodule directory would write inside the
+    # working tree, where git never looks, and the install would report success.
+    _install(nested, fakebin)
+    dst = nested / ".git" / "modules" / "docs" / "vendored-docs" / "hooks" / "commit-msg"
+    assert fakebin.has_call(f"cp {nested / 'scripts' / 'git-hooks' / 'commit-msg'} {dst}")
+    assert not fakebin.has_call("docs/vendored-docs/.git/hooks/commit-msg")
+
+
+def test_vendored_repo_is_skipped(nested, fakebin):
+    # Upstream's commits are not ours to gate, and the hook would refuse them.
+    result = _install(nested, fakebin)
+    assert "Skipped vendored repo: frontend/viewer/ohif" in result.stdout
+    assert not fakebin.has_call("frontend/viewer/ohif")
+
+
+def test_repos_under_node_modules_are_not_visited(nested, fakebin):
+    # A dependency shipping its own .git is not part of the tree we hold the
+    # convention over, and installing there would be undone by the next install.
+    _install(nested, fakebin)
+    assert not fakebin.has_call("node_modules/dep")
+
+
+def test_only_the_shared_hooks_reach_nested_repos(nested, fakebin):
+    # pre-commit gates on .review/findings/, which exists in the top repository
+    # alone, so copying it outward would be a gate over nothing.
+    _install(nested, fakebin)
+    dst = nested / "packages" / "one" / ".git" / "hooks" / "pre-commit"
+    assert not fakebin.has_call(f"cp {nested / 'scripts' / 'git-hooks' / 'pre-commit'} {dst}")
+
+
+def test_top_repo_still_gets_a_shim_not_a_copy(nested, fakebin):
+    # The nested branch must not capture the repository the script runs in; its
+    # hooks are shimmed so an edit to the tracked hook takes effect immediately.
+    _install(nested, fakebin)
+    hook = nested / ".git" / "hooks" / "commit-msg"
+    assert hook.is_file()
+    assert "scripts/git-hooks/commit-msg" in hook.read_text()
+    assert not fakebin.has_call(f"cp {nested / 'scripts' / 'git-hooks' / 'commit-msg'} {hook}")
+
+
+def test_nested_install_is_idempotent(nested, fakebin):
+    first = _install(nested, fakebin)
+    second = _install(nested, fakebin)
+    assert first.stdout == second.stdout

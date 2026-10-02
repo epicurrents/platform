@@ -254,7 +254,27 @@ A `commitlint` GitHub Action will enforce the format on PR titles before merge �
 
 ### Signing
 
-Commits should be signed (GPG or SSH key) for release-bound work.
+Two separate things, and a commit needs both.
+
+A **cryptographic signature**, from `commit.gpgsign` and a GPG or SSH key, which is what ties the commit to you.
+
+A **`Signed-off-by:` trailer**, which `git commit -s` adds and which a `commit-msg` hook refuses a commit without. Merge commits are exempt: git composes their message, and a merge attests to nothing its commits did not already carry. Bypass with `--no-verify` when knowingly mid-flight.
+
+The hook is [scripts/git-hooks/commit-msg](../scripts/git-hooks/commit-msg), and [scripts/install-dev-tools.sh](../scripts/install-dev-tools.sh) puts it in every repository of the tree. This repository gets a shim that execs the tracked file, so an edit takes effect at once. The nested repositories — the submodules, the viewer's workspace packages, the active project — get a copy instead, because the shim resolves the repository root at run time and inside a nested repository that resolves to the wrong one; a copy means an edit reaches them at the next run of the installer. Vendored third-party trees are excluded, since those commits are upstream's. Nothing under a hooks directory is tracked by git, so **re-run the installer after anything that clones a repository**, or the convention is simply not enforced there and nothing says so. `bootstrap.sh` handles the submodules and the project itself; the one to remember by hand is the builder's own `npm run setup` inside the viewer, which clones every workspace package at once.
+
+#### Releasing an npm package
+
+`npm version` runs a plain `git commit -m` with no `-s` and offers no switch for the trailer, so the hook refuses the commit, npm aborts, and the tag is never created — leaving the version bump staged. Give npm a commit message that carries the trailer itself, in `~/.npmrc`:
+
+```
+message = "%s\n\nSigned-off-by: Your Name <you@example.com>"
+sign-git-commit = true
+sign-git-tag = true
+```
+
+The double quotes are load-bearing. `npm config set message …` writes the value unquoted, and npm then treats `\n` as two literal characters, so the hook still refuses. Write the line by hand.
+
+The two `sign-git-*` keys make npm pass `-S` to the commit and `-s` to the tag, so a bump produces a signed commit and a signed annotated tag. The tag's annotation is the same message, trailer included. Running `npm version` inside a workspace member also rewrites the workspace root's lockfile, which is gitignored in the viewer and therefore inert.
 
 ### Working with an AI assistant
 

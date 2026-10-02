@@ -164,6 +164,13 @@ step_project_clone() {
     source="$(resolve_project_repo "$PROJECT_REPO")"
     printf 'Cloning project %s from %s\n' "$ACTIVE_PROJECT" "$source"
     git clone --depth 1 "$source" "projects/$ACTIVE_PROJECT"
+    # The dev-tooling step ran before this repository existed, and nothing under
+    # a hooks directory is tracked, so the clone arrives with no commit-msg hook:
+    # it would accept a commit carrying no sign-off and report nothing. The
+    # install is idempotent, so running it again here costs a file copy.
+    if [ -z "${SKIP_DEV_TOOLS_INSTALL:-}" ]; then
+        bash scripts/install-dev-tools.sh >/dev/null
+    fi
 }
 
 if [ -n "$ACTIVE_PROJECT" ] && [ ! -d "projects/$ACTIVE_PROJECT" ]; then

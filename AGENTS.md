@@ -148,6 +148,7 @@ Rules:
 - **Multi-scope commits drop the scope** rather than picking one (`chore: bump dependencies and rebuild lockfiles`). If a change genuinely spans many scopes, that's usually a signal to split it.
 - Body optional; when present, explains *why* not what, wraps at 72 chars, references the related ROADMAP / README / issue.
 - Enforcement is **at the PR-title level**, not per-commit — default merge is squash, so the PR title becomes `main`'s history.
+- **Every commit carries a `Signed-off-by:` trailer**, which `git commit -s` adds and a `commit-msg` hook refuses a commit without, in every repository of the tree. `npm version` cannot satisfy it unaided and needs npm's `message` config to carry the trailer. Both are documented in [docs/developing.md → Signing](docs/developing.md#signing).
 
 When the user asks for a commit-message suggestion, invoke the `/commit-message` skill — it inspects the staged diff and generates conforming suggestions.
 

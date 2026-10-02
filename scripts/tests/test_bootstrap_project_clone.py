@@ -147,3 +147,66 @@ class TestCloneStep:
         combined = result.stdout + result.stderr
         assert "EPICURRENTS_PROJECT_REPO" in combined
         assert "projects/thing" in combined
+
+
+class TestHooksReachTheClone:
+    """The clone happens after the dev-tooling step, so it needs its own install.
+
+    Nothing under a hooks directory is tracked, so a freshly cloned project has
+    no ``commit-msg`` hook and accepts a commit with no sign-off while reporting
+    nothing — the same silent non-gate the install script exists to prevent.
+    """
+
+    @staticmethod
+    def _run(tmp_path: Path, extra_env: dict[str, str] | None = None) -> list[str]:
+        """Run the shipped ``step_project_clone`` with git and the installer logged."""
+        source = SCRIPT.read_text()
+        start = source.index("step_project_clone() {")
+        end = source.index("\n}\n", start) + 3
+        fn = source[start:end]
+
+        log = tmp_path / "order.log"
+        bindir = tmp_path / "bin"
+        bindir.mkdir()
+        (bindir / "git").write_text(f'#!/bin/sh\necho "git $*" >> {log}\n')
+        (bindir / "git").chmod(0o755)
+        scripts_dir = tmp_path / "scripts"
+        scripts_dir.mkdir()
+        # The real installer would walk the host's repositories; this stands in for
+        # it so the test observes the invocation rather than its effects.
+        (scripts_dir / "install-dev-tools.sh").write_text(f'#!/bin/sh\necho "install-dev-tools" >> {log}\n')
+        (scripts_dir / "install-dev-tools.sh").chmod(0o755)
+
+        env = {
+            "PATH": f"{bindir}:/usr/bin:/bin",
+            "ACTIVE_PROJECT": "example",
+            "PROJECT_REPO": "example",
+            **(extra_env or {}),
+        }
+        subprocess.run(
+            ["bash", "-c", f"{fn}\nstep_project_clone"],
+            cwd=tmp_path,
+            env=env,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        return log.read_text().splitlines() if log.exists() else []
+
+    def test_installer_runs_after_the_clone(self, tmp_path: Path):
+        lines = self._run(tmp_path)
+        assert any(line.startswith("git clone") for line in lines), lines
+        assert "install-dev-tools" in lines, lines
+        # Order matters: installing before the clone is what already happened in
+        # the earlier step and is precisely what leaves the clone ungated.
+        assert lines.index("install-dev-tools") > next(
+            i for i, line in enumerate(lines) if line.startswith("git clone")
+        ), lines
+
+    def test_skip_flag_suppresses_the_install(self, tmp_path: Path):
+        # The test harness sets this so a suite run never touches a real hooks
+        # directory; the clone itself must still happen.
+        lines = self._run(tmp_path, {"SKIP_DEV_TOOLS_INSTALL": "1"})
+        assert any(line.startswith("git clone") for line in lines), lines
+        assert "install-dev-tools" not in lines, lines
+

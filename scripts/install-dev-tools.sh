@@ -53,6 +53,69 @@ SHIM
     done
 fi
 
+# ── Git hooks in the nested repositories ───────────────────────────────────
+#
+# The tree is a set of independent repositories — the submodules, the viewer's
+# workspace packages, the active project — and a commit in any of them needs the
+# same sign-off as one here. Only the hooks named below go out to them:
+# `pre-commit` gates on `.review/findings/`, which exists in this repository
+# alone, so installing it elsewhere would be a gate over nothing.
+#
+# They get a copy, not the shim above. The shim resolves `git rev-parse
+# --show-toplevel` at run time, and inside a nested repository that answers with
+# the nested repository, so it would look for a `scripts/git-hooks/` that is not
+# there. The cost of a copy is that an edit to the tracked hook reaches them only
+# at the next run of this script, which is the same contract as a fresh clone.
+#
+# The hooks directory is asked for rather than assumed: a submodule's `.git` is a
+# file pointing into `.git/modules/<path>`, so `<repo>/.git/hooks` does not exist
+# for one and writing there would silently install nothing.
+#
+# Vendored third-party trees are excluded. Their commits are upstream's, and a
+# hook refusing them enforces a convention we do not hold over that code.
+
+shared_hooks="commit-msg"
+excluded_repos="frontend/viewer/ohif plugins/dicom/ohif-viewer"
+
+if [ -d "$hooks_src" ]; then
+    git_entries="$(find "$repo_root" -name .git -not -path '*/node_modules/*' \
+        \( -type d -o -type f \) 2>/dev/null | sort || true)"
+    while IFS= read -r git_entry; do
+        [ -n "$git_entry" ] || continue
+        nested_root="$(dirname "$git_entry")"
+        [ "$nested_root" = "$repo_root" ] && continue
+        rel="${nested_root#"$repo_root"/}"
+
+        excluded=0
+        for ex in $excluded_repos; do
+            case "$rel" in
+                "$ex" | "$ex"/*) excluded=1 ;;
+            esac
+        done
+        if [ "$excluded" = 1 ]; then
+            echo "Skipped vendored repo: $rel"
+            continue
+        fi
+
+        nested_hooks="$(cd "$nested_root" && git rev-parse --git-path hooks 2>/dev/null)" || {
+            echo "WARNING: $rel is not a readable git repository — skipping." >&2
+            continue
+        }
+        case "$nested_hooks" in
+            /*) ;;
+            *) nested_hooks="$nested_root/$nested_hooks" ;;
+        esac
+        mkdir -p "$nested_hooks"
+
+        for name in $shared_hooks; do
+            [ -f "$hooks_src/$name" ] || continue
+            cp "$hooks_src/$name" "$nested_hooks/$name"
+            chmod +x "$nested_hooks/$name"
+            echo "Installed git hook: $rel/.git/hooks/$name (copy)"
+        done
+    done <<< "$git_entries"
+fi
+
 # ── AI-tool discovery symlinks ─────────────────────────────────────────────
 #
 # .review/ holds the tool-agnostic review-agent specs.  Individual AI
