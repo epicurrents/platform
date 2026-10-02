@@ -35,6 +35,7 @@ harness.
 
 from __future__ import annotations
 
+import json
 import os
 import shlex
 import shutil
@@ -47,20 +48,51 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 SCRIPTS_DIR = REPO_ROOT / "scripts"
 
-# Some fixture-builder modes (--demo / --dist / archive) bundle the compiled
-# frontend, so make-bootstrap-fixture.sh hard-requires frontend/dist. The
-# pytest-only CI `test` job never builds the frontend, so skip those tests there;
-# they still run locally and anywhere the frontend has been compiled.
-#
-# build-info.json is part of what "built" means here: the builder refuses a bundle
-# whose provenance it cannot establish, so a dist left over from before the build
-# started stamping itself is not a usable one. Skipping rather than failing keeps
-# that a prompt to rebuild instead of a red suite on a stale checkout; the refusal
-# itself is covered against a synthetic repo root in test_make_bootstrap_fixture.
+
+def _frontend_dist_blocker() -> str | None:
+    """Say why the packager cannot build a package from this checkout's frontend/dist, or ``None``.
+
+    Some fixture-builder modes (--demo / --dist / archive) bundle the compiled frontend, so
+    make-bootstrap-fixture.sh hard-requires frontend/dist and refuses a bundle whose provenance it
+    cannot establish or which names something the package does not carry. Each of those refusals is
+    a property of the developer's checkout rather than of the code under test, so the tests that
+    build a package skip on it: a prompt to rebuild reads as what it is, where a failure reads as a
+    broken packager. The refusals themselves are covered against a synthetic repository root in
+    test_make_bootstrap_fixture, where the stamp is written by the test.
+
+    The packages these tests build carry no project and no plugin, and a blank stamp — the base UI —
+    goes into any package, so that is what is required here. A test that wants a project-stamped
+    bundle needs a condition of its own.
+    """
+    dist = REPO_ROOT / "frontend" / "dist"
+    if not (dist / "index.html").exists():
+        return "frontend/dist not built — run 'npm run build' in frontend/"
+    stamp_file = dist / "build-info.json"
+    if not stamp_file.exists():
+        return "frontend/dist predates build-info.json — rebuild it with 'npm run build'"
+    # Anything the stamp cannot be read out of is refused the way a missing one is, and for the same
+    # reason the packager gives: an absent project reads as "the base UI", which is the spelling that
+    # goes into every package, so a file that cannot be parsed would otherwise pass as the one value
+    # it must not be assumed to hold.
+    try:
+        stamp = json.loads(stamp_file.read_text())
+        carried = [str(stamp["project"] or ""), *(str(plugin) for plugin in stamp.get("plugins") or [])]
+    except (AttributeError, KeyError, OSError, TypeError, ValueError):
+        return "frontend/dist/build-info.json is unreadable — rebuild with 'npm run build'"
+    named = [item for item in carried if item]
+    if named:
+        return (
+            f"frontend/dist was built for {', '.join(named)}, which the packages these tests build "
+            "do not carry — blank VITE_PROJECT / VITE_PLUGINS in frontend/.env and rebuild the SPA"
+        )
+    return None
+
+
+_FRONTEND_DIST_BLOCKER = _frontend_dist_blocker()
+
 requires_built_frontend = pytest.mark.skipif(
-    not (REPO_ROOT / "frontend" / "dist" / "index.html").exists()
-    or not (REPO_ROOT / "frontend" / "dist" / "build-info.json").exists(),
-    reason="frontend/dist not built (or built before build-info.json) — run 'npm run build'",
+    _FRONTEND_DIST_BLOCKER is not None,
+    reason=_FRONTEND_DIST_BLOCKER or "",
 )
 
 # The fixture builder copies with rsync, which the platform image deliberately

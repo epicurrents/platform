@@ -209,4 +209,3 @@ class TestHooksReachTheClone:
         lines = self._run(tmp_path, {"SKIP_DEV_TOOLS_INSTALL": "1"})
         assert any(line.startswith("git clone") for line in lines), lines
         assert "install-dev-tools" not in lines, lines
-

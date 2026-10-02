@@ -9,12 +9,17 @@ that consume them live in test_update.py.
 
 import base64
 import hashlib
+import itertools
 import json
 import os
+import shlex
+import shutil
 import subprocess
 import sys
 import tarfile
 from pathlib import Path
+
+import pytest
 
 from scripts.tests.conftest import REPO_ROOT, SCRIPTS_DIR, requires_built_frontend, requires_rsync
 
@@ -47,6 +52,39 @@ def _key(tmp_path):
 
 def _manifest(archive):
     return json.loads(archive.with_name(archive.name + ".manifest.json").read_text())
+
+
+@pytest.fixture
+def release_tags(tmp_path):
+    """Return a callable that makes the packager see exactly the release tags it is given.
+
+    Signing consults `git tag -l` and refuses a version that is not newer than the newest release,
+    so a test that signs otherwise asserts against whatever the checkout happens to be tagged with:
+    green until the release it was written after, red for everyone afterwards. Every signing test
+    therefore declares its own tag list, and the two that are about the guard declare the list that
+    drives it.
+
+    The returned callable installs a `git` ahead of PATH that answers a tag listing from the given
+    names and execs the real binary for everything else, so the rest of the build still has a working
+    one. Each call gets a directory of its own: two overlays handed out in one test would otherwise
+    both point at the same shim, and the second list would answer for both.
+    """
+    real_git = shutil.which("git")
+    assert real_git, "the packager reads release tags through git"
+    counter = itertools.count()
+
+    def tags(*names):
+        bindir = tmp_path / f"tagbin{next(counter)}"
+        bindir.mkdir()
+        git = bindir / "git"
+        listing = "; ".join(f"echo {shlex.quote(name)}" for name in names)
+        git.write_text(
+            f'#!/bin/sh\ncase "$*" in *"tag -l"*) {listing} ;; *) exec {shlex.quote(real_git)} "$@" ;; esac\n'
+        )
+        git.chmod(0o755)
+        return {"PATH": f"{bindir}:{os.environ['PATH']}"}
+
+    return tags
 
 
 class TestReleaseSignHelper:
@@ -137,15 +175,15 @@ class TestReleaseSignHelper:
 
 @requires_built_frontend
 class TestSignedPackage:
-    def _signed_demo(self, tmp_path):
+    def _signed_demo(self, tmp_path, release_tags):
         key = _key(tmp_path)
         dest = tmp_path / "demo"
-        result = _run(dest, "--demo", "--tarball", "--sign-key", str(key))
+        result = _run(dest, "--demo", "--tarball", "--sign-key", str(key), env=release_tags("v0.0.1"))
         assert result.returncode == 0, result.stderr
         return dest, tmp_path / "demo.tar.gz", key
 
-    def test_writes_manifest_signature_and_public_key(self, tmp_path):
-        dest, archive, key = self._signed_demo(tmp_path)
+    def test_writes_manifest_signature_and_public_key(self, tmp_path, release_tags):
+        dest, archive, key = self._signed_demo(tmp_path, release_tags)
         manifest = archive.with_name(archive.name + ".manifest.json")
         signature = archive.with_name(archive.name + ".manifest.sig")
         assert manifest.is_file() and signature.is_file()
@@ -155,8 +193,8 @@ class TestSignedPackage:
         with tarfile.open(archive) as tf:
             assert "demo/RELEASE_KEY.pub" in tf.getnames()
 
-    def test_manifest_binds_the_tarball_and_names_what_it_is(self, tmp_path):
-        _, archive, key = self._signed_demo(tmp_path)
+    def test_manifest_binds_the_tarball_and_names_what_it_is(self, tmp_path, release_tags):
+        _, archive, key = self._signed_demo(tmp_path, release_tags)
         manifest = _manifest(archive)
         assert manifest["sha256"] == hashlib.sha256(archive.read_bytes()).hexdigest()
         assert manifest["size"] == archive.stat().st_size
@@ -172,12 +210,21 @@ class TestSignedPackage:
         assert manifest["built_at"].endswith("Z")
         assert manifest["successor_key"] is None and manifest["successor_key_id"] is None
 
-    def test_a_successor_key_is_announced_in_the_manifest_and_shipped(self, tmp_path):
+    def test_a_successor_key_is_announced_in_the_manifest_and_shipped(self, tmp_path, release_tags):
         key = _key(tmp_path)
         _helper("keygen", str(tmp_path / "keys" / "next.key"))
         nxt = tmp_path / "keys" / "next.key.pub"
         dest = tmp_path / "demo"
-        result = _run(dest, "--demo", "--tarball", "--sign-key", str(key), "--successor-key", str(nxt))
+        result = _run(
+            dest,
+            "--demo",
+            "--tarball",
+            "--sign-key",
+            str(key),
+            "--successor-key",
+            str(nxt),
+            env=release_tags("v0.0.1"),
+        )
         assert result.returncode == 0, result.stderr
         archive = tmp_path / "demo.tar.gz"
         manifest = _manifest(archive)
@@ -199,18 +246,23 @@ class TestSignedPackage:
             assert "demo/RELEASE_KEY.next.pub" in tf.getnames()
         assert "successor key id" in result.stdout
 
-    def test_a_successor_needs_a_signing_key_and_must_be_another_key(self, tmp_path):
+    def test_a_successor_needs_a_signing_key_and_must_be_another_key(self, tmp_path, release_tags):
         key = _key(tmp_path)
         pub = key.with_name("release.key.pub")
+        old = release_tags("v0.0.1")
         result = _run(tmp_path / "demo", "--demo", "--tarball", "--successor-key", str(pub))
         assert result.returncode != 0 and "needs --sign-key" in result.stderr
-        result = _run(tmp_path / "demo", "--demo", "--tarball", "--sign-key", str(key), "--successor-key", str(pub))
+        result = _run(
+            tmp_path / "demo", "--demo", "--tarball", "--sign-key", str(key), "--successor-key", str(pub), env=old
+        )
         assert result.returncode != 0 and "a successor is a different key" in result.stderr
-        result = _run(tmp_path / "demo", "--demo", "--tarball", "--sign-key", str(key), "--successor-key", str(key))
+        result = _run(
+            tmp_path / "demo", "--demo", "--tarball", "--sign-key", str(key), "--successor-key", str(key), env=old
+        )
         assert result.returncode != 0 and "not an Ed25519 public key" in result.stderr
 
-    def test_filelist_names_every_regular_file_including_itself_sorted(self, tmp_path):
-        dest, archive, _ = self._signed_demo(tmp_path)
+    def test_filelist_names_every_regular_file_including_itself_sorted(self, tmp_path, release_tags):
+        dest, archive, _ = self._signed_demo(tmp_path, release_tags)
         listed = (dest / "FILELIST").read_text().splitlines()
         assert listed == sorted(listed, key=lambda s: s.encode())
         on_disk = sorted((str(p.relative_to(dest)) for p in dest.rglob("*") if p.is_file()), key=lambda s: s.encode())
@@ -243,45 +295,31 @@ class TestSignedPackage:
         result = _run(tmp_path / "demo", "--demo", "--tarball", "--sign-key", str(bad))
         assert result.returncode != 0 and "not a usable Ed25519" in result.stderr
 
-    def test_signing_refuses_a_version_that_is_not_newer_than_the_newest_tag(self, tmp_path):
-        # A git on PATH that reports a release tag at the current version.
-        bindir = tmp_path / "bin"
-        bindir.mkdir()
+    def test_signing_refuses_a_version_that_is_not_newer_than_the_newest_tag(self, tmp_path, release_tags):
         version = _helper("version").stdout.strip()
-        git = bindir / "git"
-        git.write_text(
-            f'#!/bin/sh\ncase "$*" in *"tag -l"*) echo v0.0.1; echo v{version} ;; *) exec /usr/bin/git "$@" ;; esac\n'
-        )
-        git.chmod(0o755)
         result = _run(
             tmp_path / "demo",
             "--demo",
             "--tarball",
             "--sign-key",
             str(_key(tmp_path)),
-            env={"PATH": f"{bindir}:{os.environ['PATH']}"},
+            env=release_tags("v0.0.1", f"v{version}"),
         )
         assert result.returncode != 0
         assert f"newest release tag is v{version}" in result.stderr
         assert not (tmp_path / "demo" / "docker-compose.yml").exists(), "refused before copying"
 
-    def test_a_pre_release_tag_does_not_poison_the_newest_tag(self, tmp_path):
-        # The platform's parser rejects v0.1.0-rc1; seeded as the newest tag it
-        # masked every later comparison and refused to sign anything.
-        bindir = tmp_path / "bin"
-        bindir.mkdir()
-        git = bindir / "git"
-        git.write_text(
-            '#!/bin/sh\ncase "$*" in *"tag -l"*) echo v0.1.0-rc1; echo v0.0.1 ;; *) exec /usr/bin/git "$@" ;; esac\n'
-        )
-        git.chmod(0o755)
+    def test_a_pre_release_tag_does_not_poison_the_newest_tag(self, tmp_path, release_tags):
+        # The platform's parser rejects v0.1.0-rc1, so a tag like it takes no part in the
+        # comparison. Seeded as the newest tag it would mask every later one and refuse to sign
+        # anything, which is why the newest tag here is one the parser reads.
         result = _run(
             tmp_path / "demo",
             "--demo",
             "--tarball",
             "--sign-key",
             str(_key(tmp_path)),
-            env={"PATH": f"{bindir}:{os.environ['PATH']}"},
+            env=release_tags("v0.1.0-rc1", "v0.0.1"),
         )
         assert result.returncode == 0, result.stderr
 
