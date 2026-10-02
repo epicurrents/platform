@@ -263,7 +263,9 @@ Reaching the checkout-free state needs `@epicurrents/interface`, `dicom-reader` 
 | `@epicurrents/core` | 1.0.3 | 2026-08-04 | 2026-09-09 |
 | `@epicurrents/eeg-module` | 0.1.1-8 | 2024-02-18 | 2026-09-09 |
 | `@epicurrents/edf-reader` | 0.2.0-0 | 2024-03-13 | 2026-09-09 |
-| `scoped-event-log` | 3.2.0 | 2026-06-07 | 2026-07-14 |
+| `scoped-event-log` | 3.2.2 | 2026-10-02 | 2026-10-02 |
+
+`scoped-event-log` is the first row to close, on 2026-10-02: 3.2.2 was published from the commit the checkout is on, so a consumer installing it from the registry and one building from source now get the same code. The other three still answer the same version string with source states weeks to years apart.
 
 So installing `@epicurrents/eeg-module@0.1.1-8` returns early-2024 code while the checkout at that same version is two and a half years newer. Publishing on a better cadence does not close that: a version string has to identify a source state before pinning one means anything, which makes a republish round the prerequisite rather than the three missing packages. Everything else the builder clones sits at `0.0.0` or `0.0.1` and has never been published at all.
 
