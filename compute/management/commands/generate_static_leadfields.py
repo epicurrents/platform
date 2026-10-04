@@ -20,9 +20,13 @@ content-hashed ``.bin`` blobs cache as ``immutable``).
 
 Filenames are **content-addressed** — a short hash of the arrays + identifying params
 — so a recomputation after an MNE upgrade or a parameter change produces a new
-filename the service worker re-fetches, rather than serving a stale cached copy. Each
-run also removes the previous hash for the same ``(montage, orient, grid)`` so stale
-files do not accumulate.
+filename the service worker re-fetches, rather than serving a stale cached copy.
+
+A run rewrites ``manifest.json`` from the entries it computed and then deletes every
+blob the manifest no longer names, which is what keeps superseded hashes from piling
+up. It also means the bundle holds one set at a time: two runs do not accumulate into
+a two-orientation bundle, and a client asking for a montage or an orientation the
+bundle no longer carries falls through to the API.
 
 Usage
 -----
@@ -41,9 +45,8 @@ from pathlib import Path
 from django.conf import settings
 from django.core.management.base import BaseCommand, CommandError
 
-#: Mid-density standard montages shipped by default, at fixed orientation and the
-#: default 7.5 mm grid — small enough to cache. Free orientation (×3 size) and
-#: high-density caps stay API-only / ad-hoc. Override by passing montage names.
+#: Mid-density standard montages shipped by default, at the default 7.5 mm grid.
+#: High-density caps stay API-only / ad-hoc. Override by passing montage names.
 DEFAULT_MONTAGES = ["standard_1020"]
 
 
@@ -58,7 +61,13 @@ class Command(BaseCommand):
             help=f"Montages to generate (default: {' '.join(DEFAULT_MONTAGES)}).",
         )
         parser.add_argument("--grid-resolution-mm", type=float, default=7.5, metavar="MM")
-        parser.add_argument("--n-orient", type=int, default=1, choices=[1, 3], metavar="N")
+        # Free orientation by default, at three times the bytes, because a bundle generated with
+        # no arguments has to be one the viewer can use and its source-localisation tool asks for
+        # three. A fixed field constrains every dipole to point radially outward from the sphere
+        # centre, so a tangential source cannot be represented and is absorbed as a displaced
+        # position instead. The distributed inverses read the three-component field as well, so one
+        # bundle serves every method.
+        parser.add_argument("--n-orient", type=int, default=3, choices=[1, 3], metavar="N")
         parser.add_argument("--sphere-radius-m", type=float, default=0.09, metavar="R")
         parser.add_argument(
             "--sphere-center-m",
@@ -147,11 +156,6 @@ class Command(BaseCommand):
             filename = f"{montage_name}_{orient_label}_{grid_res:g}mm.{content_hash}.bin"
             url = f"/vendor/leadfields/{filename}"
 
-            # Drop any prior hash for this (montage, orient, grid) so stale,
-            # never-served blobs don't pile up in the static dir.
-            for stale in out_dir.glob(f"{montage_name}_{orient_label}_{grid_res:g}mm.*.bin"):
-                if stale.name != filename:
-                    stale.unlink()
             (out_dir / filename).write_bytes(blob)
 
             entries.append(
@@ -173,6 +177,17 @@ class Command(BaseCommand):
 
         manifest = {"format_version": MANIFEST_FORMAT_VERSION, "entries": entries}
         (out_dir / "manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+
+        # Delete every blob the manifest no longer names. Matching on the name this run would have
+        # written is not enough, because the orientation and the grid are both part of a filename:
+        # a run at either setting changed leaves the previous blob on disk under a name nothing
+        # looks for and nothing deletes. The directory is deploy-generated and holds nothing anyone
+        # else put there, so a blob the manifest does not list is dead weight by definition.
+        kept = {entry["file"] for entry in entries}
+        for stale in sorted(out_dir.glob("*.bin")):
+            if stale.name not in kept:
+                stale.unlink()
+                self.stdout.write(f"  Removed unreferenced {stale.name}.")
         self.stdout.write(
             self.style.SUCCESS(
                 f"Wrote manifest.json ({len(entries)} entr{'y' if len(entries) == 1 else 'ies'}) → {out_dir}"
