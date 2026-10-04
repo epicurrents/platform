@@ -17,7 +17,7 @@ Pin format
 be added without reshaping the file::
 
     {
-        "repository": "epicurrents/app",
+        "repository": "epicurrents/builder",
         "artifacts": {
             "public": {
                 "tag": "full-v0.1.0",

@@ -44,7 +44,7 @@ def _pin(tmp_path: Path, archive: Path, *, sha256: str | None = None, target: st
     path.write_text(
         json.dumps(
             {
-                "repository": "epicurrents/app",
+                "repository": "epicurrents/builder",
                 "artifacts": {
                     "public": {
                         "tag": tag,
@@ -103,7 +103,7 @@ class TestInstall:
 
     def test_an_empty_pin_installs_nothing_and_succeeds(self, tmp_path, out_dir):
         pin = tmp_path / "viewer-pin.json"
-        pin.write_text(json.dumps({"repository": "epicurrents/app", "artifacts": {}}))
+        pin.write_text(json.dumps({"repository": "epicurrents/builder", "artifacts": {}}))
         _run(pin, out_dir)
         assert not (out_dir / STAMP_NAME).exists()
 
@@ -181,7 +181,7 @@ class TestCheck:
         # update.sh runs --check before deciding to fetch; an unpinned deployment builds the
         # edition from the checkout and must not be reported as broken.
         pin = tmp_path / "viewer-pin.json"
-        pin.write_text(json.dumps({"repository": "epicurrents/app", "artifacts": {}}))
+        pin.write_text(json.dumps({"repository": "epicurrents/builder", "artifacts": {}}))
         _run(pin, out_dir, "--check")
 
     def test_a_corrupt_stamp_reads_as_not_installed(self, tmp_path, out_dir):
@@ -242,9 +242,9 @@ class TestPinValidation:
         from epicurrents.management.commands.vendor_viewer import Command
 
         url = Command._url(
-            {"repository": "epicurrents/app"},
+            {"repository": "epicurrents/builder"},
             {"tag": "full-v1.0.0", "archive": "epicurrents-full-v1.0.0.tar.gz"},
         )
         assert url == (
-            "https://github.com/epicurrents/app/releases/download/full-v1.0.0/epicurrents-full-v1.0.0.tar.gz"
+            "https://github.com/epicurrents/builder/releases/download/full-v1.0.0/epicurrents-full-v1.0.0.tar.gz"
         )

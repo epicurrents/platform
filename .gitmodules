@@ -1,6 +1,6 @@
 [submodule "frontend/viewer"]
 	path = frontend/viewer
-	url = https://github.com/epicurrents/app
+	url = https://github.com/epicurrents/builder
 
 [submodule "docs/epicurrents"]
 	path = docs/epicurrents
