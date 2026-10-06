@@ -229,7 +229,7 @@ Always wrap user-facing text in `t(key, SCOPE, params?)`. The key string doubles
 
 ### Colour conventions
 
-The frontend supports light, dark, and system-auto colour modes (see `frontend/src/stores/theme.ts`). The active mode is applied by toggling `wa-dark` / `wa-light` on `document.documentElement`; WebAwesome's CSS custom properties adapt automatically.
+The frontend supports light, dark, and system-auto colour modes (see `frontend/src/stores/theme.ts`). The active mode is applied by toggling `wa-dark` / `wa-light` on `document.documentElement`; WebAwesome's CSS custom properties adapt automatically. The viewer is light only, so **any route that mounts it sets `meta.lightOnly: true`**, which holds the whole interface light while it is active; a project's `viewerPanel` is covered by the core `/viewer` route. See [frontend/README.md → Light theme on viewer routes](frontend/README.md#light-theme-on-viewer-routes).
 
 **Always use WA semantic colour tokens** — never hardcode hex values, `rgb()`, or `rgba()` in component styles or inline bindings. Hardcoded colours do not adapt to mode switches and will look broken in dark mode.
 

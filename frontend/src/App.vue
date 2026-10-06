@@ -85,7 +85,17 @@ const THEME_OPTIONS: { value: ThemeMode; icon: string; label: string }[] = [
 ]
 
 const themeIcon = computed(() =>
-    THEME_OPTIONS.find(o => o.value === themeStore.mode)?.icon ?? 'display'
+    themeStore.lightOnly
+        ? 'sun'
+        : THEME_OPTIONS.find(o => o.value === themeStore.mode)?.icon ?? 'display'
+)
+
+// While a viewer route holds the interface light, the picker is shown disabled rather than offering a choice that
+// would not apply until the user leaves the page.
+const themeTitle = computed(() =>
+    themeStore.lightOnly
+        ? t('The viewer has a light theme only; your choice applies again on other pages.', SCOPE)
+        : t('Color theme', SCOPE)
 )
 
 const baseNavLinks: ProjectNavLink[] = [
@@ -238,9 +248,10 @@ function handleUserMenu (event: Event) {
             <wa-dropdown>
                 <wa-button
                     appearance="plain"
+                    :disabled="themeStore.lightOnly"
                     slot="trigger"
                     size="s"
-                    title="Color theme"
+                    :title="themeTitle"
                 >
                     <wa-icon :name="themeIcon"></wa-icon>
                 </wa-button>

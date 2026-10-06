@@ -1,6 +1,7 @@
 import { createRouter, createWebHistory } from 'vue-router'
 import { t } from '#i18n'
 import { authGuard } from './guard'
+import { syncRouteTheme } from './theme'
 import { plugin } from '#projects/active'
 import { plugin as pluginsPlugin } from '#plugins/active'
 import AdminAccountsView from '#views/AdminAccountsView.vue'
@@ -85,6 +86,7 @@ export const router = createRouter({
             name: 'viewer',
             component: ViewerView,
             meta: {
+                lightOnly: true,
                 navSection: 'home',
                 requiresAuthUnlessToken: true,
                 title: 'Viewer',
@@ -265,3 +267,5 @@ router.afterEach((to) => {
     const key = (to.meta.title as string | undefined) ?? ''
     setPageTitle(key ? t(key, TITLE_SCOPE) : '')
 })
+
+router.afterEach(syncRouteTheme)

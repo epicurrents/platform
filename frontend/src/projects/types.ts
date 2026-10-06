@@ -66,6 +66,12 @@ export interface ViewerPlugin {
      *    `t(key, 'Router')`, so it can also be supplied as an i18n key.
      *  - `navSection: 'foo'` — matches the `section` field on a sibling
      *    `ProjectNavLink` to drive the active-nav highlight.
+     *  - `lightOnly: true` — on any route that mounts the viewer. The viewer has
+     *    a light theme only, so the interface around it (navigation bar,
+     *    drawers, dialogs, the project toggle tab) is held light while the
+     *    route is active, whatever theme the user chose. Set on a parent route,
+     *    it covers the children. A `viewerPanel` needs nothing: it renders on
+     *    the core viewer route, which sets the flag.
      */
     routes?: RouteRecordRaw[]
 

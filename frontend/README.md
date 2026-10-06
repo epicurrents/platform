@@ -159,6 +159,12 @@ The viewer itself installs a `beforeunload` handler for the document-level exits
 
 The other caller is `ViewerView` itself. The viewer allows one application per document and the container div is destroyed when the view unmounts, so a remount — a route change away and back — cannot re-attach the existing application and reloads the document instead. That reload is programmatic, hence the same waiver.
 
+## Light theme on viewer routes
+
+The viewer has a light theme only, so a route that mounts it sets `meta.lightOnly: true` and the interface around it — navigation bar, drawers, dialogs, the project toggle tab — stays light while the route is active. A dark interface against the light signal display is a hard contrast with nothing to gain. `syncRouteTheme` in [src/router/theme.ts](src/router/theme.ts) reads the flag from every matched record after each navigation, so a parent route covers its children, and sets `lightOnly` on the theme store, which applies `wa-light` regardless of the stored choice. The choice itself is untouched: the theme picker shows disabled on such a route, and the user's mode applies again on the next route without the flag.
+
+Core sets the flag on `/viewer`, which is also where a project's `viewerPanel` renders, so an overlay panel needs nothing of its own. A project route that mounts the viewer itself sets it on its route record.
+
 ## Viewer export targets
 
 The viewer's file menu offers "Send recording to" entries for a recording opened from a local file, one per export target the host registers with `registerSignalExportTarget`; a recording loaded from a URL is offered none, which core enforces. The viewer knows no platform endpoint, so each target's `submit` is platform code. [lib/exportTargets.ts](src/lib/exportTargets.ts) holds the templates:
@@ -180,7 +186,7 @@ A target reports its outcome as a message rather than throwing, and the gate's 4
 | `/datasets` | `DatasetsView` | Dataset list |
 | `/datasets/:id` | `DatasetView` | Dataset detail — items, access rights, and the submission pool section (author, superuser); on a release-gated dataset, the curator review on each recording row (approval count, approve or withdraw, veto with a reason from a closed list) for whoever the review endpoint answers, which includes write grantees |
 | `/upload` | `UploadView` | Recording upload |
-| `/viewer` | `ViewerView` | Embedded signal viewer |
+| `/viewer` | `ViewerView` | Embedded signal viewer; [held light](#light-theme-on-viewer-routes) |
 | `/annotations/export` | `AnnotationExportView` | Annotation export (staff) |
 | `/settings/viewer` | `ViewerConfigView` | Viewer settings (staff) |
 | `/admin/accounts` | `AdminAccountsView` | Account roster — search, paging, create (staff) |
@@ -296,6 +302,7 @@ function onPickerSelect(sel: PickerSelection) {
 | Store | File | State |
 |---|---|---|
 | `useAuthStore` | `auth.ts` | Authenticated user, login/logout |
+| `useThemeStore` | `theme.ts` | The user's colour mode, and the light-only override a viewer route sets |
 | `useRecordingsStore` | `recordings.ts` | Recording list, upload queue |
 | `useLibraryStore` | `library.ts` | Top-level collections and datasets lists |
 | `useMaintenanceStore` | `maintenance.ts` | The maintenance lock as a refusal, a status read or the lock probe last reported it, the probe poll and reload, and whether the maintenance feature is enabled on this deployment |
