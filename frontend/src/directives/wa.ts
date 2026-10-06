@@ -5,8 +5,8 @@
  *
  * The directive binds reactiveObject[key] to the element two-way: it reflects
  * changes to reactiveObject[key] onto the element and writes user input back to
- * it, handling WA-INPUT (including number types with locale-aware decimal
- * parsing), WA-TEXTAREA, WA-COMBOBOX, WA-SELECT (change event), WA-SWITCH, and
+ * it, handling WA-INPUT (a number type is written back as a number, NaN when
+ * cleared), WA-TEXTAREA, WA-COMBOBOX, WA-SELECT (change event), WA-SWITCH, and
  * WA-CHECKBOX (checked property).
  *
  * @package    epicurrents/platform
@@ -16,17 +16,19 @@
 
 import { watch, type Directive } from 'vue'
 
-const decimalSep = 1.1.toLocaleString().substring(1, 2)
-
 type WaBinding = [Record<string, unknown>, string]
 type ElEntry = { handler: EventListener; eventName: string; stop: () => void }
 const elMap = new WeakMap<HTMLInputElement, ElEntry>()
+
+// A number input's value is always the plain, '.'-decimal form whatever the user's locale, and the browser renders it
+// localised itself, so both directions convert without a locale. A cleared or incomplete field reads as NaN.
+const readNumber = (value: string) => value.trim() === '' ? NaN : Number(value)
 
 const setValue = (el: HTMLInputElement, value: unknown) => {
     if (el.tagName === 'WA-SWITCH' || el.tagName === 'WA-CHECKBOX') {
         el.checked = Boolean(value ?? false)
     } else if (el.tagName === 'WA-INPUT' && typeof value === 'number') {
-        el.value = value.toLocaleString()
+        el.value = Number.isFinite(value) ? String(value) : ''
     } else {
         el.value = (value ?? '') as string
     }
@@ -44,9 +46,7 @@ const waDirective: Directive<HTMLInputElement, WaBinding> = {
             const target = event.target as HTMLInputElement
             if (!target) return
             if (el.tagName === 'WA-INPUT' && el.type === 'number') {
-                obj[key] = target.value.includes(decimalSep)
-                    ? parseFloat(target.value)
-                    : parseInt(target.value)
+                obj[key] = readNumber(target.value)
             } else if (el.tagName === 'WA-SWITCH' || el.tagName === 'WA-CHECKBOX') {
                 obj[key] = target.checked
             } else {
