@@ -68,6 +68,9 @@ class Command(BaseCommand):
             for recording in recordings:
                 if (recording.file_extension or "").lower() not in (".edf", ".bdf"):
                     continue
+                if recording.storage == Recording.Storage.LINKED:
+                    # Nothing rewrites a linked file, so there is no drift to repair.
+                    continue
                 checked += 1
                 try:
                     result = refresh_signal_metadata(recording, dry_run=dry_run)

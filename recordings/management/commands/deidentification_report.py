@@ -16,6 +16,10 @@ without processing — a format with no parser — has no meta row and no pass t
 recording whose audit record disagrees with its meta row has been edited after ingest; the report
 prints both and leaves the conclusion to the reader.
 
+A linked recording (``import_recordings --link``) is a fourth kind: its file is the operator's, read in place
+and never written, so no pass applies and nothing can be behind. Its row says ``linked`` and repeats the
+operator's assertion of the source's de-identification that the import required.
+
 Each row also repeats ``Recording.public_source``, the DOI or URL of the published dataset the
 author says the data was taken from, so the reader can tell a recording acquired here from one
 whose original is already public (paragraph 26); the platform asserts nothing about the locator.
@@ -39,6 +43,7 @@ from django.utils import timezone
 
 from recordings.deidentification_record import (
     INGEST_OVERRIDE_SETTINGS,
+    LINKED_SOURCE_DEIDENTIFICATION,
     current_ingest_overrides,
     current_pass_versions,
     stored_deidentification_records,
@@ -65,6 +70,7 @@ def report_row(
     """Assemble one recording's entry of the report."""
     row: dict = {
         "hash": _hash_of(recording),
+        "storage": recording.storage,
         "public_source": recording.public_source or None,
         "deidentification_version": None,
         "channel_order_version": None,
@@ -73,6 +79,11 @@ def report_row(
         "behind": False,
     }
     if meta is None:
+        return row
+    if recording.storage == Recording.Storage.LINKED:
+        # No pass wrote the file, so there is no version to be behind; the file keeps its annotation text.
+        row["annotation_text_preserved"] = True
+        row["source_deidentification"] = LINKED_SOURCE_DEIDENTIFICATION
         return row
     stamped = meta.deidentification_version
     row["deidentification_version"] = stamped
@@ -163,8 +174,16 @@ class Command(BaseCommand):
         )
         unstamped = 0
         unprocessed = 0
+        linked = 0
         for row in report["recordings"]:
             source = row["public_source"] or "-"
+            if row.get("storage") == Recording.Storage.LINKED:
+                linked += 1
+                self.stdout.write(
+                    f"{row['hash']:32}  {'-':>4}  {'-':>5}  {'preserved':15}  {'linked, asserted by operator':60}  "
+                    f"{source}"
+                )
+                continue
             if row["deidentification_version"] is None:
                 unprocessed += 1
                 self.stdout.write(f"{row['hash']:32}  {'-':>4}  {'-':>5}  {'no pass applies':15}  {'-':60}  {source}")
@@ -182,6 +201,7 @@ class Command(BaseCommand):
         summary = (
             f"{len(report['recordings'])} recording(s); {report['behind_count']} behind the current pass; "
             f"{unstamped} processed before the record existed; {unprocessed} stored without a pass; "
+            f"{linked} linked in place; "
             f"{report['public_source_count']} from a published source."
         )
         if report["behind_count"]:

@@ -95,7 +95,7 @@ def _run(path):
         pk=1,
         input_version_id=signal_loader.SOURCE_VERSION_ID,
         recording_id=7,
-        recording=SimpleNamespace(file_path=str(path)),
+        recording=SimpleNamespace(file_path=str(path), storage="managed"),
     )
 
 

@@ -189,6 +189,11 @@ def refresh_signal_metadata(recording, *, dry_run: bool = False) -> MetadataRefr
     """
     from recordings.models import RecordingMeta, SignalInfo
 
+    if recording.storage == recording.Storage.LINKED:
+        # The rows describe the file as it was linked, with its channel block cleaned in the database only;
+        # re-deriving them from the file would put its uncleaned labels back. A linked file that has changed
+        # is refused by the serving paths instead (recordings.linked).
+        raise MetadataRefreshError("A linked recording's file is never rewritten, so its metadata is not refreshed.")
     extension = (recording.file_extension or "").lower()
     if extension not in EDF_EXTENSIONS:
         raise MetadataRefreshError(f"Only EDF and BDF recordings carry parseable signal metadata, not {extension!r}.")

@@ -11,6 +11,7 @@ Usage
         [--public-source DOI_OR_URL]
         [--reprocess]
         [--resume | --discard]
+        [--link --source-deidentified]
 
 ``source_path``
     Directory containing EDF/BDF files (and optional ``.json`` sidecars). A file the viewer exported as a
@@ -44,6 +45,19 @@ Usage
     Re-process files already marked ``DONE`` in the current (resumed) job.
     Skipped by default.
 
+``--link``
+    Register EDF/BDF files in place instead of copying them (``recordings.linked``).
+    The source must lie under one of ``RECORDINGS_LINKED_ROOTS`` and the owner must be
+    a superuser. The file is read and never written: no copy, no de-identification,
+    no channel reordering, no annotation stripping, no preservation copy. Files that
+    would need conversion, and viewer export containers, are refused. Requires
+    ``--source-deidentified``.
+
+``--source-deidentified``
+    The operator's assertion that the files to be linked are already de-identified.
+    Recorded in each linked recording's de-identification record, in place of the
+    pass the platform did not apply.
+
 ``--resume`` / ``--discard``
     Required when an ``IN_PROGRESS`` job already exists. ``--resume``
     continues from where the last run stopped; ``--discard`` marks the old
@@ -62,8 +76,8 @@ import hashlib
 import json
 import logging
 import os
+import secrets
 import shutil
-import uuid
 from collections import Counter
 from pathlib import Path
 
@@ -81,6 +95,11 @@ logger = logging.getLogger(__name__)
 # copy of that list drifts, and did: .csv had a working converter this command never reached,
 # while .e was collected here for a converter the platform does not ship.
 _EDF_EXTENSIONS = {".edf", ".bdf"}
+
+
+def _new_stored_name(suffix: str) -> str:
+    """A fresh ``Recording.stored_name``: 32 upper-case hex characters and the extension, as the upload path makes."""
+    return f"{secrets.token_hex(16).upper()}{suffix}"
 
 
 class Command(BaseCommand):
@@ -137,6 +156,19 @@ class Command(BaseCommand):
             ),
         )
         parser.add_argument(
+            "--link",
+            action="store_true",
+            help=(
+                "Register EDF/BDF files in place under RECORDINGS_LINKED_ROOTS instead of copying them. "
+                "The files are never written. Superuser owners only; requires --source-deidentified."
+            ),
+        )
+        parser.add_argument(
+            "--source-deidentified",
+            action="store_true",
+            help="Assert that the files to be linked are already de-identified. Required by --link.",
+        )
+        parser.add_argument(
             "--public-source",
             default="",
             metavar="DOI_OR_URL",
@@ -184,6 +216,11 @@ class Command(BaseCommand):
             public_source = normalise_public_source(options["public_source"])
         except ValueError as exc:
             raise CommandError(str(exc))
+        link = bool(options["link"])
+        if link:
+            self._check_link_preconditions(source_path, owner, options)
+        elif options["source_deidentified"]:
+            raise CommandError("--source-deidentified asserts something about files to be linked; it needs --link.")
 
         structure_map = {
             "recursive": ImportJob.Structure.RECURSIVE,
@@ -213,6 +250,10 @@ class Command(BaseCommand):
 
         if existing and options["resume"]:
             job = existing
+            if job.link != link:
+                # One job never holds both kinds of recording: a resumed job keeps the mode it was created in.
+                mode = "--link" if job.link else "without --link"
+                raise CommandError(f"Job {job.pk} was created {mode}; resume it the same way.")
             self.stdout.write(f"Resuming job {job.pk} (source={job.source_path!r}, pipeline={job.pipeline_label!r}).")
         else:
             job = ImportJob.objects.create(
@@ -220,10 +261,42 @@ class Command(BaseCommand):
                 source_path=str(source_path),
                 pipeline_label=options["pipeline"],
                 structure=structure,
+                link=link,
             )
-            self.stdout.write(f"Created import job {job.pk}.")
+            self.stdout.write(f"Created {'link' if link else 'import'} job {job.pk}.")
 
         self._run_job(job, source_path, pipeline, owner, options["reprocess"], public_source=public_source)
+
+    def _check_link_preconditions(self, source_path: Path, owner, options) -> None:
+        """Refuse a link run the platform cannot stand behind, before any job row is written.
+
+        Linking is a superuser-level act: the files are served as the operator supplied them, so the
+        owner must be someone already entitled to all of them, and the de-identification they rest on
+        is the operator's word, which is therefore required rather than assumed.
+        """
+        from recordings.linked import linked_roots
+
+        if not options["source_deidentified"]:
+            raise CommandError(
+                "--link serves files exactly as they are, with no de-identification pass. Pass "
+                "--source-deidentified to assert that they are already de-identified."
+            )
+        if not owner.is_superuser:
+            raise CommandError("--link registers files for a superuser only; the owner is not one.")
+        if options["preserve_annotations"]:
+            raise CommandError("--preserve-annotations has no meaning with --link: a linked file is never stripped.")
+        if not getattr(settings, "RECORDINGS_ALLOW_PRESERVE_ANNOTATIONS", True):
+            # A linked file keeps its annotation text, which this deployment forbids a stored file to do.
+            raise CommandError(
+                "--link is not permitted on this deployment: a linked file keeps its annotation text, "
+                "and RECORDINGS_ALLOW_PRESERVE_ANNOTATIONS is off."
+            )
+        roots = linked_roots()
+        if not roots:
+            raise CommandError("RECORDINGS_LINKED_ROOTS names no existing directory; nothing can be linked.")
+        if not any(source_path.is_relative_to(root) for root in roots):
+            listed = ", ".join(str(root) for root in roots)
+            raise CommandError(f"{source_path} is not under a linked root ({listed}).")
 
     # ------------------------------------------------------------------
     # Job execution
@@ -248,6 +321,7 @@ class Command(BaseCommand):
                 "structure": job.structure,
                 "owner_id": owner.pk,
                 "reprocess": bool(reprocess),
+                "link": job.link,
             },
         ):
             self._run_job_body(job, source_path, pipeline, owner, reprocess, public_source=public_source)
@@ -255,7 +329,7 @@ class Command(BaseCommand):
     def _run_job_body(self, job, source_path, pipeline, owner, reprocess: bool, *, public_source: str = "") -> None:
         from recordings.models import ImportJob, ImportJobFile
 
-        edf_files = self._collect_files(source_path, job.structure)
+        edf_files = self._collect_files(source_path, job.structure, link=job.link)
         self.stdout.write(f"Found {len(edf_files)} file(s) to import.")
 
         # Ensure an ImportJobFile row exists for every discovered file.
@@ -297,7 +371,8 @@ class Command(BaseCommand):
                 continue
 
             try:
-                recording = self._process_file(
+                process = self._link_file if job.link else self._process_file
+                recording = process(
                     abs_path, job, source_path, owner, pipeline, collection_map, public_source=public_source
                 )
                 job_file.status = ImportJobFile.Status.DONE
@@ -330,12 +405,13 @@ class Command(BaseCommand):
     # File discovery
     # ------------------------------------------------------------------
 
-    def _collect_files(self, source_path: Path, structure: str) -> list[Path]:
+    def _collect_files(self, source_path: Path, structure: str, *, link: bool = False) -> list[Path]:
         """Return the importable files under *source_path*, reporting what was passed over.
 
         Importable means EDF/BDF plus whatever the converter registry currently handles.
         Resolving that here rather than at import time is what lets a converter registered by
         a project or plugin be seen, since those settings are merged after this module loads.
+        A link run takes EDF/BDF only: a converted file is a new file, which cannot be in place.
         """
         from recordings.models import ImportJob
         from recordings.pipelines import converter_extensions
@@ -345,7 +421,7 @@ class Command(BaseCommand):
         # otherwise collect files that fail one by one.
         usable = converter_extensions(available_only=True)
         declared = converter_extensions()
-        handled = _EDF_EXTENSIONS | usable
+        handled = _EDF_EXTENSIONS if link else _EDF_EXTENSIONS | usable
         candidates = source_path.iterdir() if structure == ImportJob.Structure.FLAT else source_path.rglob("*")
 
         files = []
@@ -359,8 +435,16 @@ class Command(BaseCommand):
             elif suffix:
                 skipped[suffix] += 1
 
-        self._report_skipped(skipped, declared - usable)
+        if link:
+            self._report_skipped_for_link(skipped)
+        else:
+            self._report_skipped(skipped, declared - usable)
         return sorted(files)
+
+    def _report_skipped_for_link(self, skipped: Counter) -> None:
+        if skipped:
+            listed = ", ".join(f"{suffix} ({count})" for suffix, count in sorted(skipped.items()))
+            self.stdout.write(self.style.WARNING(f"  Skipped, only EDF/BDF can be linked in place: {listed}"))
 
     def _report_skipped(self, skipped: Counter, uninstalled: set[str]) -> None:
         """Name the extensions that were passed over, so an empty run is never unexplained.
@@ -446,23 +530,10 @@ class Command(BaseCommand):
         public_source: str = "",
     ):
         from django.conf import settings
-        from django.contrib.contenttypes.models import ContentType
 
-        from activity.audit import serialize_instance
-        from annotations.models import Annotation
-        from epicurrents.models import AccessRight
-        from epicurrents.system_user import get_system_user
-        from library.models import CollectionItem
-        from recordings.converters.sidecar import save_sidecar_events, sidecar_carries_events
         from recordings.metadata import stored_hash_of
-        from recordings.models import ImportJob, Recording, stored_original_name
+        from recordings.models import stored_original_name
         from recordings.processors.edf import process_edf_file
-        from recordings.tasks import (
-            _annotation_hash,
-            _determine_modality,
-            _save_edf_results,
-            _write_final_recording_transition,
-        )
 
         # ── Compute source file hash ──────────────────────────────────────────
         hasher = hashlib.sha256()
@@ -513,7 +584,9 @@ class Command(BaseCommand):
             file_hash = edf_hasher.hexdigest()
 
         # ── Copy to permanent storage ─────────────────────────────────────────
-        stored_name = f"{uuid.uuid4().hex}{suffix}"
+        # Upper-case hex, as on the upload path: the API resolves a recording by matching the URL hash against
+        # this name case-sensitively, so a lower-case name is unreachable on Postgres.
+        stored_name = _new_stored_name(suffix)
         storage_root = Path(settings.RECORDINGS_UPLOAD_PATH)
         if not storage_root.is_absolute():
             storage_root = Path(settings.BASE_DIR) / storage_root
@@ -529,7 +602,7 @@ class Command(BaseCommand):
             shutil.rmtree(source_for_edf.parent, ignore_errors=True)
 
         # ── EDF processing ────────────────────────────────────────────────────
-        from recordings.container import detach_footer, footer_carries_events, save_viewer_sidecar
+        from recordings.container import detach_footer
 
         try:
             # A container exported by the viewer: the footer is detached first, as on the upload path.
@@ -544,25 +617,153 @@ class Command(BaseCommand):
         # The digest of the file as served, taken after process_edf_file's in-place rewrites.
         stored_hash = stored_hash_of(permanent_path)
 
-        # ── Persist to DB (atomic) ────────────────────────────────────────────
+        return self._persist_recording(
+            abs_path,
+            job,
+            owner,
+            collection_map,
+            result=result,
+            footer=footer,
+            sidecar_data=sidecar_data_from_converter,
+            public_source=public_source,
+            fields={
+                "original_name": stored_original_name(original_name_for_db, suffix),
+                "stored_name": stored_name,
+                "file_extension": suffix,
+                "file_size": permanent_path.stat().st_size,
+                "file_path": str(permanent_path),
+                "file_hash": file_hash,
+            },
+            stored_hash=stored_hash,
+        )
+
+    def _link_file(
+        self,
+        abs_path: Path,
+        job,
+        source_path: Path,
+        owner,
+        pipeline,
+        collection_map: dict,
+        *,
+        public_source: str = "",
+    ):
+        """Register *abs_path* in place as a linked recording, reading it and never writing it.
+
+        The file is stat'ed before and after it is read, and refused if either look differs: the rows
+        are written from what was read, and a file changing underneath would leave them describing
+        neither version. ``linked_at`` is taken after the second look, so the serving check, which
+        refuses a file modified after it, accepts exactly the bytes that were read.
+        """
+        from recordings.linked import LinkedSourceError, read_linked_edf, resolve_linked_source
+        from recordings.models import Recording, stored_original_name
+
+        resolved = resolve_linked_source(abs_path)
+        if str(resolved) in self._already_linked():
+            raise LinkedSourceError(f"{resolved} is already linked.")
+        before = resolved.stat()
+        data = resolved.read_bytes()
+        # The bytes are served unaltered, so the digest of the source is also the digest of the stored file.
+        digest = hashlib.sha256(data).hexdigest()
+        result = read_linked_edf(resolved, data)
+        del data
+        after = resolved.stat()
+        if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
+            raise LinkedSourceError(f"{resolved} changed while it was being read.")
+        linked_at = timezone.now()
+        if after.st_mtime > linked_at.timestamp():
+            # Served only while not modified after linked_at, so a file dated in the future would be refused
+            # on every read; refusing it here says why while the operator is watching.
+            raise LinkedSourceError(f"{resolved} has a modification time in the future; it would never be served.")
+
+        suffix = resolved.suffix.lower()
+        recording = self._persist_recording(
+            abs_path,
+            job,
+            owner,
+            collection_map,
+            result=result,
+            footer=None,
+            sidecar_data=None,
+            public_source=public_source,
+            fields={
+                "original_name": stored_original_name(resolved.name, suffix),
+                "stored_name": _new_stored_name(suffix),
+                "file_extension": suffix,
+                "file_size": after.st_size,
+                "file_path": str(resolved),
+                "file_hash": digest,
+                "storage": Recording.Storage.LINKED,
+                "linked_at": linked_at,
+            },
+            stored_hash=digest,
+        )
+        self._already_linked().add(str(resolved))
+        return recording
+
+    def _already_linked(self) -> set[str]:
+        """The paths of the active linked recordings, read once per run and kept current as the run links more.
+
+        One query rather than one per file: an archive large enough to need linking would otherwise scan the
+        recordings table once for every file in it.
+        """
+        from recordings.models import Recording
+
+        if getattr(self, "_linked_paths", None) is None:
+            self._linked_paths = set(
+                Recording.objects.filter(storage=Recording.Storage.LINKED, deleted_at__isnull=True).values_list(
+                    "file_path", flat=True
+                )
+            )
+        return self._linked_paths
+
+    def _persist_recording(
+        self,
+        abs_path: Path,
+        job,
+        owner,
+        collection_map: dict,
+        *,
+        result,
+        footer,
+        sidecar_data,
+        public_source: str,
+        fields: dict,
+        stored_hash: str,
+    ):
+        """Write the rows for one processed file, atomically: the recording, its metadata and annotations, the
+        owner's access right, the preservation copy of a managed file, the sidecar and the collection membership.
+        """
+        from django.contrib.contenttypes.models import ContentType
+
+        from activity.audit import serialize_instance
+        from annotations.models import Annotation
+        from epicurrents.models import AccessRight
+        from epicurrents.system_user import get_system_user
+        from library.models import CollectionItem
+        from recordings.container import footer_carries_events, save_viewer_sidecar
+        from recordings.converters.sidecar import save_sidecar_events, sidecar_carries_events
+        from recordings.models import ImportJob, Recording
+        from recordings.tasks import (
+            _annotation_hash,
+            _determine_modality,
+            _save_edf_results,
+            _write_final_recording_transition,
+        )
+
+        file_hash = fields["file_hash"]
         with transaction.atomic():
             recording = Recording.objects.create(
                 author=owner,
-                original_name=stored_original_name(original_name_for_db, suffix),
                 public_source=public_source,
-                stored_name=stored_name,
-                file_extension=suffix,
-                file_size=permanent_path.stat().st_size,
-                file_path=str(permanent_path),
-                file_hash=file_hash,
                 status=Recording.Status.PROCESSING,
+                **fields,
             )
 
             _save_edf_results(
                 recording,
                 result,
-                events_from_sidecar=sidecar_carries_events(sidecar_data_from_converter)
-                or footer_carries_events(footer),
+                events_from_sidecar=sidecar_carries_events(sidecar_data) or footer_carries_events(footer),
             )
             if footer is not None:
                 try:
@@ -571,9 +772,9 @@ class Command(BaseCommand):
                     # Source path logged deliberately; see the failure log in handle().
                     logger.warning("import_recordings: footer rows of %s not saved: %s", abs_path, exc)
 
-            if sidecar_data_from_converter is not None:
+            if sidecar_data is not None:
                 try:
-                    save_sidecar_events(recording, sidecar_data_from_converter)
+                    save_sidecar_events(recording, sidecar_data)
                 except Exception as exc:
                     # Source path logged deliberately; see the failure log in handle().
                     logger.warning(
@@ -584,7 +785,6 @@ class Command(BaseCommand):
 
             # Compute content_hash (mirrors process_recording task logic).
             modality = _determine_modality(result.signal_infos)
-            recording.file_path = str(permanent_path)
             recording.status = Recording.Status.READY
             recording.modality = modality
             payload = serialize_instance(recording)
@@ -626,14 +826,15 @@ class Command(BaseCommand):
             # extension; pass the actual source filename via
             # ``original_name_override`` so the preserved file is stored
             # under its true name and the manifest records the as-uploaded
-            # identity.
+            # identity. A linked file is not copied: it is the original,
+            # held by the operator, and duplicating it is what linking avoids.
             from recordings.preservation import (
                 REASON_ALL,
                 should_preserve_original,
                 write_original,
             )
 
-            if should_preserve_original():
+            if recording.storage == Recording.Storage.MANAGED and should_preserve_original():
                 write_original(
                     recording,
                     abs_path,

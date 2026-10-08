@@ -53,11 +53,21 @@ class RecordingsConfig(AppConfig):
         # Patient-side PHI must not persist in audit payloads: the uploaded
         # filename and the processing-error text (paths, traces) are masked
         # at write time. The live row keeps both for the author-only API
-        # surfaces; file_path stays unmasked because it derives from the
-        # random stored_name and rollback restore needs it.
+        # surfaces.
         from activity.audit import register_masked_fields
 
         register_masked_fields("recordings.recording", {"original_name", "processing_error"})
+        # A linked recording's file_path is the operator's own path to the
+        # source file, directory and filename included, which in a clinical
+        # archive is routinely named after the patient (recordings.linked).
+        # Registration is per field, so the path is kept out of every
+        # recording's trail; a managed path is a random stored_name the trail
+        # gains nothing from. Withheld rather than masked, because an unsalted
+        # digest of a guessable path is a confirmation oracle. Rollback skips
+        # withheld values, so a live row keeps its path; the one restore it
+        # cannot complete is of a hard-deleted row, whose managed file every
+        # deletion path has already unlinked.
+        register_masked_fields("recordings.recording", {"file_path"}, withhold=True)
         # The bulk-import rows carry the same class of data under different
         # names. `relative_path` is the source filename inside the import tree —
         # `original_name` before a Recording exists — and `source_path` is the

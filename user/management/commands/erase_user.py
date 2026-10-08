@@ -214,21 +214,33 @@ class Command(BaseCommand):
         the database pointing at them. A failed unlink aborts the command
         before any DB deletion — files already unlinked stay gone, and a
         re-run is safe because missing files are skipped.
+
+        A linked recording's file is not the subject's upload but the
+        operator's source data, registered in place; it is left where it is
+        and the recording goes with the rows (``recordings.linked``).
         """
-        paths = [r.file_path for r in user.recordings.all()]
-        paths += [m.file_path for m in user.media_files.all()]
-        for raw_path in paths:
+        from recordings.linked import unlink_recording_file
+
+        def _abort(raw_path, exc):
+            return CommandError(
+                f"Could not delete file {raw_path}: {exc}. Aborting before "
+                "any database rows are removed; re-run once the file is "
+                "removable."
+            )
+
+        for recording in user.recordings.all():
+            try:
+                unlink_recording_file(recording, missing_ok=True)
+            except OSError as exc:
+                raise _abort(recording.file_path, exc) from exc
+        for raw_path in [m.file_path for m in user.media_files.all()]:
             path = Path(raw_path)
             if not path.exists():
                 continue
             try:
                 path.unlink()
             except OSError as exc:
-                raise CommandError(
-                    f"Could not delete file {raw_path}: {exc}. Aborting before "
-                    "any database rows are removed; re-run once the file is "
-                    "removable."
-                ) from exc
+                raise _abort(raw_path, exc) from exc
 
     def _flush_sessions(self, user_id: int) -> int:
         """Delete every DB session belonging to the subject."""

@@ -174,3 +174,6 @@ id_ed25519*
 # final move is a same-filesystem rename; an interrupted run can leave one.
 requirements.lock.*
 projects/.spec-backend-only/
+
+# Default source of the read-only linked-recordings mount (recordings/README.md).
+/linked/

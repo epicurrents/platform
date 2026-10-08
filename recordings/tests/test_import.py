@@ -620,3 +620,22 @@ class TestImportJobSingleInProgressConstraint:
         ImportJob.objects.create(owner=user, source_path="/b", status=ImportJob.Status.ABORTED)
         job = ImportJob.objects.create(owner=user, source_path="/c", status=ImportJob.Status.IN_PROGRESS)
         assert job.pk is not None
+
+
+@pytest.mark.django_db
+class TestStoredNameForm:
+    """The API resolves a recording by matching the URL hash against ``stored_name`` case-sensitively.
+
+    SQLite's LIKE ignores case, so a lookup test cannot catch a lower-case name here; Postgres does not, and such a
+    recording answers 404 on every by-hash route. The form is therefore pinned directly.
+    """
+
+    def test_an_imported_recording_is_named_as_an_upload_is(self, user, tmp_path):
+        import re
+
+        src = tmp_path / "src"
+        src.mkdir()
+        _write_edf(src / "rec.edf")
+        with override_settings(RECORDINGS_UPLOAD_PATH=str(tmp_path / "uploads")):
+            _call_import(src, user.username, structure="flat")
+        assert re.fullmatch(r"[0-9A-F]{32}\.edf", Recording.objects.get(author=user).stored_name)

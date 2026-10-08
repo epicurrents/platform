@@ -659,7 +659,7 @@ class TestPooledIngestTrail:
         return ObjectChangeLog.objects.filter(content_type__app_label="recordings", content_type__model=model)
 
     def test_no_file_or_ledger_row_carries_a_value_of_a_recording(self, run):
-        from activity.audit import _mask_value
+        from activity.audit import WITHHELD_SENTINEL, _mask_value
 
         recording_side = set()
         for change in self._rows("recording"):
@@ -671,7 +671,9 @@ class TestPooledIngestTrail:
         for change in self._rows("submissionfile") | self._rows("submissionledger"):
             ledger_side |= _trail_strings(change.before_state) | _trail_strings(change.changes or {})
         assert ledger_side
-        assert not recording_side & ledger_side
+        # The withheld sentinel is one constant written in place of every withheld value on every model, so it
+        # appearing on both sides joins nothing.
+        assert not (recording_side & ledger_side) - {WITHHELD_SENTINEL}
 
     def test_the_joining_file_fields_are_withheld_not_masked(self, run):
         from activity.audit import WITHHELD_SENTINEL

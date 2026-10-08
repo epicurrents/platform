@@ -26,10 +26,13 @@ env/
 
 # Deployment state. Snapshots hold a database dump and a copy of .env; the
 # spool holds uploaded packages and job logs; the installed file list is the
-# previous release's. None of it is code, and COPY . . would bake every byte of
-# it into the image — the dumps into an artifact that outlives every erasure.
+# previous release's; linked/ is the default source of the linked-recordings
+# mount and may hold recordings. None of it is code, and COPY . . would bake
+# every byte of it into the image — the dumps into an artifact that outlives
+# every erasure.
 backups/
 update/
+linked/
 .epicurrents-files
 
 # Logs

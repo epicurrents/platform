@@ -145,6 +145,9 @@ def _save_edf_results(recording, result, *, events_from_sidecar: bool = False) -
 
     channel_layout, unresolved_count = assess_channel_layout(signal_infos)
     duration = header.data_record_count * header.data_record_duration
+    # Neither pass wrote a linked file, so neither version is stamped on it: the record of a linked
+    # recording is its storage kind, which ``recordings.deidentification_record`` reports in their place.
+    linked = recording.storage == recording.Storage.LINKED
     meta = RecordingMeta.objects.create(
         content_type=recording_ct,
         object_id=str(recording.pk),
@@ -157,10 +160,10 @@ def _save_edf_results(recording, result, *, events_from_sidecar: bool = False) -
         recording_date=None,  # always null: date stripped during de-identification
         channel_layout=channel_layout,
         unresolved_channel_count=unresolved_count,
-        channel_order_version=CHANNEL_ORDER_VERSION,
+        channel_order_version=0 if linked else CHANNEL_ORDER_VERSION,
         # The process record: which pass wrote the file and whether the text
         # survived, from the result rather than from any caller-side flag.
-        deidentification_version=DEIDENTIFICATION_VERSION,
+        deidentification_version=0 if linked else DEIDENTIFICATION_VERSION,
         annotation_text_preserved=result.annotation_text_preserved,
     )
 
@@ -795,6 +798,7 @@ def _purge_deleted_recordings_body(*, cutoff, retention_days):
     ``pre_delete`` so each removal lands in ``ObjectChangeLog`` under
     the surrounding ``recordings.purge`` ``Activity`` row.
     """
+    from recordings.linked import unlink_recording_file
     from recordings.models import Recording
 
     # Normal trash: soft-deleted READY and FAILED recordings past the
@@ -812,10 +816,9 @@ def _purge_deleted_recordings_body(*, cutoff, retention_days):
     errors = 0
 
     for recording in queryset.iterator():
-        file_path = Path(recording.file_path)
         try:
-            if file_path.exists():
-                file_path.unlink()
+            # A linked recording's file is the operator's: the helper leaves it, and purging removes the rows.
+            unlink_recording_file(recording, missing_ok=True)
         except OSError as exc:
             logger.error(
                 "Could not delete file %s for recording %d: %s — skipping row.",
@@ -842,7 +845,7 @@ def _purge_deleted_recordings_body(*, cutoff, retention_days):
         file_existed_at_check = file_path.exists()
         if file_existed_at_check:
             try:
-                file_path.unlink()
+                unlink_recording_file(recording)
             except OSError as exc:
                 # File present but unlink failed (permission, I/O error).
                 # Preserve the DB row so a future run can retry; deleting

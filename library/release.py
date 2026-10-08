@@ -764,9 +764,8 @@ def veto_member(item: DatasetItem) -> str:
     Must be called inside an audited scope and a transaction, so each deletion is recorded. Only
     recording members are vetoed; another member type raises ``ValueError``.
     """
-    from pathlib import Path
-
     from library.pools import is_pool
+    from recordings.linked import unlink_recording_file
     from recordings.models import Recording
 
     if item.content_type_id != ContentType.objects.get_for_model(Recording, for_concrete_model=False).pk:
@@ -776,7 +775,7 @@ def veto_member(item: DatasetItem) -> str:
         item.delete()
         return "membership"
     if recording.file_path:
-        Path(recording.file_path).unlink(missing_ok=True)
+        unlink_recording_file(recording, missing_ok=True)
     recording.delete()
     return "recording"
 

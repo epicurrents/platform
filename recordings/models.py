@@ -84,6 +84,23 @@ class Recording(models.Model):
     # Empty for a recording that never reached READY.
     stored_hash = models.CharField(max_length=64, blank=True, default="")
 
+    class Storage(models.TextChoices):
+        MANAGED = "managed", "Managed"
+        LINKED = "linked", "Linked"
+
+    # Where the file lives. A managed file is the platform's own copy under
+    # ``RECORDINGS_UPLOAD_PATH``, written by the ingest pass. A linked file is
+    # the operator's, registered in place under one of ``RECORDINGS_LINKED_ROOTS``
+    # by ``import_recordings --link``: never written, renamed or unlinked by the
+    # platform, and de-identified by whoever produced it rather than by the
+    # ingest pass. ``recordings.linked`` holds the rules.
+    storage = models.CharField(max_length=16, choices=Storage.choices, default=Storage.MANAGED)
+    # When a linked file was registered. A file modified after this, or no longer
+    # of ``file_size`` bytes, is refused to every reader: the rows describe the
+    # file as it was linked, and the bytes would no longer match them. Null for a
+    # managed file.
+    linked_at = models.DateTimeField(null=True, blank=True, default=None)
+
     class Status(models.TextChoices):
         PENDING = "pending", "Pending"
         PROCESSING = "processing", "Processing"
@@ -369,6 +386,9 @@ class ImportJob(models.Model):
         choices=Structure.choices,
         default=Structure.RECURSIVE,
     )
+    # Whether the job registers files in place (``--link``) rather than copying them. Fixed at
+    # creation: a resumed job keeps its mode, so one job never holds both kinds of recording.
+    link = models.BooleanField(default=False)
     status = models.CharField(
         max_length=16,
         choices=Status.choices,

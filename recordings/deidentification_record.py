@@ -13,6 +13,11 @@ and keep that documentation. The platform's record has three parts, and this mod
   audit row is tamper-evident, so the record cannot be edited after the fact, and the overrides
   are kept nowhere else once the deployment's settings change.
 
+A linked recording (``recordings.linked``) is the exception to all three: no pass wrote its file,
+which is the operator's and was de-identified by whoever produced it. Its versions are ``0``, its
+annotation text is kept, and its sealed record names it ``linked`` with the operator's assertion
+in place of a pass, so the report can say which of the two kinds of claim each recording rests on.
+
 ``manage.py deidentification_report`` presents the record per recording and flags every
 recording written by an older pass than the current one.
 """
@@ -29,6 +34,9 @@ from recordings.processors.channel_labels import CHANNEL_ORDER_VERSION
 from recordings.processors.edf import DEIDENTIFICATION_VERSION
 
 DEIDENTIFICATION_RECORD_KEY = "deidentification_record"
+
+#: What a linked recording's record says in place of a pass version.
+LINKED_SOURCE_DEIDENTIFICATION = "asserted by the operator at link; platform pass not applied"
 
 # The ingest privacy overrides, with their declared defaults. The record captures
 # every one of them whether or not it is on, because "the default was in force"
@@ -70,12 +78,17 @@ def build_deidentification_record(recording) -> dict | None:
     meta = _meta_for(recording)
     if meta is None:
         return None
-    return {
+    record = {
         "deidentification_version": meta.deidentification_version,
         "annotation_text_preserved": meta.annotation_text_preserved,
         "channel_order_version": meta.channel_order_version,
         "ingest_overrides": current_ingest_overrides(),
     }
+    if recording.storage == recording.Storage.LINKED:
+        # The import refuses to link without the operator's assertion, so every linked record carries it.
+        record["storage"] = recording.Storage.LINKED.value
+        record["source_deidentification"] = LINKED_SOURCE_DEIDENTIFICATION
+    return record
 
 
 def _record_rows(recording_ct, **filters):

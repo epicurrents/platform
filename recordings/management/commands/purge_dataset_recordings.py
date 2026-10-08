@@ -46,6 +46,7 @@ from django.db import transaction
 from activity.models import Activity
 from activity.system_activity import with_system_activity
 from library.models import Dataset, DatasetItem
+from recordings.linked import unlink_recording_file
 from recordings.models import Recording, SubmissionFile
 
 STATUS_PURGED = "purged"
@@ -185,10 +186,10 @@ class Command(BaseCommand):
             return {"hash": digest, "status": STATUS_NOT_FOUND, "count": 0}
         purged = spooled_purged
         for recording in matches:
-            file_path = Path(recording.file_path) if recording.file_path else None
             try:
-                if file_path is not None and file_path.exists():
-                    file_path.unlink()
+                # A linked recording's file is the operator's and stays; withdrawing it removes the rows.
+                if recording.file_path:
+                    unlink_recording_file(recording, missing_ok=True)
             except OSError as exc:
                 # The row stays so the next run can retry: deleting it now would
                 # leave the file on disk with nothing remembering it.

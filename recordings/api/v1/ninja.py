@@ -467,13 +467,18 @@ def _release_month_of(recording, *, can_see_author_fields: bool, release_month_b
 
 
 def _stored_digest_withheld(recording, *, can_see_author_fields: bool, user, withheld_ids: set | None = None) -> bool:
-    """True when the caller receives no ``stored_hash`` for *recording*: a gated member they do not manage.
+    """True when the caller receives no ``stored_hash`` for *recording*: a gated member they do not manage, or a
+    linked recording.
 
-    The decision is ``library.release.stored_digest_withheld_ids``; authors and superusers always
-    receive the digest. *withheld_ids* is the batch answer a listing computes once.
+    The gated decision is ``library.release.stored_digest_withheld_ids``; authors and superusers always
+    receive the digest. *withheld_ids* is the batch answer a listing computes once. A linked file is never
+    rewritten, so its stored digest is the digest of the operator's source file, the link to the original that
+    ``file_hash`` is withheld everywhere for being.
     """
     if can_see_author_fields:
         return False
+    if recording.storage == Recording.Storage.LINKED:
+        return True
     if withheld_ids is not None:
         return str(recording.pk) in withheld_ids
     from library.release import stored_digest_withheld
@@ -557,6 +562,23 @@ def _with_listing_order(queryset):
         .annotate(sort_at=Coalesce(F("release_month"), F("created_at")))
         .order_by("-sort_at", Lower("display_name"), "stored_name")
     )
+
+
+def _servable_file(recording) -> Path:
+    """Return the recording's file, or raise the HttpError a byte-serving endpoint answers with instead.
+
+    404 when the file is missing. 409 when the recording is linked and its file is no longer the one that was
+    linked (``recordings.linked``): the rows the serving paths cut the bytes by describe the file as it was read.
+    """
+    from recordings.linked import linked_file_change
+
+    file_path = Path(recording.file_path)
+    if not file_path.exists() or not file_path.is_file():
+        raise HttpError(404, "Recording file not found on disk")
+    reason = linked_file_change(recording)
+    if reason is not None:
+        raise HttpError(409, f"Recording file cannot be served: {reason}.")
+    return file_path
 
 
 def _ensure_pinned_content(recording, expect_stored_hash: str | None, *, digest_withheld: bool) -> None:
@@ -2565,9 +2587,7 @@ def download_recording(
         ),
     )
 
-    file_path = Path(recording.file_path)
-    if not file_path.exists() or not file_path.is_file():
-        raise HttpError(404, "Recording file not found on disk")
+    file_path = _servable_file(recording)
 
     log_activity(
         verb="recordings.download",
@@ -2581,14 +2601,17 @@ def download_recording(
     # the capability is off, no proxy is in front, or the grant is
     # middleware-applied — in which case the bytes are computed and no file on
     # disk holds them. See epicurrents/offload.py.
-    offloaded = offload_file_response(
-        request,
-        file_path,
-        root=settings.RECORDINGS_UPLOAD_PATH,
-        namespace="recordings",
-        filename=download_filename,
-        apply_middleware=apply_middleware,
-    )
+    # A linked file lies outside the offload root by construction, so it is streamed here without asking.
+    offloaded = None
+    if recording.storage == Recording.Storage.MANAGED:
+        offloaded = offload_file_response(
+            request,
+            file_path,
+            root=settings.RECORDINGS_UPLOAD_PATH,
+            namespace="recordings",
+            filename=download_filename,
+            apply_middleware=apply_middleware,
+        )
     if offloaded is not None:
         return offloaded
     if apply_middleware:
@@ -2747,9 +2770,7 @@ def slice_recording(
         ),
     )
 
-    file_path = Path(recording.file_path)
-    if not file_path.exists() or not file_path.is_file():
-        raise HttpError(404, "Recording file not found on disk")
+    file_path = _servable_file(recording)
 
     dr = float(meta.data_record_duration)
     n_records = meta.data_record_count

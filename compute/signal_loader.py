@@ -68,6 +68,7 @@ import math
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from recordings.linked import ensure_linked_file_unchanged
 from recordings.pipeline.manifest import SOURCE_VERSION_ID
 from recordings.processors.channel_labels import classify_channel
 from recordings.processors.edf import (
@@ -300,6 +301,8 @@ def load_signal_window(run: AnalysisRun, segment: SegmentPlan) -> SignalWindow:
     path = Path(run.recording.file_path)
     if not path.is_file():
         raise FileNotFoundError(f"Source signal for recording {run.recording_id} not found at {path}.")
+    # A linked file read after it changed would be scored against rows describing other bytes.
+    ensure_linked_file_unchanged(run.recording)
 
     header, all_infos = read_header(path)
     infos = [info for info in all_infos if not info.is_annotation_channel]

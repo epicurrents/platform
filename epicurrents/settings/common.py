@@ -258,6 +258,11 @@ RECORDINGS_STAGING_PATH = config("RECORDINGS_STAGING_PATH", default=str(BASE_DIR
 #   python manage.py import_recordings "$RECORDINGS_IMPORT_PATH" --username <owner>
 RECORDINGS_IMPORT_PATH = config("RECORDINGS_IMPORT_PATH", default=str(BASE_DIR / "recordings_import"))
 RECORDINGS_TRASH_RETENTION_DAYS = config("RECORDINGS_TRASH_RETENTION_DAYS", default=30, cast=int)
+# Directories ``import_recordings --link`` may register recordings from in place, as paths inside
+# the containers, comma-separated. Mount each read-only into every service that reads recording
+# files (web, celery). The platform never writes, renames or unlinks a file under these roots,
+# and serves one only while it is unchanged since it was linked. See recordings/README.md.
+RECORDINGS_LINKED_ROOTS = config("RECORDINGS_LINKED_ROOTS", default="", cast=Csv())
 # Tiered preservation of the as-uploaded file.  Three modes:
 #   "none"   — never write the original anywhere (current behaviour).
 #   "failed" — copy to the originals volume when ingest fails.
