@@ -8,6 +8,21 @@ Entries are written for the person deciding whether to upgrade, so the ones that
 
 ## [Unreleased]
 
+### Added
+
+- **Recordings can be registered in place.** `import_recordings --link --source-deidentified` registers EDF/BDF files under `RECORDINGS_LINKED_ROOTS`, a read-only mount set by `RECORDINGS_LINKED_HOST_PATH`, without copying them: the platform reads a linked file and never writes, re-dates or removes it, and refuses it to every reader once its size differs or it was modified after it was linked. For a dataset too large to duplicate, on a deployment whose users are entitled to the source data. Migration `recordings.0003` adds `Recording.storage`, `Recording.linked_at` and `ImportJob.link`. [recordings/README.md → Linked recordings](recordings/README.md#linked-recordings).
+- **The account the containers run as is configurable.** `EPICURRENTS_UID` / `EPICURRENTS_GID` in `.env`, read by the compose files, the image build and [update.sh](scripts/update.sh); the distribution's start script and [the bootstrap](scripts/lib/bootstrap_steps.sh) record the account running them on the first run. A deployment whose `.env` names neither runs as 1000, as before. For a host where uid 1000 belongs to someone else.
+
+### Changed
+
+- **A distribution's prepare-host script no longer adopts an existing uid-1000 account.** It uses the account named by `--user` (`epicurrents`) if it exists and otherwise creates it, with uid 1000 when that is free. On a server uid 1000 is as likely to be a service's account as a person's, and the deployment's files would have become that service's.
+- **`file_path` is withheld from a recording's audit trail.** A linked recording's path is the operator's own and may be named after a patient; registration is per field, so every recording's is withheld.
+- A distribution or demo package carries an INSTALL-RHEL guide, which its README and start script already pointed to; [make-bootstrap-fixture.sh](scripts/make-bootstrap-fixture.sh) writes it.
+
+### Fixed
+
+- **Recordings brought in by `import_recordings` answer on Postgres.** They were named with lower-case hex while the API matches the URL hash case-sensitively against the upper-case names uploads get, so every by-hash route answered 404. SQLite's `LIKE` ignores case, which kept the test suite green. Recordings imported before the fix keep their lower-case names, and their files on disk are named after them, so they stay unreachable until a repair command renames both; see ROADMAP.
+
 ## [0.1.2] — 2026-09-29
 
 Includes the changes that builds numbered 0.1.1 carried; 0.1.1 was never released on its own.

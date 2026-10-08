@@ -267,6 +267,41 @@ class TestOwnershipPreflight:
         assert "not writable by uid 1000" not in result.stdout + result.stderr
 
 
+class TestDeploymentAccount:
+    """The account the preflight checks the tree against is EPICURRENTS_UID / EPICURRENTS_GID in .env.
+
+    ``stat`` is stubbed, so these run where GNU stat is absent too: the subject is which
+    uid the tree is compared with, not how ownership is read.
+    """
+
+    @staticmethod
+    def _stat(fakebin, uid, gid, mode):
+        fakebin.stub("stat", body=f'case "$2" in %a) echo {mode} ;; %u) echo {uid} ;; %g) echo {gid} ;; esac')
+
+    def test_the_tree_is_checked_against_the_account_in_env(self, fakebin, tmp_path):
+        _deploy(fakebin, tmp_path, EPICURRENTS_UID="1234", EPICURRENTS_GID="1235")
+        self._stat(fakebin, 1000, 1000, 755)
+        result = run_script("update.sh", fakebin, cwd=tmp_path)
+        assert result.returncode != 0
+        assert "not writable by uid 1234" in result.stderr
+        assert "chown -R 1234:1235" in result.stderr
+
+    def test_a_tree_owned_by_the_account_in_env_passes(self, fakebin, tmp_path):
+        _deploy(fakebin, tmp_path, EPICURRENTS_UID="1234", EPICURRENTS_GID="1235")
+        self._stat(fakebin, 1234, 1235, 755)
+        result = run_script("update.sh", fakebin, cwd=tmp_path, args=["--from", "repo", "--no-pull"])
+        assert result.returncode == 0, result.stderr
+        assert "not writable" not in result.stdout + result.stderr
+
+    def test_a_deployment_naming_no_account_is_checked_as_1000(self, fakebin, tmp_path):
+        _deploy(fakebin, tmp_path)
+        self._stat(fakebin, 0, 0, 755)
+        result = run_script("update.sh", fakebin, cwd=tmp_path)
+        assert result.returncode != 0
+        assert "not writable by uid 1000" in result.stderr
+        assert "chown -R 1000:1000" in result.stderr
+
+
 #: A podman stub shaped like DOCKER_PS_RUNNING, plus the `--version` string that
 #: identifies the runtime. Detection reads that name rather than trusting the command
 #: name, because podman-docker installs a `docker` that is this same binary.

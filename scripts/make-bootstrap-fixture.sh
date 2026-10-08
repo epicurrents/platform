@@ -71,7 +71,7 @@
 #                        added, but a posture worth choosing rather than
 #                        inheriting from having named a domain.
 #   --tarball            Also pack <dest> into <dest>.tar.gz, stamped as owned by
-#                        uid/gid 1000 — the uid every container runs as. Ownership
+#                        uid/gid 1000 — the default deployment account. Ownership
 #                        is why this exists rather than being left to the caller:
 #                        tar records the *builder's* uid, an update rsyncs it onto
 #                        the deployment as root, and the deployment account then
@@ -131,12 +131,12 @@ die()  { printf '\n\033[1;31mERROR:\033[0m %s\n' "$*" >&2; exit 1; }
 # (501 there), update.sh rsyncs it onto the deployment as root, and the account the
 # containers run as is locked out of files in its own tree.
 #
-# 1000 rather than 0, deliberately. update.sh runs as root on a typical host, so
-# root-owned members land as root-owned files and reproduce the same lockout with a
-# different uid. Every container in this stack runs as uid 1000 and prepare-host.sh
-# hands the tree to whoever holds it, so 1000 is the uid the tree has to belong to;
-# extraction by that account itself produces the same result, since tar cannot set
-# ownership unprivileged anyway.
+# 1000 rather than 0, deliberately: root-owned members land as root-owned files when
+# root extracts them, and reproduce the same lockout with a different uid. 1000 is
+# the default deployment account (EPICURRENTS_UID). A deployment running as another
+# account is unaffected either way: update.sh overlays a package with the ownership
+# of the tree it is applied to, and an account extracting the archive itself gets
+# its own ownership, since tar cannot set ownership unprivileged.
 #
 # The two tar flavours spell this differently. Read to EOF rather than piping into
 # `head` — under `set -o pipefail` an early close kills the producer and the whole
@@ -929,16 +929,16 @@ if [ "$CONTAINER_RUNTIME" = docker ]; then
     RUNTIME_FLOOR=25
     RUNTIME_LABEL="Docker Engine"
 else
-    # Rootful, deliberately. Every service declares `user: "1000:1000"` against a
-    # bind mount of this directory, and only a rootful runtime maps container uid
-    # 1000 to host uid 1000. Rootless Podman remaps it into the invoking user's
-    # subuid range, where the tree this package unpacked as uid 1000 is one the
+    # Rootful, deliberately. Every service runs as the deployment account's uid
+    # against a bind mount of this directory, and only a rootful runtime maps a
+    # container uid to the same host uid. Rootless Podman remaps it into the
+    # invoking user's subuid range, where the tree this account owns is one the
     # containers cannot write — the same failure as unpacking as root, arriving
     # from the opposite direction. So compose runs under sudo even though the
     # script itself must not.
     if ! command -v sudo >/dev/null 2>&1; then
         echo "Podman needs sudo here: the stack runs rootful, because only a rootful" >&2
-        echo "runtime maps the containers' uid 1000 to this directory's owner." >&2
+        echo "runtime maps the containers' uid to this directory's owner." >&2
         exit 1
     fi
 
@@ -1041,23 +1041,44 @@ if [ ! -d projects ]; then
     exit 1
 fi
 
-# web, celery, celery-beat and migrate all run as uid/gid 1000:1000 against a bind
-# mount of this directory, so it has to be writable by that uid regardless of who
-# launches the stack. Extracting a package as root produces a tree that is not,
-# and the deployment then comes up and fails on its first write — far from the
-# cause. Linux only: Docker Desktop maps ownership inside its own VM, where none
-# of this applies, and `getent` is the same Linux probe bootstrap.sh uses.
+# web, celery, celery-beat and migrate all run as the deployment account against a
+# bind mount of this directory, so it has to be writable by that account regardless
+# of who launches the stack. Extracting a package as root produces a tree that is
+# not, and the deployment then comes up and fails on its first write — far from
+# the cause. Linux only: Docker Desktop maps ownership inside its own VM, where
+# none of this applies, and `getent` is the same Linux probe bootstrap.sh uses.
+#
+# The deployment account is EPICURRENTS_UID / EPICURRENTS_GID in .env. A first run
+# has no .env, and takes the account running this script, which is recorded once
+# .env exists; every later run, and update.sh, reads it back. The ids are exported
+# so the compose calls below, the first image build included, use them before .env
+# can say so. Outside Linux nothing is exported and the default of 1000 stands.
+RECORD_DEPLOY_IDS=false
 if command -v getent >/dev/null 2>&1; then
+    env_id() {
+        [ -f .env ] || return 0
+        grep -E "^$1=[0-9]+[[:space:]]*$" .env | tail -1 | cut -d= -f2 | tr -d ' ' || true
+    }
+    DEPLOY_UID="$(env_id EPICURRENTS_UID)"
+    DEPLOY_GID="$(env_id EPICURRENTS_GID)"
+    if [ -z "$DEPLOY_UID" ] || [ -z "$DEPLOY_GID" ]; then
+        DEPLOY_UID="$(id -u)"
+        DEPLOY_GID="$(id -g)"
+        RECORD_DEPLOY_IDS=true
+    fi
+    export EPICURRENTS_UID="$DEPLOY_UID" EPICURRENTS_GID="$DEPLOY_GID"
+
     # Two different questions, and the ownership check below answers only the
-    # second. A tree already handed to uid 1000 is writable by uid 1000, so it
-    # passes that check no matter who invokes this — including root, who can write
-    # anywhere. The .env generated below belongs to the invoking user, so a root
+    # second. A tree already handed to the deployment account is writable by it, so
+    # it passes that check no matter who invokes this — including root, who can
+    # write anywhere. The .env generated below belongs to the invoking user, so a root
     # run leaves a root-owned .env inside a tree the deployment account and the
     # containers both need to write, and nothing fails until much later.
     if [ "$(id -u)" -eq 0 ]; then
-        echo "Do not run this as root. The deployment runs as uid 1000, and the .env" >&2
-        echo "this generates belongs to whoever invokes it — as root that is a file" >&2
-        echo "neither the account nor the containers can write." >&2
+        echo "Do not run this as root. The deployment runs as the account that owns" >&2
+        echo "this directory, and the .env this generates belongs to whoever invokes" >&2
+        echo "it — as root that is a file neither the account nor the containers can" >&2
+        echo "write." >&2
         if [ -f ./prepare-host.sh ]; then
             echo "If the host is not prepared yet, that is the script to run as root:" >&2
             echo "    sudo ./prepare-host.sh" >&2
@@ -1084,17 +1105,17 @@ if command -v getent >/dev/null 2>&1; then
         # or not stat reported a leading setuid digit.
         DIR_MODE="$(printf "%04d" "$DIR_MODE")"
         WRITABLE=false
-        if [ "$DIR_UID" = "1000" ] && [ "$(( ${DIR_MODE:1:1} & 2 ))" -ne 0 ]; then
+        if [ "$DIR_UID" = "$DEPLOY_UID" ] && [ "$(( ${DIR_MODE:1:1} & 2 ))" -ne 0 ]; then
             WRITABLE=true
         fi
-        if [ "$DIR_GID" = "1000" ] && [ "$(( ${DIR_MODE:2:1} & 2 ))" -ne 0 ]; then
+        if [ "$DIR_GID" = "$DEPLOY_GID" ] && [ "$(( ${DIR_MODE:2:1} & 2 ))" -ne 0 ]; then
             WRITABLE=true
         fi
         if [ "$(( ${DIR_MODE:3:1} & 2 ))" -ne 0 ]; then
             WRITABLE=true
         fi
         if [ "$WRITABLE" = false ]; then
-            echo "$(pwd) is not writable by uid 1000, which is the user every" >&2
+            echo "$(pwd) is not writable by uid ${DEPLOY_UID}, which is the user every" >&2
             echo "container runs as (owner ${DIR_UID}:${DIR_GID}, mode ${DIR_MODE})." >&2
             echo "The stack would start and then fail on its first write." >&2
             if [ -f ./prepare-host.sh ]; then
@@ -1104,9 +1125,9 @@ if command -v getent >/dev/null 2>&1; then
             else
                 echo "Fix the ownership and run this again:" >&2
             fi
-            echo "    sudo chown -R 1000:1000 $(pwd)" >&2
-            echo "Then run this script as the account holding uid 1000, so the .env" >&2
-            echo "it generates belongs to the same user." >&2
+            echo "    sudo chown -R ${DEPLOY_UID}:${DEPLOY_GID} $(pwd)" >&2
+            echo "Then run this script as the account holding uid ${DEPLOY_UID}, so the" >&2
+            echo ".env it generates belongs to the same user." >&2
             exit 1
         fi
     fi
@@ -1118,6 +1139,9 @@ fi
 # bind-mount source the runtime creates itself belongs to root, and the web
 # tier could then never write a request into it.
 mkdir -p update/packages update/jobs
+# The default source of the read-only linked-recordings mount, created for the
+# same reason: Podman refuses a bind source that does not exist.
+mkdir -p linked
 
 # Two modes, chosen by whether .env names a domain — the same rule bootstrap.sh
 # and update.sh use, so a deployment behaves identically however it was created.
@@ -1190,6 +1214,11 @@ if [ -n "$ACTIVE_PLUGINS" ]; then
     echo "==> Activating plugins: $ACTIVE_PLUGINS"
     grep -v '^EPICURRENTS_PLUGINS=' .env > .env.tmp && mv .env.tmp .env
     echo "EPICURRENTS_PLUGINS=$ACTIVE_PLUGINS" >> .env
+fi
+if [ "$RECORD_DEPLOY_IDS" = true ]; then
+    echo "==> Recording the deployment account: uid ${DEPLOY_UID}, gid ${DEPLOY_GID}"
+    grep -v -E '^EPICURRENTS_(UID|GID)=' .env > .env.tmp && mv .env.tmp .env
+    printf 'EPICURRENTS_UID=%s\nEPICURRENTS_GID=%s\n' "$DEPLOY_UID" "$DEPLOY_GID" >> .env
 fi
 
 if [ "$MODE" = production ]; then
@@ -1412,7 +1441,7 @@ START
 # root: Docker has to exist, and the files have to belong to the account the
 # containers run as. start.sh can do neither, because it must run AS that
 # unprivileged account — it writes .env as whoever invokes it, and every service
-# runs as uid 1000 against a bind mount of this directory. A root-run start.sh
+# runs as that account against a bind mount of this directory. A root-run start.sh
 # would produce exactly the tree its own preflight refuses.
 #
 # Idempotent: run it again after changing anything and it will report what is
@@ -1422,8 +1451,8 @@ START
 #   sudo ./prepare-host.sh [--user NAME] [--no-sudoers] [--with-updater]
 #
 #   --user NAME    Account to create and hand the deployment to. Default
-#                  "epicurrents". Ignored when uid 1000 is already taken — see
-#                  the account section below.
+#                  "epicurrents". An existing account of that name is used as
+#                  it is.
 #   --no-sudoers   Skip the passwordless-sudo drop-in for that account.
 #   --with-updater Install the remote-maintenance host agent as well
 #                  (updater/install-updater.sh), so later releases can be
@@ -1482,27 +1511,24 @@ install_docker_engine
 DOCKER_VERSION="$(require_docker_engine_version)"
 echo "    Docker Engine ${DOCKER_VERSION}"
 
-# The deployment account is whoever holds uid 1000, and the name is negotiable
-# where the uid is not: every service in the compose file runs as 1000:1000
-# against a bind mount of this directory, so a tree owned by any other uid is one
-# the containers cannot write. On an image that already has a uid-1000 account —
-# Ubuntu cloud images ship one — creating a second account would silently give it
-# 1001 and produce that exact tree, which is why an existing holder wins here
-# rather than the name passed in.
+# The deployment account is an account of its own, whatever uid it gets: the
+# containers run as the account that owns this directory, which start.sh records
+# in .env on its first run. uid 1000 is taken when free, since a deployment that
+# predates the setting runs as 1000, but an account already holding it is never
+# adopted — on a server it is as likely to be a service's account (a log
+# forwarder, say) as a person's, and the deployment's files would become that
+# service's to read and write.
 echo "==> Resolving the deployment account…"
-EXISTING_1000="$(getent passwd 1000 | cut -d: -f1 || true)"
-if [ -n "$EXISTING_1000" ]; then
-    if [ "$EXISTING_1000" != "$DEPLOY_USER" ]; then
-        echo "    uid 1000 already belongs to '${EXISTING_1000}'; using that account."
-        echo "    (The containers run as uid 1000, so the uid decides, not the name.)"
-    else
-        echo "    ${EXISTING_1000} already holds uid 1000."
-    fi
-    DEPLOY_USER="$EXISTING_1000"
+if getent passwd "$DEPLOY_USER" >/dev/null 2>&1; then
+    echo "    ${DEPLOY_USER} exists (uid $(id -u "$DEPLOY_USER")); using it."
+elif getent passwd 1000 >/dev/null 2>&1; then
+    echo "    uid 1000 belongs to '$(getent passwd 1000 | cut -d: -f1)'; creating ${DEPLOY_USER} with its own uid…"
+    adduser --disabled-password --gecos "" "$DEPLOY_USER"
 else
     echo "    Creating ${DEPLOY_USER} with uid 1000…"
     adduser --disabled-password --gecos "" --uid 1000 "$DEPLOY_USER"
 fi
+DEPLOY_UID="$(id -u "$DEPLOY_USER")"
 
 DEPLOY_HOME="$(getent passwd "$DEPLOY_USER" | cut -d: -f6)"
 
@@ -1527,7 +1553,7 @@ fi
 # fail on a given image — an earlier version put it last, and a missing
 # /etc/sudoers.d aborted the run with the tree still owned by root.
 echo "==> Handing the package to ${DEPLOY_USER}…"
-chown -R "${DEPLOY_USER}:${DEPLOY_USER}" .
+chown -R "${DEPLOY_USER}:" .
 echo "    $(pwd) is now owned by ${DEPLOY_USER}."
 
 # After the handover, so the spool directories the installer creates take the
@@ -1546,8 +1572,8 @@ echo "==> SSH access…"
 if [ -s "${DEPLOY_HOME}/.ssh/authorized_keys" ]; then
     echo "    ${DEPLOY_USER} already has authorized_keys."
 elif [ -s /root/.ssh/authorized_keys ]; then
-    install -d -m 700 -o "$DEPLOY_USER" -g "$DEPLOY_USER" "${DEPLOY_HOME}/.ssh"
-    install -m 600 -o "$DEPLOY_USER" -g "$DEPLOY_USER" \
+    install -d -m 700 -o "$DEPLOY_USER" -g "$(id -g "$DEPLOY_USER")" "${DEPLOY_HOME}/.ssh"
+    install -m 600 -o "$DEPLOY_USER" -g "$(id -g "$DEPLOY_USER")" \
         /root/.ssh/authorized_keys "${DEPLOY_HOME}/.ssh/authorized_keys"
     echo "    Copied root's authorized_keys to ${DEPLOY_USER}."
 else
@@ -1578,7 +1604,7 @@ echo " Host prepared"
 echo "================================================================"
 echo
 echo "  Docker:      ${DOCKER_VERSION}"
-echo "  Account:     ${DEPLOY_USER} (uid 1000, docker group)"
+echo "  Account:     ${DEPLOY_USER} (uid ${DEPLOY_UID}, docker group)"
 echo "  Deployment:  $(pwd)"
 echo
 echo "  Next, as ${DEPLOY_USER} rather than root — group membership applies"
@@ -1712,11 +1738,14 @@ each step.
   macOS/Windows, or Docker Engine 25+ / Podman 4+ on Linux. Nothing else: no
   Python, Node, or database to install. `start.sh` detects which runtime is
   present and drives it; on Podman it runs the stack rootful through `sudo`,
-  because only a rootful runtime maps the containers' uid 1000 to this
-  directory's owner. On RHEL and its rebuilds, see `INSTALL-RHEL.md`.
-- On Linux, **a normal user account, not root**. Every container runs as uid
-  1000 against this directory, so the deployment has to belong to the account
-  that runs it. A tree unpacked as root is one the containers cannot write.
+  because only a rootful runtime maps the containers' uid to this directory's
+  owner. On RHEL and its rebuilds, see `INSTALL-RHEL.md`.
+- On Linux, **a normal user account, not root**, which owns this directory.
+  Every container runs as that account: `start.sh` records its uid and gid in
+  `.env` (`EPICURRENTS_UID`, `EPICURRENTS_GID`) on the first run. Any uid will
+  do; use an account of its own rather than one a service already runs as, since
+  the containers' files become that account's. A tree unpacked as root is one
+  the containers cannot write.
 
 ## Prepare the host (fresh Linux server)
 
@@ -1727,8 +1756,8 @@ exists yet — run this once, as root:
 sudo ./prepare-host.sh
 ```
 
-It installs Docker Engine, creates the `epicurrents` account with uid 1000 and
-puts it in the docker group, copies root's SSH keys across so you can log in as
+It installs Docker Engine, creates the `epicurrents` account (uid 1000 when that
+is free, the next free uid otherwise) and puts it in the docker group, copies root's SSH keys across so you can log in as
 it, and hands this directory over. Then log in as that account rather than using
 `su`, because docker group membership applies only to a new session.
 
@@ -1880,6 +1909,117 @@ COMMONTAIL
         echo "  start from the main repository's getting-started guide."
     } > "$DEST/README.md"
     ok "README.md"
+
+    # The README and start.sh send a Red Hat recipient here, since prepare-host.sh is
+    # Debian/Ubuntu only. The docker-compose release and its checksums are read out of
+    # bootstrap-podman.sh, the checkout path's RHEL preparation, so the two never pin
+    # different binaries.
+    info "Writing INSTALL-RHEL.md"
+    DC_PIN_VERSION="$(sed -n 's/^ *DC_VERSION="\(v[0-9.]*\)".*/\1/p' "$REPO_ROOT/scripts/bootstrap-podman.sh")"
+    DC_PIN_X86="$(sed -n 's/^ *x86_64) *DC_SHA256="\([0-9a-f]\{64\}\)".*/\1/p' "$REPO_ROOT/scripts/bootstrap-podman.sh")"
+    DC_PIN_ARM="$(sed -n 's/^ *aarch64) *DC_SHA256="\([0-9a-f]\{64\}\)".*/\1/p' "$REPO_ROOT/scripts/bootstrap-podman.sh")"
+    [ -n "$DC_PIN_VERSION" ] && [ -n "$DC_PIN_X86" ] && [ -n "$DC_PIN_ARM" ] \
+        || die "Could not read the docker-compose pin from scripts/bootstrap-podman.sh for INSTALL-RHEL.md."
+    sed -e "s/@DC_VERSION@/${DC_PIN_VERSION}/g" -e "s/@DC_SHA_X86@/${DC_PIN_X86}/g" -e "s/@DC_SHA_ARM@/${DC_PIN_ARM}/g" \
+        > "$DEST/INSTALL-RHEL.md" <<'RHEL'
+# Installing on RHEL and its rebuilds
+
+`prepare-host.sh` is for Debian and Ubuntu. On RHEL 9 and its rebuilds (Alma, Rocky) the stack runs on rootful Podman, and the host is prepared by hand with the steps below. Run them in order, as a user with sudo. `start.sh` checks each of these itself and names the fix if one is missing.
+
+## 1. Podman, its DNS resolver and docker-compose
+
+The compose provider has to be Docker Inc.'s docker-compose v2: podman-compose silently ignores parts of the compose files, and `start.sh` refuses it. No RHEL package ships docker-compose v2, so it is downloaded and checked against a pinned checksum.
+
+```bash
+sudo dnf install -y podman aardvark-dns
+sudo dnf remove -y podman-compose
+curl -fsSL https://github.com/docker/compose/releases/download/@DC_VERSION@/docker-compose-linux-$(uname -m) -o /tmp/docker-compose
+```
+
+Check the download against the checksum for the machine's architecture, then install it. On x86_64:
+
+```bash
+echo "@DC_SHA_X86@  /tmp/docker-compose" | sha256sum -c -
+```
+
+On aarch64:
+
+```bash
+echo "@DC_SHA_ARM@  /tmp/docker-compose" | sha256sum -c -
+```
+
+Then:
+
+```bash
+sudo install -m 0755 /tmp/docker-compose /usr/local/bin/docker-compose
+sudo cp /usr/local/bin/docker-compose /usr/bin/docker-compose
+sudo systemctl enable --now podman.socket
+sudo -E podman compose version
+```
+
+The last command should name Docker Compose. The copy into `/usr/bin` is for a sudo whose `secure_path` leaves out `/usr/local/bin`.
+
+## 2. The deployment account
+
+Every container runs as the account that owns this directory, which `start.sh` records in `.env` (`EPICURRENTS_UID`, `EPICURRENTS_GID`) on its first run. Any uid will do. Use an account of its own rather than one a service already runs as, since the containers' files become that account's: on a server, uid 1000 is often taken by a service such as a log forwarder. The account needs sudo, because the stack runs through `sudo podman`.
+
+```bash
+sudo useradd -m epicurrents
+sudo usermod -aG wheel epicurrents
+sudo passwd epicurrents
+```
+
+## 3. Unpack as that account
+
+Log in as the account rather than switching to it from root, and unpack in its home directory. Unpacked by the account itself, the files are its own whatever the archive records.
+
+```bash
+tar -xzf epicurrents-*.tar.gz -C ~
+```
+
+## 4. SELinux
+
+With SELinux enforcing (`getenforce` says `Enforcing`), containers cannot read a home directory as it is labelled by default, and the start fails on `Permission denied` for `/code/manage.py`. Label the deployment for containers, with the account's home and the unpacked directory's name filled in:
+
+```bash
+sudo semanage fcontext -a -t container_file_t "/home/epicurrents/DIRECTORY(/.*)?"
+sudo restorecon -R /home/epicurrents/DIRECTORY
+```
+
+`semanage` comes with `policycoreutils-python-utils`. The rule is recorded, so a later relabel of the file system keeps it, and files the stack creates inherit the label.
+
+## 5. Start
+
+```bash
+cd ~/DIRECTORY
+./start.sh
+```
+
+The first run builds the image, records the account in `.env`, starts the stack and prints the URL and the admin login. Without `PROXY_DOMAIN` it listens on the server's loopback only; reach it through an SSH tunnel:
+
+```bash
+ssh -L 8000:127.0.0.1:8000 epicurrents@SERVER
+```
+
+## Linking an archive in place
+
+Recordings can be registered where they are rather than copied (`import_recordings --link`; see the platform's recordings documentation). The archive is mounted read-only at `/data/linked`, set in `.env`:
+
+```
+RECORDINGS_LINKED_HOST_PATH=/path/to/archive
+RECORDINGS_LINKED_ROOTS=/data/linked
+```
+
+Under SELinux the archive needs a label containers may read. On a local disk:
+
+```bash
+sudo semanage fcontext -a -t container_ro_file_t "/path/to/archive(/.*)?"
+sudo restorecon -R /path/to/archive
+```
+
+On NFS, allow containers to read NFS instead: `sudo setsebool -P virt_use_nfs 1`. Relabelling changes no modification time, so label before or after linking alike.
+RHEL
+    ok "INSTALL-RHEL.md"
 else
     info "Writing bootstrap-smoke.sh runner"
     {
@@ -2166,7 +2306,7 @@ if [ "$DEMO" = true ] || [ "$DIST" = true ]; then
         echo "  Both parts matter. COPYFILE_DISABLE and the metadata flags keep macOS"
         echo "  extended attributes out of the archive, where GNU tar would materialise"
         echo "  them as real files or warn about each one. The ownership flags stamp"
-        echo "  the tree as uid 1000, the account the containers run as, instead of"
+        echo "  the tree as uid 1000, the default deployment account, instead of"
         echo "  whoever happened to build it."
     fi
 else

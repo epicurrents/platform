@@ -71,7 +71,7 @@ The named volumes were never created with the right ownership. Run the helper:
 docker compose run --rm init-volumes
 ```
 
-This sets `1000:1000` ownership on the `recordings-data`, `staging-data`, `media-data`, `celery-data`, and `static` volumes (mounted at `/recordings`, `/staging`, `/media`, `/celery`, `/static`) so the unprivileged container user can write to them. Postgres manages the ownership of its own volume.
+This sets the deployment account's ownership (`EPICURRENTS_UID`:`EPICURRENTS_GID` from `.env`, `1000:1000` when unset) on the `recordings-data`, `staging-data`, `media-data`, `celery-data`, and `static` volumes (mounted at `/recordings`, `/staging`, `/media`, `/celery`, `/static`) so the unprivileged container user can write to them. Postgres manages the ownership of its own volume.
 
 ### Bootstrap stops with "Refusing to continue with values that would not survive the trip to the container"
 

@@ -217,6 +217,15 @@ step_envgen() {
         --entrypoint python \
         --user "$(id -u):$(id -g)" \
         web manage.py init_env
+    # The account running this bootstrap owns the checkout, so it is the one the
+    # containers run as: EPICURRENTS_UID / EPICURRENTS_GID, read by compose and by
+    # update.sh. Linux only, the same probe the distribution's start.sh uses;
+    # Docker Desktop maps ownership in its own VM and keeps the default of 1000.
+    if command -v getent >/dev/null 2>&1; then
+        grep -v -E '^EPICURRENTS_(UID|GID)=' .env > .env.tmp && mv .env.tmp .env
+        printf 'EPICURRENTS_UID=%s\nEPICURRENTS_GID=%s\n' "$(id -u)" "$(id -g)" >> .env
+        step_note "containers run as uid $(id -u), gid $(id -g)"
+    fi
     step_note ".env created at $(pwd)/.env"
 }
 
@@ -304,8 +313,8 @@ sync_frontend_project() {
 # The dev compose file, not the production overlay: production gives `vendor` a
 # single writable mount for the Pyodide tree and mounts viewer-dist read-only
 # everywhere, so the overlay's vendor service cannot write this. Running it
-# unprivileged through `.:/code` also keeps the output owned by 1000:1000, the
-# same as the frontend build that writes into the same directory.
+# unprivileged through `.:/code` also keeps the output owned by the deployment
+# account, the same as the frontend build that writes into the same directory.
 
 step_viewer() {
     $COMPOSE --profile vendor run --rm --no-deps -T vendor python manage.py vendor_viewer
@@ -426,6 +435,9 @@ fi
 # web tier could then never write a request into it. Not a step of its own —
 # there is nothing to report.
 mkdir -p update/packages update/jobs
+# The default source of the read-only linked-recordings mount, created for the same reason: Podman refuses a
+# bind source that does not exist, and Docker would create it as root.
+mkdir -p linked
 
 # ── 9. Start the stack ───────────────────────────────────────────────────────
 

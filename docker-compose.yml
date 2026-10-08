@@ -57,11 +57,15 @@
 # will run. Empty is the base platform and a supported build.
 x-build-args: &build-args
   EPICURRENTS_PROJECT: ${EPICURRENTS_PROJECT:-}
+  # The deployment account every service runs as (see `user:` below), so the
+  # image's appuser carries the same ids. 1000 when .env does not say.
+  APP_UID: ${EPICURRENTS_UID:-1000}
+  APP_GID: ${EPICURRENTS_GID:-1000}
 
 services:
   init-volumes:
     image: busybox:1.38.0
-    command: ["sh", "-c", "mkdir -p /media/uploads /media/staging && chown -R 1000:1000 /recordings /staging /media /celery /static"]
+    command: ["sh", "-c", "mkdir -p /media/uploads /media/staging && chown -R ${EPICURRENTS_UID:-1000}:${EPICURRENTS_GID:-1000} /recordings /staging /media /celery /static"]
     volumes:
       - recordings-data:/recordings
       - staging-data:/staging
@@ -147,7 +151,7 @@ services:
       args: *build-args
     # Unprivileged like celery/celery-beat; init-volumes pre-chowns the
     # static volume that collectstatic writes into.
-    user: "1000:1000"
+    user: "${EPICURRENTS_UID:-1000}:${EPICURRENTS_GID:-1000}"
     entrypoint: []
     working_dir: /code
     # The wait loop is bounded because an unbounded one is indistinguishable from
@@ -217,7 +221,7 @@ services:
     # Unprivileged like migrate: in a checkout the tree being written is the
     # developer's own, and root-owned output there is a nuisance to clean up.
     # The production overlay makes the opposite choice for the opposite reason.
-    user: "1000:1000"
+    user: "${EPICURRENTS_UID:-1000}:${EPICURRENTS_GID:-1000}"
     entrypoint: []
     working_dir: /code
     env_file:
@@ -238,7 +242,7 @@ services:
       args: *build-args
     # Unprivileged: web serves untrusted uploads and federation traffic;
     # an in-process compromise must not land as in-container root.
-    user: "1000:1000"
+    user: "${EPICURRENTS_UID:-1000}:${EPICURRENTS_GID:-1000}"
     command: python manage.py runserver 0.0.0.0:8000
     env_file:
       - ./.env
@@ -282,6 +286,12 @@ services:
       - recordings-data:/data/recordings
       - staging-data:/data/staging
       - media-data:/data/media
+      # Recordings registered in place by `import_recordings --link`, read-only:
+      # the platform never writes a linked file. RECORDINGS_LINKED_HOST_PATH names
+      # the host tree, and RECORDINGS_LINKED_ROOTS=/data/linked in .env enables
+      # linking from it; the default is the empty linked/ directory beside this
+      # file. See recordings/README.md.
+      - ${RECORDINGS_LINKED_HOST_PATH:-./linked}:/data/linked:ro
     depends_on:
       migrate:
         condition: service_completed_successfully
@@ -293,7 +303,7 @@ services:
       context: .
       target: runtime
       args: *build-args
-    user: "1000:1000"
+    user: "${EPICURRENTS_UID:-1000}:${EPICURRENTS_GID:-1000}"
     entrypoint: []
     working_dir: /code
     # --concurrency is pinned rather than left to celery's default, which is the
@@ -322,6 +332,12 @@ services:
       - staging-data:/data/staging
       - media-data:/data/media
       - celery-data:/data/celery
+      # Recordings registered in place by `import_recordings --link`, read-only:
+      # the platform never writes a linked file. RECORDINGS_LINKED_HOST_PATH names
+      # the host tree, and RECORDINGS_LINKED_ROOTS=/data/linked in .env enables
+      # linking from it; the default is the empty linked/ directory beside this
+      # file. See recordings/README.md.
+      - ${RECORDINGS_LINKED_HOST_PATH:-./linked}:/data/linked:ro
     # `inspect ping` is scoped to this container's own node (`-d celery@<hostname>`)
     # rather than broadcast: an unscoped ping succeeds as long as *some* worker on
     # the broker answers, so a wedged container would keep reporting healthy on a
@@ -448,7 +464,7 @@ services:
       context: .
       target: runtime
       args: *build-args
-    user: "1000:1000"
+    user: "${EPICURRENTS_UID:-1000}:${EPICURRENTS_GID:-1000}"
     entrypoint: []
     working_dir: /code
     command: celery -A epicurrents beat -l info --scheduler django_celery_beat.schedulers:DatabaseScheduler
@@ -577,11 +593,11 @@ services:
     working_dir: /repo/frontend
     # Runs as root inside the container so npm can write to the named
     # node_modules volumes (which start out root-owned on a fresh deploy).
-    # The final chown puts the host-visible build outputs back under
-    # 1000:1000 so the bind-mounted dist directories don't end up owned by
-    # root on the deploy host. This shape also works under rootless Podman,
-    # where a `user: "1000:1000"` directive would clash with the user
-    # namespace mapping.
+    # The final chown puts the host-visible build outputs back under the
+    # deployment account so the bind-mounted dist directories don't end up
+    # owned by root on the deploy host. This shape also works under rootless
+    # Podman, where a `user:` directive would clash with the user namespace
+    # mapping.
     environment:
       # NODE_CA_BUNDLE_PATH points at the host's CA bundle when the deploy
       # is behind a TLS-intercepting proxy with a private CA (common on
@@ -618,7 +634,7 @@ services:
         if [ ! -s viewer-dist/epicurrents-lib.umd.js ]; then npm run build:edition; fi
         npm run build:viewer
         npm run build
-        chown -R 1000:1000 /repo/frontend/dist /repo/frontend/viewer-dist 2>/dev/null || true
+        chown -R ${EPICURRENTS_UID:-1000}:${EPICURRENTS_GID:-1000} /repo/frontend/dist /repo/frontend/viewer-dist 2>/dev/null || true
     # The mount layout mirrors the repository rather than mounting frontend/ on
     # its own, because a project's Vue plugin lives at projects/<name>/frontend/
     # — a sibling of this directory, not a child. The `#project` alias resolves

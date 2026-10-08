@@ -47,6 +47,11 @@ FROM python:3.14-slim AS base
 # Redeclared because ARG is per-stage. Used only to name the project in the
 # digest-mismatch message below, so the remedy it prints can be pasted as-is.
 ARG EPICURRENTS_PROJECT=""
+# The account the containers run as, EPICURRENTS_UID / EPICURRENTS_GID in .env and
+# passed by the compose build args. The image carries it as appuser so a process
+# started without compose's `user:` runs as the same ids; compose pins them anyway.
+ARG APP_UID=1000
+ARG APP_GID=1000
 
 ENV PIP_DISABLE_PIP_VERSION_CHECK=1
 ENV PYTHONDONTWRITEBYTECODE=1
@@ -107,8 +112,13 @@ RUN apt-get update -y \
         pip install --require-hashes -r project-requirements/requirements.lock; \
     fi \
     && rm -rf /var/lib/apt/lists/* \
-    && groupadd -g 1000 appuser \
-    && useradd -u 1000 -g appuser -s /bin/sh -M appuser
+    # -o: the ids are the host account's and may collide with one the base image
+    # already has (a macOS primary gid of 20 is Debian's dialout); appuser takes
+    # them anyway, since it is the ids that the bind mount checks, not the name.
+    # -l: a directory-assigned uid can run to billions, and useradd sizes lastlog
+    # and faillog by uid, which writes files of that order into the image.
+    && groupadd -o -g "$APP_GID" appuser \
+    && useradd -l -o -u "$APP_UID" -g appuser -s /bin/sh -M appuser
 
 # Copy entrypoint into /code (original behavior). Note: when bind-mounting the host into /code
 # this file may be hidden by the mount. Ensure your host mount is available when running.
@@ -148,7 +158,8 @@ FROM base AS runtime
 
 COPY . .
 
-# Drop privilege by default. Every compose service already pins user 1000:1000,
+# Drop privilege by default. Every compose service already pins its user to the
+# deployment account (EPICURRENTS_UID:EPICURRENTS_GID),
 # so this changes nothing about how the stack runs — it changes what happens when
 # the image is run any other way: a bare `docker run`, a cloud container service,
 # a future Kubernetes manifest. Without it the image's default is root and each of

@@ -33,13 +33,13 @@ Do not attach `web-firewall` — it is the application hosts' and is attached to
 
 ## Preparing an instance
 
-Hetzner images give you `root` and nothing else, and both bootstraps refuse to run as root. Create the deployment account first — the uid is what matters, not the name, because every service runs as 1000:1000 against a bind mount:
+Hetzner images give you `root` and nothing else, and both bootstraps refuse to run as root. Create the deployment account first. Any uid will do: the bootstrap records the account running it as `EPICURRENTS_UID` / `EPICURRENTS_GID` in `.env`, and every service runs as that account.
 
 ```bash
 # Debian/Ubuntu
-adduser --disabled-password --gecos "" --uid 1000 epicurrents
+adduser --disabled-password --gecos "" epicurrents
 # RHEL family
-useradd --uid 1000 --create-home epicurrents
+useradd --create-home epicurrents
 ```
 
 Then give it sudo (`NOPASSWD` — the Podman path sudoes every compose call, and a password prompt mid-build stalls the run), copy `root`'s `authorized_keys` across, and install `git`.

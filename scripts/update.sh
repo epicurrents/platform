@@ -238,8 +238,9 @@ ROOT_REAL="$(pwd -P)"
 # Docker or Podman, settled the same way the distribution's start.sh settles it:
 # podman-docker installs a `docker` that answers by execing podman, so the name in
 # the version string is the discriminator, not whether the command exists. Podman
-# runs rootful because every service declares `user: "1000:1000"` against a bind
-# mount, and only a rootful runtime maps that uid to the deployment's owner —
+# runs rootful because every service declares the deployment account's uid as its
+# `user:` against a bind mount, and only a rootful runtime maps that uid to the
+# deployment's owner —
 # through sudo when this script is not root already, and directly when it is,
 # since a root-owned updater's host may not have sudo at all.
 if command -v docker >/dev/null 2>&1 && ! docker --version 2>&1 | grep -qi podman; then
@@ -260,6 +261,18 @@ fi
 # PROXY_DOMAIN value in .env. This is not cosmetic: a stack brought up with the
 # overlay has to be updated with it too, or `up -d` treats the running caddy
 # container as an orphan and the deployment loses its TLS terminator mid-update.
+# The account every container runs as, EPICURRENTS_UID / EPICURRENTS_GID in .env.
+# A deployment whose .env names neither predates the setting and runs as 1000.
+deploy_id() {
+    local value
+    value="$(grep -E "^$1=" .env 2>/dev/null | tail -1 | cut -d= -f2- | tr -d ' "' || true)"
+    case "$value" in
+        ""|*[!0-9]*) value=1000 ;;
+    esac
+    printf '%s' "$value"
+}
+DEPLOY_UID="$(deploy_id EPICURRENTS_UID)"
+DEPLOY_GID="$(deploy_id EPICURRENTS_GID)"
 PROXY_ENABLED=false
 if [ -f .env ] && grep -qE '^PROXY_DOMAIN=[^[:space:]]' .env; then
     COMPOSE+=(-f docker-compose.proxy.yml)
@@ -675,7 +688,7 @@ inspect_archive_listing() {
     fi
     # Device nodes and pipes have no place in a code tree, and an extraction run
     # as root would create them; setuid or setgid bits survive rsync -a the
-    # same way and turn a file in a uid-1000 tree into something else.
+    # same way and turn a file in the deployment account's tree into something else.
     if grep -qE '^[bcp]' <<< "$verbose"; then
         refuse contents "Refusing the archive: it carries a device node or a named pipe."
     fi
@@ -1036,12 +1049,12 @@ refresh_vendored_assets() {
     # restores with rsync as the deploy user — root-owned files there would
     # survive the rollback.
     emit "step=vendor"
-    if "${COMPOSE[@]}" --profile vendor run --rm --no-deps -T --user 1000:1000 vendor \
+    if "${COMPOSE[@]}" --profile vendor run --rm --no-deps -T --user "${DEPLOY_UID}:${DEPLOY_GID}" vendor \
             python manage.py vendor_viewer --check > /dev/null 2>&1; then
         ok "Viewer edition matches the pin"
     else
         info "Installing the pinned viewer edition"
-        if "${COMPOSE[@]}" --profile vendor run --rm --no-deps -T --user 1000:1000 vendor \
+        if "${COMPOSE[@]}" --profile vendor run --rm --no-deps -T --user "${DEPLOY_UID}:${DEPLOY_GID}" vendor \
                 python manage.py vendor_viewer; then
             ok "Viewer edition installed"
         else
@@ -1124,6 +1137,10 @@ recreate_stack() {
     fi
     emit "step=recreate"
     info "Recreating containers"
+    # The default source of the read-only linked-recordings mount. A deployment
+    # created before the mount existed has no such directory, and Podman refuses
+    # a bind source that does not exist.
+    mkdir -p linked
     "${COMPOSE[@]}" up -d --force-recreate "${services[@]}"
     SERVICES_STOPPED=false
     WORKERS_STOPPED=false
@@ -1621,7 +1638,8 @@ esac
 info "Updating from $MODE (backup: $([ "$BACKUP" = true ] && echo on || echo off), overlay: production)"
 
 # ── Preflight: the tree must belong to the account the containers run as ──────
-# web, celery, celery-beat and migrate all run as uid/gid 1000 against a bind mount
+# web, celery, celery-beat and migrate all run as the deployment account
+# (EPICURRENTS_UID / EPICURRENTS_GID, 1000 when .env does not say) against a bind mount
 # of this directory, so a tree owned by anyone else comes up and then fails on its
 # first write, far from the cause. The way it happens is an archive: tar records
 # the *builder's* uid, and an update applied as root preserves it, so a package
@@ -1638,10 +1656,10 @@ if DIR_MODE="$(stat -c %a . 2>/dev/null)"; then
     DIR_GID="$(stat -c %g .)"
     DIR_MODE="$(printf '%04d' "$DIR_MODE")"
     TREE_WRITABLE=false
-    if [ "$DIR_UID" = "1000" ] && [ "$(( ${DIR_MODE:1:1} & 2 ))" -ne 0 ]; then
+    if [ "$DIR_UID" = "$DEPLOY_UID" ] && [ "$(( ${DIR_MODE:1:1} & 2 ))" -ne 0 ]; then
         TREE_WRITABLE=true
     fi
-    if [ "$DIR_GID" = "1000" ] && [ "$(( ${DIR_MODE:2:1} & 2 ))" -ne 0 ]; then
+    if [ "$DIR_GID" = "$DEPLOY_GID" ] && [ "$(( ${DIR_MODE:2:1} & 2 ))" -ne 0 ]; then
         TREE_WRITABLE=true
     fi
     if [ "$(( ${DIR_MODE:3:1} & 2 ))" -ne 0 ]; then
@@ -1649,14 +1667,14 @@ if DIR_MODE="$(stat -c %a . 2>/dev/null)"; then
     fi
     if [ "$TREE_WRITABLE" = false ]; then
         if [ "$MODE" = archive ]; then
-            die "$ROOT is not writable by uid 1000, the user every container runs as \
+            die "$ROOT is not writable by uid ${DEPLOY_UID}, the user every container runs as \
 (owner ${DIR_UID}:${DIR_GID}, mode ${DIR_MODE}). The update would apply and the stack \
 would then fail on its first write. Fix the ownership and re-run:
-    sudo chown -R 1000:1000 $ROOT"
+    sudo chown -R ${DEPLOY_UID}:${DEPLOY_GID} $ROOT"
         else
-            warn "$ROOT is owned by ${DIR_UID}:${DIR_GID} and is not writable by uid 1000,"
+            warn "$ROOT is owned by ${DIR_UID}:${DIR_GID} and is not writable by uid ${DEPLOY_UID},"
             warn "which every container runs as. If this is a deployment rather than a"
-            warn "development checkout, fix it with: sudo chown -R 1000:1000 $ROOT"
+            warn "development checkout, fix it with: sudo chown -R ${DEPLOY_UID}:${DEPLOY_GID} $ROOT"
         fi
     fi
 fi

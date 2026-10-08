@@ -182,6 +182,38 @@ exec "$@"
 """
 
 
+# The account start.sh runs as decides which uid the containers get, so a test that
+# stubs the tree's ownership states the invoking account too rather than inheriting
+# the uid of whoever runs the suite.
+def _id_stub(uid, gid):
+    return f'case "$1" in -u) echo {uid} ;; -g) echo {gid} ;; *) echo "uid={uid}(deploy) gid={gid}(deploy)" ;; esac'
+
+
+_ID_1000 = _id_stub(1000, 1000)
+
+
+# Docker that builds and runs one-off containers successfully and fails at the
+# first other compose call, so start.sh gets as far as generating and editing .env
+# and then stops. The build reports the uid compose would interpolate.
+_DOCKER_BUILDS_STUB = """
+case "$1 $2" in
+    "compose version") echo "Docker Compose version v2.29.0"; exit 0 ;;
+esac
+case "$1" in
+    --version) echo "Docker version 28.1.1, build abcdefg"; exit 0 ;;
+    version) echo "28.1.1"; exit 0 ;;
+esac
+for arg in "$@"; do
+    case "$arg" in
+        build) echo "BUILD-UID ${EPICURRENTS_UID:-unset}:${EPICURRENTS_GID:-unset}" >&2; exit 0 ;;
+        run) exit 0 ;;
+    esac
+done
+echo "STUB-DOCKER $*" >&2
+exit 9
+"""
+
+
 def _stat_stub(uid, gid, mode):
     return f"""
 case "$2" in
@@ -720,6 +752,7 @@ class TestStartShPreflight:
             sudo=_SUDO_STUB,
             getent="exit 0",
             stat=_stat_stub(uid=1000, gid=1000, mode=755),
+            id=_ID_1000,
         )
         result = self._start(dest, path)
         assert "No container runtime found" not in result.stderr
@@ -740,6 +773,7 @@ class TestStartShPreflight:
             sudo=_SUDO_STUB,
             getent="exit 0",
             stat=_stat_stub(uid=1000, gid=1000, mode=755),
+            id=_ID_1000,
         )
         result = self._start(dest, path)
         assert "Docker Engine 25+" not in result.stderr
@@ -776,6 +810,7 @@ class TestStartShPreflight:
             sudo=_SUDO_STUB,
             getent="exit 0",
             stat=_stat_stub(uid=1000, gid=1000, mode=755),
+            id=_ID_1000,
         )
         result = self._start(dest, path)
         assert result.returncode != 0
@@ -798,6 +833,7 @@ class TestStartShPreflight:
             sudo=_SUDO_STUB,
             getent="exit 0",
             stat=_stat_stub(uid=1000, gid=1000, mode=755),
+            id=_ID_1000,
         )
         result = self._start(dest, path)
         assert "aardvark-dns" not in result.stderr
@@ -827,6 +863,7 @@ class TestStartShPreflight:
             sudo=_SUDO_STUB,
             getent="exit 0",
             stat=_stat_stub(uid=1000, gid=1000, mode=755),
+            id=_ID_1000,
         )
         result = self._start(dest, path)
         assert "STUB-DOCKER" in result.stderr
@@ -858,6 +895,7 @@ class TestStartShPreflight:
             docker=_DOCKER_STUB,
             getent="exit 0",
             stat=_stat_stub(uid=0, gid=0, mode=755),
+            id=_ID_1000,
         )
         result = self._start(dest, path)
         assert result.returncode != 0
@@ -874,6 +912,7 @@ class TestStartShPreflight:
             docker=_DOCKER_STUB,
             getent="exit 0",
             stat=_stat_stub(uid=1000, gid=1000, mode=755),
+            id=_ID_1000,
         )
         result = self._start(dest, path)
         assert "not writable by uid 1000" not in result.stderr
@@ -912,6 +951,7 @@ class TestStartShPreflight:
             docker=_DOCKER_STUB,
             getent="exit 0",
             stat=_stat_stub(uid=0, gid=0, mode=777),
+            id=_ID_1000,
         )
         result = self._start(dest, path)
         assert "STUB-DOCKER" in result.stderr, result.stderr
@@ -927,10 +967,67 @@ class TestStartShPreflight:
             docker=_DOCKER_STUB,
             getent="exit 0",
             stat=_stat_stub(uid=0, gid=0, mode=777),
+            id=_ID_1000,
         )
         result = self._start(dest, path)
         assert "not writable by uid 1000" not in result.stderr
         assert "STUB-DOCKER" in result.stderr
+
+    # ── The deployment account ───────────────────────────────────────────────
+    # The containers run as EPICURRENTS_UID / EPICURRENTS_GID. A first run takes the
+    # account running start.sh and records it; a later run reads it back.
+
+    def test_records_the_account_running_it_on_the_first_run(self, tmp_path):
+        dest = tmp_path / "dist"
+        assert _run(dest, "--dist").returncode == 0
+        path = _stub_path(
+            tmp_path,
+            docker=_DOCKER_BUILDS_STUB,
+            getent="exit 0",
+            stat=_stat_stub(uid=1234, gid=1235, mode=755),
+            id=_id_stub(1234, 1235),
+        )
+        result = self._start(dest, path)
+        env = (dest / ".env").read_text().splitlines()
+        assert "EPICURRENTS_UID=1234" in env, result.stderr
+        assert "EPICURRENTS_GID=1235" in env, result.stderr
+        # Before .env exists the ids reach compose from the environment, so even the
+        # first image build carries the account rather than the default.
+        assert "BUILD-UID 1234:1235" in result.stderr, result.stderr
+
+    def test_an_account_recorded_in_env_wins_over_the_invoking_one(self, tmp_path):
+        dest = tmp_path / "dist"
+        assert _run(dest, "--dist").returncode == 0
+        env_file = dest / ".env"
+        env_file.write_text((dest / ".env.example").read_text() + "EPICURRENTS_UID=2000\nEPICURRENTS_GID=2001\n")
+        path = _stub_path(
+            tmp_path,
+            docker=_DOCKER_BUILDS_STUB,
+            getent="exit 0",
+            stat=_stat_stub(uid=2000, gid=2001, mode=755),
+            id=_id_stub(1234, 1235),
+        )
+        result = self._start(dest, path)
+        assert "not writable" not in result.stderr, result.stderr
+        assert "BUILD-UID 2000:2001" in result.stderr, result.stderr
+        env = env_file.read_text().splitlines()
+        assert env.count("EPICURRENTS_UID=2000") == 1 and "EPICURRENTS_UID=1234" not in env
+
+    def test_a_tree_the_account_cannot_write_is_refused_by_its_own_uid(self, tmp_path):
+        dest = tmp_path / "dist"
+        assert _run(dest, "--dist").returncode == 0
+        path = _stub_path(
+            tmp_path,
+            docker=_DOCKER_BUILDS_STUB,
+            getent="exit 0",
+            stat=_stat_stub(uid=1000, gid=1000, mode=755),
+            id=_id_stub(1234, 1235),
+        )
+        result = self._start(dest, path)
+        assert result.returncode != 0
+        assert "not writable by uid 1234" in result.stderr
+        assert "chown -R 1234:1235" in result.stderr
+        assert "BUILD-UID" not in result.stderr, "the build started on a tree the account cannot write"
 
     def test_refuses_a_docker_engine_below_the_compose_floor(self, tmp_path):
         # 24 accepts the volume subpath syntax in these compose files and mounts the
@@ -1035,36 +1132,45 @@ class TestPrepareHost:
     # things the script exists for: the account resolution, and the ordering that
     # decides whether a partial run leaves the tree owned by root.
 
-    def _root_env(self, fakebin, uid_1000_owner=None, groups="sudo"):
+    def _root_env(self, fakebin, uid_1000_owner=None, groups="sudo", existing=()):
         """Make prepare-host.sh believe it is root on a Debian server.
 
         ``uid_1000_owner`` is the account ``getent passwd 1000`` reports, or None
-        for an image where the uid is still free — the one input the account
-        resolution branches on. ``groups`` is what that account already belongs
-        to, which is what decides whether usermod is called.
+        for an image where the uid is still free. ``existing`` names the accounts
+        that already exist by name; the uid-1000 holder is one of them. ``groups``
+        is what the deployment account already belongs to, which is what decides
+        whether usermod is called. An account looked up by name answers uid 1001
+        unless it is the uid-1000 holder.
         """
+        known = set(existing) | ({uid_1000_owner} if uid_1000_owner else set())
+        created = fakebin.path / "created-accounts"
         fakebin.stub(
             "id",
             body=f"""
 case "${{1:-}}" in
-    -u) echo 0 ;;
+    -u) if [ -n "${{2:-}}" ]; then [ "$2" = "{uid_1000_owner or ""}" ] && echo 1000 || echo 1001; else echo 0; fi ;;
+    -g) if [ -n "${{2:-}}" ]; then [ "$2" = "{uid_1000_owner or ""}" ] && echo 1000 || echo 1001; else echo 0; fi ;;
     -nG) echo "{groups}" ;;
     *) echo "uid=0(root) gid=0(root)" ;;
 esac
 """,
         )
         owner = f'echo "{uid_1000_owner}:x:1000:1000::/home/{uid_1000_owner}:/bin/bash"' if uid_1000_owner else "exit 2"
+        named = " | ".join(f'"passwd {name}"' for name in sorted(known)) or '"passwd -none-"'
         fakebin.stub(
             "getent",
             body=f"""
 case "$1 $2" in
     "passwd 1000") {owner} ;;
     "group docker") echo "docker:x:999:" ;;
-    passwd*) echo "$2:x:1000:1000::/home/$2:/bin/bash" ;;
+    {named}) echo "$2:x:1001:1001::/home/$2:/bin/bash" ;;
+    passwd*) grep -qx "$2" "{created}" 2>/dev/null && echo "$2:x:1001:1001::/home/$2:/bin/bash" || exit 2 ;;
+    *) exit 2 ;;
 esac
 """,
         )
-        fakebin.stub("adduser")
+        # An account adduser created exists from then on, as the real one would.
+        fakebin.stub("adduser", body=f'for name; do :; done; echo "$name" >> "{created}"')
 
     def _prepare(self, dest, fakebin, *args):
         return subprocess.run(
@@ -1076,25 +1182,36 @@ esac
             text=True,
         )
 
-    def test_an_existing_uid_1000_account_wins_over_the_requested_name(self, tmp_path, fakebin):
-        # Ubuntu cloud images ship a uid-1000 account. Creating a second one there
-        # would silently give it 1001, and every container runs as 1000 against a
-        # bind mount of the deployment — so the uid decides which account is used,
-        # and --user does not.
+    def test_an_existing_uid_1000_account_is_never_adopted(self, tmp_path, fakebin):
+        # On a server uid 1000 is as likely to be a service's account (a log
+        # forwarder) as a person's, and adopting it would make the deployment's
+        # files that service's. The deployment gets an account of its own, at
+        # whatever uid is free, which start.sh then records for the containers.
         dest = tmp_path / "dist"
         assert _run(dest, "--dist").returncode == 0
-        self._root_env(fakebin, uid_1000_owner="ubuntu")
+        self._root_env(fakebin, uid_1000_owner="splunkfwd")
 
         result = self._prepare(dest, fakebin, "--user", "epicurrents", "--no-sudoers")
 
         assert result.returncode == 0, result.stderr
-        assert not fakebin.has_call("adduser"), "created a second account beside the uid-1000 holder"
-        assert fakebin.has_call("chown -R ubuntu:ubuntu ."), fakebin.calls()
-        assert fakebin.has_call("usermod -aG docker ubuntu"), fakebin.calls()
-        # The summary names the account either way, so the assertion is on the
-        # explanation: an operator who passed --user and got something else needs to
-        # be told why, or the script looks like it ignored them.
-        assert "uid 1000 already belongs to" in result.stdout, result.stdout
+        created = [c for c in fakebin.calls() if c.startswith("adduser")]
+        assert len(created) == 1 and created[0].endswith("epicurrents"), fakebin.calls()
+        assert "--uid" not in created[0], "asked for a uid that is taken"
+        assert fakebin.has_call("chown -R epicurrents: ."), fakebin.calls()
+        assert not fakebin.has_call("splunkfwd"), "touched the account already holding uid 1000"
+        assert "uid 1000 belongs to 'splunkfwd'" in result.stdout, result.stdout
+        assert "(uid 1001, docker group)" in result.stdout, result.stdout
+
+    def test_an_existing_account_of_the_requested_name_is_used(self, tmp_path, fakebin):
+        dest = tmp_path / "dist"
+        assert _run(dest, "--dist").returncode == 0
+        self._root_env(fakebin, uid_1000_owner="ubuntu", existing=("deployer",))
+
+        result = self._prepare(dest, fakebin, "--user", "deployer", "--no-sudoers")
+
+        assert result.returncode == 0, result.stderr
+        assert not fakebin.has_call("adduser"), fakebin.calls()
+        assert fakebin.has_call("chown -R deployer: ."), fakebin.calls()
 
     def test_with_updater_installs_the_agent_after_the_handover(self, tmp_path, fakebin):
         # The installer creates spool directories owned by whoever owns the tree,
@@ -1150,7 +1267,7 @@ esac
         assert len(created) == 1, fakebin.calls()
         assert "--uid 1000" in created[0], created[0]
         assert created[0].endswith("deployer"), created[0]
-        assert fakebin.has_call("chown -R deployer:deployer ."), fakebin.calls()
+        assert fakebin.has_call("chown -R deployer: ."), fakebin.calls()
 
     def test_hands_the_tree_over_before_the_steps_that_can_fail(self, tmp_path, fakebin):
         # Handing the package to the deployment account is the half start.sh cannot
@@ -1162,12 +1279,12 @@ esac
         # which is where a reordering would show up.
         dest = tmp_path / "dist"
         assert _run(dest, "--dist").returncode == 0
-        self._root_env(fakebin, uid_1000_owner="ubuntu", groups="ubuntu docker")
+        self._root_env(fakebin, uid_1000_owner="ubuntu", groups="ubuntu docker", existing=("ubuntu",))
 
-        result = self._prepare(dest, fakebin, "--no-sudoers")
+        result = self._prepare(dest, fakebin, "--user", "ubuntu", "--no-sudoers")
 
         assert result.returncode == 0, result.stderr
-        assert fakebin.has_call("chown -R ubuntu:ubuntu ."), fakebin.calls()
+        assert fakebin.has_call("chown -R ubuntu: ."), fakebin.calls()
         assert not fakebin.has_call("usermod"), "re-added an account already in the docker group"
 
         # Anchored on the code rather than on the section headings: the comment

@@ -20,8 +20,9 @@
 # files rely on. docker-compose v2 speaks the specification natively and works
 # against the rootful podman socket.
 #
-# Why rootful: every service declares `user: "1000:1000"` against a bind mount of
-# the deployment, and only a rootful runtime maps that uid to the tree's owner.
+# Why rootful: every service runs as the deployment account's uid (EPICURRENTS_UID)
+# against a bind mount of the deployment, and only a rootful runtime maps that uid
+# to the tree's owner.
 # Rootless Podman remaps it into the invoking user's subuid range, where the
 # checkout is one the containers cannot write. So each compose call goes through
 # sudo while the script itself still refuses to run as root.

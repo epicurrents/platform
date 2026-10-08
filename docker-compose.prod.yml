@@ -87,7 +87,7 @@ services:
     # mounted read-only into web and celery, so this is again the one container
     # that can populate it. Unlike frontend/vendor it *is* part of update.sh's code
     # snapshot, and the rollback restores it with rsync as the deploy user — so the
-    # viewer step runs with an explicit `--user 1000:1000` rather than inheriting
+    # viewer step runs with an explicit `--user` of the deployment account rather than inheriting
     # the root above, which would leave files a rollback cannot overwrite.
     volumes: !override
       - ./frontend/vendor:/code/frontend/vendor
@@ -152,6 +152,8 @@ services:
       # deployment account, so Docker does not create it as root. Read-write:
       # requests and markers are written here.
       - ./update:/data/update
+      # Linked recordings, read-only; see the note on the same mount in docker-compose.yml.
+      - ${RECORDINGS_LINKED_HOST_PATH:-./linked}:/data/linked:ro
 
   celery:
     <<: *production-runtime
@@ -194,6 +196,8 @@ services:
       # The spool sync reads it every minute and the daily prune removes the
       # files of long-finished jobs, so read-write here too.
       - ./update:/data/update
+      # Linked recordings, read-only; see the note on the same mount in docker-compose.yml.
+      - ${RECORDINGS_LINKED_HOST_PATH:-./linked}:/data/linked:ro
 
   celery-beat:
     <<: *production-runtime
