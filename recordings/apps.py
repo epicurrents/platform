@@ -86,8 +86,13 @@ class RecordingsConfig(AppConfig):
         # withheld rather than masked: the recording's own trail rows carry the
         # hash and the size in the clear, and a mask is a digest recomputable from
         # them. `error` may quote paths and joins nothing, so a mask does.
+        # `not_before` is set once for a whole batch of files the server accepts,
+        # so in the trail it would group those rows across ledgers and state the
+        # deployment's backup horizon; it is withheld with the rest.
         register_masked_fields(
-            "recordings.submissionfile", {"file_hash", "file_size", "sidecar", "sidecar_hash"}, withhold=True
+            "recordings.submissionfile",
+            {"file_hash", "file_size", "sidecar", "sidecar_hash", "not_before"},
+            withhold=True,
         )
         register_masked_fields("recordings.submissionfile", {"error"})
         # Art. 15: a ledger is the contributor's own activity record. It carries

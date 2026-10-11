@@ -599,7 +599,7 @@ class TestPoolEndpoints:
 _NAMES = itertools.count(1)
 
 
-def _spooled(pool_fixture, spool, *, age_hours=48, sidecar_extra=None, ledger=None, data=None):
+def _spooled(pool_fixture, spool, *, age_hours=48, sidecar_extra=None, ledger=None, data=None, not_before=None):
     dataset, contributor, _group = pool_fixture
     ledger = ledger or SubmissionLedger.objects.get_or_create(dataset=dataset, contributor=contributor)[0]
     data = _edf() if data is None else data
@@ -617,6 +617,7 @@ def _spooled(pool_fixture, spool, *, age_hours=48, sidecar_extra=None, ledger=No
         file_hash=hashlib.sha256(data).hexdigest(),
         sidecar_hash=hashlib.sha256(json.dumps(sidecar, sort_keys=True).encode()).hexdigest(),
         sidecar=sidecar,
+        not_before=not_before,
     )
     SubmissionFile.objects.filter(pk=row.pk).update(received_at=timezone.now() - timedelta(hours=age_hours))
     row.refresh_from_db()
@@ -1003,6 +1004,53 @@ class TestContributorHold:
         assert SubmissionFile.objects.filter(pk=fresh.pk).exists()
         purge = Activity.objects.get(verb="recordings.submission.purge")
         assert purge.metadata == {"count": 1, "reason": "waiting", "retention_days": 10}
+
+
+class TestNotBefore:
+    """A file with a not-before date is neither taken nor counted before it, and waits from it."""
+
+    def test_a_file_before_its_date_stays_in_the_spool(self, pool, spool):
+        row = _spooled(pool, spool, not_before=timezone.now() + timedelta(days=1))
+        assert ingest_pooled_submissions() == {"ingested": 0, "failed": 0}
+        assert SubmissionFile.objects.filter(pk=row.pk, status=SubmissionFile.Status.PENDING).exists()
+        assert Path(row.file_path).exists()
+
+    def test_a_file_past_its_date_is_taken(self, pool, spool):
+        _spooled(pool, spool, not_before=timezone.now() - timedelta(minutes=1))
+        assert ingest_pooled_submissions() == {"ingested": 1, "failed": 0}
+
+    def test_the_pooling_delay_still_applies_past_the_date(self, pool, spool, settings):
+        settings.RECORDINGS_SUBMISSION_POOLING_DELAY_HOURS = 24
+        _spooled(pool, spool, age_hours=1, not_before=timezone.now() - timedelta(minutes=1))
+        assert ingest_pooled_submissions() == {"ingested": 0, "failed": 0}
+
+    def test_a_file_before_its_date_does_not_count_towards_m(self, pool, spool, make_user):
+        register_ingest_profile(_profile(m=2))
+        _spooled(pool, spool)
+        later = _spooled(
+            pool,
+            spool,
+            ledger=TestContributorHold._second_ledger(pool, make_user),
+            not_before=timezone.now() + timedelta(days=1),
+        )
+        assert ingest_pooled_submissions() == {"ingested": 0, "failed": 0}
+        SubmissionFile.objects.filter(pk=later.pk).update(not_before=timezone.now() - timedelta(minutes=1))
+        assert ingest_pooled_submissions() == {"ingested": 2, "failed": 0}
+
+    def test_the_waiting_window_runs_from_the_date(self, pool, spool, settings):
+        settings.RECORDINGS_SUBMISSION_WAITING_RETENTION_DAYS = 10
+        register_ingest_profile(_profile(m=2))
+        held_back = _spooled(pool, spool, age_hours=11 * 24, not_before=timezone.now() - timedelta(days=9))
+        overdue = _spooled(pool, spool, age_hours=30 * 24, not_before=timezone.now() - timedelta(days=11))
+        ingest_pooled_submissions()
+        assert SubmissionFile.objects.filter(pk=held_back.pk).exists()
+        assert not SubmissionFile.objects.filter(pk=overdue.pk).exists()
+
+    def test_the_date_is_withheld_from_the_trail(self, pool, spool):
+        from activity.audit import WITHHELD_SENTINEL, serialize_instance
+
+        row = _spooled(pool, spool, not_before=timezone.now() + timedelta(days=90))
+        assert serialize_instance(row)["not_before"] == WITHHELD_SENTINEL
 
     def test_an_unheld_pool_never_retires_a_waiting_file(self, pool, spool, settings):
         settings.RECORDINGS_SUBMISSION_WAITING_RETENTION_DAYS = 10

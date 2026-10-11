@@ -879,7 +879,8 @@ def ingest_pooled_submissions() -> dict:
 
     The pooled counterpart of the upload's immediate ``process_recording``. A submission
     accepted by the gate (``recordings.submissions``) waits in the spool until it is older
-    than ``RECORDINGS_SUBMISSION_POOLING_DELAY_HOURS``; this run then takes every such file
+    than ``RECORDINGS_SUBMISSION_POOLING_DELAY_HOURS`` and past its ``not_before`` date, if it
+    has one (:func:`_due`); this run then takes every such file
     from every ledger, shuffles them, and creates each recording under the system user as an
     unreleased member of the ledger's pool. The recording carries nothing that names the
     ledger, and the file row is deleted once the recording exists, so the ledger is left with
@@ -924,7 +925,7 @@ def ingest_pooled_submissions() -> dict:
     _retire_waiting_submissions(held)
 
     pending = list(
-        SubmissionFile.objects.filter(status=SubmissionFile.Status.PENDING, received_at__lt=cutoff)
+        SubmissionFile.objects.filter(_due(cutoff), status=SubmissionFile.Status.PENDING)
         .exclude(ledger__dataset_id__in=held)
         .select_related("ledger", "ledger__dataset")
     )
@@ -963,12 +964,23 @@ def ingest_pooled_submissions() -> dict:
 _WITHDRAWN = "withdrawn"
 
 
+def _due(cutoff):
+    """The condition on a ``SubmissionFile`` that the run may take it: received before *cutoff* and past ``not_before``.
+
+    The ingest and the contributor count share it, so a file the run would not take never counts towards ``m``.
+    """
+    from django.db.models import Q
+
+    return Q(received_at__lt=cutoff) & (Q(not_before__isnull=True) | Q(not_before__lte=timezone.now()))
+
+
 def pools_short_of_contributors(cutoff=None) -> set[int]:
     """Primary keys of the pools whose profile sets ``m`` and that have fewer than ``m`` contributors.
 
     A contributor is a ledger with a file ingested, or with a file waiting in the spool that this
     run would take: received before *cutoff*, the pooling-delay boundary, which defaults to now minus
-    ``RECORDINGS_SUBMISSION_POOLING_DELAY_HOURS``. A file still inside the delay does not count, or a
+    ``RECORDINGS_SUBMISSION_POOLING_DELAY_HOURS``, and past its ``not_before`` date. A file still inside
+    the delay or before that date does not count, or a
     second contributor submitting an hour before the run would release the first contributor's
     files alone. A ledger whose every file failed contributed nothing. A pool whose profile is no
     longer registered is not held here: its files fail at ingest, which is the existing answer to a
@@ -982,9 +994,7 @@ def pools_short_of_contributors(cutoff=None) -> set[int]:
     if cutoff is None:
         delay_hours = getattr(settings, "RECORDINGS_SUBMISSION_POOLING_DELAY_HOURS", 24)
         cutoff = timezone.now() - timedelta(hours=delay_hours)
-    waiting = SubmissionFile.objects.filter(
-        ledger=OuterRef("pk"), status=SubmissionFile.Status.PENDING, received_at__lt=cutoff
-    )
+    waiting = SubmissionFile.objects.filter(_due(cutoff), ledger=OuterRef("pk"), status=SubmissionFile.Status.PENDING)
     contributing = SubmissionLedger.objects.filter(Q(ingested_count__gt=0) | Exists(waiting)).values_list(
         "dataset_id", "dataset__submission_profile"
     )
@@ -1076,7 +1086,10 @@ def _retire_waiting_submissions(held: set[int]) -> int:
 
     The hold is otherwise open-ended: a pool that never reaches its ``m`` would keep its
     contributors' files on disk indefinitely, bytes nobody reads and nobody could release.
+    The window runs from ``not_before`` where a file has one, since it could not count before then.
     """
+    from django.db.models.functions import Coalesce
+
     from recordings.models import SubmissionFile
 
     if not held:
@@ -1084,8 +1097,8 @@ def _retire_waiting_submissions(held: set[int]) -> int:
     retention_days = getattr(settings, "RECORDINGS_SUBMISSION_WAITING_RETENTION_DAYS", 180)
     cutoff = timezone.now() - timedelta(days=retention_days)
     stale = list(
-        SubmissionFile.objects.filter(
-            status=SubmissionFile.Status.PENDING, received_at__lt=cutoff, ledger__dataset_id__in=held
+        SubmissionFile.objects.annotate(waiting_since=Coalesce("not_before", "received_at")).filter(
+            status=SubmissionFile.Status.PENDING, waiting_since__lt=cutoff, ledger__dataset_id__in=held
         )
     )
     return _retire_submissions(stale, reason="waiting", retention_days=retention_days)

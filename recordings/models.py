@@ -549,6 +549,11 @@ class SubmissionFile(models.Model):
     so a file held for months before failing still gets the whole window.
     Deleting a row unlinks its spooled bytes once the deletion commits
     (``recordings.submissions.unlink_spooled_bytes``), whichever path deletes it.
+
+    ``not_before`` holds a file back past the pooling delay: the run neither takes
+    it nor counts its ledger towards the pool's ``m`` before then, and a held
+    pool's waiting window runs from it rather than from receipt. Null for a file
+    the submission endpoint accepted, which waits only for the delay.
     """
 
     class Status(models.TextChoices):
@@ -575,6 +580,7 @@ class SubmissionFile(models.Model):
     )
     error = models.TextField(blank=True, default="")
     received_at = models.DateTimeField(auto_now_add=True)
+    not_before = models.DateTimeField(null=True, blank=True)
     failed_at = models.DateTimeField(null=True, blank=True)
 
     class Meta:
