@@ -42,13 +42,17 @@ from recordings.submissions import (
     BLANK_START_TIME,
     DEFAULT_FORBIDDEN_SIDECAR_KEYS,
     IngestProfile,
+    PoolUnavailable,
+    SubmissionRefused,
     Violation,
+    accept_submission,
     can_submit_to_dataset,
     get_ingest_profile,
     parse_sidecar,
     public_profile,
     register_ingest_profile,
     reset_ingest_profiles,
+    spool_held_file,
     validate_file,
     validate_sidecar,
     validate_submission,
@@ -1058,6 +1062,118 @@ class TestNotBefore:
         row = _spooled(pool, spool, age_hours=11 * 24)
         ingest_pooled_submissions()
         assert SubmissionFile.objects.filter(pk=row.pk).exists()
+
+
+class TestAcceptSubmission:
+    """The accept path the endpoint and a server-side hand-over share."""
+
+    @staticmethod
+    def _held(tmp_path, data: bytes) -> Path:
+        source = tmp_path / "held.edf"
+        source.write_bytes(data)
+        return source
+
+    def test_received_data_is_spooled_with_its_not_before_date(self, pool, spool):
+        dataset, contributor, _group = pool
+        data = _edf()
+        not_before = timezone.now() + timedelta(days=120)
+        accepted = accept_submission(
+            dataset, contributor, sidecar=_sidecar(data), data=data, extension=".edf", not_before=not_before
+        )
+        assert accepted.ledger_created
+        row = SubmissionFile.objects.get(ledger=accepted.ledger)
+        assert row.not_before == not_before
+        assert row.file_hash == hashlib.sha256(data).hexdigest()
+        assert Path(row.file_path).read_bytes() == data
+
+    def test_a_held_file_is_re_dithered_into_the_spool_and_the_source_left_alone(self, pool, spool, tmp_path):
+        dataset, contributor, _group = pool
+        data = _edf()
+        source = self._held(tmp_path, data)
+        copy = spool_held_file(source, ".edf")
+        assert copy.path.parent == spool
+        assert copy.path.read_bytes() != data
+        assert source.read_bytes() == data
+
+        accepted = accept_submission(dataset, contributor, sidecar={"profile_version": "1"}, held=copy)
+        row = SubmissionFile.objects.get(ledger=accepted.ledger)
+        spooled = Path(row.file_path).read_bytes()
+        assert Path(row.file_path) == copy.path
+        assert row.file_hash == hashlib.sha256(spooled).hexdigest() != hashlib.sha256(data).hexdigest()
+        assert row.sidecar["recording_sha256"] == row.file_hash
+
+    def test_a_held_file_declares_its_own_digest_over_a_stale_one(self, pool, spool, tmp_path):
+        dataset, contributor, _group = pool
+        data = _edf()
+        copy = spool_held_file(self._held(tmp_path, data), ".edf")
+        accepted = accept_submission(dataset, contributor, sidecar=_sidecar(data), held=copy)
+        row = SubmissionFile.objects.get(ledger=accepted.ledger)
+        assert row.sidecar["recording_sha256"] == hashlib.sha256(copy.path.read_bytes()).hexdigest()
+
+    def test_a_refused_held_file_writes_nothing_and_unlinks_its_copy(self, pool, spool, tmp_path):
+        dataset, contributor, _group = pool
+        copy = spool_held_file(self._held(tmp_path, _edf()), ".edf")
+        with pytest.raises(SubmissionRefused) as refused:
+            accept_submission(dataset, contributor, sidecar={"profile_version": "1", "annotator": "x"}, held=copy)
+        assert "sidecar_forbidden_key" in _codes(refused.value.violations)
+        assert not copy.path.exists()
+        assert list(spool.iterdir()) == []
+        assert SubmissionFile.objects.count() == 0
+        assert SubmissionLedger.objects.count() == 0
+
+    def test_refused_received_data_writes_nothing(self, pool, spool):
+        dataset, contributor, _group = pool
+        data = _edf(patient="Jane Doe")
+        with pytest.raises(SubmissionRefused):
+            accept_submission(dataset, contributor, sidecar=_sidecar(data), data=data, extension=".edf")
+        assert not spool.exists() or list(spool.iterdir()) == []
+        assert SubmissionFile.objects.count() == 0
+
+    @pytest.mark.parametrize("route", ["data", "held"])
+    def test_a_pool_closed_under_the_lock_writes_nothing(self, pool, spool, tmp_path, route):
+        dataset, contributor, _group = pool
+        data = _edf()
+        Dataset.objects.filter(pk=dataset.pk).update(submissions_open=False)
+        if route == "data":
+            kwargs = {"data": data, "extension": ".edf"}
+        else:
+            kwargs = {"held": spool_held_file(self._held(tmp_path, data), ".edf")}
+        # ``dataset`` is the stale, open instance: only the locked re-read sees the closed intake.
+        with pytest.raises(PoolUnavailable):
+            accept_submission(dataset, contributor, sidecar=_sidecar(data), **kwargs)
+        assert list(spool.iterdir()) == []
+        assert SubmissionFile.objects.count() == 0
+        assert SubmissionLedger.objects.count() == 0
+
+    def test_data_and_held_are_exclusive(self, pool, spool, tmp_path):
+        dataset, contributor, _group = pool
+        data = _edf()
+        with pytest.raises(TypeError):
+            accept_submission(dataset, contributor, sidecar=_sidecar(data))
+        copy = spool_held_file(self._held(tmp_path, data), ".edf")
+        with pytest.raises(TypeError):
+            accept_submission(dataset, contributor, sidecar=_sidecar(data), data=data, extension=".edf", held=copy)
+
+    def test_a_held_copy_is_accepted_once(self, pool, spool, tmp_path):
+        dataset, contributor, _group = pool
+        copy = spool_held_file(self._held(tmp_path, _edf()), ".edf")
+        accept_submission(dataset, contributor, sidecar={"profile_version": "1"}, held=copy)
+        with pytest.raises(ValueError):
+            accept_submission(dataset, contributor, sidecar={"profile_version": "1", "annotator": "x"}, held=copy)
+        assert copy.path.exists()
+        assert SubmissionFile.objects.count() == 1
+
+    def test_a_held_file_enters_only_as_edf_or_bdf(self, spool, tmp_path):
+        with pytest.raises(ValueError):
+            spool_held_file(self._held(tmp_path, _edf()), ".csv")
+        assert not spool.exists() or list(spool.iterdir()) == []
+
+    def test_a_held_file_that_cannot_be_re_dithered_leaves_no_copy(self, spool, tmp_path):
+        signals = [*SIGNALS, {"label": "EDF Annotations", "sample_count": 32}]
+        source = self._held(tmp_path, _edf(signals=signals, reserved="EDF+C"))
+        with pytest.raises(ValueError):
+            spool_held_file(source, ".edf")
+        assert list(spool.iterdir()) == []
 
 
 class TestWithdrawalDuringIngest:

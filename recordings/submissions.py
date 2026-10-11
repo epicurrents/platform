@@ -8,10 +8,12 @@ promised is absent: blanked identification fields as the de-identifier writes th
 annotation channel, the channel set and order, the rate, ranges, length, the forbidden sidecar
 keys and the declared hash. Dropping one, or letting a failing check repair the file instead of
 refusing it, admits the site's or the vendor's signature into the pool with every locally
-written test still green. The endpoint contract is the other half: a refused submission writes
-no row and no file. Contract tests are in ``recordings/tests/test_submissions.py`` (``TestGate``
-pins each check, including the blank fields against the de-identifier's actual output,
-``TestPoolEndpoints`` the write-nothing refusal and the ledger as the audit target,
+written test still green. The accept path is the other half: :func:`accept_submission` runs the
+gate before any write, so a refused submission writes no row and no file, and a file the server
+already holds reaches the spool only through :func:`spool_held_file`'s re-dither. Contract tests are
+in ``recordings/tests/test_submissions.py`` (``TestGate`` pins each check, including the blank
+fields against the de-identifier's actual output, ``TestPoolEndpoints`` the write-nothing refusal
+and the ledger as the audit target, ``TestAcceptSubmission`` the shared path and the held route,
 ``TestPooledIngest`` the random order and the system author, ``TestPooledIngestTrail`` the unjoinable trail).
 
 A pooled dataset cannot trust an arriving file the way an upload trusts its author: the
@@ -542,3 +544,157 @@ def submission_spool_root() -> Path:
     if not root.is_absolute():
         root = Path(settings.BASE_DIR) / root
     return root
+
+
+# ---------------------------------------------------------------------------
+# The accept path
+# ---------------------------------------------------------------------------
+
+
+class SubmissionRefused(Exception):
+    """The gate refused a submission. Nothing was written, and a held file's spooled copy is unlinked."""
+
+    def __init__(self, violations: list[Violation]):
+        super().__init__(f"{len(violations)} violation(s)")
+        self.violations = violations
+
+
+class PoolUnavailable(Exception):
+    """The pool was closed, dissolved or left by the contributor before the file could be accepted."""
+
+
+@dataclass(frozen=True)
+class HeldFileCopy:
+    """A re-dithered copy of a file the server holds, waiting in the spool for :func:`accept_submission`.
+
+    Made only by :func:`spool_held_file`, so the held route cannot reach the spool without the re-dither.
+    """
+
+    path: Path
+    extension: str
+
+
+@dataclass(frozen=True)
+class AcceptedSubmission:
+    """The ledger a file was accepted against, and whether this acceptance created it."""
+
+    ledger: Any
+    ledger_created: bool
+
+
+def _fresh_spool_path(extension: str) -> Path:
+    import secrets
+
+    spool = submission_spool_root()
+    spool.mkdir(parents=True, exist_ok=True)
+    while True:
+        path = spool / f"{secrets.token_hex(16).upper()}{extension}"
+        if not path.exists():
+            return path
+
+
+def spool_held_file(source: Path, extension: str) -> HeldFileCopy:
+    """Copy a file the server already holds into the spool under a fresh name and re-dither the copy.
+
+    The source is left as it is. The copy's digest therefore equals no digest the server has recorded for the
+    source, so no value joins the spool row to the source's own trail. Raises what ``redither_edf`` raises,
+    with the copy unlinked. A copy waits without a row until it is accepted, so it must be accepted, or
+    unlinked, within ``RECORDINGS_SUBMISSION_SPOOL_SWEEP_GRACE_HOURS``. *extension* is ``.edf`` or ``.bdf``,
+    as on the endpoint.
+    """
+    import shutil
+
+    from recordings.processors.redither import redither_edf
+
+    if extension not in (".edf", ".bdf"):
+        raise ValueError("A held file enters the spool as .edf or .bdf")
+    path = _fresh_spool_path(extension)
+    try:
+        shutil.copyfile(source, path)
+        redither_edf(path)
+    except BaseException:
+        path.unlink(missing_ok=True)
+        raise
+    return HeldFileCopy(path=path, extension=extension)
+
+
+def accept_submission(
+    dataset: Any,
+    contributor: Any,
+    *,
+    sidecar: Any,
+    data: bytes | None = None,
+    extension: str | None = None,
+    held: HeldFileCopy | None = None,
+    not_before: Any = None,
+) -> AcceptedSubmission:
+    """Check a submission against the pool's profile and, if it passes, accept it into the spool.
+
+    The one accept path for a pool, shared by the submission endpoint and any server-side hand-over. Pass
+    either the received ``data`` with its ``extension``, or a ``held`` copy from :func:`spool_held_file`. A
+    held copy never travelled, so the server declares its digest in the sidecar itself before the gate runs.
+
+    The gate runs before any write. A refusal raises :class:`SubmissionRefused` and writes nothing; received
+    bytes were never written and a held copy is unlinked. Under the pool's row lock, the lock its configuration
+    writes take, the contributor must still be allowed to submit, or :class:`PoolUnavailable` is raised. The
+    contributor's ledger for the pool is created with their first accepted file. ``not_before`` holds the file
+    back from the pooled run until that time.
+
+    No activity is logged here: the caller audits against the returned ledger, or opens the system scope its
+    row writes are recorded under. Received bytes are written inside the transaction, after the row, and any
+    failure unlinks the spool file. Inside an outer transaction that later rolls back, the bytes stay without a
+    row until the spool sweep removes them.
+    """
+    from django.db import transaction
+
+    from library.models import Dataset
+    from recordings.models import SubmissionFile, SubmissionLedger
+
+    if (data is None) == (held is None):
+        raise TypeError("accept_submission takes either data or held, not both and not neither")
+    if held is not None:
+        extension = held.extension
+        # Before the cleanup below can run: a second acceptance of one copy that failed would unlink the
+        # bytes the first one's row names.
+        if SubmissionFile.objects.filter(file_path=str(held.path)).exists():
+            raise ValueError("This held copy has already been accepted")
+    elif not extension:
+        raise TypeError("accept_submission needs the extension of received data")
+
+    path = held.path if held is not None else None
+    try:
+        if held is not None:
+            data = held.path.read_bytes()
+            if isinstance(sidecar, dict):
+                sidecar = {**sidecar, DECLARED_HASH_KEY: hashlib.sha256(data).hexdigest()}
+        profile = get_ingest_profile(dataset.submission_profile)
+        if profile is None:
+            raise PoolUnavailable("The pool's ingest profile is no longer registered")
+        violations = validate_submission(profile, data, sidecar)
+        if violations:
+            raise SubmissionRefused(violations)
+        if path is None:
+            path = _fresh_spool_path(extension)
+        with transaction.atomic():
+            locked = Dataset.objects.select_for_update().get(pk=dataset.pk)
+            if not can_submit_to_dataset(contributor, locked):
+                raise PoolUnavailable("The pool no longer accepts files from this contributor")
+            ledger, created = SubmissionLedger.objects.get_or_create(dataset=locked, contributor=contributor)
+            SubmissionFile.objects.create(
+                ledger=ledger,
+                stored_name=path.name,
+                file_extension=extension,
+                file_path=str(path),
+                file_size=len(data),
+                file_hash=hashlib.sha256(data).hexdigest(),
+                sidecar_hash=hashlib.sha256(json.dumps(sidecar, sort_keys=True).encode()).hexdigest(),
+                sidecar=sidecar,
+                not_before=not_before,
+            )
+            if held is None:
+                path.write_bytes(data)
+    except BaseException:
+        if path is not None:
+            path.unlink(missing_ok=True)
+        raise
+    return AcceptedSubmission(ledger=ledger, ledger_created=created)

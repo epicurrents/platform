@@ -60,7 +60,6 @@ supplied) require session authentication or a ``FederatedBearer`` JWT.
 """
 
 import hashlib
-import json
 import logging
 import math
 import re
@@ -3246,15 +3245,14 @@ def submit_file(
     The pool must be open and the caller in its group at the time of the request: a
     membership withdrawn or intake closed since answers as though the pool did not exist.
     """
-    from recordings.models import SubmissionFile, SubmissionLedger
     from recordings.submissions import (
+        PoolUnavailable,
+        SubmissionRefused,
         Violation,
-        can_submit_to_dataset,
+        accept_submission,
         get_ingest_profile,
         parse_sidecar,
-        submission_spool_root,
         validate_file,
-        validate_submission,
     )
 
     user = _require_auth(request)
@@ -3278,51 +3276,32 @@ def submit_file(
         violations = validate_file(profile, data)
         violations.append(Violation("sidecar_shape", "The sidecar is not valid JSON."))
     else:
-        violations = validate_submission(profile, data, sidecar_document)
-    if violations:
-        rows = [{"code": v.code, "message": v.message} for v in violations]
-        # Against the pool rather than the ledger: a refusal writes nothing, and a
-        # contributor's first file may be refused before any ledger exists.
-        log_activity(
-            verb="recordings.submission.file.reject",
-            target=dataset,
-            metadata={
-                "violation_count": len(rows),
-                "violation_codes": sorted({row["code"] for row in rows}),
-            },
-        )
-        return 422, {"accepted": False, "violations": rows}
-
-    spool = submission_spool_root()
-    spool.mkdir(parents=True, exist_ok=True)
-    stored_name = f"{secrets.token_hex(16).upper()}{extension}"
-    while (spool / stored_name).exists():
-        stored_name = f"{secrets.token_hex(16).upper()}{extension}"
-    spool_path = spool / stored_name
-    # The bytes are written inside the transaction, after the row: a failure before the write leaves
-    # nothing, a failed write rolls the row back and unlinks, and only a worker dying between the write
-    # and the commit can leave bytes without a row, which the hourly sweep of the spool unlinks.
-    try:
-        with transaction.atomic():
-            # The pool's row lock, the one its configuration writes take: a dissolve or a
-            # closed intake that committed since the check above refuses this file.
-            dataset = type(dataset).objects.select_for_update().get(pk=dataset.pk)
-            if not can_submit_to_dataset(user, dataset):
-                raise HttpError(404, "Submission pool not found")
-            ledger, created = SubmissionLedger.objects.get_or_create(dataset=dataset, contributor=user)
-            SubmissionFile.objects.create(
-                ledger=ledger,
-                stored_name=stored_name,
-                file_extension=extension,
-                file_path=str(spool_path),
-                file_size=len(data),
-                file_hash=hashlib.sha256(data).hexdigest(),
-                sidecar_hash=hashlib.sha256(json.dumps(sidecar_document, sort_keys=True).encode()).hexdigest(),
-                sidecar=sidecar_document,
-            )
-            log_activity(verb="recordings.submission.file.accept", target=ledger, metadata={"ledger_created": created})
-            spool_path.write_bytes(data)
-    except Exception:
-        spool_path.unlink(missing_ok=True)
-        raise
-    return 202, {"accepted": True}
+        try:
+            # One transaction with the audit row, so an acceptance is never committed without it; bytes left
+            # by a rollback here have no row, and the spool sweep removes them.
+            with transaction.atomic():
+                accepted = accept_submission(dataset, user, sidecar=sidecar_document, data=data, extension=extension)
+                log_activity(
+                    verb="recordings.submission.file.accept",
+                    target=accepted.ledger,
+                    metadata={"ledger_created": accepted.ledger_created},
+                )
+        except SubmissionRefused as refused:
+            violations = refused.violations
+        except PoolUnavailable:
+            # A dissolve, a closed intake or a withdrawn membership that committed since the check above.
+            raise HttpError(404, "Submission pool not found") from None
+        else:
+            return 202, {"accepted": True}
+    rows = [{"code": v.code, "message": v.message} for v in violations]
+    # Against the pool rather than the ledger: a refusal writes nothing, and a
+    # contributor's first file may be refused before any ledger exists.
+    log_activity(
+        verb="recordings.submission.file.reject",
+        target=dataset,
+        metadata={
+            "violation_count": len(rows),
+            "violation_codes": sorted({row["code"] for row in rows}),
+        },
+    )
+    return 422, {"accepted": False, "violations": rows}
