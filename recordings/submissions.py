@@ -14,7 +14,8 @@ already holds reaches the spool only through :func:`spool_held_file`'s re-dither
 in ``recordings/tests/test_submissions.py`` (``TestGate`` pins each check, including the blank
 fields against the de-identifier's actual output, ``TestPoolEndpoints`` the write-nothing refusal
 and the ledger as the audit target, ``TestAcceptSubmission`` the shared path and the held route,
-``TestPooledIngest`` the random order and the system author, ``TestPooledIngestTrail`` the unjoinable trail).
+``TestPooledIngest`` the random order and the system author, ``TestPooledIngestTrail`` the unjoinable trail,
+``TestUploadAgainstProfile`` the file checks for an upload and a stored file that still passes them).
 
 A pooled dataset cannot trust an arriving file the way an upload trusts its author: the
 file was prepared elsewhere against a published profile, and a file that departs from the
@@ -476,6 +477,29 @@ def validate_sidecar(profile: IngestProfile, sidecar: Any, data: bytes) -> list[
 def validate_submission(profile: IngestProfile, data: bytes, sidecar: Any) -> list[Violation]:
     """Every violation of ``profile`` by the pair. Empty means the submission may be accepted."""
     return validate_file(profile, data) + validate_sidecar(profile, sidecar, data)
+
+
+def validate_upload(profile: IngestProfile, data: bytes) -> list[Violation]:
+    """Every violation of ``profile`` by the recording bytes of an ordinary upload. Empty means the file conforms.
+
+    For a project that holds an upload to a pool's profile before the file ever reaches a pool: a refusal while the
+    uploader can still act on it, and a second check of the stored file before a hand-over. An upload carries no gate
+    sidecar, so only the file is checked, by :func:`validate_file`, and whatever a project sends beside the file is
+    its own to check. A container from the viewer's export is checked as the EDF it carries, which is what ingest
+    stores. Its footer must end where the file does, and what the footer holds is left to the upload's ingest.
+
+    A file that passes still passes once the upload pipeline has processed it, which is what lets the stored file be
+    checked again. ``TestUploadAgainstProfile`` pins that for a template in canonical order that ends in ECG.
+    """
+    from recordings.container import read_container_marker
+
+    marker = read_container_marker(data)
+    if marker is None:
+        return validate_file(profile, data)
+    _plain, total, kib = marker
+    if kib < 1 or total + kib * 1024 != len(data):
+        return [Violation("container", "The container's marker does not match the file's length.")]
+    return validate_file(profile, data[:total])
 
 
 # ---------------------------------------------------------------------------

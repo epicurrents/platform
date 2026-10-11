@@ -56,6 +56,7 @@ from recordings.submissions import (
     validate_file,
     validate_sidecar,
     validate_submission,
+    validate_upload,
 )
 from recordings.tasks import ingest_pooled_submissions
 from recordings.tests.test_edf_processor import _make_edf_data, _make_edf_header
@@ -1428,3 +1429,123 @@ class TestStoredBytesOfACanonicalSubmission:
         assert hashlib.sha256(stored).hexdigest() != second.file_hash
         assert len(stored) == len(canonical)
         assert stored[:256] == canonical[:256]
+
+
+# ---------------------------------------------------------------------------
+# An ordinary upload held to a profile
+# ---------------------------------------------------------------------------
+
+
+def _template_profile() -> IngestProfile:
+    """A pool template as a project builds one: the 10-20 electrodes in the platform's canonical order, then ECG."""
+    from recordings.processors.channel_labels import CANONICAL_EEG_ORDER
+
+    electrodes = {"Fp1", "Fp2", "F7", "F3", "Fz", "F4", "F8", "T7", "C3", "Cz", "C4", "T8", "P7", "P3", "Pz", "P4"}
+    electrodes |= {"P8", "O1", "O2"}
+    channels = (*(label for label in CANONICAL_EEG_ORDER if label in electrodes), "ECG")
+    return _profile(
+        key="test.template",
+        channels=channels,
+        sampling_rate=200.0,
+        physical_min=-3276.8,
+        physical_max=3276.7,
+        durations_seconds=(10.0,),
+    )
+
+
+def _template_excerpt(profile: IngestProfile) -> bytes:
+    """A file prepared against *profile*: its channels labelled as the profile lists them, ten one-second records.
+
+    The transducer and prefiltering strings are written as the source gave them, as the viewer's exporter does, and
+    the gate does not read them, so the ingest pass has the signal block to rewrite.
+    """
+    signals = [
+        {
+            "label": channel,
+            "unit": "uV",
+            "phys_min": -3276.8,
+            "phys_max": 3276.7,
+            "sample_count": 200,
+            "transducer": "AgAgCl cup electrode",
+            "prefiltering": "HP:0.53Hz LP:70Hz N:50Hz",
+        }
+        for channel in profile.channels
+    ]
+    return _edf(n_records=10, signals=signals)
+
+
+def _as_container(edf: bytes, footer: dict) -> bytes:
+    """*edf* as the viewer's export sends it: the marker in the reserved field and the footer appended."""
+    body = json.dumps(footer).encode("utf-8")
+    kib = -(-len(body) // 1024)
+    marker = f"EDF EC:{len(edf)}:{kib}".ljust(44).encode("ascii")
+    return edf[:192] + marker + edf[236:] + body.ljust(kib * 1024, b"\x00")
+
+
+class TestUploadAgainstProfile:
+    """``validate_upload``: the file checks of the gate, for an upload that carries no gate sidecar."""
+
+    def test_the_template_is_one_a_file_can_carry(self):
+        assert register_ingest_profile(_template_profile()) is None
+
+    def test_a_prepared_excerpt_passes(self):
+        profile = _template_profile()
+        assert validate_upload(profile, _template_excerpt(profile)) == []
+
+    def test_the_file_checks_apply(self):
+        profile = _template_profile()
+        data = _edf(n_records=3, signals=SIGNALS, patient="Jane Doe")
+        assert {"identification", "channels", "sampling_rate", "range", "duration"} <= _codes(
+            validate_upload(profile, data)
+        )
+
+    def test_no_sidecar_is_asked_for(self):
+        profile = _template_profile()
+        assert not any(v.code.startswith("sidecar") for v in validate_upload(profile, _template_excerpt(profile)))
+
+    def test_a_container_is_checked_as_the_edf_it_carries(self):
+        profile = _template_profile()
+        container = _as_container(_template_excerpt(profile), {"version": "1.0", "events": [], "interruptions": []})
+        assert validate_file(profile, container) != []
+        assert validate_upload(profile, container) == []
+
+    def test_a_container_carrying_a_failing_edf_is_refused(self):
+        profile = _template_profile()
+        container = _as_container(_edf(n_records=10, signals=SIGNALS), {"version": "1.0"})
+        assert "channels" in _codes(validate_upload(profile, container))
+
+    @pytest.mark.parametrize("cut", [1, 1024])
+    def test_a_container_shorter_than_its_marker_is_refused(self, cut):
+        profile = _template_profile()
+        container = _as_container(_template_excerpt(profile), {"version": "1.0"})
+        assert _codes(validate_upload(profile, container[:-cut])) == {"container"}
+
+    @pytest.mark.parametrize("discard", [False, True])
+    @pytest.mark.parametrize("container", [False, True], ids=["edf", "container"])
+    def test_the_stored_file_of_a_passing_upload_still_passes(
+        self, discard, container, user, spool, settings, django_capture_on_commit_callbacks
+    ):
+        settings.RECORDINGS_DISCARD_SOURCE_CHANNEL_METADATA = discard
+        settings.RECORDINGS_DISCARD_ORIGINAL_NAME = discard
+        settings.RECORDINGS_DISCARD_EMBEDDED_ANNOTATIONS = discard
+        profile = _template_profile()
+        data = _template_excerpt(profile)
+        if container:
+            data = _as_container(data, {"version": "1.0", "events": [], "interruptions": []})
+        assert validate_upload(profile, data) == []
+
+        upload = SimpleUploadedFile("excerpt.edf", data, content_type="application/octet-stream")
+        with django_capture_on_commit_callbacks(execute=True):
+            response = _client(user).post("/recordings/api/v1/upload", {"file": upload})
+        assert response.status_code == 202, response.content
+        recording = Recording.objects.get(stored_name=response.json()["stored_name"])
+        assert recording.status == Recording.Status.READY, recording.processing_error
+
+        stored = Path(recording.file_path).read_bytes()
+        header_record = 256 * (1 + len(profile.channels))
+        # The pass rewrote the signal block, so the check below is of its output rather than of the upload.
+        assert stored[256:header_record] != data[256:header_record]
+        assert validate_upload(profile, stored) == []
+        assert validate_file(profile, stored) == []
+        labels = [s.label.strip() for s in parse_signal_infos(stored, parse_edf_header(stored))]
+        assert labels[-1] == "ECG"
