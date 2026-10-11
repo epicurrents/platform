@@ -242,7 +242,13 @@ RELATION_HANDLING: dict[str, _Handling] = {
 
 
 def register_export_relation(
-    model_label: str, field_name: str, *, fields=(), omit_reason: str = "", title: str = ""
+    model_label: str,
+    field_name: str,
+    *,
+    fields=(),
+    omit_reason: str = "",
+    title: str = "",
+    include_masked=(),
 ) -> None:
     """Declare how a relation to the user model is treated by the subject export.
 
@@ -256,6 +262,10 @@ def register_export_relation(
     out, and say why in the payload). Naming neither, or both, is a configuration
     error that ``manage.py check`` reports; see :mod:`user.checks`.
 
+    *include_masked* names exported fields that the project registers for audit
+    masking or withholding but that the subject is entitled to see, such as
+    their own free text kept out of the trail; see :func:`_export`.
+
     ``model_label`` is the lowercase ``app_label.model_name`` pair, as
     ``register_subject_pii`` takes.
     """
@@ -263,7 +273,7 @@ def register_export_relation(
     if omit_reason:
         RELATION_HANDLING[key] = _omit(omit_reason, title=title)
     else:
-        RELATION_HANDLING[key] = _export(*fields, title=title)
+        RELATION_HANDLING[key] = _export(*fields, title=title, include_masked=tuple(include_masked))
 
 
 def _model_label(relation) -> str:

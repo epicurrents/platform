@@ -221,6 +221,27 @@ class TestDeclaredFieldsActuallyArrive:
             "add to include_masked if the subject may see it, or stop declaring it"
         )
 
+    def test_a_project_can_export_a_field_it_withholds_from_the_trail(self, user, monkeypatch):
+        """A project's own words, withheld from the audit trail, still reach the subject who wrote them."""
+        from django.apps import apps
+
+        from user.export import register_export_relation
+        from user.models import UserPreference
+
+        UserPreference.objects.create(user=user, scope="viewer", values={"montage": "longitudinal"})
+        label = apps.get_model("user.UserPreference")._meta.label_lower
+        original = registered_masked_fields(label)
+        monkeypatch.setitem(RELATION_HANDLING, f"{label}:user", RELATION_HANDLING[f"{label}:user"])
+        register_masked_fields(label, {"values"}, withhold=True)
+        try:
+            register_export_relation(label, "user", fields=("scope", "values"))
+            assert "values" not in export_user_data(user)["data"][f"{label}:user"][0]
+            register_export_relation(label, "user", fields=("scope", "values"), include_masked=("values",))
+            assert export_user_data(user)["data"][f"{label}:user"][0]["values"] == {"montage": "longitudinal"}
+        finally:
+            register_masked_fields(label, set(), withhold=True)
+            register_masked_fields(label, original)
+
     def test_the_uploaded_filename_reaches_the_subject(self, user, tmp_path):
         """The concrete case, stated on its own: an author asking what is held
         about them is entitled to the name of the file they uploaded."""
