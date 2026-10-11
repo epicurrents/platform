@@ -69,7 +69,7 @@ class ChangeLogOut(Schema):
     activity_id: int | None = None  # PK of the parent Activity row, if the change was made within an API request
     after_hash: str  # 32-char integrity hash from audit.compute_audit_hash
     verified: bool  # True when after_hash matches a fresh recompute of the row's contents; False on tamper / corruption
-    erased: bool  # True when the row was subject-erased (GDPR Art. 17); payload is scrubbed and rollback is refused
+    erased: bool  # True when the row was erased (subject erasure or row scrub); payload is scrubbed, rollback refused
     created_at: datetime
 
 
@@ -156,7 +156,7 @@ def rollback_bulk_endpoint(request, payload: BulkRollbackIn):
         # so the caller sees "row integrity issue, can't apply this rollback".
         raise HttpError(409, str(exc))
     except ValueError as exc:
-        # Non-restorable entry in the batch (subject-erased row, erasure
+        # Non-restorable entry in the batch (erased row, erasure
         # record, vanished model); the transaction rolled back on exit.
         raise HttpError(400, str(exc))
 

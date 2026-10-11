@@ -88,7 +88,7 @@ One row per tracked create / modify / delete / rollback. Lives in `activity_obje
 | `modify` | After `post_save` with `created=False`, when fields actually changed | Pre-save snapshot | Field-level diff | Restores `before_state`. |
 | `delete` | Before `pre_delete` fires | Final snapshot of the doomed object | `null` | Re-creates the object using `before_state`. |
 | `rollback` | After any rollback executes | Object state at the start of the rollback | Diff between that and the restored state | Same shape as `modify`, so rollback-of-rollback is well-defined. |
-| `erase` | Appended by `erase_subject` after a GDPR Art. 17 scrub | Scrub summary (per-model row counts, reason) — no object state | `null` | None — erasure records refuse rollback. |
+| `erase` | Appended by `erase_subject` after a GDPR Art. 17 scrub, and by `scrub_rows` on each shard it scrubbed | Scrub summary (per-model row counts, reason; for a row scrub also the field names) — no object state | `null` | None — erasure records refuse rollback. |
 
 The `before_state → changes → after_hash` triple is enough to (a) reconstruct the object at any historical point and (b) detect *accidental* corruption or *naive* tampering with stored audit rows (see [Threat model](#threat-model) for the precise scope).
 
@@ -135,6 +135,16 @@ Which models and fields participate is a registration, not a hardcode: owning ap
 A registered model that is later dropped from the schema keeps its registration, with `historical=True`: the audit rows outlive the model and still need scrubbing, and the scrub itself needs only the ContentType row, which survives a model deletion. The flag tells the system check in [checks.py](checks.py) not to expect the model — and to error the other way, when a historical registration's model turns out to still exist. It also forfeits the check's typo protection, so every historical registration needs a test scrubbing synthesized rows end-to-end. The shape is a project that dropped a profile model: the registration stays in its `apps.py` with the flag, and its erasure test pins the scrub.
 
 The surviving ContentType row is load-bearing, which is why `ObjectChangeLog.content_type` is `on_delete=PROTECT`: `manage.py remove_stale_contenttypes` offers to delete exactly that row, and under CASCADE a confirmed run would take the whole shard with it — outside the sanctioned tombstoning path, and silently unhooking the scrub. With PROTECT the command fails loudly on any ContentType the trail still references; leave stale ContentTypes in place.
+
+### Row scrubs
+
+`scrub_rows` is the same scrub and seal keyed by rows instead of a subject. Each `RowScrub` names a model label, the object ids and the payload fields, and every change-log row of those objects has those fields scrubbed, delete and rollback rows included. It is for values that are not personal data alone but would join two records the platform keeps apart: a submission pool's hand-over scrubs the code values, onsets and digests of a review copy, which would otherwise pair the pooled file with the round it came from.
+
+- **Validated before any write.** An uninstalled model, a field the model does not have and a scrub naming no fields are refused with `ValueError`, as is a reason that is not a lower-case code. A wrong name would otherwise scrub nothing and report zero rows, which a clean run reports too, and the registry check that catches this for `register_subject_pii` cannot see a direct call.
+- **One record per shard, naming no object.** The run appends a chained `erase` row on each content type it scrubbed, all with one random run id as their object id, carrying the row counts, the field names and the reason. The objects are what the scrub exists to stop joining, so the record does not list them.
+- **Deleting and scrubbing together.** A delete record's state is outside its seal, so deleting the objects and scrubbing their trail in one transaction leaves nothing readable a moment later; the run is atomic and nests inside the caller's transaction.
+
+Activity metadata is not touched: by [the metadata rule](../AGENTS.md#activity-metadata-carries-identifiers-never-names) it carries identifiers, and a deleted object's id resolves to nothing.
 
 The operator-facing entry point is the [`erase_user` management command](../user/README.md#account-erasure-gdpr-art-17) in the user app, which handles the account row, owned files, and sessions before calling `erase_subject`. Calling `erase_subject(user_pk)` directly covers the audit trail only.
 

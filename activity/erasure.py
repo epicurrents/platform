@@ -18,6 +18,15 @@ regress independently:
   so post-erasure tampering stays detectable. The erasure itself is
   recorded as a chained ``ACTION_ERASE`` row on the subject's shard.
 
+``scrub_rows`` is the second entry point, keyed by rows rather than by a
+subject: the caller names a model, the object ids and the fields, and every
+change-log row of those objects is scrubbed and sealed the same way, with a
+chained ``ACTION_ERASE`` record of the run on each shard it touched. It is
+for a value that is not personal data alone but would join two records the
+platform keeps apart, such as a reviewed copy and the pooled file made from
+it. The same two halves hold: a narrowed selection leaves the join in the
+permanent trail, and a broken seal makes the scrubbed rows unverifiable.
+
 Contract test: ``activity/tests/test_erasure.py``. See AGENTS.md →
 *Load-bearing files* before modifying.
 
@@ -27,8 +36,12 @@ for the core registrations. Project plugins with their own user-linked
 PII models register the same way.
 """
 
+import re
+import uuid
+from collections.abc import Iterable
 from dataclasses import dataclass
 
+from django.apps import apps
 from django.contrib.auth import get_user_model
 from django.contrib.contenttypes.models import ContentType
 from django.db import transaction
@@ -236,5 +249,113 @@ def erase_subject(user_pk, *, erased_by=None) -> dict:
             hash_payload=erase_summary,
             timestamp=timezone.now(),
         )
+
+    return summary
+
+
+# A row scrub's reason is a code, never text, because the record of the run is permanent.
+_REASON_RE = re.compile(r"^[a-z][a-z0-9_.]{0,63}$")
+
+# Object ids per query; keeps the IN list inside SQLite's bound-parameter limit.
+_ID_CHUNK = 500
+
+
+@dataclass(frozen=True)
+class RowScrub:
+    """The change-log rows of *object_ids* of *model_label*, and the payload fields to scrub from them.
+
+    ``fields`` are serialized attnames, as ``serialize_instance`` writes them, so a foreign key is
+    ``recording_id`` rather than ``recording``. A bare string for either is refused: iterated, it
+    would name one-character ids or fields, and a wrong id scrubs another object without an error.
+    """
+
+    model_label: str
+    object_ids: tuple[str, ...]
+    fields: frozenset[str]
+
+    def __init__(self, model_label: str, object_ids: Iterable, fields: Iterable[str]):
+        if isinstance(object_ids, str | bytes) or isinstance(fields, str | bytes):
+            raise TypeError("RowScrub takes object_ids and fields as collections, not a single string")
+        object.__setattr__(self, "model_label", model_label)
+        object.__setattr__(self, "object_ids", tuple(dict.fromkeys(str(object_id) for object_id in object_ids)))
+        object.__setattr__(self, "fields", frozenset(fields))
+
+
+def _validate_scrub(scrub: RowScrub):
+    """Return the scrub's content type, or raise when it names a model or field that does not exist.
+
+    A wrong name scrubs nothing and reports zero rows, which a clean run reports too, so it is
+    refused before anything is written.
+    """
+    try:
+        model = apps.get_model(scrub.model_label)
+    except (LookupError, ValueError) as error:
+        raise ValueError(f"scrub_rows: {scrub.model_label!r} is not an installed model") from error
+    if not scrub.fields:
+        raise ValueError(f"scrub_rows: the scrub of {scrub.model_label} names no fields")
+    attnames = {field.attname for field in model._meta.concrete_fields}
+    unknown = sorted(scrub.fields - attnames)
+    if unknown:
+        raise ValueError(f"scrub_rows: {scrub.model_label} has no field {', '.join(unknown)}")
+    return ContentType.objects.get_for_model(model, for_concrete_model=False)
+
+
+def scrub_rows(scrubs: Iterable[RowScrub], *, reason: str, performed_by=None) -> dict[str, int]:
+    """Scrub the named fields from every change-log row of the named objects, and record the run.
+
+    Each row is tombstoned and sealed as ``erase_subject`` does it, so the chain keeps verifying
+    and later tampering is detected. Delete and rollback rows are selected with the rest, which
+    is what lets a caller delete objects and scrub their trail in one transaction: a delete
+    record's state is outside its seal until the scrub seals it.
+
+    The run appends one chained ``ACTION_ERASE`` row on each shard it scrubbed, all under one
+    random run id as their object id. The record carries the row count and the field names per
+    model and *reason*, a lower-case code; it names no object, because the objects are what the
+    scrub exists to stop joining.
+
+    Every scrub is validated before any write, and the whole run is atomic. Returns the scrubbed
+    row count per model label.
+    """
+    scrubs = list(scrubs)
+    if not _REASON_RE.match(reason or ""):
+        raise ValueError(f"scrub_rows: reason {reason!r} is not a lower-case code")
+    content_types = [_validate_scrub(scrub) for scrub in scrubs]
+
+    summary: dict[str, int] = {}
+    fields: dict[str, set[str]] = {}
+    shards: dict[str, ContentType] = {}
+    with transaction.atomic():
+        for scrub, content_type in zip(scrubs, content_types, strict=True):
+            scrubbed = 0
+            for start in range(0, len(scrub.object_ids), _ID_CHUNK):
+                rows = ObjectChangeLog.objects.filter(
+                    content_type=content_type,
+                    object_id__in=scrub.object_ids[start : start + _ID_CHUNK],
+                ).exclude(action=ObjectChangeLog.ACTION_ERASE)
+                for row in rows.iterator():
+                    if _scrub_row(row, scrub.fields):
+                        scrubbed += 1
+            summary[scrub.model_label] = summary.get(scrub.model_label, 0) + scrubbed
+            fields.setdefault(scrub.model_label, set()).update(scrub.fields)
+            shards[scrub.model_label] = content_type
+
+        record = {
+            "erased": dict(sorted(summary.items())),
+            "fields": {label: sorted(names) for label, names in sorted(fields.items())},
+            "reason": reason,
+        }
+        run_id = uuid.uuid4().hex
+        timestamp = timezone.now()
+        for label in sorted(shards):
+            create_chained_change_log(
+                content_type=shards[label],
+                object_id=run_id,
+                action=ObjectChangeLog.ACTION_ERASE,
+                performed_by=performed_by,
+                before_state=record,
+                changes=None,
+                hash_payload=record,
+                timestamp=timestamp,
+            )
 
     return summary

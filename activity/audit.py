@@ -465,7 +465,7 @@ def compute_erased_hash(
     algorithm: str,
     hash_key_version: int | None,
 ) -> str:
-    """Seal a subject-erased row's scrubbed payload.
+    """Seal an erased row's scrubbed payload.
 
     Computed at erasure time over the post-scrub ``before_state`` /
     ``changes`` plus the row's original ``after_hash``, which binds the seal
@@ -618,7 +618,7 @@ def verify_change_hash(change) -> bool:
     when a v2+ row references a key version no longer in settings — the
     caller decides whether that's a tamper signal or a configuration error.
 
-    Subject-erased rows (non-null ``erased_at``) verify against
+    Erased rows (non-null ``erased_at``) verify against
     ``erased_hash`` instead: the original ``after_hash`` no longer matches
     the scrubbed payload by design, but the erasure routine sealed the
     scrubbed content, so post-erasure tampering is still detectable. The
@@ -1342,7 +1342,7 @@ def rollback_change(*, user, change_id: int):
         raise ValueError("Erasure records cannot be rolled back — they carry no object state.")
     if change.erased_at is not None:
         raise ValueError(
-            "This change log entry was subject-erased under GDPR Art. 17; "
+            "This change log entry was erased, by a GDPR Art. 17 subject erasure or a row scrub; "
             "its state payload no longer exists and cannot be restored."
         )
     model_class = change.content_type.model_class()

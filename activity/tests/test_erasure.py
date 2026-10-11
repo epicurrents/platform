@@ -270,7 +270,7 @@ class TestEraseSubject:
         user_pk = user.pk
         erase_subject(user_pk)
         erased = ObjectChangeLog.objects.filter(content_type=_user_ct(), erased_at__isnull=False).first()
-        with pytest.raises(ValueError, match="subject-erased"):
+        with pytest.raises(ValueError, match="was erased"):
             rollback_change(user=superuser, change_id=erased.pk)
         erase_record = ObjectChangeLog.objects.get(content_type=_user_ct(), action=ObjectChangeLog.ACTION_ERASE)
         with pytest.raises(ValueError, match="cannot be rolled back"):
@@ -322,3 +322,191 @@ class TestContentTypeProtection:
         with pytest.raises(ProtectedError):
             ct.delete()
         assert ObjectChangeLog.objects.filter(content_type=ct).exists()
+
+
+def _coded_events(make_user, count=2):
+    """Audited events with a code each, created, modified and deleted the way a round leaves them."""
+    from model_bakery import baker
+
+    from annotations.models import Code, Event
+
+    author = make_user()
+    events, codes = [], []
+    with with_system_activity("tests.review.annotate", interface=Activity.Interface.COMMAND):
+        for index in range(count):
+            event = baker.make(
+                Event,
+                author=author,
+                target_content_type=_user_ct(),
+                target_object_id=str(author.pk),
+                name=f"spike {index}",
+                timestamp=12.5 + index,
+                duration=0.25,
+                object_hash=f"{index:032x}",
+            )
+            event.timestamp += 1
+            event.save()
+            events.append(event)
+            codes.append(
+                baker.make(
+                    Code,
+                    content_type=ContentType.objects.get_for_model(Event),
+                    object_id=str(event.pk),
+                    standard="epicurrents.eeg",
+                    value="spike",
+                )
+            )
+    return events, codes
+
+
+def _rows(model, objects):
+    ct = ContentType.objects.get_for_model(model)
+    return ObjectChangeLog.objects.filter(content_type=ct, object_id__in=[str(obj.pk) for obj in objects]).exclude(
+        action=ObjectChangeLog.ACTION_ERASE
+    )
+
+
+@pytest.mark.django_db
+class TestScrubRows:
+    def _scrub(self, events, codes, reason="review.handover"):
+        from activity.erasure import RowScrub, scrub_rows
+
+        return scrub_rows(
+            [
+                RowScrub("annotations.event", [e.pk for e in events], {"timestamp", "duration", "object_hash"}),
+                RowScrub("annotations.code", [c.pk for c in codes], {"value"}),
+            ],
+            reason=reason,
+        )
+
+    def test_scrubs_the_named_fields_of_the_named_objects_only(self, make_user):
+        from annotations.models import Code, Event
+
+        events, codes = _coded_events(make_user, count=3)
+        with with_system_activity("tests.review.handover", interface=Activity.Interface.COMMAND):
+            summary = self._scrub(events[:2], codes[:2])
+
+        assert summary == {"annotations.event": 4, "annotations.code": 2}
+        for row in _rows(Event, events[:2]):
+            assert row.erased_at is not None
+            assert row.before_state["timestamp"] == ERASED_SENTINEL
+            assert row.before_state["object_hash"] == ERASED_SENTINEL
+            assert row.before_state["name"].startswith("spike")
+            if row.changes:
+                assert row.changes["timestamp"] == {"from": ERASED_SENTINEL, "to": ERASED_SENTINEL}
+        for row in _rows(Code, codes[:2]):
+            assert row.before_state["value"] == ERASED_SENTINEL
+            assert row.before_state["standard"] == "epicurrents.eeg"
+        for row in [*_rows(Event, events[2:]), *_rows(Code, codes[2:])]:
+            assert row.erased_at is None
+
+    def test_a_delete_in_the_same_transaction_is_scrubbed(self, make_user):
+        from django.db import transaction
+
+        from annotations.models import Event
+
+        events, codes = _coded_events(make_user, count=1)
+        with with_system_activity("tests.review.handover", interface=Activity.Interface.COMMAND):
+            with transaction.atomic():
+                Event.objects.get(pk=events[0].pk).delete()
+                self._scrub(events, codes)
+
+        deleted = _rows(Event, events).get(action=ObjectChangeLog.ACTION_DELETE)
+        assert deleted.before_state["timestamp"] == ERASED_SENTINEL
+        assert verify_change_hash(deleted)
+
+    def test_scrubbed_rows_verify_and_the_chains_stay_intact(self, make_user):
+        from annotations.models import Code, Event
+
+        events, codes = _coded_events(make_user)
+        self._scrub(events, codes)
+        for model in (Event, Code):
+            ct = ContentType.objects.get_for_model(model)
+            for row in ObjectChangeLog.objects.filter(content_type=ct):
+                assert verify_change_hash(row), f"row {row.pk} failed verification"
+            assert verify_chain(ct).ok
+
+    def test_the_run_is_recorded_on_each_shard_and_names_no_object(self, make_user):
+        from annotations.models import Code, Event
+
+        events, codes = _coded_events(make_user)
+        self._scrub(events, codes)
+        records = list(ObjectChangeLog.objects.filter(action=ObjectChangeLog.ACTION_ERASE))
+        assert {record.content_type for record in records} == {
+            ContentType.objects.get_for_model(Event),
+            ContentType.objects.get_for_model(Code),
+        }
+        assert len({record.object_id for record in records}) == 1
+        for record in records:
+            assert record.before_state == {
+                "erased": {"annotations.code": 2, "annotations.event": 4},
+                "fields": {
+                    "annotations.code": ["value"],
+                    "annotations.event": ["duration", "object_hash", "timestamp"],
+                },
+                "reason": "review.handover",
+            }
+            assert verify_change_hash(record)
+            payload = json.dumps(record.before_state)
+            for obj in [*events, *codes]:
+                assert f'"{obj.pk}"' not in payload
+
+    def test_a_second_run_changes_no_seal(self, make_user):
+        events, codes = _coded_events(make_user)
+        self._scrub(events, codes)
+        sealed = {
+            row.pk: (row.erased_at, row.erased_hash) for row in ObjectChangeLog.objects.filter(erased_at__isnull=False)
+        }
+        assert self._scrub(events, codes) == {"annotations.event": 0, "annotations.code": 0}
+        for row in ObjectChangeLog.objects.filter(pk__in=sealed):
+            assert (row.erased_at, row.erased_hash) == sealed[row.pk]
+
+    def test_object_ids_beyond_one_query_are_all_scrubbed(self, make_user, monkeypatch):
+        from activity import erasure
+        from annotations.models import Event
+
+        monkeypatch.setattr(erasure, "_ID_CHUNK", 1)
+        events, codes = _coded_events(make_user, count=3)
+        assert self._scrub(events, codes)["annotations.event"] == 6
+        assert not _rows(Event, events).filter(erased_at__isnull=True).exists()
+
+    @pytest.mark.parametrize(
+        "label,fields,reason",
+        [
+            ("annotations.nosuchmodel", {"value"}, "review.handover"),
+            ("annotations.code", {"valeu"}, "review.handover"),
+            ("annotations.code", set(), "review.handover"),
+            ("annotations.code", {"value"}, "Handed over by the curator"),
+        ],
+    )
+    def test_a_scrub_that_cannot_be_what_was_meant_writes_nothing(self, make_user, label, fields, reason):
+        from activity.erasure import RowScrub, scrub_rows
+
+        events, codes = _coded_events(make_user)
+        before = ObjectChangeLog.objects.count()
+        with pytest.raises(ValueError, match="scrub_rows"):
+            scrub_rows(
+                [
+                    RowScrub("annotations.event", [e.pk for e in events], {"timestamp"}),
+                    RowScrub(label, [c.pk for c in codes], fields),
+                ],
+                reason=reason,
+            )
+        assert ObjectChangeLog.objects.count() == before
+        assert not ObjectChangeLog.objects.filter(erased_at__isnull=False).exists()
+
+    @pytest.mark.parametrize("object_ids,fields", [("42", {"value"}), (["42"], "value")])
+    def test_a_bare_string_is_not_read_as_a_collection(self, object_ids, fields):
+        from activity.erasure import RowScrub
+
+        with pytest.raises(TypeError):
+            RowScrub("annotations.code", object_ids, fields)
+
+    def test_rollback_is_refused_on_a_scrubbed_row(self, make_user, superuser):
+        from annotations.models import Event
+
+        events, codes = _coded_events(make_user)
+        self._scrub(events, codes)
+        row = _rows(Event, events).filter(action=ObjectChangeLog.ACTION_MODIFY).first()
+        with pytest.raises(ValueError, match="was erased"):
+            rollback_change(user=superuser, change_id=row.pk)
