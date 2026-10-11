@@ -40,6 +40,8 @@ def run_emitter(tmp_path, monkeypatch):
             "BACKUP_LOCAL_ENABLED",
         ):
             monkeypatch.delenv(var, raising=False)
+        # Set as the db service sets it; a test about the name overrides it.
+        monkeypatch.setenv("DB_NAME", "epicurrents")
         for key, value in (env or {}).items():
             monkeypatch.setenv(key, value)
         emitter.main()
@@ -57,7 +59,15 @@ class TestEmitRuntimeConfig:
             "/data/media/uploads",
         ]
         assert config["repositories"] == [{"path": "/backup", "label": "local"}]
-        assert config["postgresql_databases"] == [{"name": "all", "hostname": "db"}]
+        assert config["postgresql_databases"] == [
+            {
+                "name": "epicurrents",
+                "hostname": "db",
+                "format": "custom",
+                "no_owner": True,
+                "options": "--exclude-table-data=recordings_submissionfile",
+            }
+        ]
         assert config["keep_daily"] == 7
         assert config["keep_weekly"] == 4
         assert config["keep_monthly"] == 6
@@ -83,6 +93,7 @@ class TestEmitRuntimeConfig:
         payload. The emitter must abort before writing any file."""
         emitter = _load_emitter()
         monkeypatch.setenv("BORGMATIC_ACTIVE_DIR", str(tmp_path))
+        monkeypatch.setenv("DB_NAME", "epicurrents")
         monkeypatch.setenv(
             "BORG_REMOTE_REPO",
             "user@host:/srv/borg\nhooks:\n  before_backup:\n    - rm -rf /data",
@@ -95,6 +106,7 @@ class TestEmitRuntimeConfig:
     def test_carriage_return_in_repo_also_aborts(self, tmp_path, monkeypatch):
         emitter = _load_emitter()
         monkeypatch.setenv("BORGMATIC_ACTIVE_DIR", str(tmp_path))
+        monkeypatch.setenv("DB_NAME", "epicurrents")
         monkeypatch.setenv("BORG_REMOTE_REPO", "user@host:/srv/borg\rinjected")
         with pytest.raises(SystemExit) as exc:
             emitter.main()
@@ -103,6 +115,7 @@ class TestEmitRuntimeConfig:
     def test_non_integer_retention_aborts(self, tmp_path, monkeypatch):
         emitter = _load_emitter()
         monkeypatch.setenv("BORGMATIC_ACTIVE_DIR", str(tmp_path))
+        monkeypatch.setenv("DB_NAME", "epicurrents")
         monkeypatch.setenv("BACKUP_KEEP_DAILY", "abc; rm -rf /")
         with pytest.raises(SystemExit) as exc:
             emitter.main()
@@ -126,6 +139,7 @@ class TestEmitRuntimeConfig:
         before regenerating."""
         emitter = _load_emitter()
         monkeypatch.setenv("BORGMATIC_ACTIVE_DIR", str(tmp_path))
+        monkeypatch.setenv("DB_NAME", "epicurrents")
         stale = tmp_path / "remote.yaml"
         stale.write_text("repositories:\n  - path: leftover\n")
         monkeypatch.delenv("BORG_REMOTE_REPO", raising=False)
@@ -140,6 +154,7 @@ class TestEmitRuntimeConfig:
         test pins that contract."""
         emitter = _load_emitter()
         monkeypatch.setenv("BORGMATIC_ACTIVE_DIR", str(tmp_path))
+        monkeypatch.setenv("DB_NAME", "epicurrents")
         monkeypatch.setenv(
             "BORG_PASSPHRASE",
             "secret\nhooks:\n  before_backup:\n    - touch /tmp/pwned\n",
@@ -215,6 +230,7 @@ class TestFailureVisibility:
         operator-supplied and equally reaches the config."""
         emitter = _load_emitter()
         monkeypatch.setenv("BORGMATIC_ACTIVE_DIR", str(tmp_path))
+        monkeypatch.setenv("DB_NAME", "epicurrents")
         monkeypatch.setenv(
             "BORG_MONITOR_URL", "https://hc-ping.com/x\ncommands:\n  - after: error\n    run: [rm -rf /data]"
         )
@@ -339,6 +355,44 @@ class TestRepositoryTiers:
         # about the running system says which of the two happened.
         with pytest.raises(SystemExit) as exc:
             run_emitter({"BACKUP_LOCAL_ENABLED": value, "BORG_REMOTE_REPO": "ssh://borg@host/srv/repo"})
+        assert exc.value.code != 0
+
+
+class TestSpoolExclusion:
+    """The submission spool's rows stay out of every database dump.
+
+    A ``SubmissionFile`` row names its ledger beside the received digest and the
+    sidecar, both of which the pooled member repeats, so a dump holding one
+    joins a contributor to their member for as long as the archive is kept.
+    """
+
+    def test_the_dump_is_per_database_so_a_table_can_be_excluded(self, run_emitter):
+        # Without a format borgmatic runs pg_dumpall, which ignores the option.
+        pg = run_emitter()["postgresql_databases"][0]
+        assert pg["format"] == "custom"
+        assert pg["name"] != "all"
+
+    def test_every_listed_table_is_excluded(self, run_emitter):
+        emitter = _load_emitter()
+        options = run_emitter()["postgresql_databases"][0]["options"].split(" ")
+        assert "recordings_submissionfile" in emitter.EXCLUDED_TABLE_DATA
+        assert options == [f"--exclude-table-data={table}" for table in emitter.EXCLUDED_TABLE_DATA]
+
+    def test_the_snapshot_in_update_sh_excludes_the_same_tables(self):
+        script = (Path(__file__).resolve().parents[2] / "scripts" / "update.sh").read_text()
+        dump_lines = [line for line in script.splitlines() if "pg_dump " in line and "exec -T db" in line]
+        assert dump_lines, "update.sh no longer takes its snapshot with pg_dump; the parse is wrong"
+        for line in dump_lines:
+            excluded = set(re.findall(r"--exclude-table-data=([a-z_]+)", line))
+            assert excluded == set(_load_emitter().EXCLUDED_TABLE_DATA), line
+
+    def test_the_database_is_named_from_the_environment(self, run_emitter):
+        assert run_emitter({"DB_NAME": "other_db"})["postgresql_databases"][0]["name"] == "other_db"
+
+    @pytest.mark.parametrize("value", ["", "all; rm -rf /", "-dbname", "name with space"])
+    def test_an_unusable_database_name_is_refused(self, run_emitter, value):
+        with pytest.raises(SystemExit) as exc:
+            run_emitter({"DB_NAME": value})
         assert exc.value.code != 0
 
 

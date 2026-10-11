@@ -146,6 +146,8 @@ CREATE TABLE app_row (id serial PRIMARY KEY, payload jsonb NOT NULL DEFAULT '{}'
 CREATE INDEX app_row_payload_idx ON app_row USING gin (payload);
 INSERT INTO django_migrations (app, name) VALUES ('recordings', '0001_initial');
 INSERT INTO app_row (payload) VALUES ('{"k": 1}');
+CREATE TABLE recordings_submissionfile (id serial PRIMARY KEY, file_hash varchar(64) NOT NULL);
+INSERT INTO recordings_submissionfile (file_hash) VALUES ('spool-row-digest');
 """
 
 # What a release that adds a table does: the table, a row in django_migrations
@@ -201,6 +203,21 @@ class TestRollbackRestore:
         sql(postgres, "INSERT INTO app_row (payload) VALUES ('{\"k\": 3}');")
         assert sql(postgres, "SELECT max(id) FROM app_row;") == "2"
         assert sql(postgres, "SELECT count(*) FROM pg_indexes WHERE indexname = 'app_row_payload_idx';") == "1"
+
+    def test_the_submission_spool_comes_back_empty(self, fakebin, tmp_path, postgres):
+        # Its rows join a contributor to their pooled member, so the snapshot
+        # holds the table and none of its rows; the restore leaves it usable.
+        dump = _update_then_break(fakebin, tmp_path, postgres)
+        with gzip.open(dump, "rt") as fh:
+            body = fh.read()
+        assert "CREATE TABLE public.recordings_submissionfile" in body
+        assert "spool-row-digest" not in body
+
+        result = run_script("update.sh", fakebin, cwd=tmp_path, args=["--rollback", "--yes"])
+        assert result.returncode == 0, result.stderr
+
+        assert sql(postgres, "SELECT count(*) FROM recordings_submissionfile;") == "0"
+        sql(postgres, "INSERT INTO recordings_submissionfile (file_hash) VALUES ('after-restore');")
 
     def test_a_restore_that_fails_leaves_the_database_exactly_as_it_was(self, fakebin, tmp_path, postgres):
         # The schema drop runs inside the restore's transaction, so a dump that

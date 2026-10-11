@@ -406,6 +406,9 @@ services:
       # injection can't escalate to a credential leak.
       - PGUSER=${DB_USERNAME}
       - PGPASSWORD=${DB_PASSWORD}
+      # The database the backup dumps, by name: the emitter needs it to leave
+      # the submission spool's rows out of the dump.
+      - DB_NAME=${DB_NAME}
     volumes:
       - recordings-data:/data/recordings:ro
       - media-data:/data/media:ro

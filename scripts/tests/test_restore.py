@@ -93,3 +93,20 @@ class TestRestoreSequencing:
         migrate_idx = next(i for i, c in enumerate(calls) if "manage.py migrate" in c)
         start_idx = next(i for i, c in enumerate(calls) if "compose start" in c)
         assert restore_idx < migrate_idx < start_idx
+
+    def test_the_schema_is_cleared_before_the_db_restore(self, fakebin, tmp_path):
+        # pg_restore --clean drops only what the dump holds, so a table a later
+        # migration created would survive and fail the migrate that follows.
+        result = _run_restore(fakebin, tmp_path, replies="y\nn\n", args=["archive-2026-06-11"])
+        assert result.returncode == 0, result.stderr
+        calls = fakebin.calls()
+        drop_idx = next(i for i, c in enumerate(calls) if "DROP SCHEMA IF EXISTS public CASCADE" in c)
+        restore_idx = next(i for i, c in enumerate(calls) if "borgmatic restore" in c)
+        stop_idx = next(i for i, c in enumerate(calls) if "compose stop" in c)
+        assert stop_idx < drop_idx < restore_idx
+
+    def test_a_failed_schema_clear_restores_nothing(self, fakebin, tmp_path):
+        fakebin.stub("docker", body='case "$*" in *"DROP SCHEMA"*) exit 1 ;; esac')
+        result = _run_restore(fakebin, tmp_path, replies="y\nn\n", args=["archive-2026-06-11"])
+        assert result.returncode != 0
+        assert not fakebin.has_call("borgmatic restore")

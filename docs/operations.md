@@ -427,13 +427,15 @@ scripts/restore.sh
 
 Interactive: choose an archive, choose what to restore (database, recording and media files, or both). File extraction runs through the `borg-restore` compose service, which mounts the data volumes read-write. **Stop the stack first** unless you really mean to overwrite a running system.
 
+The database is dumped in PostgreSQL's custom format and restored with `pg_restore`, without roles or ownership, into whatever account `.env` names. The script drops and recreates the database schema first, because `pg_restore` replaces only the objects in the dump and a table from a later migration would otherwise survive and fail the `migrate` that follows; a restore that fails after that point leaves an empty database. The submission spool's rows are left out of every dump, the borg archives and the pre-update snapshots alike, because a row joins a contributor to the recording their file becomes ([recordings/README.md → Submissions](../recordings/README.md#submissions)). A restore or a rollback therefore discards every file waiting in a submission pool's spool. Its contributors are not told, and a file that reached the spool from a project's own route may exist nowhere else.
+
 ### Rehearse a restore
 
 ```bash
 scripts/restore-drill.sh
 ```
 
-An untested restore is a hypothesis. The drill seeds a database row and a recording file, backs both up through the same borgmatic config production uses, destroys the database volume and unlinks the file, restores, and asserts the row came back and the file is byte-identical. It also asserts both halves were genuinely gone before the restore, so a drill whose destroy step quietly did nothing cannot report a pass.
+An untested restore is a hypothesis. The drill seeds a database row and a recording file, backs both up through the same borgmatic config production uses, destroys the database volume and unlinks the file, restores, and asserts the row came back and the file is byte-identical. It also asserts both halves were genuinely gone before the restore, so a drill whose destroy step quietly did nothing cannot report a pass, and that a seeded submission spool row did not come back while its table did.
 
 Everything runs under a dedicated compose project with its own network and volumes, and it publishes no host port, so it is safe to run alongside a live deployment. Pass `--keep` to leave the scratch stack up for inspection instead of tearing it down. Expect a few minutes: the run builds the image, initialises Postgres twice and creates a real Borg archive.
 

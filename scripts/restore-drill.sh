@@ -79,12 +79,12 @@ drop_volume() {
     docker volume rm -f "$volume" > /dev/null 2>&1 || true
 }
 
-# Both readback helpers pull a sentinel-prefixed value out of the container's
+# The readback helpers pull a sentinel-prefixed value out of the container's
 # output rather than reading it whole. Django's boot warnings and compose's own
 # progress lines share the stream, and an earlier version that stripped the
 # output down to its digits silently read a timestamp as the row count — a drill
 # that reports a number nobody produced is worse than one that fails.
-# `|| true` on both helpers: they end in a pipeline, and under pipefail a
+# `|| true` on each helper: they end in a pipeline, and under pipefail a
 # container that exits non-zero — which is exactly what a failed restore looks
 # like, the database coming back without the table — would abort the caller's
 # assignment before the die that explains what went wrong. An empty result is the
@@ -100,6 +100,15 @@ marker_row_count() {
 from django.contrib.auth import get_user_model
 print('DRILLROWS', get_user_model().objects.filter(username='${MARKER_USER}').count())
 " 2>/dev/null | sed -n 's/.*DRILLROWS \([0-9][0-9]*\).*/\1/p' | tail -1; } || true
+}
+
+# The submission spool's rows are left out of the dump, so the drill seeds one and
+# expects the table back with none. Empty output means the table is missing.
+spool_row_count() {
+    { dc run --rm --no-deps --entrypoint python web manage.py shell -c "
+from recordings.models import SubmissionFile
+print('DRILLSPOOL', SubmissionFile.objects.count())
+" 2>/dev/null | sed -n 's/.*DRILLSPOOL \([0-9][0-9]*\).*/\1/p' | tail -1; } || true
 }
 
 cleanup() {
@@ -153,7 +162,7 @@ ok "Schema created"
 
 # ── 2. Seed data on both sides of the backup ─────────────────────────────────
 # One row and one file, because the restore path treats them completely
-# differently: the database goes through pg_dump / psql, the file through borg
+# differently: the database goes through pg_dump / pg_restore, the file through borg
 # extract into a read-write mount. A drill that checked only one would pass with
 # the other half broken.
 
@@ -163,6 +172,19 @@ from django.contrib.auth import get_user_model
 get_user_model().objects.create_user(username='${MARKER_USER}', password='drill')
 " > /dev/null
 ok "Marker user created"
+
+dc run --rm --no-deps --entrypoint python web manage.py shell -c "
+from django.contrib.auth import get_user_model
+from library.models import Dataset
+from recordings.models import SubmissionFile, SubmissionLedger
+user = get_user_model().objects.get(username='${MARKER_USER}')
+ledger = SubmissionLedger.objects.create(dataset=Dataset.objects.create(author=user, name='drill'), contributor=user)
+SubmissionFile.objects.create(
+    ledger=ledger, stored_name='restore-drill-spool', file_extension='.edf',
+    file_path='/nonexistent', file_size=0, file_hash='0' * 64, sidecar_hash='0' * 64,
+)
+" > /dev/null
+ok "Spool row created"
 
 MARKER_CONTENT="epicurrents restore drill marker payload"
 dc run --rm --no-deps --entrypoint sh --user 0:0 celery -c "
@@ -174,6 +196,7 @@ EXPECTED_HASH="$(marker_hash)"
 ok "Marker file created (sha256 ${EXPECTED_HASH:0:12}…)"
 
 [ "$(marker_row_count)" = "1" ] || die "the seeded marker row is not readable — the drill cannot test a restore of it"
+[ "$(spool_row_count)" = "1" ] || die "the seeded spool row is not readable — the drill cannot test its exclusion"
 ok "Seed verified on both halves"
 
 # ── 3. Back up through the production config ─────────────────────────────────
@@ -262,10 +285,15 @@ ROW_COUNT="$(marker_row_count)"
 [ "$ROW_COUNT" = "1" ] || die "marker row did not come back (found ${ROW_COUNT:-no} matching rows)"
 ok "Marker row restored"
 
+SPOOL_COUNT="$(spool_row_count)"
+[ -n "$SPOOL_COUNT" ] || die "the submission spool table did not come back"
+[ "$SPOOL_COUNT" = "0" ] || die "the backup carried ${SPOOL_COUNT} submission spool row(s); they must be left out of every dump"
+ok "Submission spool table restored empty"
+
 ACTUAL_HASH="$(marker_hash)"
 [ -n "$ACTUAL_HASH" ] || die "marker file did not come back"
 [ "$ACTUAL_HASH" = "$EXPECTED_HASH" ] || die "marker file content differs: expected $EXPECTED_HASH, got $ACTUAL_HASH"
 ok "Marker file restored byte-identical"
 
 echo
-bold "Restore drill passed — database row and recording file both recovered."
+bold "Restore drill passed — database row and recording file both recovered, spool rows left out."

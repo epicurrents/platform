@@ -87,6 +87,16 @@ ok "Application containers stopped"
 # ── 4. Restore PostgreSQL ─────────────────────────────────────────────────────
 
 info "Restoring PostgreSQL from archive: $ARCHIVE"
+# pg_restore --clean drops only the objects the dump holds, so a table a later
+# migration created would survive the restore while the restored
+# django_migrations says its migration never ran, and the migrate below would
+# die on "relation already exists". Dropping the schema first makes the restore
+# a replacement, as update.sh does for a rollback. Not in the restore's
+# transaction, so a restore that fails after this leaves an empty database.
+# SC2016: $POSTGRES_* must expand inside the db container's shell, not here.
+# shellcheck disable=SC2016
+docker compose exec -T db sh -c 'psql -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "SET lock_timeout = '"'"'30s'"'"'; DROP SCHEMA IF EXISTS public CASCADE; CREATE SCHEMA public;"' \
+    || die "Could not clear the database schema; nothing was restored. Stop whatever holds a connection (the borg service mid-backup, a shell) and retry."
 docker compose run --rm borg borgmatic restore --archive "$ARCHIVE"
 ok "Database restored"
 

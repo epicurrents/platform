@@ -436,6 +436,16 @@ class TestSharedTail:
         vendoring = [call for call in fakebin.calls() if "vendor_pyodide" in call and "--check" not in call]
         assert not vendoring, f"expected no re-vendoring when --check passes, got {vendoring}"
 
+    def test_the_snapshot_leaves_the_submission_spool_rows_out(self, fakebin, tmp_path):
+        # A spool row joins a contributor's ledger to content the pooled member
+        # repeats, and a snapshot is kept for as long as KEEP_BACKUPS allows.
+        _deploy(fakebin, tmp_path)
+        result = run_script("update.sh", fakebin, cwd=tmp_path, args=["--from", "repo", "--no-pull"])
+        assert result.returncode == 0, result.stderr
+        dumps = [call for call in fakebin.calls() if "pg_dump" in call]
+        assert dumps
+        assert all("--exclude-table-data=recordings_submissionfile" in call for call in dumps), dumps
+
     def test_no_backup_skips_the_dump(self, fakebin, tmp_path):
         _deploy(fakebin, tmp_path)
         result = run_script(

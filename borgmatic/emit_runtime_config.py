@@ -51,6 +51,15 @@ DEFAULT_ACTIVE_DIR = "/run/borgmatic-active"
 # built against it.
 FAILURE_TOKEN = "EPICURRENTS_BACKUP_FAILURE"
 
+# Tables whose rows are dumped as schema only. A row in one of them joins a
+# contributor's submission ledger to content the pooled member repeats, and an
+# archive keeps that join for as long as the archive is kept, which the audit
+# trail's withheld fields do nothing about. Restoring one restores an empty
+# table: the bytes its rows describe are on the staging volume, which is not
+# backed up either. scripts/update.sh excludes the same tables from its
+# pre-update snapshot, and a test keeps the two lists equal.
+EXCLUDED_TABLE_DATA = ("recordings_submissionfile",)
+
 
 def _reject_control_chars(name: str, value: str) -> str:
     if "\n" in value or "\r" in value:
@@ -100,6 +109,23 @@ def _validate_archive_prefix(value: str) -> str:
     return value
 
 
+def _validate_database_name(value: str) -> str:
+    """Return the database to dump, refusing an empty or unusual name.
+
+    The name is set rather than discovered: ``name: all`` with a dump format
+    lists the databases by connecting to one named after the user, which exists
+    only while ``DB_USERNAME`` and ``DB_NAME`` agree, and dumps the test and
+    maintenance databases beside the deployment's own.
+    """
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_-]*", value):
+        sys.stderr.write(
+            f"FATAL: DB_NAME={value!r} is not a database name the backup can use. "
+            "Set it in .env to the name the db service creates.\n"
+        )
+        sys.exit(1)
+    return value
+
+
 def _parse_int(name: str, value: str, default: int) -> int:
     if not value:
         return default
@@ -118,6 +144,7 @@ def main() -> None:
 
     local_enabled = _parse_bool("BACKUP_LOCAL_ENABLED", os.environ.get("BACKUP_LOCAL_ENABLED", ""), True)
     archive_prefix = _validate_archive_prefix(os.environ.get("BORG_ARCHIVE_PREFIX", "").strip() or "epicurrents")
+    database_name = _validate_database_name(os.environ.get("DB_NAME", "").strip())
 
     keep_daily = _parse_int("BACKUP_KEEP_DAILY", os.environ.get("BACKUP_KEEP_DAILY", ""), 7)
     keep_weekly = _parse_int("BACKUP_KEEP_WEEKLY", os.environ.get("BACKUP_KEEP_WEEKLY", ""), 4)
@@ -151,10 +178,21 @@ def main() -> None:
         # PostgreSQL credentials reach pg_dump via PGUSER / PGPASSWORD env
         # vars (set on the borg service in docker-compose). Keeping them
         # out of the YAML removes the injection surface entirely.
+        #
+        # The custom format is what admits the table exclusion: without a
+        # format borgmatic dumps through pg_dumpall, which has no way to leave a
+        # table's rows out. It restores through pg_restore, and carries no roles,
+        # which the db container creates from its own environment.
         "postgresql_databases": [
             {
-                "name": "all",
+                "name": database_name,
                 "hostname": "db",
+                "format": "custom",
+                # Restored objects belong to whoever restores them, so a
+                # deployment restored under another DB_USERNAME does not stop at
+                # the first ALTER OWNER naming a role the new cluster lacks.
+                "no_owner": True,
+                "options": " ".join(f"--exclude-table-data={table}" for table in EXCLUDED_TABLE_DATA),
             }
         ],
         # Explicit, because the default is "{hostname}-{now}" and this runs in a

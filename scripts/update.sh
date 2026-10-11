@@ -1358,9 +1358,15 @@ snapshot_database() {
     # untouched by migrations; enable borg for full data-volume backups.
     ensure_db_up
     info "Backing up the database to $1"
+    # The submission spool's rows are dumped as schema only: a row joins a
+    # contributor's ledger to content the pooled member repeats, and a snapshot
+    # is kept for as long as KEEP_BACKUPS lets it. A rollback therefore empties
+    # the spool, and sweep_spool unlinks the bytes left behind. The borg dump
+    # excludes the same tables (EXCLUDED_TABLE_DATA in
+    # borgmatic/emit_runtime_config.py), and a test keeps the two lists equal.
     # SC2016: $POSTGRES_* must expand inside the db container's shell, not here.
     # shellcheck disable=SC2016
-    if "${COMPOSE[@]}" exec -T db sh -c 'pg_dump --clean --if-exists --no-owner -U "$POSTGRES_USER" "$POSTGRES_DB"' \
+    if "${COMPOSE[@]}" exec -T db sh -c 'pg_dump --clean --if-exists --no-owner --exclude-table-data=recordings_submissionfile -U "$POSTGRES_USER" "$POSTGRES_DB"' \
             | gzip > "$1/db.sql.gz"; then
         ok "Database dumped ($(du -h "$1/db.sql.gz" | cut -f1))"
     else
