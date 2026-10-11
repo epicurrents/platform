@@ -64,6 +64,9 @@
 #   ./update.sh --rollback --code-only   restore the code and rebuild, keeping the
 #                                        database and .env; refused when a migration
 #                                        was applied since the snapshot
+#   ./update.sh --prune-snapshots        remove the snapshots under backups/ older than
+#                                        BACKUP_SNAPSHOT_MAX_AGE_DAYS in .env and exit;
+#                                        an update applies the same limit when it prunes
 #   ./update.sh --skip-beat              leave celery-beat stopped after the recreate,
 #                                        so no scheduled purge runs before the update
 #                                        is verified; start it yourself afterwards
@@ -79,15 +82,16 @@ set -euo pipefail
 # --code-only, repeatable --release-key and the migrations record in snapshots;
 # 4 made a present release key require a signature, refused downgrades, took
 # the database dump before the tree changes, and exits non-zero on a failed
-# health check.
-UPDATER_SCRIPT_VERSION=4
+# health check; 5 added --prune-snapshots and the age limit
+# BACKUP_SNAPSHOT_MAX_AGE_DAYS sets on every snapshot.
+UPDATER_SCRIPT_VERSION=5
 
 info() { printf '\n\033[1;34m==> %s\033[0m\n' "$*"; }
 ok()   { printf '    \033[32m✓\033[0m  %s\n'  "$*"; }
 warn() { printf '    \033[33m!\033[0m  %s\n'  "$*"; }
 # Machine-readable progress, one fact per line, for a caller that tees this
-# script's output. Kept to a small vocabulary: step, snapshot, health, done,
-# failed, and the facts --check-archive reports.
+# script's output. Kept to a small vocabulary: step, snapshot, pruned, health,
+# done, failed, and the facts --check-archive reports.
 emit() { printf '::%s\n' "$*"; }
 die()  {
     local msg="$*"
@@ -143,6 +147,7 @@ RELEASE_KEYS=()
 CODE_ONLY=false
 SNAPSHOT=""
 ROOT=""
+PRUNE_ONLY=false
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -167,6 +172,7 @@ while [ $# -gt 0 ]; do
         --rollback)  ROLLBACK=true; shift ;;
         --skip-beat) SKIP_BEAT=true; shift ;;
         --keep-lock) KEEP_LOCK=true; shift ;;
+        --prune-snapshots) PRUNE_ONLY=true; shift ;;
         --require-signature) REQUIRE_SIGNATURE=true; shift ;;
         --require-newer)     REQUIRE_NEWER=true; shift ;;
         --allow-unsigned)    ALLOW_UNSIGNED=true; shift ;;
@@ -189,6 +195,11 @@ if [ -n "$SNAPSHOT" ] && [ "$ROLLBACK" = false ]; then
 fi
 if [ "$CODE_ONLY" = true ] && [ "$ROLLBACK" = false ]; then
     die "--code-only applies to --rollback only."
+fi
+if [ "$PRUNE_ONLY" = true ]; then
+    if [ "$ROLLBACK" = true ] || [ -n "$SNAPSHOT" ] || [ "$MODE_GIVEN" = true ] || [ -n "$ARCHIVE" ] || [ -n "$CHECK_ARCHIVE" ]; then
+        die "--prune-snapshots prunes and exits; it does not combine with an update, a rollback, a snapshot or a check."
+    fi
 fi
 
 # ── Locate the deployment root ────────────────────────────────────────────────
@@ -301,8 +312,9 @@ INSTALLED_FILELIST="./.epicurrents-files"
 RESTORE_LOCK_TIMEOUT="${UPDATE_RESTORE_LOCK_TIMEOUT:-60s}"
 
 [ -f .env ] || die "No .env in $ROOT — initialize the deployment first (./start.sh in a distribution, or 'python manage.py init_env' in a checkout)."
-# --check-archive reads the package and the tree; it drives no container.
-[ -n "$CHECK_ARCHIVE" ] || [ -n "$CONTAINER_RUNTIME" ] \
+# --check-archive reads the package and the tree, and --prune-snapshots the
+# backups/ directory; neither drives a container.
+[ -n "$CHECK_ARCHIVE" ] || [ "$PRUNE_ONLY" = true ] || [ -n "$CONTAINER_RUNTIME" ] \
     || die "No container runtime found — this needs Docker Engine or Podman, either one with Compose v2."
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -1283,6 +1295,51 @@ find_latest_complete_snapshot() {
     return 1
 }
 
+snapshot_max_age_days() {
+    # BACKUP_SNAPSHOT_MAX_AGE_DAYS from .env: a whole number of days, at least
+    # one, or empty for no age limit. Anything else is reported on stdout as
+    # "invalid" for the caller to refuse or warn on, never read as a number.
+    local value
+    value="$(grep -E '^BACKUP_SNAPSHOT_MAX_AGE_DAYS=' .env 2>/dev/null | tail -1 | cut -d= -f2- | tr -d ' "'"'"'' || true)"
+    case "$value" in
+        "") printf '' ;;
+        0*|*[!0-9]*) printf 'invalid' ;;
+        *) printf '%s' "$value" ;;
+    esac
+}
+
+utc_stamp_days_ago() {
+    # $1 = days. The UTC stamp, in the form snapshot names carry, of that many
+    # days before now. GNU date takes -d, BSD date -r.
+    local epoch=$(( $(date -u +%s) - $1 * 86400 ))
+    date -u -d "@$epoch" +%Y%m%d-%H%M%S 2>/dev/null || date -u -r "$epoch" +%Y%m%d-%H%M%S
+}
+
+prune_snapshots_by_age() {
+    # $1 = days. Remove every snapshot under backups/ whose stamp is older,
+    # whatever its label: pre-update, the agent's backup, post-update and
+    # pre-rollback ones, and those an operator named. A snapshot carries the
+    # database, and the backup horizon (epicurrents/backup_horizon.py) counts
+    # on no copy outliving this limit. Kept: the snapshot an unfinished update
+    # waits to be rolled back to, and anything that is not a stamped directory.
+    # The stamp in the name rather than the mtime, which a restore can change.
+    local days="$1" cutoff keep_name="" d name stamp
+    cutoff="$(utc_stamp_days_ago "$days")"
+    [ ! -f "$UNFINISHED_MARKER" ] || keep_name="$(cat "$UNFINISHED_MARKER" 2>/dev/null || true)"
+    for d in "$BACKUP_DIR"/*; do
+        [ -d "$d" ] && [ ! -L "$d" ] || continue
+        name="$(basename "$d")"
+        [[ "$name" =~ ^[A-Za-z0-9][A-Za-z0-9_-]*-([0-9]{8}-[0-9]{6})$ ]] || continue
+        stamp="${BASH_REMATCH[1]}"
+        [ "$name" != "$keep_name" ] || continue
+        if [[ "$stamp" < "$cutoff" ]]; then
+            info "Removing snapshot $name, older than $days days"
+            emit "pruned=$name"
+            rm -rf "$d"
+        fi
+    done
+}
+
 prune_backups() {
     # Keep the newest $KEEP_BACKUPS pre-update snapshots; drop the rest. ls -t
     # over our own timestamped dir names is fine — no untrusted filenames here.
@@ -1302,6 +1359,14 @@ prune_backups() {
     ls -1dt "$BACKUP_DIR"/pre-update-* 2>/dev/null | while read -r d; do
         [ -f "$d/db.sql.gz" ] || { warn "Discarding half-written snapshot $(basename "$d")"; rm -rf "$d"; }
     done || true
+    # Then the age limit, over every snapshot rather than the pre-update ones.
+    local max_age
+    max_age="$(snapshot_max_age_days)"
+    case "$max_age" in
+        "") ;;
+        invalid) warn "BACKUP_SNAPSHOT_MAX_AGE_DAYS in .env is not a whole number of days above zero; no snapshot is pruned by age." ;;
+        *) prune_snapshots_by_age "$max_age" ;;
+    esac
 }
 
 snapshot_code() {
@@ -1425,6 +1490,29 @@ DROP SCHEMA IF EXISTS public CASCADE;
 CREATE SCHEMA public;
 SQL
 }
+
+# ── Prune-only mode ───────────────────────────────────────────────────────────
+# The age limit alone, for the host agent to apply daily: an update prunes too,
+# but a deployment that is not updated would otherwise keep its snapshots past
+# the limit for as long as it is not. Takes the run lock, so it never prunes
+# under an update in progress.
+
+if [ "$PRUNE_ONLY" = true ]; then
+    max_age="$(snapshot_max_age_days)"
+    case "$max_age" in
+        "")
+            ok "BACKUP_SNAPSHOT_MAX_AGE_DAYS is not set; snapshots are kept by count."
+            emit "done"
+            exit 0
+            ;;
+        invalid) die "BACKUP_SNAPSHOT_MAX_AGE_DAYS in .env is not a whole number of days above zero." ;;
+    esac
+    take_run_lock
+    emit "step=prune"
+    prune_snapshots_by_age "$max_age"
+    emit "done"
+    exit 0
+fi
 
 # ── Snapshot-only mode ────────────────────────────────────────────────────────
 # A named snapshot, taken without changing anything: what a caller takes before

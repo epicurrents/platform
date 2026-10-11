@@ -2253,3 +2253,88 @@ class TestListingHardeningEdges:
         )
         assert result.returncode == 0, result.stderr
         assert "check=ok" in _progress(result)
+
+
+class TestSnapshotAgeLimit:
+    """BACKUP_SNAPSHOT_MAX_AGE_DAYS bounds every snapshot under backups/ by age.
+
+    The backup horizon (epicurrents/backup_horizon.py) counts on no snapshot outliving the limit,
+    so the prune covers every label, and --prune-snapshots applies it without an update for the
+    host agent to run daily.
+    """
+
+    @staticmethod
+    def _stamp(days_ago):
+        from datetime import datetime, timedelta, timezone
+
+        return (datetime.now(timezone.utc) - timedelta(days=days_ago)).strftime("%Y%m%d-%H%M%S")
+
+    def _snapshot(self, tmp_path, label, days_ago):
+        snap = tmp_path / "backups" / f"{label}-{self._stamp(days_ago)}"
+        snap.mkdir(parents=True)
+        with gzlib.open(snap / "db.sql.gz", "wt") as fh:
+            fh.write("-- dump\n")
+        (snap / ".env").write_text("DJANGO_MODE=production\n")
+        return snap
+
+    def test_prune_only_removes_every_label_past_the_limit_and_keeps_the_rest(self, fakebin, tmp_path):
+        _deploy(fakebin, tmp_path, BACKUP_SNAPSHOT_MAX_AGE_DAYS="30")
+        old = [self._snapshot(tmp_path, label, 40) for label in ("pre-update", "backup", "post-update", "before-x")]
+        young = [self._snapshot(tmp_path, label, 2) for label in ("pre-update", "backup")]
+        unstamped = tmp_path / "backups" / "operator-notes"
+        unstamped.mkdir()
+        result = run_script("update.sh", fakebin, cwd=tmp_path, args=["--prune-snapshots"])
+        assert result.returncode == 0, result.stderr
+        assert not any(path.exists() for path in old)
+        assert all(path.exists() for path in young) and unstamped.exists()
+        assert sorted(line for line in _progress(result) if line.startswith("pruned=")) == sorted(
+            f"pruned={path.name}" for path in old
+        )
+
+    def test_prune_only_keeps_the_snapshot_an_unfinished_update_waits_on(self, fakebin, tmp_path):
+        _deploy(fakebin, tmp_path, BACKUP_SNAPSHOT_MAX_AGE_DAYS="30")
+        waiting = self._snapshot(tmp_path, "pre-update", 40)
+        (tmp_path / "backups" / ".update-unfinished").write_text(f"{waiting.name}\n")
+        result = run_script("update.sh", fakebin, cwd=tmp_path, args=["--prune-snapshots"])
+        assert result.returncode == 0, result.stderr
+        assert waiting.exists()
+
+    def test_prune_only_needs_no_container_runtime(self, fakebin, tmp_path):
+        _deploy(fakebin, tmp_path, BACKUP_SNAPSHOT_MAX_AGE_DAYS="30")
+        fakebin.remove("docker")
+        fakebin.remove("podman")
+        old = self._snapshot(tmp_path, "pre-update", 40)
+        result = run_script("update.sh", fakebin, cwd=tmp_path, args=["--prune-snapshots"])
+        assert result.returncode == 0, result.stderr
+        assert not old.exists()
+
+    def test_without_a_limit_nothing_is_pruned_by_age(self, fakebin, tmp_path):
+        _deploy(fakebin, tmp_path)
+        old = self._snapshot(tmp_path, "pre-update", 400)
+        result = run_script("update.sh", fakebin, cwd=tmp_path, args=["--prune-snapshots"])
+        assert result.returncode == 0, result.stderr
+        assert old.exists()
+
+    @pytest.mark.parametrize("value", ["0", "thirty", "-5", "07"])
+    def test_a_limit_that_is_not_a_whole_number_above_zero_is_refused(self, fakebin, tmp_path, value):
+        _deploy(fakebin, tmp_path, BACKUP_SNAPSHOT_MAX_AGE_DAYS=value)
+        old = self._snapshot(tmp_path, "pre-update", 400)
+        result = run_script("update.sh", fakebin, cwd=tmp_path, args=["--prune-snapshots"])
+        assert result.returncode != 0
+        assert old.exists()
+
+    def test_prune_only_does_not_combine_with_a_rollback(self, fakebin, tmp_path):
+        _deploy(fakebin, tmp_path, BACKUP_SNAPSHOT_MAX_AGE_DAYS="30")
+        result = run_script("update.sh", fakebin, cwd=tmp_path, args=["--prune-snapshots", "--rollback"])
+        assert result.returncode != 0
+        assert "does not combine" in result.stderr
+
+    def test_an_update_applies_the_limit_when_it_prunes(self, fakebin, tmp_path):
+        _deploy(fakebin, tmp_path, BACKUP_SNAPSHOT_MAX_AGE_DAYS="30")
+        _build_package(tmp_path)
+        fakebin.stub("rsync")
+        old = [self._snapshot(tmp_path, "pre-update", 40), self._snapshot(tmp_path, "backup", 40)]
+        result = run_script("update.sh", fakebin, cwd=tmp_path)
+        assert result.returncode == 0, result.stderr
+        assert not any(path.exists() for path in old)
+        assert list((tmp_path / "backups").glob(f"pre-update-{self._stamp(0)[:8]}-*"))

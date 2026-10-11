@@ -825,6 +825,24 @@ RECORDINGS_SUBMISSION_SPOOL_SWEEP_GRACE_HOURS = config(
     "RECORDINGS_SUBMISSION_SPOOL_SWEEP_GRACE_HOURS", default=24, cast=int
 )
 
+# The backup horizon (epicurrents/backup_horizon.py): how long every copy of the database taken
+# before a moment outlives it. The borg service reads the retention and interval from its own
+# environment list; these are the same .env values, kept as the strings .env holds so that an
+# empty or malformed one reaches the horizon's own parsing rather than failing the boot here.
+BACKUP_KEEP_DAILY = config("BACKUP_KEEP_DAILY", default="")
+BACKUP_KEEP_WEEKLY = config("BACKUP_KEEP_WEEKLY", default="")
+BACKUP_KEEP_MONTHLY = config("BACKUP_KEEP_MONTHLY", default="")
+BACKUP_INTERVAL = config("BACKUP_INTERVAL", default="")
+BACKUP_REMOTE_CONFIGURED = bool(config("BORG_REMOTE_REPO", default="").strip())
+# Attested by the operator: the remote's administrator compacts it at least this often.
+BACKUP_REMOTE_COMPACTION_DAYS = config("BACKUP_REMOTE_COMPACTION_DAYS", default="")
+# The age past which update.sh and the host agent remove a snapshot under backups/. Empty keeps
+# them by count alone.
+BACKUP_SNAPSHOT_MAX_AGE_DAYS = config("BACKUP_SNAPSHOT_MAX_AGE_DAYS", default="")
+# Set by a project that dates pooled files by the horizon; manage.py check then refuses a
+# deployment whose horizon cannot be computed.
+BACKUP_HORIZON_REQUIRED = env_bool("BACKUP_HORIZON_REQUIRED", default=False)
+
 # ──────────────────────────────────────────────────────────────────────────────
 # External login — OpenID Connect (Microsoft Entra ID).
 # ──────────────────────────────────────────────────────────────────────────────

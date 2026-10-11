@@ -147,8 +147,8 @@ def main() -> None:
     database_name = _validate_database_name(os.environ.get("DB_NAME", "").strip())
 
     keep_daily = _parse_int("BACKUP_KEEP_DAILY", os.environ.get("BACKUP_KEEP_DAILY", ""), 7)
-    keep_weekly = _parse_int("BACKUP_KEEP_WEEKLY", os.environ.get("BACKUP_KEEP_WEEKLY", ""), 4)
-    keep_monthly = _parse_int("BACKUP_KEEP_MONTHLY", os.environ.get("BACKUP_KEEP_MONTHLY", ""), 6)
+    keep_weekly = _parse_int("BACKUP_KEEP_WEEKLY", os.environ.get("BACKUP_KEEP_WEEKLY", ""), 3)
+    keep_monthly = _parse_int("BACKUP_KEEP_MONTHLY", os.environ.get("BACKUP_KEEP_MONTHLY", ""), 5)
 
     # Two tiers, independently selectable. The local repository is fast to
     # restore from and survives nothing the host does not; the remote one is

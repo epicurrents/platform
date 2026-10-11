@@ -47,13 +47,15 @@ set -euo pipefail
 # the files it publishes into the spool set their own mode.
 umask 077
 
-AGENT_VERSION=3
+AGENT_VERSION=4
 PROTOCOL=1
 OPERATION_UPDATE="platform.update"
 OPERATION_BACKUP="platform.backup"
 OPERATION_ROLLBACK="platform.rollback"
 # update.sh from this version on takes --code-only and several --release-key.
 UPDATER_SCRIPT_CODE_ONLY=3
+# update.sh from this version on takes --prune-snapshots.
+UPDATER_SCRIPT_PRUNE=5
 
 CONFIG_DIR="${EPICURRENTS_UPDATER_CONFIG_DIR:-/etc/epicurrents-updater}"
 LIB_DIR="${EPICURRENTS_UPDATER_LIB_DIR:-/usr/local/lib/epicurrents-updater}"
@@ -1987,6 +1989,43 @@ prune_state() {
     done
 }
 
+# ── The snapshot age limit ────────────────────────────────────────────────────
+
+# When the agent last applied it. Checked against 23 hours rather than 24, so
+# the run does not slide a minute later every day.
+SNAPSHOT_PRUNE_MARKER="$STATE_DIR/snapshots-pruned"
+
+prune_snapshots_daily() {
+    # update.sh applies BACKUP_SNAPSHOT_MAX_AGE_DAYS when it updates, and a
+    # deployment that is not updated would keep a snapshot past it for as long
+    # as it is not; the backup horizon counts on no snapshot outliving the
+    # limit. So once a day, between jobs, the agent runs the prune alone. A
+    # failure is logged and retried on the next tick: update.sh refuses while
+    # another run holds its lock, which is the expected case during an update
+    # started from a shell.
+    [ ! -f "$ACTIVE_LOCK" ] || return 0
+    [ "$(updater_script_version)" -ge "$UPDATER_SCRIPT_PRUNE" ] || return 0
+    if [ -f "$SNAPSHOT_PRUNE_MARKER" ] && [ -z "$(find "$SNAPSHOT_PRUNE_MARKER" -mmin +1380 2>/dev/null)" ]; then
+        return 0
+    fi
+    local output rc line
+    set +e
+    output="$("$UPDATE_SH" --root "$DEPLOY_ROOT" --prune-snapshots 2>&1)"
+    rc=$?
+    set -e
+    while IFS= read -r line; do
+        case "$line" in
+            ::pruned=*) log "pruned snapshot ${line#::pruned=}, older than BACKUP_SNAPSHOT_MAX_AGE_DAYS" ;;
+        esac
+    done <<< "$output"
+    if [ "$rc" -eq 0 ]; then
+        touch "$SNAPSHOT_PRUNE_MARKER" 2>/dev/null || true
+    else
+        log "the snapshot prune failed (exit $rc): $(printf '%s\n' "$output" | grep -E '^::(failed|refused)=' | tail -1)"
+    fi
+    return 0
+}
+
 main() {
     if ! load_config; then
         log "no configuration at $CONFIG_DIR/config; nothing to do"
@@ -2012,6 +2051,7 @@ main() {
     write_heartbeat
     handle_stale_lock || exit 0
     tick
+    prune_snapshots_daily
 }
 
 main "$@"

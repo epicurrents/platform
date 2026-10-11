@@ -69,8 +69,8 @@ class TestEmitRuntimeConfig:
             }
         ]
         assert config["keep_daily"] == 7
-        assert config["keep_weekly"] == 4
-        assert config["keep_monthly"] == 6
+        assert config["keep_weekly"] == 3
+        assert config["keep_monthly"] == 5
 
     def test_postgres_section_omits_credentials(self, run_emitter):
         """PGUSER / PGPASSWORD reach pg_dump via libpq env vars — the YAML

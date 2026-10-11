@@ -66,7 +66,7 @@ Contact for privacy questions: `[FILL: email address]`.
 | Action log — the searchable index | 90 days, then archived but retained (`ACTIVITY_ARCHIVE_AFTER_DAYS`) |
 | Action log — the tamper-evident record of changes | **Permanently.** It is an integrity record: entries are chained to each other, so removing one would break the chain that proves the rest were not altered. When you exercise your right to erasure we overwrite the personal data inside these entries and re-seal them, leaving the chain verifiable and the personal data gone |
 | Things you put in the trash | 30 days, then permanently deleted (`RECORDINGS_TRASH_RETENTION_DAYS`, `MEDIA_TRASH_RETENTION_DAYS`, `LIBRARY_TRASH_RETENTION_DAYS`) |
-| Backups | About six months, encrypted `[FILL if you changed the retention, and for an off-site copy state how often it is compacted: until then it keeps everything it was sent]` |
+| Backups | Up to about six months, encrypted `[FILL if you changed the retention, and for an off-site copy state how often it is compacted: until then it keeps everything it was sent]` |
 
 ## Who else sees it
 

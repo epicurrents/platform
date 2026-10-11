@@ -1,4 +1,4 @@
-"""Django system checks: the platform pin, the text-hygiene patterns and the anonymisation assessment's age.
+"""Django system checks: the platform pin, the text-hygiene patterns, the anonymisation assessment's age and the backup horizon.
 
 A project lives in its own repository now, and nothing keeps it in step with the
 platform it is checked out beside. The failure that follows is rarely a clean
@@ -40,6 +40,7 @@ from django.conf import settings
 from django.core.checks import Error, Tags, Warning, register
 
 from epicurrents.assessment import assessment_currency
+from epicurrents.backup_horizon import BackupHorizonUnknown, backup_horizon
 from epicurrents.version import InvalidVersion, __version__, compatible_range, satisfies
 
 # Apps that are the platform itself, and so cannot be pinned to it. Everything
@@ -163,5 +164,49 @@ def check_assessment_currency(app_configs, **kwargs):
                 "its Currency block and ASSESSMENT_REVIEWED_ON in epicurrents/assessment.py in the same commit."
             ),
             id="epicurrents.W020",
+        )
+    ]
+
+
+@register(Tags.security)
+def check_backup_horizon(app_configs, **kwargs):
+    """Refuse a deployment that needs the backup horizon and cannot compute it; warn on an uncompacted remote.
+
+    The error applies only where ``BACKUP_HORIZON_REQUIRED`` is set, by a project that dates pooled
+    files by the horizon: there a guessed figure would release a file while a backup still holds
+    the copy it was made from. Everywhere else the one term worth a warning is the remote, because
+    an append-only repository nobody compacts keeps erased data indefinitely and makes the retention
+    the deployment states untrue, whether or not anything is pooled.
+    """
+    try:
+        backup_horizon()
+    except BackupHorizonUnknown as unknown:
+        reasons = unknown.reasons
+    else:
+        return []
+    if getattr(settings, "BACKUP_HORIZON_REQUIRED", False):
+        return [
+            Error(
+                "The backup horizon cannot be computed: " + "; ".join(reasons) + ".",
+                hint=(
+                    "This deployment dates pooled files by the horizon. Set BACKUP_SNAPSHOT_MAX_AGE_DAYS, and with "
+                    "BORG_REMOTE_REPO set, BACKUP_REMOTE_COMPACTION_DAYS to the interval the remote's administrator "
+                    "compacts it at. See docs/operations.md, The backup horizon."
+                ),
+                id="epicurrents.E030",
+            )
+        ]
+    remote = [reason for reason in reasons if "BACKUP_REMOTE_COMPACTION_DAYS" in reason]
+    if not remote:
+        return []
+    return [
+        Warning(
+            remote[0] + ".",
+            hint=(
+                "The host's prune only marks archives as deleted on an append-only remote. Arrange compaction on the "
+                "remote side and record its interval in BACKUP_REMOTE_COMPACTION_DAYS. See docs/operations.md, Expire "
+                "the remote repository."
+            ),
+            id="epicurrents.W030",
         )
     ]

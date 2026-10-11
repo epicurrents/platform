@@ -16,6 +16,7 @@ import os
 import shutil
 import stat
 import subprocess
+import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -33,8 +34,10 @@ INSTALLER = SCRIPTS_DIR / "updater" / "install-updater.sh"
 # with that token, fail-before and fail-after make an update exit non-zero
 # before or after its snapshot, no-migrations makes the update report that it
 # applied none, snapshot-fail fails --snapshot, rollback-fail fails --rollback,
-# decline-code-only makes --rollback --code-only refuse by name, and
-# verified-by-next reports the second --release-key as the one that verified.
+# decline-code-only makes --rollback --code-only refuse by name,
+# verified-by-next reports the second --release-key as the one that verified,
+# and prune-fail fails --prune-snapshots, which otherwise reports one pruned
+# snapshot.
 # Versions come from $FAKE_DIR/installed and /package.
 FAKE_UPDATE_SH = r"""#!/bin/sh
 UPDATER_SCRIPT_VERSION=3
@@ -52,6 +55,7 @@ while [ $# -gt 0 ]; do
         --snapshot) LABEL="$2"; shift 2 ;;
         --rollback) ROLLBACK=1; shift ;;
         --code-only) CODE_ONLY=1; shift ;;
+        --prune-snapshots) MODE=prune; shift ;;
         --archive) shift 2 ;;
         --release-key) KEYS="$KEYS $2"; shift 2 ;;
         *) shift ;;
@@ -61,6 +65,16 @@ done
 cd "$ROOT" || exit 2
 installed="$(cat "$FAKE_DIR/installed")"
 package="$(cat "$FAKE_DIR/package")"
+if [ "$MODE" = prune ]; then
+    if [ -e "$FAKE_DIR/prune-fail" ]; then
+        echo "::refused=locked"
+        echo "::failed=another run holds the lock (stand-in)"
+        exit 1
+    fi
+    echo "::pruned=pre-update-20200101-000000"
+    echo "::done"
+    exit 0
+fi
 if [ "$MODE" = check ]; then
     for marker in "$FAKE_DIR"/refuse-*; do
         [ -e "$marker" ] || continue
@@ -408,7 +422,7 @@ class TestHeartbeatAndConfig:
         result = _run(staged)
         assert result.returncode == 0, result.stderr
         beat = staged.heartbeat()
-        assert beat["protocol"] == 1 and beat["enabled"] is False and beat["version"] == "3"
+        assert beat["protocol"] == 1 and beat["enabled"] is False and beat["version"] == "4"
         assert beat["runtime"] == "docker" and beat["last_run"].endswith("Z")
         assert beat["capabilities"] == ["platform.update", "platform.backup", "platform.rollback"]
         assert beat["self_update"] is False and beat["snapshots"] == []
@@ -466,7 +480,7 @@ class TestAcceptance:
         assert status["running_version"] == "0.2.0"
         assert status["snapshot"] == "pre-update-20260920-100000"
         assert status["started_at"].endswith("Z") and status["finished_at"] is None
-        assert status["verify_deadline"].endswith("Z") and status["agent_version"] == "3"
+        assert status["verify_deadline"].endswith("Z") and status["agent_version"] == "4"
         assert status["operation"] == "platform.update" and status["migrations_applied"] is True
 
         calls = staged.update_sh_calls()
@@ -1372,11 +1386,11 @@ class TestSelfUpdate:
     def test_an_older_or_equal_agent_is_kept(self, fakebin, tmp_path):
         staged = _stage(tmp_path, fakebin, SELF_UPDATE=1)
         before = (staged.lib_dir / "epicurrents-updater.sh").read_text()
-        sha = _package(staged, _tarball(tmp_path, {"updater/epicurrents-updater.sh": self._agent("3")}))
+        sha = _package(staged, _tarball(tmp_path, {"updater/epicurrents-updater.sh": self._agent("4")}))
         job_id = _request(staged, sha)
         _run(staged)
         assert (staged.lib_dir / "epicurrents-updater.sh").read_text() == before
-        assert "this is 3; this one stays" in staged.log(job_id)
+        assert "this is 4; this one stays" in staged.log(job_id)
 
     def test_an_agent_that_does_not_parse_is_kept(self, fakebin, tmp_path):
         staged = _stage(tmp_path, fakebin, SELF_UPDATE=1)
@@ -1738,6 +1752,52 @@ def test_the_agent_and_installer_parse_and_carry_a_version():
     for script in (AGENT, INSTALLER):
         subprocess.run(["bash", "-n", str(script)], check=True)
     body = AGENT.read_text()
-    assert "AGENT_VERSION=3" in body
+    assert "AGENT_VERSION=4" in body
     assert 'OPERATION_UPDATE="platform.update"' in body
     assert 'OPERATION_BACKUP="platform.backup"' in body and 'OPERATION_ROLLBACK="platform.rollback"' in body
+
+
+class TestSnapshotPrune:
+    """Once a day, between jobs, the agent has update.sh apply the snapshot age limit, so a
+    deployment that is not updated does not keep a snapshot past it."""
+
+    def _prune_capable(self, staged, version=5):
+        (staged.lib_dir / "update.sh").write_text(
+            f"#!/bin/sh\nUPDATER_SCRIPT_VERSION={version}\n"
+            + FAKE_UPDATE_SH[len("#!/bin/sh\nUPDATER_SCRIPT_VERSION=3\n") :]
+        )
+
+    def _prunes(self, staged):
+        return [call for call in staged.update_sh_calls() if "--prune-snapshots" in call]
+
+    def test_a_tick_prunes_once_a_day(self, fakebin, tmp_path):
+        staged = _stage(tmp_path, fakebin)
+        self._prune_capable(staged)
+        result = _run(staged)
+        assert result.returncode == 0, result.stderr
+        assert self._prunes(staged) == [f"--root {staged.root} --prune-snapshots"]
+        assert "pruned snapshot pre-update-20200101-000000" in result.stderr
+        _run(staged)
+        assert len(self._prunes(staged)) == 1
+        marker = staged.state_dir / "snapshots-pruned"
+        day_ago = time.time() - 24 * 3600
+        os.utime(marker, (day_ago, day_ago))
+        _run(staged)
+        assert len(self._prunes(staged)) == 2
+
+    def test_an_older_update_sh_is_not_asked_to_prune(self, fakebin, tmp_path):
+        staged = _stage(tmp_path, fakebin)
+        self._prune_capable(staged, version=4)
+        _run(staged)
+        assert self._prunes(staged) == []
+
+    def test_a_failed_prune_is_logged_and_retried_on_the_next_tick(self, fakebin, tmp_path):
+        staged = _stage(tmp_path, fakebin)
+        self._prune_capable(staged)
+        staged.mark("prune-fail")
+        result = _run(staged)
+        assert result.returncode == 0, result.stderr
+        assert "the snapshot prune failed" in result.stderr
+        assert not (staged.state_dir / "snapshots-pruned").exists()
+        _run(staged)
+        assert len(self._prunes(staged)) == 2

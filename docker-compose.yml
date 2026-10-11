@@ -399,8 +399,8 @@ services:
       - BORG_ARCHIVE_PREFIX=${BORG_ARCHIVE_PREFIX:-epicurrents}
       - BACKUP_INTERVAL=${BACKUP_INTERVAL:-86400}
       - BACKUP_KEEP_DAILY=${BACKUP_KEEP_DAILY:-7}
-      - BACKUP_KEEP_WEEKLY=${BACKUP_KEEP_WEEKLY:-4}
-      - BACKUP_KEEP_MONTHLY=${BACKUP_KEEP_MONTHLY:-6}
+      - BACKUP_KEEP_WEEKLY=${BACKUP_KEEP_WEEKLY:-3}
+      - BACKUP_KEEP_MONTHLY=${BACKUP_KEEP_MONTHLY:-5}
       # libpq credentials reach pg_dump via env, not via the borgmatic YAML
       # config. Keeps the password out of any on-disk YAML so a config-file
       # injection can't escalate to a credential leak.
