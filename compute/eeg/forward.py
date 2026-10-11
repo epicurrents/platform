@@ -28,11 +28,15 @@ be overridden per call for paediatric data or unusual cap placements.
 Orientation convention
 ----------------------
 ``n_orient=1`` (default): fixed orientation — the source dipole is
-constrained to point radially outward from the sphere centre.  This is
-the standard choice for sLORETA / eLORETA / dSPM.
+constrained to point radially outward from the sphere centre. This is
+the standard choice for sLORETA / eLORETA / dSPM. The column is the
+free-orientation gain projected onto that unit vector, not MNE's
+``force_fixed``: a volume source space gives every source a ``+z`` normal,
+so ``force_fixed`` yields vertical dipoles, which agree with radial ones
+only under the vertex.
 
 ``n_orient=3``: free orientation — three orthogonal components (x, y, z)
-per source.  The lead field has ``n_sources * 3`` columns.  Use this
+per source. The lead field has ``n_sources * 3`` columns. Use this
 for unconstrained dipole fitting.
 """
 
@@ -176,22 +180,10 @@ def compute_eeg_lead_field(
     )
 
     # ------------------------------------------------------------------
-    # 5. Orientation constraint
+    # 5. Extract arrays
     # ------------------------------------------------------------------
-    if n_orient == 1:
-        # Fixed (radial) orientation: force_fixed collapses each triplet
-        # of columns to a single column.
-        fwd = mne.convert_forward_solution(
-            fwd,
-            surf_ori=False,
-            force_fixed=True,
-            verbose=False,
-        )
-
-    # ------------------------------------------------------------------
-    # 6. Extract arrays
-    # ------------------------------------------------------------------
-    # fwd['sol']['data'] shape: (n_channels, n_sources * n_orient)
+    # The solution is always the free-orientation one, (n_channels, n_sources * 3); a fixed
+    # orientation is applied below, once the singular sources are gone.
     lead_field: np.ndarray = np.ascontiguousarray(fwd["sol"]["data"], dtype=np.float64)
 
     # Source positions from the (single) volume source space.
@@ -202,7 +194,7 @@ def compute_eeg_lead_field(
     src_pos: np.ndarray = np.ascontiguousarray(src_vol["rr"][used_mask], dtype=np.float64)
 
     n_sources = src_pos.shape[0]
-    expected_cols = n_sources * n_orient
+    expected_cols = n_sources * 3
     if lead_field.shape != (len(ch_names), expected_cols):
         raise RuntimeError(
             f"Unexpected lead field shape {lead_field.shape}; expected ({len(ch_names)}, {expected_cols})."
@@ -215,11 +207,10 @@ def compute_eeg_lead_field(
     # model (Sarvas 1987 et al.), not an MNE bug; BEM pipelines do not see
     # it because realistic head meshes exclude the centre implicitly.
     # We drop affected sources rather than caching poisoned bytes.
-    finite_per_col = np.isfinite(lead_field).all(axis=0)
+    finite_per_source = np.isfinite(lead_field).all(axis=0).reshape(-1, 3).all(axis=1)
+    # A fixed orientation also needs a radial direction, which a source at the centre does not have.
     if n_orient == 1:
-        finite_per_source = finite_per_col
-    else:
-        finite_per_source = finite_per_col.reshape(-1, n_orient).all(axis=1)
+        finite_per_source &= np.linalg.norm(src_pos - np.asarray(sphere_center_m), axis=1) > 1e-9
     n_dropped = int((~finite_per_source).sum())
     if n_dropped:
         logger.warning(
@@ -227,10 +218,20 @@ def compute_eeg_lead_field(
             n_dropped,
             sphere_center_m,
         )
-        keep_cols = finite_per_source if n_orient == 1 else np.repeat(finite_per_source, n_orient)
-        lead_field = np.ascontiguousarray(lead_field[:, keep_cols])
+        lead_field = np.ascontiguousarray(lead_field[:, np.repeat(finite_per_source, 3)])
         src_pos = np.ascontiguousarray(src_pos[finite_per_source])
         n_sources = src_pos.shape[0]
+
+    # ------------------------------------------------------------------
+    # 6. Orientation constraint
+    # ------------------------------------------------------------------
+    if n_orient == 1:
+        # Each source's x/y/z gain projected onto its outward radial unit vector, so a positive
+        # moment points away from the sphere centre and makes the scalp above it positive.
+        radial = src_pos - np.asarray(sphere_center_m)
+        radial /= np.linalg.norm(radial, axis=1, keepdims=True)
+        gain = lead_field.reshape(len(ch_names), n_sources, 3)
+        lead_field = np.ascontiguousarray(np.einsum("cni,ni->cn", gain, radial))
 
     # Final safety net: should never trip after the filter, but if MNE ever
     # produces a non-finite value through a path the filter doesn't cover

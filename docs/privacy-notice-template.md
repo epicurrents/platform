@@ -66,7 +66,7 @@ Contact for privacy questions: `[FILL: email address]`.
 | Action log — the searchable index | 90 days, then archived but retained (`ACTIVITY_ARCHIVE_AFTER_DAYS`) |
 | Action log — the tamper-evident record of changes | **Permanently.** It is an integrity record: entries are chained to each other, so removing one would break the chain that proves the rest were not altered. When you exercise your right to erasure we overwrite the personal data inside these entries and re-seal them, leaving the chain verifiable and the personal data gone |
 | Things you put in the trash | 30 days, then permanently deleted (`RECORDINGS_TRASH_RETENTION_DAYS`, `MEDIA_TRASH_RETENTION_DAYS`, `LIBRARY_TRASH_RETENTION_DAYS`) |
-| Backups | About six months, encrypted `[FILL if you changed the retention]` |
+| Backups | About six months, encrypted `[FILL if you changed the retention, and for an off-site copy state how often it is compacted: until then it keeps everything it was sent]` |
 
 ## Who else sees it
 
@@ -88,7 +88,7 @@ You can ask us to:
 
 - **Show you** what we hold about you (Art. 15). `[FILL: name a contact and a realistic turnaround. There is no self-service export; an operator produces one with `manage.py export_user`, so this is a person's response time, not a download link.]`
 - **Correct** it (Art. 16). Your own name and email are editable in your profile; ask us for anything else.
-- **Delete** it (Art. 17). We remove your account, your sessions, and the personal data inside the permanent action log. Two consequences worth stating plainly rather than burying. Erasing your account also deletes the recordings and files **you uploaded**, along with the annotations on them — so if you uploaded clinical data that others rely on, `[FILL: say what you do about this — transferring ownership before erasure, or the retention duty you rely on to refuse the request in part]`. And data already written to an encrypted backup disappears when that backup rotates out, which takes up to about six months.
+- **Delete** it (Art. 17). We remove your account, your sessions, and the personal data inside the permanent action log. Two consequences worth stating plainly rather than burying. Erasing your account also deletes the recordings and files **you uploaded**, along with the annotations on them — so if you uploaded clinical data that others rely on, `[FILL: say what you do about this — transferring ownership before erasure, or the retention duty you rely on to refuse the request in part]`. And data already written to an encrypted backup disappears when that backup rotates out, which takes up to about six months `[FILL if you changed the retention or keep an off-site copy: give the longest time any copy is kept]`.
 - **Restrict** processing (Art. 18) or **object** to it (Art. 21). `[FILL: contact]`
 - **Take your data elsewhere** (Art. 20). You can download recordings you own and export your annotations.
 - **Withdraw consent** at any time, where consent is what we rely on — turning off notifications, for instance. This does not undo what was lawful before you withdrew it.

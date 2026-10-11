@@ -58,7 +58,7 @@ The forward solution uses the analytical sphere formula in MNE, so no OpenMEEG /
 
 Orientation:
 
-- `n_orient=1` (default) — fixed (radial) orientation; standard for sLORETA / eLORETA / dSPM.
+- `n_orient=1` (default) — fixed (radial) orientation; standard for sLORETA / eLORETA / dSPM. Each column is the free-orientation gain projected onto the source's outward radial direction, so a positive moment makes the scalp above it positive. It is not MNE's `force_fixed`, which follows the volume source space's normals — all `+z` — and gives vertical dipoles.
 - `n_orient=3` — free orientation; three orthogonal components per source. Use for unconstrained dipole fitting.
 
 ## Models

@@ -470,6 +470,12 @@ Set `BACKUP_LOCAL_ENABLED=false` for the remote-only arrangement, which is the r
 
 A value outside `true`/`false`/`yes`/`no`/`on`/`off`/`1`/`0` is also refused rather than treated as the default. `BACKUP_LOCAL_ENABLED=flase` quietly keeping the local tier would leave an operator believing they had turned it off, with nothing about the running system distinguishing the two.
 
+### Expire the remote repository
+
+The retention the deployment sets (`BACKUP_KEEP_DAILY`, `BACKUP_KEEP_WEEKLY`, `BACKUP_KEEP_MONTHLY`) is applied to both repositories, but on the append-only remote it only marks archives as deleted. Borg keeps the data until the repository is compacted by someone with full access, and the host has append-only access precisely so that it cannot do that. Left alone, the remote grows without bound and keeps everything it was ever sent, including data an account erasure removed everywhere else, which makes the retention stated in [gdpr-compliance.md](gdpr-compliance.md#data-inventory) untrue.
+
+Compaction therefore runs on the remote side, on a schedule, by whoever administers the remote: `borg compact` against the repository with full access, at least once per retention period and preferably monthly. Before compacting, check that the deletions the host recorded since the last compaction are the ones the retention policy explains: a compromised host can also only mark archives as deleted, and compaction is the moment those deletions become permanent. Record the schedule and who runs it with the deployment's records of processing; the erasure procedure relies on it.
+
 ### Keep the passphrase somewhere the host loss cannot reach
 
 `BORG_PASSPHRASE` lives in `.env`, and `.env` is deliberately in no archive — an archive carrying the passphrase that decrypts it is not a control. The consequence is that losing the host loses the ability to read the backups, off-host copies included. The passphrase therefore needs custody arranged *before* it is needed, not after:

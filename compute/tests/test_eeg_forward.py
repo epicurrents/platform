@@ -106,3 +106,36 @@ def test_roundtrip_bytes():
 
     np.testing.assert_array_equal(lf, lf_rt)
     np.testing.assert_array_equal(src_pos, sp_rt)
+
+
+def test_fixed_orientation_is_radial_not_vertical():
+    """A fixed column is the free gain projected on the outward radial direction of its source.
+
+    MNE's ``force_fixed`` follows the volume source space's normals, which are all ``+z``; this pins
+    that the fixed lead field is the radial one rather than the vertical one it would otherwise be.
+    """
+    center = np.array([0.0, 0.0, 0.04])
+    lf1, src1, *_ = compute_eeg_lead_field("standard_1020", grid_resolution_mm=20.0, n_orient=1)
+    lf3, src3, *_ = compute_eeg_lead_field("standard_1020", grid_resolution_mm=20.0, n_orient=3)
+    np.testing.assert_allclose(src1, src3)
+    gain = lf3.reshape(lf3.shape[0], src3.shape[0], 3)
+    radial = (src3 - center) / np.linalg.norm(src3 - center, axis=1, keepdims=True)
+    np.testing.assert_allclose(lf1, np.einsum("cni,ni->cn", gain, radial), rtol=1e-10, atol=0)
+    # Away from the vertex, radial and vertical differ, so the vertical gain must not match.
+    lateral = np.abs(radial[:, 2]) < 0.5
+    assert lateral.any()
+    assert not np.allclose(lf1[:, lateral], gain[:, lateral, 2])
+
+
+def test_fixed_orientation_positive_moment_is_positive_above_the_source():
+    """A positive radial moment points outward, so the electrode nearest a superficial source reads positive."""
+    import mne
+
+    center = np.array([0.0, 0.0, 0.04])
+    lf1, src1, ch_names, _ = compute_eeg_lead_field("standard_1020", grid_resolution_mm=10.0, n_orient=1)
+    positions = mne.channels.make_standard_montage("standard_1020").get_positions()["ch_pos"]
+    electrodes = np.array([positions[name] for name in ch_names])
+    depth = np.linalg.norm(src1 - center, axis=1)
+    for k in np.argsort(depth)[-20:]:
+        nearest = int(np.argmin(np.linalg.norm(electrodes - src1[k], axis=1)))
+        assert lf1[nearest, k] > 0, f"source {k} at {src1[k]} reads {lf1[nearest, k]} at {ch_names[nearest]}"

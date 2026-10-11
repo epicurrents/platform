@@ -21,6 +21,7 @@ Entries are written for the person deciding whether to upgrade, so the ones that
 
 ### Fixed
 
+- **Fixed-orientation lead fields are radial.** `n_orient=1` produced vertical dipoles: MNE's `force_fixed` follows a volume source space's normals, which all point along `+z`, so the two agreed only under the vertex. Each column is now the free-orientation gain projected onto the source's outward radial direction. Lead fields already computed with `n_orient=1`, cached rows and static bundles alike, are the vertical ones; recompute them with `compute_leadfield --n-orient 1 --force` and `generate_static_leadfields --n-orient 1`. Free-orientation lead fields are unaffected.
 - **Recordings brought in by `import_recordings` answer on Postgres.** They were named with lower-case hex while the API matches the URL hash case-sensitively against the upper-case names uploads get, so every by-hash route answered 404. SQLite's `LIKE` ignores case, which kept the test suite green. Recordings imported before the fix keep their lower-case names, and their files on disk are named after them, so they stay unreachable until a repair command renames both; see ROADMAP.
 
 ## [0.1.2] — 2026-09-29
