@@ -114,8 +114,10 @@ class IngestProfile:
     ``validate_sidecar`` receives the sidecar after the shape checks passed and returns
     further violations; ``ingest`` receives the created recording and the sidecar, inside the
     ingest transaction, after the platform has written the sidecar's events, interruptions and
-    coded labels, and writes whatever else the project derives from it. Both are optional. ``forbidden_sidecar_keys`` extends the default set;
-    it cannot shrink it.
+    coded labels, and writes whatever else the project derives from it. Both are optional.
+    ``forbidden_sidecar_keys`` extends the default set; it cannot shrink it. ``server_sidecar_keys`` are top-level
+    keys accepted only in a sidecar the server builds for a file it already holds, never in one a contributor sent,
+    so what a project derives from such a key can be trusted to have come from the platform's own records.
 
     ``k`` and ``m`` are the pool's release conditions. ``k`` is the smallest equivalence class a release run publishes
     from, applied by the project's selector (``library.release.select_by_class_size``); ``m`` is the number of active
@@ -138,6 +140,7 @@ class IngestProfile:
     durations_seconds: tuple[float, ...] = ()
     required_sidecar_keys: tuple[str, ...] = ()
     forbidden_sidecar_keys: tuple[str, ...] = ()
+    server_sidecar_keys: tuple[str, ...] = ()
     validate_sidecar: Callable[[dict], list[Violation]] | None = field(default=None, compare=False)
     ingest: Callable[[Any, dict], None] | None = field(default=None, compare=False)
     k: int | None = None
@@ -429,8 +432,14 @@ def validate_file(profile: IngestProfile, data: bytes) -> list[Violation]:
     return violations
 
 
-def validate_sidecar(profile: IngestProfile, sidecar: Any, data: bytes) -> list[Violation]:
-    """Check the sidecar's shape, its forbidden keys and its declared hash, then ask the profile."""
+def validate_sidecar(
+    profile: IngestProfile, sidecar: Any, data: bytes, *, server_built: bool = False
+) -> list[Violation]:
+    """Check the sidecar's shape, its forbidden keys and its declared hash, then ask the profile.
+
+    The profile's ``server_sidecar_keys`` are refused unless *server_built*, which only :func:`accept_submission`
+    sets, for a held copy.
+    """
     if not isinstance(sidecar, dict):
         return [Violation("sidecar_shape", "The sidecar must be a JSON object.")]
     problem = _shape_problem(sidecar)
@@ -448,6 +457,12 @@ def validate_sidecar(profile: IngestProfile, sidecar: Any, data: bytes) -> list[
         violations.append(Violation("sidecar_shape", f"The sidecar is not the viewer's shape: {exc}."))
     for path in _forbidden_keys_in(sidecar, profile.all_forbidden_sidecar_keys):
         violations.append(Violation("sidecar_forbidden_key", f"The sidecar carries the forbidden key {path!r}."))
+    if not server_built:
+        for key in profile.server_sidecar_keys:
+            if key in sidecar:
+                violations.append(
+                    Violation("sidecar_server_key", f"The key {key!r} is accepted only in a sidecar the server builds.")
+                )
     for key in (DECLARED_HASH_KEY, *profile.required_sidecar_keys):
         if key not in sidecar:
             violations.append(Violation("sidecar_missing_key", f"The sidecar lacks the required key {key!r}."))
@@ -474,9 +489,11 @@ def validate_sidecar(profile: IngestProfile, sidecar: Any, data: bytes) -> list[
     return violations
 
 
-def validate_submission(profile: IngestProfile, data: bytes, sidecar: Any) -> list[Violation]:
+def validate_submission(
+    profile: IngestProfile, data: bytes, sidecar: Any, *, server_built: bool = False
+) -> list[Violation]:
     """Every violation of ``profile`` by the pair. Empty means the submission may be accepted."""
-    return validate_file(profile, data) + validate_sidecar(profile, sidecar, data)
+    return validate_file(profile, data) + validate_sidecar(profile, sidecar, data, server_built=server_built)
 
 
 def validate_upload(profile: IngestProfile, data: bytes) -> list[Violation]:
@@ -656,7 +673,8 @@ def accept_submission(
 
     The one accept path for a pool, shared by the submission endpoint and any server-side hand-over. Pass
     either the received ``data`` with its ``extension``, or a ``held`` copy from :func:`spool_held_file`. A
-    held copy never travelled, so the server declares its digest in the sidecar itself before the gate runs.
+    held copy never travelled, so the server declares its digest in the sidecar itself before the gate runs, and its
+    sidecar may carry the profile's ``server_sidecar_keys``.
 
     The gate runs before any write. A refusal raises :class:`SubmissionRefused` and writes nothing; received
     bytes were never written and a held copy is unlinked. Under the pool's row lock, the lock its configuration
@@ -694,7 +712,8 @@ def accept_submission(
         profile = get_ingest_profile(dataset.submission_profile)
         if profile is None:
             raise PoolUnavailable("The pool's ingest profile is no longer registered")
-        violations = validate_submission(profile, data, sidecar)
+        # A held copy's sidecar is the server's own; one that arrived with the request is the contributor's.
+        violations = validate_submission(profile, data, sidecar, server_built=held is not None)
         if violations:
             raise SubmissionRefused(violations)
         if path is None:

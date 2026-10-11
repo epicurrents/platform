@@ -24,6 +24,7 @@ from epicurrents.permissions import can_read_object, get_federated_read_access_r
 from library.models import Dataset, DatasetItem, DatasetRelease
 from library.release import (
     ReleaseDecision,
+    class_k_at_run,
     eligibility_cutoff,
     eligible_items,
     member_hidden_from_reader,
@@ -566,6 +567,28 @@ class TestClassSize:
         dataset, items = _gated_dataset(author, *members)
         assert select_by_class_size(dataset, items, k=1) == []
 
+    def test_each_class_may_be_held_to_its_own_k(self, make_user):
+        author = make_user()
+        members = [_recording(author, index=n, display_name=name) for n, name in enumerate("aabb")]
+        dataset, items = _gated_dataset(author, *members)
+        k_of = {"a": 2, "b": 3}.__getitem__
+        assert [item.pk for item in select_by_class_size(dataset, items, k=k_of)] == [items[0].pk, items[1].pk]
+        assert class_k_at_run(dataset, items, k=k_of, default=2) == {"b": 3}
+
+    def test_a_media_member_never_takes_a_recordings_class(self, make_user):
+        from media.models import MediaFile
+
+        author = make_user()
+        recording = _recording(author, index=0, display_name="c")
+        dataset, items = _gated_dataset(author, recording)
+        # Its object id is the recording's primary key, so only the content type tells the two apart.
+        media_item = DatasetItem.objects.create(
+            dataset=dataset,
+            content_type=ContentType.objects.get_for_model(MediaFile),
+            object_id=str(recording.pk),
+        )
+        assert [item.pk for item in select_by_class_size(dataset, [*items, media_item], k=1)] == [items[0].pk]
+
     def test_nothing_is_selected_without_a_class_function(self, make_user):
         register_equivalence_class(None)
         author = make_user()
@@ -627,14 +650,14 @@ class TestReleaseCommand:
         def selector(ds, eligible, *, as_of):
             seen["eligible"] = [item.pk for item in eligible]
             seen["as_of"] = as_of
-            return ReleaseDecision(items=[eligible[1]], profile_version="edu-7", k=5, m=2)
+            return ReleaseDecision(items=[eligible[1]], profile_version="edu-7", k=5, class_k={"b": 10}, m=2)
 
         register_release_selector(selector)
         out = self._run(dataset.object_hash, "--as-of", "2026-10-01")
         assert seen == {"eligible": [items[0].pk, items[1].pk], "as_of": date(2026, 10, 1)}
         assert "Released 1 of 2 eligible" in out and "withheld" in out
         release = DatasetRelease.objects.get(dataset=dataset)
-        assert (release.profile_version, release.k, release.m) == ("edu-7", 5, 2)
+        assert (release.profile_version, release.k, release.class_k, release.m) == ("edu-7", 5, {"b": 10}, 2)
         items[1].refresh_from_db()
         assert items[1].release == release
 

@@ -269,6 +269,14 @@ class TestGate:
             validate_submission(_profile(forbidden_sidecar_keys=("centre",)), data, own)
         )
 
+    def test_server_keys_are_refused_unless_the_server_built_the_sidecar(self):
+        data = _edf()
+        profile = _profile(server_sidecar_keys=("derived",))
+        sidecar = _sidecar(data, derived=[])
+        assert _codes(validate_submission(profile, data, sidecar)) == {"sidecar_server_key"}
+        assert validate_submission(profile, data, sidecar, server_built=True) == []
+        assert validate_submission(profile, data, _sidecar(data)) == []
+
     def test_a_sidecar_the_pooled_ingest_could_not_read_is_refused(self):
         data = _edf()
         malformed = _sidecar(data, events=[{"class": "event", "duration": 0}])
@@ -489,6 +497,15 @@ class TestPoolEndpoints:
         response = client.get(PROFILES_URL)
         assert [row["key"] for row in response.json()] == ["test.other", "test.pool"]
         assert Activity.objects.filter(verb="recordings.submission.profile.list").exists()
+
+    def test_the_endpoint_refuses_a_server_key(self, pool, spool):
+        dataset, contributor, _group = pool
+        register_ingest_profile(_profile(server_sidecar_keys=("derived",)))
+        data = _edf()
+        response = _submit(_client(contributor), dataset, data, _sidecar(data, derived=[]))
+        assert response.status_code == 422, response.content
+        assert {v["code"] for v in response.json()["violations"]} == {"sidecar_server_key"}
+        assert SubmissionFile.objects.count() == 0
 
     def test_rejected_file_writes_nothing_and_audits_against_the_pool(self, pool, spool):
         dataset, contributor, _group = pool
@@ -1121,6 +1138,18 @@ class TestAcceptSubmission:
         assert list(spool.iterdir()) == []
         assert SubmissionFile.objects.count() == 0
         assert SubmissionLedger.objects.count() == 0
+
+    def test_only_a_held_copy_may_carry_a_server_key(self, pool, spool, tmp_path):
+        dataset, contributor, _group = pool
+        register_ingest_profile(_profile(server_sidecar_keys=("derived",)))
+        data = _edf()
+        with pytest.raises(SubmissionRefused) as refused:
+            accept_submission(dataset, contributor, sidecar=_sidecar(data, derived=[]), data=data, extension=".edf")
+        assert _codes(refused.value.violations) == {"sidecar_server_key"}
+        assert SubmissionFile.objects.count() == 0
+        copy = spool_held_file(self._held(tmp_path, data), ".edf")
+        accepted = accept_submission(dataset, contributor, sidecar={"profile_version": "1", "derived": []}, held=copy)
+        assert SubmissionFile.objects.get(ledger=accepted.ledger).sidecar["derived"] == []
 
     def test_refused_received_data_writes_nothing(self, pool, spool):
         dataset, contributor, _group = pool

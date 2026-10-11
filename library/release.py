@@ -529,12 +529,15 @@ class ReleaseDecision:
     ``items`` is a subset of the eligible set the selector was handed. The remaining fields are
     the ¶ 41 record: the preparation profile version, the equivalence-class conditions in
     force, the primary keys of the users who signed the run off and a reference to the written
-    assessment. Any left blank is filled from the command line, or left blank.
+    assessment. Any left blank is filled from the command line, or left blank. ``class_k`` holds
+    the k of each class held to one other than ``k`` (:func:`class_k_at_run`), and is never
+    taken from the command line.
     """
 
     items: list[DatasetItem]
     profile_version: str = ""
     k: int | None = None
+    class_k: dict[str, int] = field(default_factory=dict)
     m: int | None = None
     sign_off_user_ids: list[int] = field(default_factory=list)
     assessment_reference: str = ""
@@ -649,22 +652,16 @@ def deidentification_versions_of(items: list[DatasetItem]) -> list[int]:
     return sorted(set(deidentification_version_by_id(items).values()))
 
 
-def select_by_class_size(dataset: Dataset, eligible: list[DatasetItem], *, k: int) -> list[DatasetItem]:
-    """The eligible members whose equivalence class holds at least *k* recordings once this run publishes.
+ClassK = int | Callable[[Hashable], int]
 
-    A class is counted over the pool as released and still readable (released, not trashed,
-    READY) plus the eligible members in it, so a class that reached k earlier takes new members one
-    at a time and one that has not waits until enough are eligible together. The class of a member
-    is the registered function's key in its string form, the same key the anonymity report sizes,
-    so the k a run records and the k the report finds agree. Unclassified members, and members that
-    are not recordings, are never selected; without a registered function nothing is. A building
-    block for a project's selector, which still decides what else a release needs.
+
+def _run_classes(dataset: Dataset, eligible: list[DatasetItem]) -> tuple[list[str], dict[str, Hashable], int]:
+    """What a run counts: the recording ids released and then eligible, the class key of each classified one that is
+    still readable, and the recording content type's id. Without a registered class function nothing is classified.
     """
     from recordings.models import Recording
 
     fn = equivalence_class_function()
-    if fn is None:
-        return []
     recording_ct = ContentType.objects.get_for_model(Recording, for_concrete_model=False)
     released_ids = list(
         DatasetItem.objects.filter(dataset=dataset, content_type=recording_ct, release__isnull=False).values_list(
@@ -672,30 +669,69 @@ def select_by_class_size(dataset: Dataset, eligible: list[DatasetItem], *, k: in
         )
     )
     eligible_ids = [item.object_id for item in eligible if item.content_type_id == recording_ct.pk]
+    counted = [*released_ids, *eligible_ids]
+    if fn is None:
+        return counted, {}, recording_ct.pk
     readable = Recording.objects.filter(deleted_at__isnull=True, status=Recording.Status.READY)
     by_id = {
         str(recording.pk): recording
-        for recording in readable.filter(pk__in=[int(pk) for pk in [*released_ids, *eligible_ids] if str(pk).isdigit()])
+        for recording in readable.filter(pk__in=[int(pk) for pk in counted if str(pk).isdigit()])
     }
-
-    def class_of(object_id: str) -> str | None:
-        recording = by_id.get(str(object_id))
-        key = fn(recording) if recording is not None else None
-        return None if key is None else str(key)
-
-    sizes: dict[str, int] = {}
-    for object_id in [*released_ids, *eligible_ids]:
-        key = class_of(object_id)
+    keys: dict[str, Hashable] = {}
+    for object_id, recording in by_id.items():
+        key = fn(recording)
         if key is not None:
-            sizes[key] = sizes.get(key, 0) + 1
+            keys[object_id] = key
+    return counted, keys, recording_ct.pk
+
+
+def _threshold(k: ClassK, key: Hashable) -> int:
+    return k(key) if callable(k) else k
+
+
+def select_by_class_size(dataset: Dataset, eligible: list[DatasetItem], *, k: ClassK) -> list[DatasetItem]:
+    """The eligible members whose equivalence class holds at least its k recordings once this run publishes.
+
+    A class is counted over the pool as released and still readable (released, not trashed,
+    READY) plus the eligible members in it, so a class that reached k earlier takes new members one
+    at a time and one that has not waits until enough are eligible together. The class of a member
+    is the registered function's key in its string form, the same key the anonymity report sizes,
+    so the k a run records and the k the report finds agree. *k* is one number for every class, or a
+    function from the class key, as the registered function returns it, to that class's k; a selector
+    passing a function records what it applied with :func:`class_k_at_run`. Unclassified members, and
+    members that are not recordings, are never selected; without a registered function nothing is. A
+    building block for a project's selector, which still decides what else a release needs.
+    """
+    counted, keys, recording_ct_id = _run_classes(dataset, eligible)
+    sizes: dict[str, int] = {}
+    for object_id in counted:
+        key = keys.get(str(object_id))
+        if key is not None:
+            sizes[str(key)] = sizes.get(str(key), 0) + 1
     selected = []
     for item in eligible:
-        if item.content_type_id != recording_ct.pk:
+        if item.content_type_id != recording_ct_id:
             continue
-        key = class_of(item.object_id)
-        if key is not None and sizes[key] >= k:
+        key = keys.get(str(item.object_id))
+        if key is not None and sizes[str(key)] >= _threshold(k, key):
             selected.append(item)
     return selected
+
+
+def class_k_at_run(dataset: Dataset, eligible: list[DatasetItem], *, k: ClassK, default: int) -> dict[str, int]:
+    """The k each class counted at this run was held to, where it differs from *default*, keyed as the report keys it.
+
+    Every class of the pool the report on this run sizes is counted here, so the record is complete for that report.
+    A selector passing :func:`select_by_class_size` a function of the class records this as the run's ``class_k``
+    beside ``k`` = *default*.
+    """
+    _counted, keys, _recording_ct_id = _run_classes(dataset, eligible)
+    record: dict[str, int] = {}
+    for key in keys.values():
+        threshold = _threshold(k, key)
+        if threshold != default:
+            record[str(key)] = threshold
+    return dict(sorted(record.items()))
 
 
 def _standing_approvals(items: list[DatasetItem]) -> list[tuple[int, int | None]]:
@@ -846,6 +882,7 @@ def run_release(
         profile_version=decision.profile_version or profile_version,
         deidentification_versions=sorted(set(versions.values())),
         k=decision.k if decision.k is not None else k,
+        class_k=dict(decision.class_k),
         m=decision.m if decision.m is not None else m,
         assessment_reference=decision.assessment_reference or assessment_reference,
         member_count=len(decision.items),

@@ -104,7 +104,8 @@ class Command(BaseCommand):
                 "journalist risk not computed (no population frequencies)"
             )
             for cls in report["classes"]:
-                self.stdout.write(f"    {cls['key']}: {cls['size']}")
+                own_k = f" (k {cls['k']})" if cls["k"] != report["k"] else ""
+                self.stdout.write(f"    {cls['key']}: {cls['size']}{own_k}")
         for member in report["members"]:
             flag = "  re-written" if member["changed_since_release"] else ""
             version = member["deidentification_version"]

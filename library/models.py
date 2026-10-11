@@ -440,6 +440,8 @@ class DatasetRelease(models.Model):
     profile_version = models.CharField(max_length=64, blank=True, default="")
     deidentification_versions = models.JSONField(default=list, blank=True)
     k = models.PositiveIntegerField(null=True, blank=True)
+    # The k of each class held to one other than ``k``, keyed by the class in its string form.
+    class_k = models.JSONField(default=dict, blank=True)
     m = models.PositiveIntegerField(null=True, blank=True)
     # Free text the runner typed; cleared on the live row when the runner's account is erased
     # (library.apps), and scrubbed from the audit trail with it.

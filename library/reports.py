@@ -28,8 +28,9 @@ profile change (¶ 35): the record the run stored, the per-recording de-identifi
 what it released with any member since re-written by a newer pass flagged, the members withdrawn
 since, and the equivalence-class sizes over the pool as released up to that run, from which the
 minimum k, the fraction of members below the recorded k, the prosecutor risk and the entropy
-follow. The classes come from the project's registered function; without one the report says so
-and computes nothing.
+follow. A run that held some classes to a k other than its own records them in ``class_k``, and
+each of those classes is measured against the k it was held to. The classes come from the
+project's registered function; without one the report says so and computes nothing.
 
 What the platform cannot recompute, it reports as recorded. m is the number of contributors the
 pool was held to before the pooled ingest took any of its files; checking it against the released
@@ -191,14 +192,17 @@ def class_sizes(items: list[DatasetItem]) -> tuple[dict[str, int] | None, int]:
     return dict(sorted(sizes.items())), unclassified
 
 
-def class_summary(sizes: dict[str, int] | None, unclassified: int, k: int | None) -> dict[str, Any]:
+def class_summary(
+    sizes: dict[str, int] | None, unclassified: int, k: int | None, class_k: dict[str, int] | None = None
+) -> dict[str, Any]:
     """Derive the anonymity figures from class sizes: minimum k, fraction below the recorded k, risk, entropy.
 
     Prosecutor risk is the chance of picking the right record for a target known to be in the
     pool, one over the smallest class. The entropy is the base-2 log of that class size, the
     residual anonymity of its members in bits. The fraction below k is over classified members
-    and is ``None`` when the run recorded no k. Everything is ``None`` when there is nothing to
-    count.
+    and is ``None`` when the run recorded no k. Each class is measured against its own k, the
+    run's *class_k* entry where it has one and *k* otherwise, and each class row repeats it.
+    Everything is ``None`` when there is nothing to count.
     """
     if sizes is None:
         return {
@@ -210,12 +214,17 @@ def class_summary(sizes: dict[str, int] | None, unclassified: int, k: int | None
             "prosecutor_risk": None,
             "entropy_bits": None,
         }
+    class_k = class_k or {}
+
+    def held_to(key: str) -> int | None:
+        return class_k.get(key, k) if k is not None else None
+
     classified = sum(sizes.values())
     min_k = min(sizes.values()) if sizes else None
-    below = sum(size for size in sizes.values() if k is not None and size < k)
+    below = sum(size for key, size in sizes.items() if held_to(key) is not None and size < held_to(key))
     return {
         "class_function_registered": True,
-        "classes": [{"key": key, "size": size} for key, size in sizes.items()],
+        "classes": [{"key": key, "size": size, "k": held_to(key)} for key, size in sizes.items()],
         "unclassified": unclassified,
         "min_k": min_k,
         "below_k_fraction": (below / classified) if (k is not None and classified) else None,
@@ -284,6 +293,7 @@ def anonymity_report(dataset: Dataset, release: DatasetRelease) -> dict[str, Any
         "profile_version": release.profile_version,
         "deidentification_versions": list(release.deidentification_versions),
         "k": release.k,
+        "class_k": dict(release.class_k or {}),
         "m": release.m,
         "sign_off_count": release.sign_offs.count(),
         "assessment_reference": release.assessment_reference,
@@ -293,5 +303,5 @@ def anonymity_report(dataset: Dataset, release: DatasetRelease) -> dict[str, Any
         "changed_count": sum(1 for m in members if m["changed_since_release"]),
         "pool_count": len(pool),
         "members": members,
-        **class_summary(sizes, unclassified, release.k),
+        **class_summary(sizes, unclassified, release.k, release.class_k),
     }

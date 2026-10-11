@@ -283,7 +283,10 @@ class TestAnonymityReport:
             release.save()
 
         early = anonymity_report(dataset, first)
-        assert early["pool_count"] == 2 and early["classes"] == [{"key": "a", "size": 1}, {"key": "b", "size": 1}]
+        assert early["pool_count"] == 2 and early["classes"] == [
+            {"key": "a", "size": 1, "k": 2},
+            {"key": "b", "size": 1, "k": 2},
+        ]
         assert (early["min_k"], early["below_k_fraction"], early["prosecutor_risk"], early["entropy_bits"]) == (
             1,
             1.0,
@@ -293,9 +296,22 @@ class TestAnonymityReport:
 
         late = anonymity_report(dataset, second)
         assert late["pool_count"] == 6 and late["unclassified"] == 1
-        assert late["classes"] == [{"key": "a", "size": 2}, {"key": "b", "size": 3}]
+        assert late["classes"] == [{"key": "a", "size": 2, "k": 3}, {"key": "b", "size": 3, "k": 3}]
         assert late["min_k"] == 2 and late["below_k_fraction"] == pytest.approx(2 / 5)
         assert late["prosecutor_risk"] == 0.5 and late["entropy_bits"] == 1.0
+
+    def test_a_class_held_to_its_own_k_is_measured_against_it(self, make_user):
+        register_equivalence_class(_by_display_name)
+        author = make_user()
+        recordings = [_recording(author, index=i, display_name=name) for i, name in enumerate("aabbb")]
+        dataset, items = _gated_dataset(author, *recordings)
+        release = _release(dataset, *items)
+        release.k, release.class_k = 2, {"b": 4}
+        release.save()
+        report = anonymity_report(dataset, release)
+        assert report["class_k"] == {"b": 4}
+        assert report["classes"] == [{"key": "a", "size": 2, "k": 2}, {"key": "b", "size": 3, "k": 4}]
+        assert report["below_k_fraction"] == pytest.approx(3 / 5)
 
     def test_unreleased_members_are_outside_the_pool(self, make_user):
         register_equivalence_class(_by_display_name)
@@ -304,7 +320,7 @@ class TestAnonymityReport:
         waiting = _recording(author, index=1, display_name="a")
         dataset, items = _gated_dataset(author, released, waiting)
         release = _release(dataset, items[0])
-        assert anonymity_report(dataset, release)["classes"] == [{"key": "a", "size": 1}]
+        assert anonymity_report(dataset, release)["classes"] == [{"key": "a", "size": 1, "k": None}]
 
     def test_a_purged_recording_leaves_the_pool_and_counts_as_withdrawn(self, make_user):
         register_equivalence_class(_by_display_name)
@@ -355,6 +371,17 @@ class TestAnonymityReportCommand:
         assert "journalist risk not computed" in out
         row = Activity.objects.get(verb="library.dataset.anonymity_report")
         assert row.target_object_id == str(dataset.pk) and row.metadata["release_count"] == 2
+
+    def test_a_class_held_to_its_own_k_says_so(self, make_user):
+        register_equivalence_class(_by_display_name)
+        author = make_user()
+        members = [_recording(author, index=i, display_name=name) for i, name in enumerate("ab")]
+        dataset, items = _gated_dataset(author, *members)
+        release = _release(dataset, *items)
+        release.k, release.class_k = 1, {"b": 3}
+        release.save()
+        out = self._run(dataset.object_hash)
+        assert "    a: 1\n" in out and "    b: 1 (k 3)\n" in out
 
     def test_one_release_as_json_and_the_unregistered_case(self, make_user):
         author = make_user()
