@@ -70,6 +70,23 @@ declare module '@epicurrents/core/dist/types' {
         options?: Record<string, unknown>
         sidecar?: boolean
         submit(file: SignalExportFile): Promise<SignalExportTargetResult>
+        /**
+         * A switch the export dialog shows, whose `off` mode replaces the target's constraints, options, sidecar
+         * and `submit` while it is off. A viewer that predates it ignores it, and always exports in the target's
+         * own mode.
+         */
+        toggle?: SignalExportTargetToggle
+    }
+    interface SignalExportTargetMode {
+        constraints?: SignalExportConstraints
+        options?: Record<string, unknown>
+        sidecar?: boolean
+        submit(file: SignalExportFile): Promise<SignalExportTargetResult>
+    }
+    interface SignalExportTargetToggle {
+        initial?: boolean
+        label: string
+        off: SignalExportTargetMode
     }
     interface SignalExportReceipt {
         data: string

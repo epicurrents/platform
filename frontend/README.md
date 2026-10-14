@@ -174,6 +174,8 @@ The viewer's file menu offers "Send recording to" entries for a recording opened
 
 Which pools become targets is the project's configuration, not the SPA's: a project calls the template from its `onAppReady`, so a profile can change without a platform release. The profile's forbidden sidecar keys become the constraint's `forbiddenMetadataKeys`, which the export dialog passes to the exporter to remove at any depth, since the gate refuses a sidecar carrying one even where the de-identification only blanks it (`subject`, `text`).
 
+A target may carry a `toggle`, which the export dialog shows as a switch: the target's own constraints, options, sidecar and `submit` apply while it is on, and the toggle's `off` mode while it is off. It is how one menu entry offers two exports that need different files, since the switch is set before anything is encoded. Core declares it, and [src/types/core-global-augment.ts](src/types/core-global-augment.ts) mirrors it until the pinned core release does. A viewer that predates it ignores the switch and exports in the target's own mode.
+
 A target reports its outcome as a message rather than throwing, and the gate's 422 is an outcome, not an error. The per-project viewer lib registers the EDF exporter the targets encode with, in [src/viewer/base.ts](src/viewer/base.ts).
 
 ## Routes
