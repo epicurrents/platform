@@ -8,12 +8,11 @@ is present beside the platform, from the viewer's file. Both directions matter: 
 copied here is a 422 for a client using it, and a term edited here alone is a value the viewer cannot name.
 
 ``epicurrents.biosignal`` accepts every term of the shared set: what was done, given and observed during a
-recording. ``epicurrents.eeg`` accepts the EEG set's acquisition categories and delegates a value it does not know
-to the shared set, so an EEG event may carry a shared term under either standard. The EEG file also carries the
-finding categories the viewer names, scoped ``finding``; those are not registered, because findings are standardised
-through an external vocabulary rather than the platform's own, and the category filter is the one place to widen
-that. A code's ``meta`` is not validated: the file names the keys a term expects as documentation for the writer,
-and the redaction rule treats the metadata as text whatever it holds.
+recording that the signal cannot recover. ``epicurrents.eeg`` accepts the EEG set's activation procedures and
+delegates a value it does not know to the shared set, so an EEG event may carry a shared term under either standard.
+Neither file carries findings, which are coded in HED-SCORE; the scope filter stays, so a category a file scopes
+``finding`` is left out rather than registered. A code's ``meta`` is not validated: the file names the keys a term
+expects as documentation for the writer, and the redaction rule treats the metadata as text whatever it holds.
 
 Why a term is worth more than a name: under a grant carrying ``apply_middleware`` the redaction rule withholds an
 event's name and a code's metadata, and serves a code's ``standard`` and ``value``. A coded event therefore explains
@@ -53,14 +52,14 @@ VOCABULARY_PINS: dict[str, VocabularyPin] = {
     "epicurrents.biosignal": VocabularyPin(
         file="biosignal-events.json",
         label="Epicurrents biosignal acquisition events",
-        version="1.1",
-        sha256="145dd6b63ad810dd81955bb9d95f1b01d650bb3fd73a79fbf9b425c91bfc1720",
+        version="2.0",
+        sha256="b2e5e1eb14b2c3b0783d73fcf3351297af4f482ce35a49a08888cbe2304a6f67",
     ),
     "epicurrents.eeg": VocabularyPin(
         file="eeg-events.json",
         label="Epicurrents EEG events",
-        version="1.0",
-        sha256="9297d71a478026e7225a3297122c2de04d32d4ff412e8b6530dc7d65ebd70f7b",
+        version="2.0",
+        sha256="17e6996c0bd1778ffacd79e96fdb7df747725d9f431cd0dc55e8ae228b66c156",
         fallback="epicurrents.biosignal",
     ),
 }

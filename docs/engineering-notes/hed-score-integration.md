@@ -116,6 +116,8 @@ Two things stay out of the string:
 
 The second point generalises: the tag string is a new free-text-shaped field reaching a serving surface, so it gets the same scrutiny as any other. That it is validated against a schema constrains the *tags*, not the values interpolated into them.
 
+The general form is a rule for the validator: **a value placeholder is accepted only where the schema gives it a numeric value class.** A frequency or a count is accepted; `Description/#`, `Label/#` and the `Other-…/#` tags are refused with any value. The annotation-text rule serves a code's value to a de-identifying reader because it names a concept from a closed set, and a textual placeholder would carry typed text through that exemption. A term with no SCORE equivalent therefore stays uncoded rather than becoming a named `Other-…/#`. Decided with the vocabulary revision in [annotation-event-vocabulary.md §9](annotation-event-vocabulary.md), which makes HED-SCORE the platform's one finding vocabulary and records the picker's design.
+
 ## 6. What this does and does not do for de-identification
 
 Does: gives converter-derived events a canonical target vocabulary, so the vendor taxonomy stops being the only description of what happened; gives a teaching project a closed, externally curated term set that a supervisory authority can be pointed at; makes the annotation layer's semantics machine-readable for export without exporting free text.

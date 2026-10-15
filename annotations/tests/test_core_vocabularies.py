@@ -61,14 +61,13 @@ class TestPinnedCopies:
 
 
 class TestSets:
-    def test_biosignal_accepts_its_five_categories(self):
+    def test_biosignal_accepts_its_four_categories(self):
         vocabulary = load_vocabulary("epicurrents.biosignal")
         assert set(vocabulary["categories"]) == {
             "TECHNICAL",
             "INTERVENTION",
             "OBSERVATION",
             "ENVIRONMENT",
-            "PHYSIOLOGY",
         }
         assert accepted_codes("epicurrents.biosignal") == acquisition_codes("epicurrents.biosignal")
         assert {
@@ -76,10 +75,16 @@ class TestSets:
             "BIO_INT_MEDICATION",
             "BIO_OBS_LOC_ALERT",
             "BIO_ENV_NOISE",
-            "BIO_PHYS_APNEA",
+            "BIO_PHYS_SWEATING",
         } <= accepted_codes("epicurrents.biosignal")
 
+    def test_biosignal_leaves_a_state_a_channel_displays_to_hed_score(self):
+        assert not {"BIO_PHYS_APNEA", "BIO_PHYS_TACHYCARDIA", "BIO_PHYS_DESATURATION"} & accepted_codes(
+            "epicurrents.biosignal"
+        )
+
     def test_eeg_accepts_activation_and_the_shared_set_but_no_finding(self):
+        assert set(load_vocabulary("epicurrents.eeg")["categories"]) == {"ACTIVATION"}
         eeg = acquisition_codes("epicurrents.eeg")
         assert {"EEG_ACT_EC", "EEG_ACT_HV", "EEG_ACT_PHOTIC_10HZ", "EEG_ACT_STIM_NOXIOUS"} <= eeg
         assert "EEG_BKG_ALPHA" not in eeg

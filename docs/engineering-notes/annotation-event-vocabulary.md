@@ -1,6 +1,6 @@
 # Annotation event vocabulary — the acquisition set
 
-**Status:** v1.12, 2026-09-26. Design settled and built through the vendor mappings, the container the viewer's export produces for the platform, submitting from the viewer, the coded labels of the footer, the teaching project's submission path and configuring a submission pool from the dataset page; what remains is planned in section 8: the teaching project's release side, and the documentation at release. Last privacy item on the [ROADMAP](../../ROADMAP.md) ("annotation event vocabulary still fingerprints the acquisition software") and Phase 4 of the [channel de-identification plan](channel-deidentification-plan.md).
+**Status:** v1.13, 2026-10-15. Design settled and built through the vendor mappings, the container the viewer's export produces for the platform, submitting from the viewer, the coded labels of the footer, the teaching project's submission path and configuring a submission pool from the dataset page; what remains is planned in section 8: the teaching project's release side, and the documentation at release. Section 9 revises the split between this vocabulary and HED-SCORE: findings move to HED-SCORE, and the sets here keep what the signal cannot recover. Last privacy item on the [ROADMAP](../../ROADMAP.md) ("annotation event vocabulary still fingerprints the acquisition software") and Phase 4 of the [channel de-identification plan](channel-deidentification-plan.md).
 
 **This is the initial vocabulary.** It carries what a reader needs to explain a change in the signal by something that happened in the room, and no more. Terms will be added along the way, and the crosswalk columns filled, as SNOMED CT concepts are adopted for them; adding a term is an entry in a JSON file and a log row below, not a redesign.
 
@@ -16,7 +16,7 @@ The vocabulary lives in the viewer, which is where events are made and read, as 
 - **The redaction rule makes a code worth more than a name.** Under a grant carrying `apply_middleware`, `Event.name`, `value` and a code's free-form `meta` are withheld; a code's `standard` and `value` are served. So the same event, coded, explains the signal to every reader, and, named only, to the author.
 - **The viewer already has the mechanism.** `GenericAnnotation` carries `CODED_EVENTS`, `extendEvents`, `addStandardEventCodes`, `getEventForCode` and `getEventForLabel` over an empty table, and `EegEvent` re-implements all five over its own table of activation procedures and findings, with DICOM CID 3035 and IEEE MDC identifiers. Nothing else in the viewer or the platform calls any of them, so the shape is free to change.
 - **An annotation carries one code per standard.** The viewer's `codes` is `Record<standard, value>`, and the platform's `Code` row is unique per `(target, standard)`. An event therefore names one concept per vocabulary, which is what a closed-set term is for; a second concept is a second event.
-- **Findings are not the subject.** Spikes, sleep stages and semiology are what a reader concludes; this vocabulary is what a reader is told happened. The EEG finding categories stay in `EegEvent` for the viewer's own use and are covered, for external standardisation, by the [HED-SCORE](hed-score-integration.md) plugin. Sleep deprivation is a property of the recording, not an event, and belongs on a profile.
+- **Findings are not the subject.** Spikes, sleep stages and semiology are what a reader concludes; this vocabulary is what a reader is told happened. The EEG finding categories were kept in `EegEvent` for the viewer's own use, with the [HED-SCORE](hed-score-integration.md) plugin covering them for external standardisation; section 9 removes them, and HED-SCORE becomes the one finding vocabulary. Sleep deprivation is a property of the recording, not an event, and belongs on a profile.
 
 ## 2. Layout in the viewer
 
@@ -296,10 +296,69 @@ The phased plan in [anonymisation-compliance-plan.md](anonymisation-compliance-p
 - The open question in section 6: a validated identifier in a code's `meta` is text under the redaction rule.
 - From the ROADMAP, the privacy items that touch the same surfaces and would be reviewed by the same agents: purge-time tombstoning of patient-side snapshots in the change log, retention-window enforcement, ownership transfer before account erasure, the Art. 13/14 notice surface, retiring `preserve_annotations`, carrying the annotation-text rule into the viewer's rendering, and the two `import_recordings` items (source paths in logs, pruning of finished job rows).
 
+## 9. Findings move to HED-SCORE (designed 2026-10-15)
+
+**Why.** The teaching project's review route needs a reviewer's findings coded before they can feed the pool, and the platform registers none: the EEG set's finding categories were left to HED-SCORE in section 4 but kept in `EegEvent` for the viewer's own use. Compared against HED-SCORE 2.1.0 they turned out to be the weaker half of the pair. They are a flat list where SCORE composes a finding from a category tag and property tags, and they have no term for a seizure, the finding a teaching reviewer most needs to name. SCORE also covers the critical-care patterns, the photic responses and most of the benign variants, which the list lacks or holds under one generic term. Keeping both would leave two finding vocabularies to maintain and map between. So the viewer stops shipping findings of its own, and HED-SCORE, through the `hedscore` plugin of [hed-score-integration.md](hed-score-integration.md), is the one finding vocabulary.
+
+**The line between the two.** The Epicurrents sets hold what happened during the recording that the signal cannot recover: what was done, what the room did, and what was seen of the patient at the bedside. HED-SCORE holds what a reader concludes from the signal. A note that the patient talked explains an artifact no reader can attribute from the trace alone, and a note of the level of consciousness is the behavioural counterpart of a sleep stage read from the EEG, where a mismatch between the two is itself informative. Both therefore stay. A cardiac or respiratory state that a polygraphic channel displays is a reading of that channel, and is coded in SCORE's `Polygraphic-channel-feature`.
+
+This reverses the principle section 3 gives for PHYSIOLOGY, that a state of the body is one term whichever way it was noticed. The new rule is recoverability from the signal.
+
+**Layout after the change.**
+
+| Set | Holds | Standard |
+|---|---|---|
+| Shared, in core | TECHNICAL, INTERVENTION, ENVIRONMENT and OBSERVATION: events that occur in any modality and carry no reading of the signal | `epicurrents.biosignal` 2.0 |
+| EEG, in eeg-module | ACTIVATION only, stacked on the shared set through the same merged getter | `epicurrents.eeg` 2.0 |
+| Findings | Everything a reader concludes, for every modality SCORE covers | `hed`, from the `hedscore` plugin |
+
+The extension mechanism of section 2 is unchanged. A modality adds its own acquisition events by stacking a file on the shared set, as EEG does with its activation procedures, and adds no findings.
+
+**The shared set, 2.0.**
+- TECHNICAL, INTERVENTION and ENVIRONMENT are unchanged.
+- OBSERVATION absorbs the bedside signs of PHYSIOLOGY: sweating, flushing, pallor, cyanosis, hiccup, vomiting, yawning and spontaneous hyperventilation. None is recoverable from a channel; the respiration channel shows a rate, never whether it was prompted. Codes are matched by term, so these keep their `BIO_PHYS_` values.
+- PHYSIOLOGY is removed as a category.
+- Bradycardia, tachycardia, arrhythmia, asystole, apnoea, hypopnoea, periodic breathing and oxygen desaturation are removed. Their SCORE counterparts are `ECG-bradycardia`, `ECG-tachycardia`, `ECG-arrhythmia`, `ECG-asystolia`, `Apnea`, `Hypopnea`, `Periodic-respiration` and `Oxygen-saturation`. They are removed rather than deprecated in place as section 2 prescribes, because no deployment facing users holds a row coded with one; the rule applies from the first such deployment.
+- Every term with an equivalent in the base HED standard gains a `hed` entry in `standardCodes`, so an event coded at ingest exports as HED without a second lookup. Examples: `Speak`, `Cough`, `Cry`, `Move`, `Prone`, `Alert`, `Asleep`. The shared set names tags of the base HED standard only, and never HED-SCORE: core is modality-neutral and names no vocabulary a modality brings, so a SCORE crosswalk such as the medication modulator belongs in a modality's set. Most positions, the qualified AVPU levels and the procedures have none, which is why they stay Epicurrents terms. A `hed` entry is entered after a checked lookup in the pinned schema, as section 5 requires of every crosswalk.
+- Candidates, to add only when a mapping needs them: feeding, sucking, chewing or swallowing, and being held or rocked. These are bedside facts common in neonatal and ICU recordings, and SCORE names rocking and sucking only as the artifact.
+
+**The EEG set, 2.0.** ACTIVATION alone. The six finding categories and the empty OTHER category are removed rather than deprecated: the platform's validator never accepted a finding scope, so no stored row carries one of their codes, and the only consumer is the module's own test. Activation terms gain `hed` crosswalks where SCORE's `Modulator` branch or standard HED has one: `Hyperventilation`, `Intermittent-photic-stimulation` with the frequency as its value, `Auditory-stimulation`, `Nociceptive-stimulation`, and `Eyes-closed` and `Eyes-open` from `Agent-postural-state`. Codes are unchanged. SCORE's modulator grades (hyperventilation effort, sleep deprivation, medication withdrawal) are candidates for the set, not part of this step.
+
+**The platform.**
+- Both pinned copies are re-pinned at 2.0. An existing version is never re-pinned.
+- The Nicolet reader's mapping ([eventTerms.ts](../../frontend/viewer/epicurrents/nic-reader/src/nic/eventTerms.ts)) and the deployment's converter table stop coding their cardiac and respiratory event types, as they already leave finding markers uncoded.
+- Ingest stays acquisition-only. It does not learn to resolve `hed` codes.
+
+**What ingest loses.** A vendor's cardiac or respiratory marker becomes a text-free placeholder at ingest on every deployment, whether `hedscore` is enabled or not, as a vendor's spike marker does today. This follows from the line rather than being a cost of it. A monitor's tachycardia marker is a device's reading of a channel, which is a finding, and ingest codes no findings: a system-authored finding about the subject is not what this vocabulary carries across the redaction boundary. A reader who wants the state recorded codes it from the channel in SCORE.
+
+**A value placeholder carries text.** SCORE tags ending in `#` take a value, and the plugin's validator constrains the tags rather than the values interpolated into them ([hed-score-integration.md §5](hed-score-integration.md)). `Description/#`, `Label/#` and the `Other-…/#` tags would let typed text through the annotation-text rule's exemption for a code's value. The validator therefore accepts a value only where the schema gives the placeholder a numeric value class, such as a frequency or a count, and refuses every other value. A term with no SCORE equivalent is not written as an `Other-…/#` with a name.
+
+**The picker.** About 510 SCORE nodes, of which the findings and their properties are a few hundred. The aim is that most findings cost one keystroke or one click, and the schema tree is never what a reader navigates.
+1. **Search first.** One type-ahead field over the finding tags, matching the readable name, the tag and a synonym table of the abbreviations readers type: LPD and PLED, GPD, FIRDA, POSTS, spike-wave. Ranked by the person's recent and frequent picks. The readable name is shown and the tag string stored.
+2. **A quick palette.** Fifteen to twenty one-click terms with number-key shortcuts, configured per project, so a teaching deployment can offer its essentials per course level.
+3. **Groups as the fallback.** Eight top-level groups with plain names: interictal, seizures and episodes, background, sleep, benign variants, critical-care patterns, physiologic, artifacts.
+4. **Properties after the finding, all optional.** A property set per group, written by us, because the schema's `suggestedTag` attributes are too sparse to drive a form: `Epileptiform-interictal-activity` suggests `Spike` alone. A seizure offers onset, awareness and semiology; an interictal finding offers morphology, incidence and location.
+5. **What the viewer knows is filled in.** Location from the channels the annotation is drawn on, using canonical labels only per [hed-score-integration.md §5](hed-score-integration.md); duration from the span; frequency from the cursor tool when it was used.
+6. **Repetition is cheap.** A repeat-last-finding key, and a stamp mode that keeps one finding and drops an instance per click, so thirty spikes cost thirty clicks rather than thirty searches.
+
+The viewer ships an index generated from the vendored schema at build time, holding the finding branches and the properties with their names, descriptions and HED ids, never the 1 MB XML. The index carries the schema's CC-BY-4.0 attribution.
+
+**Sequencing.**
+
+| Step | Where | Size |
+|---|---|---|
+| I. Shared set 2.0 and EEG set 2.0: categories, removed terms, `hed` crosswalks, tests | viewer core, eeg-module | S |
+| J. The Nicolet mapping and the converter table leave the channel-readable event types uncoded | viewer nic-reader, deployment data | S |
+| K. The `hedscore` plugin's phases 1 and 2, with the numeric-placeholder rule | platform plugin | M |
+| L. Re-pin both sets at 2.0 | platform annotations | S |
+| M. The schema index and the picker | viewer interface | M |
+| N. The teaching project's review route codes findings through the picker, with its palette | edu project | S |
+
 ## Log
 
 | Date | Change |
 |---|---|
+| 2026-10-15 | v1.13. Section 9 written: findings move to HED-SCORE through the `hedscore` plugin and the EEG set keeps its activation procedures only. The shared set keeps what the signal cannot recover: PHYSIOLOGY's bedside signs join OBSERVATION, and its channel-readable terms are removed in favour of SCORE's polygraphic features. `hed` crosswalks are added throughout, a SCORE value placeholder is accepted only where the value class is numeric, and the picker design is recorded. Ingest stays acquisition-only, so a vendor's cardiac or respiratory marker becomes a placeholder on every deployment, as a finding marker does. |
 | 2026-09-26 | v1.12. Step H2 built: a pool is configured from the dataset page on an empty dataset and locked once a file is accepted, its contributor group is dedicated through a generic registry, and the ledger (ex `SubmissionBatch`) is resolved by the server, which also answers refusals against the pool. The published profile moves to the pool listing. |
 | 2026-09-26 | v1.11. Sex added to the teaching project's submission facts as a coded term, configured per class, with not known among the adult values. The excerpt duration stays out of the equivalence class. |
 | 2026-09-25 | v1.10. Step H's submission path built in the teaching project. It registers an adult routine profile and two coded vocabularies; the age band is entered at send time and the recording class is written by the profile's ingest. The H paragraph is corrected: sex is not collected, as the project's dataset note had already decided. |

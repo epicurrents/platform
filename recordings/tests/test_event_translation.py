@@ -15,7 +15,8 @@ from django.contrib.contenttypes.models import ContentType
 from django.test import override_settings
 from model_bakery import baker
 
-from annotations.core_vocabularies import find_acquisition_term, load_vocabulary
+from annotations import core_vocabularies
+from annotations.core_vocabularies import find_acquisition_term
 from annotations.models import Annotation, Code, Event
 from epicurrents.models import AccessRight
 from recordings.checks import check_event_translation_tables
@@ -61,6 +62,23 @@ def table(tmp_path):
 
 
 @pytest.fixture
+def finding_code(monkeypatch):
+    """A code in a finding-scoped category of the EEG set.
+
+    The shipped files carry no finding category, since findings are coded in HED-SCORE, but the scope filter stays
+    and is what keeps one out if a file gains it, so the test adds one.
+    """
+    load = core_vocabularies.load_vocabulary
+    eeg = load("epicurrents.eeg")
+    finding = {"scope": "finding", "events": {"SPIKE": {"code": "EEG_EPI_SPIKE", "name": "Spike", "class": "event"}}}
+    patched = {**eeg, "categories": {**eeg["categories"], "EPILEPTIFORM": finding}}
+    monkeypatch.setattr(core_vocabularies, "load_vocabulary", lambda s: patched if s == "epicurrents.eeg" else load(s))
+    core_vocabularies._acquisition_terms.cache_clear()
+    yield "EEG_EPI_SPIKE"
+    core_vocabularies._acquisition_terms.cache_clear()
+
+
+@pytest.fixture
 def recording(db, user):
     return baker.make("recordings.Recording", author=user, status="READY")
 
@@ -95,11 +113,9 @@ class TestTermLookup:
         term = find_acquisition_term("EEG_ACT_EC")
         assert (term.standard, term.name, term.event_class) == ("epicurrents.eeg", "Eyes closed", "activation")
 
-    def test_a_finding_term_is_not_an_acquisition_term(self):
-        categories = load_vocabulary("epicurrents.eeg")["categories"]
-        finding = next(c for c in categories.values() if c["scope"] == "finding")
-        code = next(iter(finding["events"].values()))["code"]
-        assert find_acquisition_term(code) is None
+    def test_a_finding_term_is_not_an_acquisition_term(self, finding_code):
+        assert find_acquisition_term("EEG_ACT_EC") is not None
+        assert find_acquisition_term(finding_code) is None
 
     def test_an_unknown_code_answers_none(self):
         assert find_acquisition_term("BIO_TECH_NOT_A_TERM") is None
@@ -138,11 +154,8 @@ class TestMappers:
         assert "BIO_TECH_NOT_A_TERM" in caplog.text
         assert VENDOR_LABEL not in caplog.text
 
-    def test_a_finding_term_is_refused(self):
-        categories = load_vocabulary("epicurrents.eeg")["categories"]
-        finding = next(c for c in categories.values() if c["scope"] == "finding")
-        code = next(iter(finding["events"].values()))["code"]
-        register_event_translation(lambda s: code, name=MAPPER)
+    def test_a_finding_term_is_refused(self, finding_code):
+        register_event_translation(lambda s: finding_code, name=MAPPER)
         assert translate_source_event(SourceEvent(1.0, None, label="x")) is None
 
     def test_a_raising_mapper_leaves_the_event_untranslated_and_names_no_text(self, caplog):
@@ -503,7 +516,10 @@ EVENTS_URL = "/annotations/api/v1/events/"
 
 @pytest.mark.django_db
 class TestServing:
-    """An ingest-coded event under the annotation-text rule: the term crosses a de-identifying grant, the name does not."""
+    """An ingest-coded event under the annotation-text rule.
+
+    The term crosses a de-identifying grant, and the name does not.
+    """
 
     @pytest.fixture
     def scene(self, make_user, table):
