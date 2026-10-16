@@ -1,6 +1,6 @@
 # Annotation event vocabulary — the acquisition set
 
-**Status:** v1.13, 2026-10-15. Design settled and built through the vendor mappings, the container the viewer's export produces for the platform, submitting from the viewer, the coded labels of the footer, the teaching project's submission path and configuring a submission pool from the dataset page; what remains is planned in section 8: the teaching project's release side, and the documentation at release. Section 9 revises the split between this vocabulary and HED-SCORE: findings move to HED-SCORE, and the sets here keep what the signal cannot recover. Last privacy item on the [ROADMAP](../../ROADMAP.md) ("annotation event vocabulary still fingerprints the acquisition software") and Phase 4 of the [channel de-identification plan](channel-deidentification-plan.md).
+**Status:** v1.14, 2026-10-16. Design settled and built through the vendor mappings, the container the viewer's export produces for the platform, submitting from the viewer, the coded labels of the footer, the teaching project's submission path and configuring a submission pool from the dataset page; what remains is planned in section 8: the teaching project's release side, and the documentation at release. Section 9 revises the split between this vocabulary and HED-SCORE: findings move to HED-SCORE, and the sets here keep what the signal cannot recover. Last privacy item on the [ROADMAP](../../ROADMAP.md) ("annotation event vocabulary still fingerprints the acquisition software") and Phase 4 of the [channel de-identification plan](channel-deidentification-plan.md).
 
 **This is the initial vocabulary.** It carries what a reader needs to explain a change in the signal by something that happened in the room, and no more. Terms will be added along the way, and the crosswalk columns filled, as SNOMED CT concepts are adopted for them; adding a term is an entry in a JSON file and a log row below, not a redesign.
 
@@ -341,7 +341,9 @@ The extension mechanism of section 2 is unchanged. A modality adds its own acqui
 5. **What the viewer knows is filled in.** Location from the channels the annotation is drawn on, using canonical labels only per [hed-score-integration.md §5](hed-score-integration.md); duration from the span; frequency from the cursor tool when it was used.
 6. **Repetition is cheap.** A repeat-last-finding key, and a stamp mode that keeps one finding and drops an instance per click, so thirty spikes cost thirty clicks rather than thirty searches.
 
-The viewer ships an index generated from the vendored schema at build time, holding the finding branches and the properties with their names, descriptions and HED ids, never the 1 MB XML. The index carries the schema's CC-BY-4.0 attribution.
+**Where the terms come from.** The viewer ships an index generated from the vendored schema at build time, holding the finding branches and the properties with their names, descriptions and HED ids, never the 1 MB XML. The index carries the schema's CC-BY-4.0 attribution and the version and digest of the schema it was generated from. It lives in eeg-module, because SCORE is the EEG reporting standard, as a lazily imported chunk so the EEG bundle does not grow for anyone who never opens the picker; the picker component lives in the interface. The viewer does not fetch terms from the platform: it knows nothing of the platform, and it codes findings on a local file with no server behind it. The `hedscore` plugin parses the same pinned file, and a plugin test asserts the index was generated from it ([hed-score-integration.md §4](hed-score-integration.md)).
+
+**What the host narrows.** The server's validator decides what is accepted. The SPA passes the deployment's policy into the viewer config, as it does export targets: whether `hed` is registered and at which schema version, the allowed branches from the plugin's policy endpoint, and the project's quick palette. The picker hides a branch the server would refuse and disables itself on a version mismatch. Without a host it offers the whole schema.
 
 **Sequencing.**
 
@@ -349,15 +351,16 @@ The viewer ships an index generated from the vendored schema at build time, hold
 |---|---|---|
 | I. Shared set 2.0 and EEG set 2.0: categories, removed terms, `hed` crosswalks, tests | viewer core, eeg-module | S |
 | J. The Nicolet mapping and the converter table leave the channel-readable event types uncoded | viewer nic-reader, deployment data | S |
-| K. The `hedscore` plugin's phases 1 and 2, with the numeric-placeholder rule | platform plugin | M |
+| K. The `hedscore` plugin's phase 1: vendored schema, index, validator with the numeric-placeholder rule, policy endpoint (built 2026-10-16) | platform plugin | M |
 | L. Re-pin both sets at 2.0 | platform annotations | S |
-| M. The schema index and the picker | viewer interface | M |
+| M. The schema index in eeg-module, the picker in the interface, the SPA passing the policy in | viewer eeg-module and interface, SPA | M |
 | N. The teaching project's review route codes findings through the picker, with its palette | edu project | S |
 
 ## Log
 
 | Date | Change |
 |---|---|
+| 2026-10-16 | v1.14. The picker's terms come from an index in eeg-module generated from the plugin's pinned schema, not from a platform endpoint; the host passes the deployment's policy (schema version, allowed branches, palette) into the viewer config, and the plugin's endpoint serves that policy only. Step K is the plugin's phase 1 alone, built the same day as [plugins/hedscore/](../../plugins/hedscore/README.md) with the core vocabulary listing; the sensor list is the one non-numeric value it accepts, canonical labels separated by `;`. |
 | 2026-10-15 | v1.13. Section 9 written: findings move to HED-SCORE through the `hedscore` plugin and the EEG set keeps its activation procedures only. The shared set keeps what the signal cannot recover: PHYSIOLOGY's bedside signs join OBSERVATION, and its channel-readable terms are removed in favour of SCORE's polygraphic features. `hed` crosswalks are added throughout, a SCORE value placeholder is accepted only where the value class is numeric, and the picker design is recorded. Ingest stays acquisition-only, so a vendor's cardiac or respiratory marker becomes a placeholder on every deployment, as a finding marker does. |
 | 2026-09-26 | v1.12. Step H2 built: a pool is configured from the dataset page on an empty dataset and locked once a file is accepted, its contributor group is dedicated through a generic registry, and the ledger (ex `SubmissionBatch`) is resolved by the server, which also answers refusals against the pool. The published profile moves to the pool listing. |
 | 2026-09-26 | v1.11. Sex added to the teaching project's submission facts as a coded term, configured per class, with not known among the adult values. The excerpt duration stays out of the equivalence class. |

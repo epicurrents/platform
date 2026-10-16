@@ -23,6 +23,7 @@ from annotations.vocabularies import (
 from conftest import patch_json, post_json
 
 CODES_URL = "/annotations/api/v1/codes/"
+VOCABULARIES_URL = "/annotations/api/v1/vocabularies"
 
 
 def _terms_validator(value, meta):
@@ -187,6 +188,39 @@ class TestUpdateCodeValidation:
         code = self._code(event, standard="epicurrents.example.mark", value="NotATerm")
         resp = patch_json(c, f"{CODES_URL}{code.pk}", {"standard": "test-vocab"})
         assert resp.status_code == 422
+
+
+@pytest.mark.django_db
+class TestVocabularyListing:
+    def test_lists_every_registered_standard(self, auth_client, test_vocabulary):
+        c, _user = auth_client
+        resp = c.get(VOCABULARIES_URL)
+        assert resp.status_code == 200
+        listed = {row["standard"]: row for row in resp.json()}
+        assert listed["test-vocab"] == {
+            "standard": "test-vocab",
+            "label": "Test vocabulary",
+            "version": "1.0",
+            "closed": False,
+        }
+        assert set(listed) == {v.standard for v in registered_vocabularies()}
+
+    def test_core_vocabularies_are_listed_as_closed(self, auth_client):
+        c, _user = auth_client
+        listed = {row["standard"]: row for row in c.get(VOCABULARIES_URL).json()}
+        assert listed["epicurrents.biosignal"]["closed"] is True
+        assert listed["epicurrents.eeg"]["version"] == "2.0"
+
+    def test_requires_authentication(self, client):
+        assert client.get(VOCABULARIES_URL).status_code == 401
+
+    def test_listing_is_audited_with_a_count(self, auth_client):
+        from activity.models import Activity
+
+        c, _user = auth_client
+        c.get(VOCABULARIES_URL)
+        row = Activity.objects.filter(verb="annotations.vocabulary.list").latest("pk")
+        assert row.metadata == {"vocabulary_count": len(registered_vocabularies())}
 
 
 @pytest.mark.django_db

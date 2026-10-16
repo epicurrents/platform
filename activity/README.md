@@ -436,6 +436,7 @@ To check the table against the tree, walk the AST for `log_activity` / `with_sys
 | `annotations.label.list` | `list_labels` |
 | `annotations.label.mine` | `list_my_labels` |
 | `annotations.label.update` | `update_label` |
+| `annotations.vocabulary.list` | `list_vocabularies` |
 
 ### `compute`
 

@@ -25,6 +25,7 @@ GET           /export                 Bulk export of events / labels as JSON or 
 GET           /export/types           Annotation types this deployment can export.
 GET           /export/annotators      Annotator roster (id-to-identity mapping), on the export tier.
 
+GET           /vocabularies           Registered coding standards with label and version.
 GET           /content-types          List available content types (for target lookup).
 GET           /health                 Health check.
 
@@ -47,7 +48,7 @@ from activity.audit import log_activity
 from annotations import export as annotation_export
 from annotations.models import Annotation, Code, Event, Interruption, Label
 from annotations.redaction import withheld_row_ids
-from annotations.vocabularies import validate_code
+from annotations.vocabularies import registered_vocabularies, validate_code
 from epicurrents.auth import enforce_session_csrf
 from epicurrents.permissions import (
     can_annotate_object,
@@ -351,6 +352,13 @@ class CodeIn(Schema):
     meta: dict | list | str | int | float | None = None  # mirrors Code.meta, a JSONField
 
 
+class VocabularyOut(Schema):
+    standard: str
+    label: str
+    version: str
+    closed: bool
+
+
 class CodePatch(Schema):
     standard: str | None = None
     value: str | None = None
@@ -363,6 +371,19 @@ class CodePatch(Schema):
 @api.get("/health")
 def healthcheck(request):
     return {"status": "ok"}
+
+
+@api.get("/vocabularies", auth=None, response=list[VocabularyOut])
+def list_vocabularies(request):
+    """List the coding standards this deployment validates, so a client offers an editor only for a registered one.
+
+    The list describes the deployment's configuration, not anyone's data, so every authenticated caller may read
+    it. ``closed`` says the standard accepts only enumerated terms and never a value a writer fills in.
+    """
+    _require_auth(request)
+    vocabularies = registered_vocabularies()
+    log_activity(verb="annotations.vocabulary.list", metadata={"vocabulary_count": len(vocabularies)})
+    return [VocabularyOut(standard=v.standard, label=v.label, version=v.version, closed=v.closed) for v in vocabularies]
 
 
 @api.get("/content-types", response=list[ContentTypeOut])

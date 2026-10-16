@@ -171,6 +171,23 @@ jobs:
       - run: python manage.py check
       - run: pytest plugins/dicom/tests/ -q
 
+  test-hedscore:
+    # Same shape as test-dicom: the plugin's own settings module, then the check, which here also refuses a
+    # HEDSCORE_ALLOWED_BRANCHES entry the pinned schema has no branch for.
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      DJANGO_SETTINGS_MODULE: plugins.hedscore.settings_test
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.14"
+          cache: pip
+      - run: pip install -r requirements.txt -r requirements-dev.txt -r requirements-test.txt
+      - run: python manage.py check
+      - run: pytest plugins/hedscore/tests/ -q
+
   stack-smoke:
     # Builds the image and brings up the full stack to validate things the
     # host-only jobs above cannot: image packaging (the source tree is NOT

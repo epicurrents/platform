@@ -88,3 +88,4 @@ See [docs/plugins.md](../docs/plugins.md) for the operator-facing walkthrough.
 | Plugin | README | Summary |
 |---|---|---|
 | `dicom` | [dicom/README.md](dicom/README.md) | DICOM upload / WADO / QIDO surface plus an OHIF viewer. |
+| `hedscore` | [hedscore/README.md](hedscore/README.md) | HED with the SCORE library as the `hed` annotation-code vocabulary: the vendored schema and its validator. |
