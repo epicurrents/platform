@@ -18,10 +18,14 @@ import numpy as np
 
 # Interchangeable electrode labels. Mastoid (M) and earlobe (A) references are
 # treated as equivalent for derivation purposes (clinically near-identical, and
-# used interchangeably as references) — a small approximation, documented.
+# used interchangeably as references) — a small approximation, documented. The
+# AASM eye electrodes E1/E2 are the left/right outer canthi a stored file names
+# LOC/ROC, so a montage spec written in AASM terms (``E1-M2``) resolves against it.
 _ALIAS_GROUPS = [
     {"m1", "a1"},
     {"m2", "a2"},
+    {"e1", "loc"},
+    {"e2", "roc"},
     {"t3", "t7"},
     {"t4", "t8"},
     {"t5", "p7"},

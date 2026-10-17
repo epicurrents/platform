@@ -45,6 +45,12 @@ def test_old_new_temporal_naming_alias():
     np.testing.assert_array_equal(derive(data, ch, "T3-M2"), data[0] - data[1])
 
 
+def test_aasm_eye_electrode_resolves_against_stored_name():
+    # A stored file names the left eye LOC; the AASM spec asks for E1.
+    data, ch = _rec(["LOC", "M2"])
+    np.testing.assert_array_equal(derive(data, ch, "E1-M2"), data[0] - data[1])
+
+
 def test_missing_electrode_raises():
     data, ch = _rec(["C4", "M1"])
     with pytest.raises(ValueError, match="C3"):

@@ -281,7 +281,7 @@ The pipeline filters by scope when servicing a request — same middleware list,
 
 | Class | Type | Effect |
 |---|---|---|
-| `DeidentifyEDFHeader` | Header | Removes patient and recording identifiers from the fixed header, and applies the ingest channel-block de-identification (canonical / `MISC_<n>` labels, blanked transducers, reconstructed prefiltering) as defense in depth — a no-op for files this platform ingested, since the stored bytes already carry both transforms. |
+| `DeidentifyEDFHeader` | Header | Removes patient and recording identifiers from the fixed header, and applies the ingest channel-block de-identification (canonical / `MISC_<n>` labels, blanked transducers, reconstructed prefiltering) as defense in depth — a no-op for files this platform ingested, since the stored bytes already carry both transforms and the channel pass reads its own output back as itself (pinned by `test_stored_header_reads_back_byte_identical` in [recordings/tests/test_channel_deidentification.py](../recordings/tests/test_channel_deidentification.py)). |
 | `DropChannelsMiddleware` | Signal | Removes the named channels from every data record, rewrites the header. |
 | `DropAnnotationChannelsMiddleware` | Signal | Variant of `DropChannelsMiddleware` targeting EDF+/BDF+ annotation channels only. |
 | `DownsampleMiddleware` | Signal | Integer-factor decimation of the named channels. Updates `samples_per_record` in the header. |

@@ -211,7 +211,7 @@ _MULTIMODAL_CASES: list[tuple[str, str, tuple[str, str]]] = [
     ("EMG LAT", "emg", ("emg", "EMG/LegL")),  # LAT resolves only with an EMG hint
     ("LAT", "", ("", "")),  # ambiguous bare → unclassified
     ("EMG Masseter", "emg", ("emg", "")),  # muscle name → unclassified (raw shown)
-    ("EMG1", "emg", ("emg", "")),  # generic/numbered EMG → unclassified
+    ("EMG1", "emg", ("emg", "EMG1")),  # numbered EMG keeps its number, as ECGn does
     # ECG → lead / kept-numbered / generic
     ("ECG", "ekg", ("ekg", "ECG")),
     ("EKG", "ekg", ("ekg", "ECG")),
@@ -221,9 +221,9 @@ _MULTIMODAL_CASES: list[tuple[str, str, tuple[str, str]]] = [
     ("ECG2", "ekg", ("ekg", "ECG2")),
     ("ECG1-ECG2", "ekg", ("ekg", "ECG1-ECG2")),
     ("V1", "ekg", ("ekg", "V1")),
-    # bare ambiguous non-EEG stays unclassified (no aggressive lead guessing)
-    ("II", "", ("", "")),
-    ("aVR", "", ("", "")),
+    # a bare lead name is cardiac: it is the form a lead is stored under, so it must read back as one
+    ("II", "", ("ekg", "II")),  # the form a lead is stored under reads back as cardiac
+    ("aVR", "", ("ekg", "aVR")),
     # EEG still resolves alongside
     ("Fp1", "", ("eeg", "Fp1")),
     # A label that says EEG and nothing else names no electrode, so the gate demotes
@@ -331,3 +331,87 @@ def test_classify_canonical_is_stable_under_reclassification():
             again_type, again = classify_channel(canon, typ)
             assert again == canon
             assert again_type == typ
+
+
+# Labels as an ingest receives them, classified the way ingest does — under the type
+# ``extract_signal_type`` infers from the raw label. Covers the input conventions the
+# substring prior misreads: generic input prefixes (``POL`` on Nihon Kohden spare inputs,
+# the ``ECG`` BrainQuick writes before every polygraphic channel), polarity marks,
+# whitespace references, chest ECG sides, numbered EMG, and eye and chin derivations.
+_INPUT_CONVENTION_CASES = [
+    # Generic input prefix: the rest of the label says what the channel is.
+    ("ECG EOG+", ("eog", "EOG")),
+    ("ECG EKG+", ("ekg", "ECG")),
+    ("ECG emg1+", ("emg", "EMG1")),
+    ("ECG emg2+", ("emg", "EMG2")),
+    ("ECG T9", ("eeg", "T9")),
+    ("ECG A1", ("eeg", "A1")),
+    ("ECG Photic", ("trig", "Photic")),
+    ("POL T9", ("eeg", "T9")),
+    ("POL LOC", ("eog", "LOC")),
+    ("POL ECG", ("ekg", "ECG")),
+    ("POL DC01", ("misc", "DC1")),
+    # An unknown input behind a generic prefix is not typed by the prefix word.
+    ("POL E", ("", "")),
+    ("ECG Zyg1", ("", "")),
+    # Polarity marks, primes and the EEG prefix without a separator.
+    ("Fp1+", ("eeg", "Fp1")),
+    ("EEG Fp1'", ("eeg", "Fp1")),
+    ("EEG T3'", ("eeg", "T7")),
+    ("EEGFp1", ("eeg", "Fp1")),
+    ("EEG_Fp1-Ref", ("eeg", "Fp1")),
+    ("SpO2+", ("misc", "SpO2")),
+    # A reference after whitespace, only when it is a reference word.
+    ("EEG Fp1 Ref", ("eeg", "Fp1")),
+    ("EEG Fp1 A1", ("eeg", "Fp1")),
+    ("EEG Photic Ref", ("trig", "Photic")),
+    # ECG: chest sides kept apart, a stored bipolar pair one trace, leads and numbers kept.
+    ("ECG L", ("ekg", "ECGL")),
+    ("ECG R", ("ekg", "ECGR")),
+    ("ECGL", ("ekg", "ECGL")),
+    ("ECG-L", ("ekg", "ECGL")),
+    ("EKG Left", ("ekg", "ECGL")),
+    ("ECG L+", ("ekg", "ECGL")),
+    ("ECG L-ECG R", ("ekg", "ECG")),
+    ("ECG R-ECG L", ("ekg", "ECG")),
+    ("ECG1+", ("ekg", "ECG1")),
+    ("ECG lead II", ("ekg", "II")),
+    ("ECG LA", ("ekg", "ECG")),
+    ("ECG+", ("ekg", "ECG")),
+    ("ECG L_orig", ("misc", "ECGL_orig")),
+    # EOG and EMG decided on the primary electrode of a derivation.
+    ("E1-M2", ("eog", "LOC")),
+    ("LOC-A2", ("eog", "LOC")),
+    ("EOG LOC-A2", ("eog", "LOC")),
+    ("EOG-L", ("eog", "LOC")),
+    ("EEG LOC-Ref", ("eog", "LOC")),
+    # A spelled-out side reads in either order around the EOG word.
+    ("LEFT EOG", ("eog", "LOC")),
+    ("LEFTEOG", ("eog", "LOC")),
+    ("EOG Left Side", ("eog", "LOC")),
+    ("EOG RIGHT1", ("eog", "ROC")),
+    ("Chin1-Chin2", ("emg", "EMG/Chin")),
+    ("EMG Chin+", ("emg", "EMG/Chin")),
+    ("EEG Chin-Ref", ("emg", "EMG/Chin")),
+    ("EMG1-EMG2", ("emg", "EMG1-EMG2")),
+]
+
+
+@pytest.mark.parametrize("label, expected", _INPUT_CONVENTION_CASES)
+def test_classify_channel_reads_input_conventions(label, expected):
+    from recordings.processors.edf import extract_signal_type
+
+    assert classify_channel(label, extract_signal_type(label)) == expected
+
+
+def test_canonicals_read_back_as_themselves():
+    """A consumer of the stored file re-classifies each label from its own text, under the type
+    ``extract_signal_type`` infers from it — the serving middleware, the metadata refresh and the
+    compute loader all do. A canonical that does not survive that is renamed on the wire."""
+    from recordings.processors.edf import extract_signal_type
+
+    cases = _MULTIMODAL_CASES + _CLASSIFY_CASES + _AUXILIARY_CASES + _DEMOTION_CASES
+    produced = {canon: typ for _, _, (typ, canon) in cases if canon}
+    produced.update({canon: typ for _, (typ, canon) in _INPUT_CONVENTION_CASES if canon})
+    for canon, typ in produced.items():
+        assert classify_channel(canon, extract_signal_type(canon)) == (typ, canon), canon

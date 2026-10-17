@@ -14,7 +14,7 @@ derived view recomputed on every reprocess, so it cannot drift from ``label``.
 (The ingest de-identification pass in ``processors/edf.py`` *writes* the canonical
 names into the stored file's labels; that mutation lives there, not here.)
 
-Design (docs/engineering-notes/input-normalisation-implementation-plan.md §A):
+Design:
 
 * **Vocabulary is the filter.** A label is canonicalised only if it resolves to a
   known 10-10 electrode; anything else returns ``''``.  Known non-EEG signal types
@@ -30,7 +30,19 @@ Design (docs/engineering-notes/input-normalisation-implementation-plan.md §A):
   and the primary canonicalised (referential montage); a suffix that is itself a
   scalp electrode is a genuine bipolar derivation and both sides are canonicalised
   into ``A-B`` (referential conversion, if ever needed, is a downstream remontage
-  concern, not this layer's).
+  concern, not this layer's). A reference may also follow whitespace (``Fp1 Ref``),
+  but only a known reference word does: a multi-word label stays one token.
+* **Marks are not sites.** Trailing primes (``C3'``) and the ``+`` of an
+  amplifier's positive input (``Fp1+``) are dropped from every token.
+* **A prefix names a modality or an input, and only the first is evidence.**
+  ``EEG``/``EMG``/``EOG`` say what the signal is. ``POL`` and ``ECG``/``EKG`` followed
+  by a further token are generic input prefixes some systems write before every
+  polygraphic or spare input (``POL T9``, ``ECG EOG+``); the rest of the label is
+  classified on its own, so a spare-input electrode stays an electrode.
+* **Stored labels read back as themselves.** Every canonical name, re-classified
+  from its own text the way a consumer of the stored file does, resolves to the
+  same type and name — which is why a bare ECG lead (``II``) is recognised as
+  cardiac: it is the form a lead is stored under.
 * **Unresolved EEG labels return ``''``** — never a guess.  The backfill command
   counts them as a data-quality signal.
 * **The 10-10 vocabulary also *withdraws* the EEG type.**  ``extract_signal_type``
@@ -183,8 +195,22 @@ _NON_EEG_TYPES: frozenset[str] = (PRIMARY_TYPES - {"eeg"}) | AUXILIARY_TYPES | {
 # to ``trig``/``misc``, so re-classifying an already-classified channel is idempotent.
 _MODALITY_PRIORS: frozenset[str] = (PRIMARY_TYPES - {"eeg"}) | {"ecg"}
 
-# Leading modality word to strip (``EEG Fp1-Cz`` → ``Fp1-Cz``).
-_MODALITY_PREFIX = re.compile(r"^\s*eeg\b[\s:._-]*", re.IGNORECASE)
+# Leading modality word to strip (``EEG Fp1-Cz`` → ``Fp1-Cz``). No separator is
+# required after it (``EEGFp1``), and ``_`` counts as one (``EEG_Fp1-Ref``): no
+# electrode or auxiliary token begins with ``EEG``, so nothing is cut short.
+_MODALITY_PREFIX = re.compile(r"^\s*eeg[\s:._-]*", re.IGNORECASE)
+
+# Generic input prefixes: words some systems write before every polygraphic or spare
+# input without naming its modality — Nihon Kohden's ``POL`` (``POL T9``, ``POL DC01``)
+# and the ``ECG`` BrainQuick writes before every polygraphic channel (``ECG EOG+``,
+# ``ECG emg1+``, ``ECG EKG+``). The rest of the label says what the channel is. A
+# separator is required, so ``ECG1`` and ``ECGL`` are never split.
+_GENERIC_PREFIX = re.compile(r"^\s*(pol|ecg|ekg)[\s:._]+(?=\S)", re.IGNORECASE)
+
+# Trailing marks a vendor appends to a token: primes (see ``_PRIME_SUFFIX``) and the
+# ``+`` marking an amplifier's positive input (``Fp1+``, ``ECG EOG+``). Neither names
+# a different site, so both are dropped wherever a token is resolved.
+_TRAILING_MARKS = re.compile(r"['+]+$")
 
 # Trailing prime marks (``C3'``): modified-position notation from some vendor
 # exports and neonatal montages. Normalised away on resolution (``C3'`` → ``C3``):
@@ -218,15 +244,34 @@ def is_auxiliary_type(signal_type: str) -> bool:
     return signal_type.lower() in AUXILIARY_TYPES
 
 
+def _strip_marks(token: str) -> str:
+    """Return *token* without surrounding whitespace and its trailing marks (``_TRAILING_MARKS``)."""
+    return _TRAILING_MARKS.sub("", token.strip()).strip()
+
+
+def _label_parts(label: str) -> list[str]:
+    """Split *label*, without its EEG prefix, into its primary and any suffix, marks stripped.
+
+    A suffix follows a hyphen (``Fp1-Ref``, ``Fp1-F7``) or whitespace, the latter only when the
+    trailing word is a known reference (``Fp1 Ref``, ``Fp1 A1``) — so a multi-word label such as
+    ``Resp Chest`` or ``EMG L Tib`` stays one part. Returns ``[]`` when nothing is left.
+    """
+    text = _MODALITY_PREFIX.sub("", label.strip())
+    parts = [p for p in text.split("-") if p.strip()]
+    if len(parts) == 1:
+        words = parts[0].split()
+        if len(words) > 1 and _strip_marks(words[-1]).upper() in _REFERENCE_SUFFIXES:
+            parts = [" ".join(words[:-1]), words[-1]]
+    return [stripped for stripped in (_strip_marks(p) for p in parts) if stripped]
+
+
 def _resolve_token(token: str) -> str | None:
     """Return the canonical 10-10 name for a single electrode *token*, or None.
 
-    Trailing primes are normalised away (``C3'`` → ``C3``) — see ``_PRIME_SUFFIX``.
+    Trailing primes and polarity marks are normalised away (``C3'`` → ``C3``, ``Fp1+`` → ``Fp1``)
+    — see ``_PRIME_SUFFIX`` and ``_TRAILING_MARKS``.
     """
-    up = token.strip().upper()
-    if not up:
-        return None
-    up = _PRIME_SUFFIX.sub("", up)
+    up = _strip_marks(token).upper()
     if not up:
         return None
     up = _OLD_TO_NEW.get(up, up)
@@ -244,8 +289,7 @@ def canonicalise_label(label: str, signal_type: str = "") -> str:
     if not label or signal_type.lower() in _NON_EEG_TYPES:
         return ""
 
-    text = _MODALITY_PREFIX.sub("", label.strip())
-    parts = [p.strip() for p in text.split("-") if p.strip()]
+    parts = _label_parts(label)
 
     if len(parts) == 1:
         return _resolve_token(parts[0]) or ""
@@ -255,7 +299,7 @@ def canonicalise_label(label: str, signal_type: str = "") -> str:
         primary_canon = _resolve_token(primary)
         if primary_canon is None:
             return ""
-        if _PRIME_SUFFIX.sub("", suffix.upper()) in _REFERENCE_SUFFIXES:
+        if suffix.upper() in _REFERENCE_SUFFIXES:
             return primary_canon  # referential montage — reference stripped
         suffix_canon = _resolve_token(suffix)
         if suffix_canon is None:
@@ -281,16 +325,15 @@ def canonicalise_label_keep_reference(label: str, signal_type: str = "") -> str:
     if not label or signal_type.lower() in _NON_EEG_TYPES:
         return ""
 
-    text = _MODALITY_PREFIX.sub("", label.strip())
-    parts = [p.strip() for p in text.split("-") if p.strip()]
+    parts = _label_parts(label)
 
     if len(parts) == 2:
         primary, suffix = parts
         primary_canon = _resolve_token(primary)
         if primary_canon is None:
             return ""
-        if _PRIME_SUFFIX.sub("", suffix.upper()) in _REFERENCE_SUFFIXES:
-            reference = _resolve_token(suffix) or _PRIME_SUFFIX.sub("", suffix.strip().upper())
+        if suffix.upper() in _REFERENCE_SUFFIXES:
+            reference = _resolve_token(suffix) or suffix.upper()
             return f"{primary_canon}-{reference}"
 
     return canonicalise_label(label, signal_type)
@@ -344,72 +387,154 @@ def _compact(text: str) -> str:
     return re.sub(r"[\s._/\\-]", "", text).upper()
 
 
+_EOG_SIDE_WORDS = {"L": "LOC", "LEFT": "LOC", "R": "ROC", "RIGHT": "ROC"}
+_ECG_WORD = re.compile(r"^E[CK]G")
+# ECG sides as written after the modality word (``ECG L``, ``EKG Right``).
+_ECG_SIDES = {"L": "L", "LEFT": "L", "R": "R", "RIGHT": "R"}
+# Limb electrodes: an ECG input, but not one side of the chest pair the montages derive from.
+_ECG_LIMBS = frozenset({"LA", "RA", "LL", "RL"})
+
+
+def _eog_side(token: str) -> str:
+    """``LOC`` / ``ROC`` when *token* names an eye, with or without the EOG word (``EOG L``,
+    ``EOG LOC``, ``E1``), or carries the EOG word and a spelled-out side in either order
+    (``LEFT EOG``, ``EOG Right1``), else ``''``."""
+    key = _compact(token)
+    if key in _EOG_LEFT_KEYS:
+        return "LOC"
+    if key in _EOG_RIGHT_KEYS:
+        return "ROC"
+    if "EOG" in key and "LEFT" in key:
+        return "LOC"
+    if "EOG" in key and "RIGHT" in key:
+        return "ROC"
+    if key.startswith("EOG"):
+        rest = key[3:]
+        if rest in _EOG_LEFT_KEYS:
+            return "LOC"
+        if rest in _EOG_RIGHT_KEYS:
+            return "ROC"
+        if rest in _EOG_SIDE_WORDS:
+            return _EOG_SIDE_WORDS[rest]
+    return ""
+
+
 def _canonicalise_eog(label: str) -> str:
-    """``LOC`` / ``ROC`` when a side is named (including the primary of a
-    derivation like ``E1-M2``), else plain ``EOG``.
+    """``LOC`` / ``ROC`` when a side is named, decided from the primary electrode of a
+    derivation (``E1-M2``, ``EOG LOC-A2``) or a side written after a hyphen (``EOG-L``),
+    else plain ``EOG``.
 
     E1/E2 are taken as left/right (AASM convention; a reversed montage is operator
     error, not something to second-guess here). NB: EGI high-density systems label
     EEG channels ``E1``..``EN`` — this mapping assumes clinical EOG usage.
     """
-    key = _compact(label)
-    if key in _EOG_LEFT_KEYS or ("EOG" in key and "LEFT" in key):
-        return "LOC"
-    if key in _EOG_RIGHT_KEYS or ("EOG" in key and "RIGHT" in key):
-        return "ROC"
-    # derivation (e.g. E1-M2): decide from the primary (first) electrode
-    parts = [p for p in re.sub(r"[\s._/]", "", label).upper().strip("-").split("-") if p]
-    if parts and parts[0] in _EOG_LEFT_KEYS:
-        return "LOC"
-    if parts and parts[0] in _EOG_RIGHT_KEYS:
-        return "ROC"
-    return "EOG"
+    parts = _label_parts(label)
+    if not parts:
+        return "EOG"
+    side = _eog_side(parts[0])
+    if not side and len(parts) == 2 and _compact(parts[0]) == "EOG":
+        side = _EOG_SIDE_WORDS.get(_compact(parts[1]), "")
+    return side or "EOG"
 
 
 def _emg_site(label: str) -> str:
     """The EMG site for *label*, collapsing derivations (``Chin1-Chin2`` → Chin),
     or '' when nothing matches or the parts disagree."""
-    core = re.sub(r"[\s._/]", "", label).upper()  # keep '-' for the derivation split
-    core = core.removeprefix("EMG")
-    parts = [p for p in core.strip("-").split("-") if p]
-    sites = {_EMG_SITE_BY_KEY.get(p) for p in parts}
+    sites = {_EMG_SITE_BY_KEY.get(_compact(p).removeprefix("EMG")) for p in _label_parts(label)}
     sites.discard(None)
     return sites.pop() if len(sites) == 1 else ""
 
 
 def _canonicalise_emg(label: str) -> str:
     """``EMG/<site>`` for a recognised site (Chin/LegL/LegR/ArmL/ArmR; derivations
-    collapse to the site), else '' — muscle-named or unmatched EMG is displayed by
-    its raw label."""
+    collapse to the site); a numbered channel keeps its number (``emg1+`` → ``EMG1``,
+    ``EMG1-EMG2`` kept as-is), as ``ECGn`` does; else '' — muscle-named or unmatched
+    EMG is displayed by its raw label."""
     site = _emg_site(label)
-    return f"EMG/{site}" if site else ""
+    if site:
+        return f"EMG/{site}"
+    parts = _label_parts(label)
+    numbers = [re.fullmatch(r"EMG(\d+)", _compact(p)) for p in parts]
+    if 1 <= len(parts) <= 2 and all(numbers):
+        return "-".join(f"EMG{m.group(1)}" for m in numbers if m)
+    return ""
+
+
+def _ecg_core(token: str) -> str | None:
+    """Reduce one side of an ECG label to what distinguishes it: ``''`` for the bare
+    modality word or a limb electrode, a number, a lead name, or ``L`` / ``R`` for a
+    chest side. ``None`` when *token* is not ECG-shaped."""
+    key = _compact(_strip_marks(token))
+    while _ECG_WORD.match(key):
+        key = key[3:]
+    key = key.removeprefix("LEAD")
+    if not key or key in _ECG_LIMBS:
+        return ""
+    if key.isdigit():
+        return key
+    if key in _ECG_LEAD_CANON:
+        return _ECG_LEAD_CANON[key]
+    return _ECG_SIDES.get(key)
+
+
+def _ecg_shaped(text: str) -> bool:
+    """True when every part of *text* is ECG-shaped or a reference word: the test for
+    whether the rest of an ``ECG``-prefixed label names the cardiac channel itself."""
+    return all(_ecg_core(p) is not None or p.upper() in _REFERENCE_SUFFIXES for p in _label_parts(text))
 
 
 def _canonicalise_ecg(label: str) -> str:
-    """Lead name when present, numbered ``ECGn`` kept verbatim, else generic ``ECG``.
+    """Lead name when present, numbered ``ECGn`` kept verbatim, ``ECGL`` / ``ECGR`` for a
+    chest side, else generic ``ECG``.
 
     Numbered channels are kept because we can't know which standard position (if
-    any) they map to; bipolar numbered pairs (``ECG1-ECG2``) are kept as-is.
+    any) they map to; bipolar numbered pairs (``ECG1-ECG2``) are kept as-is. The sides
+    stay distinct so a consumer can derive the bipolar trace (R - L), which carries no
+    EEG reference. A pair already stored as one bipolar derivation (``ECG L-ECG R``) is
+    a single trace and canonicalises to ``ECG``. A side written after a hyphen
+    (``ECG-L``) is that side, not a derivation against it.
     """
-    light = re.sub(r"[\s._]", "", label).upper()  # keep - / for structure
-    m = re.fullmatch(r"E[CK]G(\d+)", light)
-    if m:
-        return f"ECG{m.group(1)}"
-    m = re.fullmatch(r"E[CK]G(\d+)-E[CK]G(\d+)", light)
-    if m:
-        return f"ECG{m.group(1)}-ECG{m.group(2)}"
-    core = re.sub(r"^E[CK]G", "", light).strip("-/")
-    return _ECG_LEAD_CANON.get(core, "ECG")
+    parts = _label_parts(label)
+    if len(parts) == 2 and parts[1].upper() in _REFERENCE_SUFFIXES:
+        parts = parts[:1]
+    cores = [_ecg_core(p) for p in parts]
+    if len(parts) == 1:
+        core = cores[0]
+    elif len(parts) == 2:
+        first, second = cores
+        if first == "" and second and not _ECG_WORD.match(_compact(parts[1])):
+            core = second
+        elif first and second and first.isdigit() and second.isdigit():
+            return f"ECG{first}-ECG{second}"
+        else:
+            return "ECG"
+    else:
+        return "ECG"
+    if not core:
+        return "ECG"
+    if core.isdigit():
+        return f"ECG{core}"
+    if core in ("L", "R"):
+        return f"ECG{core}"
+    return core
 
 
 def _detect_bare_modality(label: str) -> str:
     """Modality for a label carrying no explicit EOG/EMG/EKG marker, from a small
-    set of distinctive tokens. Conservative — returns '' when unsure."""
-    key = _compact(label)
+    set of distinctive tokens, decided on the primary electrode of a derivation
+    (``LOC-A2``, ``Chin1-Chin2``, ``E1-M2``). A bare ECG lead name (``II``, ``V1``) is
+    cardiac: it is also the canonical form the lead is stored under, so a stored file
+    reads back as what it was. Conservative — returns '' when unsure."""
+    parts = _label_parts(label)
+    if not parts:
+        return ""
+    key = _compact(parts[0])
     if key in _EOG_LEFT_KEYS or key in _EOG_RIGHT_KEYS:
         return "eog"
     if key in _EMG_BARE_KEYS:
         return "emg"
+    if key in _ECG_LEAD_CANON:
+        return "ekg"
     return ""
 
 
@@ -482,8 +607,7 @@ def _aux_role(label: str) -> tuple[str, str]:
     channels are routinely recorded referentially against the same reference as the
     montage (``EEG Photic-Ref``) and so arrive wearing EEG's clothes.
     """
-    text = _MODALITY_PREFIX.sub("", label.strip())
-    parts = [p.strip() for p in text.split("-") if p.strip()]
+    parts = _label_parts(label)
     if len(parts) == 2 and parts[1].upper() in _REFERENCE_SUFFIXES:
         parts = parts[:1]
     if len(parts) != 1:
@@ -511,20 +635,31 @@ def classify_channel(label: str, prior_type: str = "") -> tuple[str, str]:
       (``Photic``, ``Event``, ``Status``, ``DC1``, ``SpO2``…) is typed ``trig`` or
       ``misc`` with its own canonical name. Checked **before** a substring-derived
       ``eeg`` prior, because that substring is exactly what mislabels these.
+    * **Generic input prefix** — ``POL``, ``ECG`` or ``EKG`` followed by a further
+      token (``POL T9``, ``ECG EOG+``, ``ECG emg1+``) names an input, not a modality:
+      the rest is classified on its own, under its own inferred type, and wins when
+      it resolves. Under ``ECG``/``EKG``, a rest that resolves to nothing but is
+      ECG-shaped (a side, a number, a lead, a reference word) is the cardiac channel
+      itself. Anything else fails closed to an unresolved channel, so an unknown
+      input behind a generic prefix is never typed by the prefix word.
     * **EOG / EMG / EKG** — canonicalised when the label carries the modality word
       (via *prior_type* from ``extract_signal_type``) or is a distinctive bare
-      token (``LOC``/``ROC``/``E1``/``E2``, chin/leg/arm EMG). EOG →
-      ``LOC``/``ROC``/``EOG``; EMG → ``EMG/<site>`` or ''; EKG → lead / ``ECGn`` /
-      ``ECG``.
-    * **Demotion** — a leftover ``eeg`` prior that resolved to no 10-10 electrode
-      and matched no auxiliary role is downgraded to ``misc`` with a ``''``
+      token (``LOC``/``ROC``/``E1``/``E2``, chin/leg/arm EMG, an ECG lead name),
+      decided on the primary electrode of a derivation (``E1-M2``). EOG →
+      ``LOC``/``ROC``/``EOG``; EMG → ``EMG/<site>``, ``EMGn`` or ''; EKG → lead /
+      ``ECGn`` / ``ECGL`` / ``ECGR`` / ``ECG``.
+    * **Demotion** — a leftover ``eeg`` prior that resolved to no 10-10 electrode,
+      matched no auxiliary role and names no eye or EMG site (``EEG LOC-Ref``,
+      ``EEG Chin-Ref`` are recognised as those) is downgraded to ``misc`` with a ``''``
       canonical. It is a real channel whose modality the label does not establish,
       and ``misc`` says that; leaving it ``eeg`` would put a photic trace or a DC
       input into a detector's montage.
 
-    A non-empty prior_type is never overridden *except* by these two
-    vocabulary-backed decisions — promotion on a 10-10 hit and demotion on an
-    ``eeg`` miss. Anything not confidently placed returns a '' canonical
+    A non-empty prior_type is never overridden *except* by vocabulary-backed
+    decisions — promotion on a 10-10 hit, an eye or EMG site recognised behind an
+    ``eeg`` prior, demotion on an ``eeg`` miss, and the rest of a generically
+    prefixed label resolving (``ECG T9`` arrives with an ``ekg`` prior and is
+    EEG). Anything not confidently placed returns a '' canonical
     ("unclassified") — the UI shows the raw label. Only EEG strips a reference;
     each other modality has its own collapse rule.
 
@@ -555,6 +690,19 @@ def classify_channel(label: str, prior_type: str = "") -> tuple[str, str]:
             return "misc", f"{base_canonical}{DERIVED_COPY_SUFFIX}"
         return "misc", ""
 
+    generic = _GENERIC_PREFIX.match(label)
+    if generic:
+        # Deferred: ``edf`` imports this module at load.
+        from recordings.processors.edf import extract_signal_type
+
+        rest = label[generic.end() :]
+        rest_type, rest_canonical = classify_channel(rest, extract_signal_type(rest))
+        if rest_canonical:
+            return rest_type, rest_canonical
+        if generic.group(1).lower() in ("ecg", "ekg") and _ecg_shaped(rest):
+            return "ekg", _canonicalise_ecg(label)
+        return ("misc", "") if rest_type == "eeg" else (rest_type, "")
+
     eeg = canonicalise_label(label, prior_type)
     if eeg and prior_type in ("", "eeg"):
         return "eeg", eeg
@@ -565,6 +713,8 @@ def classify_channel(label: str, prior_type: str = "") -> tuple[str, str]:
             return aux_type, aux_canonical
 
     modality = prior_type or _detect_bare_modality(label)
+    if modality == "eeg":
+        modality = _detect_bare_modality(label) or modality
     if modality == "eog":
         return "eog", _canonicalise_eog(label)
     if modality == "emg":
@@ -630,8 +780,8 @@ def assess_channel_layout(channels) -> tuple[str, int]:
 # Version of the canonical channel-order spec below. Stamped on
 # ``RecordingMeta.channel_order_version`` at ingest so downstream code never has
 # to guess which convention a stored file follows; bump when the ordering rules
-# change.
-CHANNEL_ORDER_VERSION = 1
+# change. Version 2 sorts every ``MISC_<n>`` channel with the unresolved group.
+CHANNEL_ORDER_VERSION = 2
 
 # The fixed EEG sequence: anterior to posterior, left/right homologous pairs
 # adjacent (lateral before medial, matching clinical display convention), the

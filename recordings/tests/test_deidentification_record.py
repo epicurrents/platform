@@ -52,11 +52,14 @@ from recordings.tests.test_edf_processor import _make_edfplus_file
 # table or the prefiltering format move the pass's output under an unchanged version. From version
 # 3 the digest also covers what the two call and what decides the labels they write
 # (``_PASS_SCOPE_EDF`` and every resolution-side definition in ``channel_labels``); the older pins
-# keep their two-function digest, which is what the scheme recorded when they were written.
+# keep their two-function digest, which is what the scheme recorded when they were written. From
+# version 4 the pass numbers ``MISC_<n>`` in stored order, so ``compute_channel_order`` and the MISC
+# label definitions are inside it too.
 PINNED_SOURCE_DIGESTS = {
     1: "0a9d581ddfab1a3f05ffd1f7b024feff1ae13a4a38302c6173b2f3707d67b4a0",
     2: "742540826cb2490ebfb2dbcd4677ccc1223a14c0eb44270b770e013736d5b79c",
     3: "8252d47cc2ad9a6f0709b939fe9757f407eb59cf9bcb778e991e5ba3093e3a6e",
+    4: "f18975887e354c24381acc827e4b372671f8114a5cdfe2d927e69690171252bf",
 }
 _TWO_FUNCTION_VERSIONS = frozenset({1, 2})
 
@@ -72,6 +75,9 @@ _PASS_SCOPE_EDF = (
     "parse_prefiltering",
     "extract_signal_type",
     "_DEFAULT_TYPE_MATCHERS",
+    "compute_channel_order",
+    "MISC_LABEL_PREFIX",
+    "_MISC_LABEL",
 )
 #: Definitions in ``processors/channel_labels.py`` outside the pass: the layout assessment and the
 #: channel order, which ``CHANNEL_ORDER_VERSION`` versions. Everything else in the module is inside,

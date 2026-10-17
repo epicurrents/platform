@@ -18,6 +18,8 @@ from django.contrib.contenttypes.models import ContentType
 from epicurrents.models import AccessRight
 from recordings.models import Recording, SignalInfo
 from recordings.processors.edf import (
+    _build_clean_header,
+    compute_channel_order,
     deidentify_signal_infos,
     format_prefiltering,
     parse_edf_header,
@@ -191,6 +193,21 @@ class TestDeidentifySignalInfos:
             hits = [e for e in _TEN_TEN_ELECTRODES if e.upper() in name]
             assert not hits, f"MISC_{n} embeds {hits}"
 
+    def test_misc_numbering_follows_the_stored_order_not_the_source_order(self):
+        # The EMG channel sorts ahead of both unresolved ones and the demoted duplicate sorts
+        # with them, so source-order numbering would disagree with the order on disk.
+        signals = [
+            {"label": "QQQ7", "sample_count": 16},
+            {"label": "EEG Fp1", "sample_count": 16},
+            {"label": "EEG Fp1", "sample_count": 16},
+            {"label": "XYZ99", "sample_count": 16},
+            {"label": "EMG Chin", "sample_count": 16},
+        ]
+        infos = _parse_fixture(signals)
+        deidentify_signal_infos(infos)
+        stored = [infos[i].label for i in compute_channel_order(infos)]
+        assert stored == ["Fp1", "EMG/Chin", "MISC_1", "MISC_2", "MISC_3"]
+
     def test_second_pass_is_stable(self):
         """Re-cleaning already-clean infos reproduces the same public values."""
         infos = _parse_fixture()
@@ -250,6 +267,74 @@ class TestProcessFileChannelCleaning:
         result, disk_infos = self._process_fixture()
         assert [s.label for s in result.signal_infos] == [s.label for s in disk_infos]
         assert [s.prefiltering for s in result.signal_infos] == [s.prefiltering for s in disk_infos]
+
+    # Labels from the conventions the pass reads: generic input prefixes, polarity marks and primes,
+    # chest ECG sides, numbered EMG, a lead stored under its bare name, an AASM eye derivation, a
+    # true EEG duplicate, and channels that resolve to nothing.
+    MIXED_CONVENTIONS = [
+        {"label": label, "sample_count": 16}
+        for label in (
+            "XYZ99",
+            "ECG EKG+",
+            "EEG Fp1'",
+            "ECG emg2+",
+            "ECG emg1+",
+            "POL T9",
+            "ECG L",
+            "ECG R",
+            "EEG Fp1'",
+            "ECG II",
+            "Value MKR+",
+            "E1-M2",
+            "EEG Zyg1'",
+            "EDF Annotations",
+        )
+    ]
+
+    def test_mixed_conventions_land_on_disk_canonical(self):
+        _, disk_infos = self._process_fixture(self.MIXED_CONVENTIONS)
+        assert [s.label for s in disk_infos] == [
+            "Fp1",
+            "T9",
+            "LOC",
+            "EMG2",
+            "EMG1",
+            "ECG",
+            "ECGL",
+            "ECGR",
+            "II",
+            "MISC_1",
+            "MISC_2",
+            "MISC_3",
+            "MISC_4",
+            "EDF Annotations",
+        ]
+
+    def test_stored_header_reads_back_byte_identical(self):
+        """The serving middleware re-runs the pass over the stored header on every de-identified
+        download; anything that is not a fixed point is renamed on the wire, so a grantee's header
+        disagrees with the rows the API serves."""
+        header_bytes = _make_edf_header(signals=self.MIXED_CONVENTIONS)
+        data_bytes = _make_edf_data(self.MIXED_CONVENTIONS)
+        with tempfile.NamedTemporaryFile(suffix=".edf", delete=False) as tmp:
+            tmp.write(header_bytes + data_bytes)
+            path = Path(tmp.name)
+        try:
+            process_edf_file(path)
+            on_disk = path.read_bytes()
+        finally:
+            path.unlink(missing_ok=True)
+        header = parse_edf_header(on_disk)
+        infos = parse_signal_infos(on_disk, header)
+        stored_labels = [s.label for s in infos]
+        deidentify_signal_infos(infos)
+        assert [s.label for s in infos] == stored_labels
+        assert _build_clean_header(header, infos) == on_disk[: header.header_record_bytes]
+
+    def test_stored_order_is_already_canonical(self):
+        """A reprocess re-derives the order from the stored labels and must find nothing to move."""
+        _, disk_infos = self._process_fixture(self.MIXED_CONVENTIONS)
+        assert compute_channel_order(disk_infos) == list(range(len(disk_infos)))
 
     def test_annotation_channel_survives_cleaning(self):
         signals = [

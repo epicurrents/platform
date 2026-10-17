@@ -294,8 +294,17 @@ def wall_clock_to_data_position(onset: float, gaps: GapMap) -> float:
 # with the helpers they call, the prefiltering format, the ASCII cleaning and the
 # canonical-label resolution and tables in ``channel_labels`` — so the bump
 # cannot be forgotten, and the report command flags every recording written by
-# an older pass. Version 3 blanks the per-signal reserved field.
-DEIDENTIFICATION_VERSION = 3
+# an older pass. Version 3 blanks the per-signal reserved field. Version 4 reads
+# generic input prefixes (``POL``, ``ECG``), polarity marks and whitespace
+# references, keeps ECG sides and numbered EMG apart, recognises bare ECG leads,
+# and numbers ``MISC_<n>`` in stored order — so the stored header reads back as
+# itself; from it on the digest also covers ``compute_channel_order``.
+DEIDENTIFICATION_VERSION = 4
+
+# Label the de-identification pass writes for a channel that resolved to no
+# canonical name, numbered ``MISC_1``, ``MISC_2``… in stored order.
+MISC_LABEL_PREFIX = "MISC_"
+_MISC_LABEL = re.compile(rf"{MISC_LABEL_PREFIX}\d+")
 
 
 @dataclass
@@ -1382,8 +1391,10 @@ def deidentify_signal_infos(signal_infos: list[EdfSignalInfo]) -> None:
     Per signal:
 
     - ``label`` → the already-computed ``canonical_label`` when the channel
-      resolved, else ``MISC_<n>`` (n counts unresolved channels in channel order;
-      the underscore keeps generated names from embedding electrode tokens the
+      resolved, else ``MISC_<n>`` (n counts unresolved channels in the canonical
+      order the file is stored in, :func:`compute_channel_order`, never the source
+      order — which the stored numbering would otherwise partly give away; the
+      underscore keeps generated names from embedding electrode tokens the
       way ``MISC3`` embeds ``C3``, which substring-matching consumers pick up).
       Fail-closed on purpose: unresolvable labels — DC inputs, vendor aux
       channels, trigger lines — are precisely the strongest site fingerprint, so
@@ -1404,9 +1415,11 @@ def deidentify_signal_infos(signal_infos: list[EdfSignalInfo]) -> None:
     duplicate labels there match vendor reality and carry no montage identity.
 
     Originals land in the ``source_*`` attributes before being overwritten.
-    Idempotent: canonical labels resolve to themselves, kept-reference forms
-    re-collide to themselves, and ``MISC_<n>`` numbering is positional, so a
-    second pass reproduces the same values.
+    Idempotent, including over the stored file read back: canonical labels
+    resolve to themselves, kept-reference forms re-collide to themselves, and
+    ``MISC_<n>`` numbering follows the stored order, so a second pass — the one
+    the serving middleware runs on every de-identified download — reproduces the
+    same header.
     """
     from recordings.processors.channel_labels import canonicalise_label_keep_reference
 
@@ -1443,15 +1456,16 @@ def deidentify_signal_infos(signal_infos: list[EdfSignalInfo]) -> None:
             else:
                 seen.add(cleaned[i])
 
-    misc_counter = 0
+    # Unresolved channels take a placeholder first, so the order below sees every
+    # channel as it will be stored, then are numbered in that order.
     for info, label in zip(signal_infos, cleaned):
-        if info.is_annotation_channel:
-            continue
-        if label is None:
+        if not info.is_annotation_channel:
+            info.label = label if label is not None else f"{MISC_LABEL_PREFIX}0"
+    misc_counter = 0
+    for idx in compute_channel_order(signal_infos):
+        if cleaned[idx] is None and not signal_infos[idx].is_annotation_channel:
             misc_counter += 1
-            info.label = f"MISC_{misc_counter}"
-        else:
-            info.label = label
+            signal_infos[idx].label = f"{MISC_LABEL_PREFIX}{misc_counter}"
 
 
 def compute_channel_order(signal_infos: list[EdfSignalInfo]) -> list[int]:
@@ -1464,6 +1478,10 @@ def compute_channel_order(signal_infos: list[EdfSignalInfo]) -> list[int]:
     annotation channels last. Groups without an internal spec keep their
     original relative order — the sort is stable by original index, so the
     result is deterministic for any input.
+
+    A ``MISC_<n>`` channel sorts with the unresolved group whatever its parsed
+    type: read back from the stored file it is untyped, so placing a demoted EEG
+    duplicate among the EEG would make a reprocess permute the file again.
     """
     from recordings.processors.channel_labels import eeg_order_rank
 
@@ -1473,6 +1491,8 @@ def compute_channel_order(signal_infos: list[EdfSignalInfo]) -> list[int]:
         info = signal_infos[idx]
         if info.is_annotation_channel:
             return (5, (0, 0), idx)
+        if _MISC_LABEL.fullmatch(info.label):
+            return (4, (0, 0), idx)
         group = group_by_type.get(info.signal_type, 4)
         sub = eeg_order_rank(info.label) if group == 0 else (0, 0)
         return (group, sub, idx)
