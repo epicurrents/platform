@@ -1,5 +1,43 @@
 import type { ViewerPlugin } from '#projects/types'
 
+const isPlainObject = (value: unknown): value is Record<string, unknown> => {
+    if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+        return false
+    }
+    const proto = Object.getPrototypeOf(value)
+    return proto === null || proto === Object.prototype
+}
+
+/**
+ * Merge viewer setup contributions into `target` in place and return it, recursing into plain objects and replacing
+ * everything else, arrays and functions included.
+ *
+ * Contributions nest: a plugin and a project can both configure `modules.eeg`, and a shallow merge would let the later
+ * one drop the earlier one's keys without a trace. Later sources win on a conflicting value; a key whose value is
+ * `undefined` is skipped.
+ *
+ * @param target - Object to merge into. Mutated in place.
+ * @param sources - Contributions, in ascending order of precedence.
+ */
+export function mergeSetup<T extends object> (target: T, ...sources: object[]): T {
+    const merged = target as Record<string, unknown>
+    for (const source of sources) {
+        for (const [key, value] of Object.entries(source)) {
+            if (value === undefined) {
+                continue
+            }
+            if (isPlainObject(value) && isPlainObject(merged[key])) {
+                merged[key] = mergeSetup({ ...merged[key] }, value)
+            } else if (isPlainObject(value)) {
+                merged[key] = mergeSetup({}, value)
+            } else {
+                merged[key] = value
+            }
+        }
+    }
+    return target
+}
+
 /**
  * Merge a list of plugin `ViewerPlugin` objects into a single one.
  *
@@ -13,8 +51,8 @@ import type { ViewerPlugin } from '#projects/types'
  *   precedence used in `main.ts`.
  * - `viewerPanel` — the first plugin that defines one wins (a page hosts a
  *   single viewer overlay).
- * - `extraSetup` — object-merged in plugin order; a later plugin overrides an
- *   earlier one on key conflicts.
+ * - `extraSetup` — merged with `mergeSetup` in plugin order; a later plugin
+ *   overrides an earlier one on a conflicting value.
  * - `onAppReady` / `onStudiesReady` — chained: every plugin's hook runs, in
  *   order, each awaited before the next.
  *
@@ -43,12 +81,8 @@ export function mergePlugins(plugins: ViewerPlugin[]): ViewerPlugin {
         }
     }
 
-    let extraSetup: Record<string, unknown> | undefined
-    for (const p of plugins) {
-        if (p.extraSetup) {
-            extraSetup = { ...(extraSetup ?? {}), ...p.extraSetup }
-        }
-    }
+    const contributions = plugins.map(p => p.extraSetup).filter(setup => !!setup)
+    const extraSetup = contributions.length ? mergeSetup({}, ...contributions) : undefined
 
     const viewerPanel = plugins.find(p => p.viewerPanel != null)?.viewerPanel ?? null
 

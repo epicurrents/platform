@@ -1,6 +1,7 @@
 import type { ViewerPlugin } from '#projects/types'
 import { mergePlugins } from './base'
 import { plugin as dicomPlugin } from './dicom/index'
+import { plugin as hedscorePlugin } from './hedscore/index'
 
 /**
  * The merged viewer plugin for every enabled frontend plugin, selected at build
@@ -24,11 +25,14 @@ import { plugin as dicomPlugin } from './dicom/index'
  * define in vite.config.ts (+ declaration in `src/vite-plugins.d.ts`), a
  * guarded `push` below, and its name in `KNOWN_PLUGINS`.
  */
-const KNOWN_PLUGINS = ['dicom']
+const KNOWN_PLUGINS = ['dicom', 'hedscore']
 
 const active: ViewerPlugin[] = []
 if (__PLUGIN_DICOM__) {
     active.push(dicomPlugin)
+}
+if (__PLUGIN_HEDSCORE__) {
+    active.push(hedscorePlugin)
 }
 
 // Surface typos early: a VITE_PLUGINS entry that matches no registered plugin

@@ -19,6 +19,7 @@ type InterfaceSettings = { app: { disclaimerAccepted: number } }
 import type { Recording } from '#api/recordings'
 import { plugin } from '#projects/active'
 import { plugin as pluginsPlugin } from '#plugins/active'
+import { mergeSetup } from '#plugins/base'
 import { waitForEventBus } from '#projects/eventBus'
 import { getViewerConfig } from '#api/viewerConfig'
 import { applyViewerSettingsOverrides, VIEWER_USER_SETTINGS_PATH } from '#lib/viewerConfig'
@@ -357,9 +358,8 @@ onMounted(async () => {
             }
             return
         }
-        const setup = Object.assign(
-            new Object(null),
-            {
+        const setup = mergeSetup(
+            Object.assign(new Object(null), {
                 assetPath: '/viewer',
                 // import.meta.hot is defined only under the Vite dev server, and
                 // undefined in any build — so this is DEBUG while developing and
@@ -375,26 +375,18 @@ onMounted(async () => {
                 // Only for a signed-in session — the endpoint is session-authenticated, so a
                 // share-token or unauthenticated viewer would collect 401s for no benefit.
                 userSettingsBackend: auth.user ? VIEWER_USER_SETTINGS_PATH : '',
-            },
+            }),
             // Plugins first, then the active project — the project has the last
-            // word on key conflicts, matching the backend's plugins < project
-            // settings precedence.
+            // word on a conflicting value, matching the backend's plugins < project
+            // settings precedence. The merge recurses, so a plugin and the project
+            // can both configure one module.
             pluginsPlugin.extraSetup ?? {},
             plugin.extraSetup ?? {},
+            // Tell the EEG module where lead fields come from. The viewer holds no URLs
+            // of its own, so its source-localisation tool reports itself unavailable
+            // unless a host supplies a provider.
+            { modules: { eeg: { leadFieldProvider } } },
         )
-        // Tell the EEG module where lead fields come from. The viewer holds no URLs of its
-        // own, so its source-localisation tool reports itself unavailable unless a host
-        // supplies a provider. Merged after the assign above rather than declared in the
-        // literal, because that assign is shallow: a plugin or project contributing its own
-        // `modules` key would otherwise replace this one wholesale.
-        const withModules = setup as { modules?: Record<string, unknown> }
-        const modules = withModules.modules ?? {}
-        const eegConfig = modules.eeg
-        modules.eeg = {
-            ...(typeof eegConfig === 'object' && eegConfig !== null ? eegConfig : {}),
-            leadFieldProvider,
-        }
-        withModules.modules = modules
         // Create the global Epicurrents object if not available.
         if (typeof window.__EPICURRENTS__ === 'undefined') {
             window.__EPICURRENTS__ = {

@@ -30,3 +30,6 @@ interface ImportMeta {
  * plugins tree-shake out of the bundle (see `src/plugins/active.ts`).
  */
 declare const __PLUGIN_DICOM__: boolean
+
+/** Build-time flag defined in vite.config.ts: `true` when `hedscore` is listed in `VITE_PLUGINS`. */
+declare const __PLUGIN_HEDSCORE__: boolean

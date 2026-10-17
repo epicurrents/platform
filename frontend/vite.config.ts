@@ -310,6 +310,9 @@ export default defineConfig(({ mode }) => {
             __PLUGIN_DICOM__: JSON.stringify(
                 (env.VITE_PLUGINS ?? '').split(',').map(s => s.trim()).includes('dicom')
             ),
+            __PLUGIN_HEDSCORE__: JSON.stringify(
+                (env.VITE_PLUGINS ?? '').split(',').map(s => s.trim()).includes('hedscore')
+            ),
         },
         build: {
             rollupOptions: {

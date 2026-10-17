@@ -1,7 +1,7 @@
 """The viewer's HED-SCORE term index was generated from the schema this plugin pins, and agrees with its parse.
 
-The picker offers the terms of an index eeg-module generates at build time; this plugin validates what the picker
-writes. Neither side authors terms, so the two agree exactly when both read the same release the same way, and these
+The picker offers the terms of an index eeg-module generates at build time, the SCORE library's and the artifact
+subtree SCORE 2 left in the HED standard; this plugin validates what the picker writes. Neither side authors terms, so the two agree exactly when both read the same release the same way, and these
 tests check that wherever the viewer checkout is present. A failure here means a term or a unit the picker offers
 and the validator refuses, or the reverse: regenerate the index from the vendored file rather than editing either.
 """
@@ -34,16 +34,34 @@ def test_index_names_the_pinned_release(viewer_index):
     }
 
 
-def test_index_holds_exactly_the_library_terms(viewer_index):
-    library = {name for name, term in load_schema().terms.items() if term.in_library}
-    assert {term["name"] for term in viewer_index["terms"]} == library
+def _subtree(schema, root):
+    return {name for name, term in schema.terms.items() if root in term.path}
+
+
+def test_index_holds_exactly_the_library_terms_and_the_standard_subtrees(viewer_index):
+    schema = load_schema()
+    expected = {name for name, term in schema.terms.items() if term.in_library}
+    for root in viewer_index["standardSubtrees"]:
+        expected |= _subtree(schema, root)
+    assert {term["name"] for term in viewer_index["terms"]} == expected
+
+
+def test_each_standard_subtree_names_the_branch_the_validator_checks(viewer_index):
+    schema = load_schema()
+    assert viewer_index["standardSubtrees"]
+    for root, branch in viewer_index["standardSubtrees"].items():
+        assert not schema.terms[root].in_library, root
+        assert schema.terms[root].branch == branch, root
+        assert root in viewer_index["branches"], root
 
 
 def test_every_term_agrees_with_the_plugin_parse(viewer_index):
     schema = load_schema()
+    roots = set(viewer_index["standardSubtrees"])
     for entry in viewer_index["terms"]:
         term = schema.terms[entry["name"]]
-        assert entry["parent"] == (term.path[-2] if len(term.path) > 1 else None), term.name
+        parent = None if term.name in roots or len(term.path) < 2 else term.path[-2]
+        assert entry["parent"] == parent, term.name
         assert entry["hedId"] == term.hed_id, term.name
         assert set(entry.get("valueClasses", [])) == term.value_classes, term.name
         assert ("valueClasses" in entry) == term.takes_value, term.name
@@ -54,7 +72,8 @@ def test_every_term_agrees_with_the_plugin_parse(viewer_index):
 
 def test_units_agree_with_the_validator(viewer_index):
     schema = load_schema()
-    named = {unit_class for term in schema.terms.values() if term.in_library for unit_class in term.unit_classes}
+    names = {term["name"] for term in viewer_index["terms"]}
+    named = {unit_class for name in names for unit_class in schema.terms[name].unit_classes}
     assert set(viewer_index["units"]) == named
     for unit_class, units in viewer_index["units"].items():
         assert set(units["units"]) == schema.units[unit_class], unit_class

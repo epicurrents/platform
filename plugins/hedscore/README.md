@@ -36,7 +36,13 @@ Mounted at `/plugin/hedscore/api/v1/`.
 |---|---|---|
 | GET | `/policy` | The schema release and digest, and the allowed branches (every branch when none is configured) |
 
-The picker's terms are not served. eeg-module generates its index from this plugin's vendored file, and the host application passes this policy to it, together with `GET /annotations/api/v1/vocabularies`, so the picker offers only what the validator accepts.
+The picker's terms are not served. eeg-module generates its index from this plugin's vendored file, and the SPA passes this policy to it, together with `GET /annotations/api/v1/vocabularies`, so the picker offers only what the validator accepts.
+
+## Frontend
+
+[frontend/src/plugins/hedscore/](../../frontend/src/plugins/hedscore/) contributes a provider at `modules.eeg.hedScore.policy` in the viewer setup and nothing else; the picker is the viewer's. The viewer calls it when the picker first opens. It answers `null` when the vocabulary listing has no `hed`, which hides the picker, and otherwise the pin and `allowed_branches`; the picker disables itself when the pin is not the release its index was generated from. A project sets its quick palette beside it, as a list of short-form tags at `modules.eeg.hedScore.palette` in its own `extraSetup`, and the two merge.
+
+A picked finding is stored on the viewer event as `codes.hed`. The viewer saves nothing to this server: a project that posts annotations to `/annotations/api/v1/codes` sends the code with `meta` set to the pin, which eeg-module's `hedSchemaMeta(index.schema)` builds.
 
 ## Verb registry
 
@@ -52,10 +58,10 @@ Audit verbs this plugin emits. A new verb belongs here in the same commit as the
 DJANGO_SETTINGS_MODULE=plugins.hedscore.settings_test pytest plugins/hedscore/tests/
 ```
 
-[test_viewer_index.py](tests/test_viewer_index.py) compares eeg-module's term index with this plugin: the release and digest it names, its terms and units against the plugin's parse, and every numeric term in its default unit against the validator. It skips without the viewer checkout. Moving `SCHEMA_PIN` fails it until the index is regenerated from the new file.
+[test_viewer_index.py](tests/test_viewer_index.py) compares eeg-module's term index with this plugin: the release and digest it names, its terms and units against the plugin's parse, the standard subtrees it carries and the branch each validates under, and every numeric term in its default unit against the validator. It skips without the viewer checkout. Moving `SCHEMA_PIN` fails it until the index is regenerated from the new file.
 
 ## Gotchas
 
 - **The digest is over the bytes in git.** The repository's `.gitattributes` normalises line endings to LF, which the vendored file already uses; re-vendoring a file with CRLF endings changes its digest on checkout.
-- **No frontend half yet.** [enable_plugin.sh](../../scripts/enable_plugin.sh) adds the name to `VITE_PLUGINS`, and the development build warns that it names an unknown plugin until the picker's step registers one.
+- **The artifacts are under `Property`.** SCORE 2 moved them into the HED standard, so `HEDSCORE_ALLOWED_BRANCHES` naming SCORE branches alone refuses every artifact tag, and the picker hides its artifacts group. Listing `Property` admits them, and with them the standard's other property tags; the text-placeholder rule still holds for those.
 - **A rule here with no test behind it is a rule nobody holds.** No review agent knows the validator's rules, so the tests are the only thing that notices one being loosened.

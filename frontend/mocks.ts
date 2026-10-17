@@ -43,6 +43,8 @@
  *   DELETE /api/v1/maintenance/packages/{sha256}
  *
  *   GET    /annotations/api/v1/content-types
+ *   GET    /annotations/api/v1/vocabularies
+ *   GET    /plugin/hedscore/api/v1/policy
  *
  *   GET    /recordings/api/v1/
  *   POST   /recordings/api/v1/upload
@@ -76,6 +78,7 @@
  */
 
 import { randomUUID } from 'node:crypto'
+import { existsSync, readFileSync } from 'node:fs'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 
 // ─── Internal types ───────────────────────────────────────────────────────────
@@ -2105,6 +2108,37 @@ export async function handleMock(
         return send(res, 200, [
             { id: RECORDING_CT_ID, app_label: 'recordings', model: 'recording', natural_key: 'recordings.recording' },
         ])
+    }
+
+    // ── Vocabularies and the hedscore policy ─────────────────────────────────
+
+    if (path === '/annotations/api/v1/vocabularies' && method === 'GET') {
+        return send(res, 200, [
+            { standard: 'epicurrents.biosignal', label: 'Epicurrents biosignal events', version: '2.0', closed: true },
+            { standard: 'epicurrents.eeg', label: 'Epicurrents EEG events', version: '2.0', closed: true },
+            { standard: 'hed', label: 'HED-SCORE', version: '2.1.0', closed: false },
+        ])
+    }
+
+    if (path === '/plugin/hedscore/api/v1/policy' && method === 'GET') {
+        // The release the viewer's index names, so the picker never reads the mock as a mismatch. Without the
+        // viewer checkout the plugin answers as if it were not installed.
+        const indexPath = new URL(
+            './viewer/epicurrents/eeg-module/src/components/vocabulary/hed-score.json',
+            import.meta.url,
+        )
+        if (!existsSync(indexPath)) {
+            return send(res, 404, { detail: 'Not Found' })
+        }
+        const index = JSON.parse(readFileSync(indexPath, 'utf-8'))
+        const scoreBranches = index.branches.filter((name: string) => !(name in index.standardSubtrees))
+        return send(res, 200, {
+            library: index.schema.library,
+            version: index.schema.version,
+            with_standard: index.schema.withStandard,
+            sha256: index.schema.sha256,
+            allowed_branches: [...scoreBranches, 'Property'],
+        })
     }
 
     // ── Recordings API ────────────────────────────────────────────────────────

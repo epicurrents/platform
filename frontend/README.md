@@ -73,6 +73,7 @@ Then run `npm run dev` as normal. Log in with any credentials — the mock accep
 **Behaviour notes:**
 - The pending recording flips to `ready` on its second status poll, exercising the upload-progress UI.
 - Renaming a recording propagates immediately to any collection/dataset items that reference it.
+- `GET /annotations/api/v1/vocabularies` lists `hed`, and the HED-SCORE policy names the release of the viewer's own term index, read from the viewer checkout, so the finding picker opens rather than reporting a mismatch. Build with `VITE_PLUGINS=hedscore` to see it.
 - `mockuser` is a superuser, which is what makes the staff- and superuser-gated surfaces (administration, viewer settings, annotation export) reachable at all in mock mode.
 - All CRUD is fully in-memory — nothing is persisted between page reloads.
 - A requested maintenance job walks through its states on a timer: a worker job finishes in a few seconds, a host update reaches the confirmation window and waits for verify or rollback. Step-up confirmations accept the password `password`, and the code `123456` when the mock user has a second factor. While a mock update runs, the mock raises the lock the host would (`updating`, then `verifying` at the confirmation window, `rolling_back` during a rollback), answers the lock probe, and refuses requests with the 503 body and `Retry-After` the lock middleware sends. A database restore answers the erasure 409 (`MOCK_ERASURES_SINCE_SNAPSHOT`), a host request is claimed (`step: "check"`) before it runs, and an uploaded package stays `unverified` for a few seconds; the seed also holds an `invalid` one. The mock has no mail backend, so every invitation answers `invitation_sent: false`. A package upload accepts any three files and reads the version and hash from the manifest part when it can parse one; nothing is verified.
@@ -101,7 +102,12 @@ build time via the comma-separated `VITE_PLUGINS` (see [src/plugins/active.ts](s
 Zero or more plugins may be enabled alongside the active project; their
 contributions are merged by `mergePlugins` in [src/plugins/base.ts](src/plugins/base.ts). Plugins use
 the same contract as projects, re-exported from [src/plugins/types.ts](src/plugins/types.ts). DICOM is
-a plugin (`VITE_PLUGINS=dicom`).
+a plugin (`VITE_PLUGINS=dicom`), and so is HED-SCORE (`VITE_PLUGINS=hedscore`), which contributes no
+routes, only the policy provider the viewer's finding picker calls ([plugins/hedscore/README.md](../plugins/hedscore/README.md#frontend)).
+
+The `extraSetup` of every plugin and of the project are merged by `mergeSetup` in the same file, which
+recurses into plain objects, so a plugin and the project can each configure `modules.eeg` without one
+dropping the other's keys; on a conflicting value the project wins, then the later plugin.
 
 The plugin contract in `src/projects/types.ts` supports:
 
