@@ -36,7 +36,7 @@ Mounted at `/plugin/hedscore/api/v1/`.
 |---|---|---|
 | GET | `/policy` | The schema release and digest, and the allowed branches (every branch when none is configured) |
 
-The picker's terms are not served. The viewer generates its index from the same release at build time, and the host application passes this policy to it, together with `GET /annotations/api/v1/vocabularies`, so the picker offers only what the validator accepts.
+The picker's terms are not served. eeg-module generates its index from this plugin's vendored file, and the host application passes this policy to it, together with `GET /annotations/api/v1/vocabularies`, so the picker offers only what the validator accepts.
 
 ## Verb registry
 
@@ -51,6 +51,8 @@ Audit verbs this plugin emits. A new verb belongs here in the same commit as the
 ```
 DJANGO_SETTINGS_MODULE=plugins.hedscore.settings_test pytest plugins/hedscore/tests/
 ```
+
+[test_viewer_index.py](tests/test_viewer_index.py) compares eeg-module's term index with this plugin: the release and digest it names, its terms and units against the plugin's parse, and every numeric term in its default unit against the validator. It skips without the viewer checkout. Moving `SCHEMA_PIN` fails it until the index is regenerated from the new file.
 
 ## Gotchas
 
