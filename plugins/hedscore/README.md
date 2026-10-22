@@ -16,7 +16,8 @@ A `hed` code's `value` is a HED string and its `meta` is the schema pin, `{"sche
 
 - Tags in their short form, spelt as the schema spells them. Long forms and extensions are refused.
 - A value only where the placeholder's value class is numeric, with a unit from its unit class: `Intermittent-photic-stimulation/10 Hz`, `Feature-amplitude/150 uV`. Every text placeholder is refused, `Description/#`, `Label/#` and the `Other-…/#` tags included.
-- `Sensor-list` is the exception: its value lists canonical channel labels separated by `;` (`Sensor-list/F7;T7`). A raw acquisition label is refused.
+- `Sensor-list` is one exception: its value lists canonical channel labels separated by `;` (`Sensor-list/F7;T7`). A raw acquisition label is refused.
+- `ID` is the other: its value is the number of a finding group, 100 to 999 without leading zeros (`ID/104`), which the viewer's picker writes on every occurrence of one finding within a recording. 0 to 99 are held back for a use not yet defined, and refused until it is, so no stored row takes on that meaning before it exists.
 - Reserved tags (`Onset`, `Duration`, `Definition` and the rest) and deprecated tags are refused. An event's timing belongs to the row.
 - Groups are checked for balance and emptiness only.
 

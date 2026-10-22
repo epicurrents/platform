@@ -13,6 +13,9 @@ text through that exemption. So the rules below are narrower than HED's own.
 - **The one exception is ``Sensor-list``,** whose value lists channels by their canonical labels, separated by
   ``;``. A canonical label comes from a closed set, and a raw acquisition label would put the site's naming
   convention back into a surface no de-identification pass reads.
+- **``ID`` takes a finding group's number,** a whole number from 100 to 999, which marks the events of one finding
+  across its occurrences within a recording. A number names no concept, but it describes no subject either. 0 to 99
+  are held back for a use not yet defined, and are refused so that no row takes on that meaning before it is.
 - **Reserved and deprecated tags are refused.** The reserved ones carry HED's timing and definition machinery, and an
   event's onset and duration belong to the row, not the string.
 - **A deployment may restrict the top-level branches** through ``HEDSCORE_ALLOWED_BRANCHES``; empty allows them all.
@@ -41,6 +44,9 @@ MAX_LENGTH = 2000
 MAX_DEPTH = 8
 
 SENSOR_LIST = "Sensor-list"
+FINDING_GROUP = "ID"
+#: The numbers a finding group may take; the lower hundred is held back.
+FINDING_GROUP_NUMBERS = range(100, 1000)
 SENSOR_SEPARATOR = ";"
 NUMERIC_CLASS = "numericClass"
 
@@ -102,6 +108,15 @@ def _check_sensors(value: str) -> None:
             raise ValueError(f"{label!r} is not a canonical channel label")
 
 
+def _check_finding_group(value: str) -> None:
+    # Written exactly as the number, so one group has one spelling.
+    if not (value.isascii() and value.isdigit()) or str(int(value)) != value or int(value) not in FINDING_GROUP_NUMBERS:
+        raise ValueError(
+            f"{FINDING_GROUP} takes a finding group's number from {FINDING_GROUP_NUMBERS.start}"
+            f" to {FINDING_GROUP_NUMBERS.stop - 1}, not {value!r}"
+        )
+
+
 def _check_tag(tag: str, index: SchemaIndex, allowed_branches: set[str]) -> None:
     name, slash, value = tag.partition("/")
     term = index.terms.get(name)
@@ -121,6 +136,8 @@ def _check_tag(tag: str, index: SchemaIndex, allowed_branches: set[str]) -> None
         raise ValueError(f"{tag!r} is not a tag: write tags in their short form, without extensions")
     if name == SENSOR_LIST:
         _check_sensors(value)
+    elif name == FINDING_GROUP:
+        _check_finding_group(value)
     elif NUMERIC_CLASS in term.value_classes:
         _check_numeric(term, value, index)
     else:

@@ -118,6 +118,16 @@ class TestComparisons:
         refuses("(Spike, (Approximately-equal-to, Feature-stopped-by/sleep))", "text value")
 
 
+class TestFindingGroup:
+    @pytest.mark.parametrize("value", ["ID/100", "ID/512", "ID/999", "(Epileptiform-interictal-activity, Left, ID/104)"])
+    def test_a_group_number_is_accepted(self, value):
+        accepts(value)
+
+    @pytest.mark.parametrize("number", ["0", "7", "99", "099", "0100", "1000", "-100", "100.0", "1e2", "١٠٠", "Anna", ""])
+    def test_any_other_value_is_refused(self, number):
+        refuses(f"ID/{number}", "finding group's number")
+
+
 class TestSensorList:
     @pytest.mark.parametrize("value", ["Sensor-list/Fp1", "Sensor-list/F7;T7;P7", "Sensor-list/Fp1-F7"])
     def test_canonical_labels_are_accepted(self, value):

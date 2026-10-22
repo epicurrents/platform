@@ -2,9 +2,10 @@
 
 Two tables live in the interface beside the SCORE term index. The canonical electrode table fills `Sensor-list`, and
 the validator accepts a sensor only when `canonicalise_label` reads it back as itself, so the copy has to agree with
-the table the platform canonicalises by. The standard terms are the HED standard's side and symmetry tags, which the
-index does not hold, so their copy has to name tags of the pinned schema that stand on their own. These tests check
-both wherever the viewer checkout is present; a failure means regenerating the copy from the platform's source.
+the table the platform canonicalises by. The standard terms are the HED standard's side and symmetry tags and the ID a
+finding group is numbered by, which the index does not hold, so their copy has to name tags of the pinned schema.
+These tests check both wherever the viewer checkout is present; a failure means regenerating the copy from the
+platform's source.
 """
 
 import json
@@ -13,7 +14,7 @@ from pathlib import Path
 import pytest
 
 from plugins.hedscore.schema import SCHEMA_PIN, load_schema
-from plugins.hedscore.validation import validate_hed
+from plugins.hedscore.validation import FINDING_GROUP, FINDING_GROUP_NUMBERS, validate_hed
 from recordings.processors import channel_labels
 from recordings.processors.channel_labels import canonicalise_label
 
@@ -64,4 +65,6 @@ def test_standard_terms_are_tags_of_the_pinned_standard(viewer_standard_terms):
 
 def test_a_finding_with_each_standard_term_validates(viewer_standard_terms):
     for entry in viewer_standard_terms["terms"]:
-        validate_hed(f"(Posterior-dominant-rhythm, {entry['name']})", SCHEMA_PIN.as_meta())
+        # The one standard tag the picker writes with a value is a finding group's number.
+        tag = f"{FINDING_GROUP}/{FINDING_GROUP_NUMBERS.start}" if entry["name"] == FINDING_GROUP else entry["name"]
+        validate_hed(f"(Posterior-dominant-rhythm, {tag})", SCHEMA_PIN.as_meta())
