@@ -45,6 +45,9 @@ export interface ProjectNavLink {
  * import { onEvent, offEvent, emitEvent } from '../eventBus'
  * ```
  */
+/** The `meta` a code of one standard is sent with; see `ViewerPlugin.codeMeta`. */
+export type CodeMetaProvider = () => unknown | Promise<unknown>
+
 export interface ViewerPlugin {
     /**
      * Optional Vue component rendered as a floating overlay inside the viewer
@@ -112,6 +115,15 @@ export interface ViewerPlugin {
      * (and can therefore override) the base setup built by the viewer.
      */
     extraSetup?: Record<string, unknown>
+
+    /**
+     * The `meta` to send with a code of each standard this plugin's vocabulary owns, keyed by standard. A vocabulary
+     * whose server-side validator pins its `meta`, such as a schema release, answers it here, so every client that
+     * saves a viewer event's codes through `#lib/annotationCodes` stamps it the same way. The provider runs on the
+     * client, and should answer what the client itself coded against rather than what the server expects, so a
+     * client out of step with the server is refused instead of being papered over.
+     */
+    codeMeta?: Record<string, CodeMetaProvider>
 
     /**
      * Called once both `Epicurrents.createEpicurrentsApp()` has resolved **and**

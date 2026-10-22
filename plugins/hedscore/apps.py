@@ -30,4 +30,6 @@ class HedscoreConfig(PluginConfig):
             label=f"HED {SCHEMA_PIN.with_standard} with the SCORE library",
             version=SCHEMA_PIN.version,
             validator=validate_hed,
+            confined=True,
+            write_meta=SCHEMA_PIN.as_meta,
         )

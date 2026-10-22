@@ -153,13 +153,13 @@ def _set_state(recording, state):
 # useful; the federation inbound surface is the one that collapses every
 # no-result outcome to 404, and it has its own contract tests.
 #
-# The generic_annotations route is the annotations app's PK-addressed list
-# endpoint, which enforces hiding purely through the resolver's read-visibility
-# gate rather than a hand-rolled check, so its denial is the resolver's 403 on
-# every state. That shape is uniform with the surface's own no-permission
-# denial (unrelated caller on READY also gets 403), so the response does not
-# distinguish FAILED, trashed, and revoked — the failure status itself stays
-# undisclosed even though the PK-addressed surface confirms row existence.
+# The generic_annotations route is the annotations app's list endpoint, which
+# names its target by hash or primary key. A recording hidden from the caller
+# answers 404 there as on the recordings API — FAILED to anyone but the author
+# and superusers, trashed to everyone — because a client names the recording by
+# its public hash, and the resolver's 403 would confirm to a hash holder that a
+# hidden recording exists. A READY recording the caller may not read is the
+# resolver's 403, as on the recordings API.
 MATRIX = [
     # detail
     ("detail", "ready", "author", 200),
@@ -213,10 +213,10 @@ MATRIX = [
     ("generic_annotations", "ready", "unrelated", 403),
     ("generic_annotations", "ready", "anonymous", 401),
     ("generic_annotations", "failed", "author", 200),
-    ("generic_annotations", "failed", "grantee", 403),
+    ("generic_annotations", "failed", "grantee", 404),
     ("generic_annotations", "failed", "superuser", 200),
-    ("generic_annotations", "trashed", "grantee", 403),
-    ("generic_annotations", "trashed", "author", 403),
+    ("generic_annotations", "trashed", "grantee", 404),
+    ("generic_annotations", "trashed", "author", 404),
 ]
 
 

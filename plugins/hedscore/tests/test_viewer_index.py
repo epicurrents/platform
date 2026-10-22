@@ -12,7 +12,7 @@ from pathlib import Path
 import pytest
 
 from plugins.hedscore.schema import SCHEMA_PIN, load_schema
-from plugins.hedscore.validation import NUMERIC_CLASS, validate_hed
+from plugins.hedscore.validation import NUMERIC_CLASS, NUMERIC_DOMAINS, validate_hed
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 VIEWER_INDEX = REPO_ROOT / "frontend/viewer/epicurrents/eeg-module/src/components/vocabulary/hed-score.json"
@@ -79,11 +79,15 @@ def test_units_agree_with_the_validator(viewer_index):
         assert set(units["units"]) == schema.units[unit_class], unit_class
 
 
-def test_every_numeric_term_written_in_its_default_unit_is_accepted(viewer_index, settings):
+def test_every_numeric_term_the_index_offers_is_accepted_in_its_domain_or_refused(viewer_index, settings):
     settings.HEDSCORE_ALLOWED_BRANCHES = []
     numeric = [term for term in viewer_index["terms"] if NUMERIC_CLASS in term.get("valueClasses", [])]
     assert numeric
     for term in numeric:
-        defaults = [viewer_index["units"][unit_class]["default"] for unit_class in term.get("unitClasses", [])]
-        value = f"{term['name']}/1 {defaults[0]}" if defaults else f"{term['name']}/1"
-        validate_hed(value, SCHEMA_PIN.as_meta())
+        domain = NUMERIC_DOMAINS.get(term["name"])
+        if domain is None:
+            with pytest.raises(ValueError, match="not accepted"):
+                validate_hed(f"{term['name']}/1", SCHEMA_PIN.as_meta())
+            continue
+        unit = f" {domain.unit}" if domain.unit else ""
+        validate_hed(f"{term['name']}/{domain.high.normalize():f}{unit}", SCHEMA_PIN.as_meta())

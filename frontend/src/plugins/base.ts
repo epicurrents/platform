@@ -51,6 +51,8 @@ export function mergeSetup<T extends object> (target: T, ...sources: object[]): 
  *   precedence used in `main.ts`.
  * - `viewerPanel` — the first plugin that defines one wins (a page hosts a
  *   single viewer overlay).
+ * - `codeMeta` — shallow-merged; the earliest plugin to provide a standard
+ *   wins, as a standard has one owning vocabulary.
  * - `extraSetup` — merged with `mergeSetup` in plugin order; a later plugin
  *   overrides an earlier one on a conflicting value.
  * - `onAppReady` / `onStudiesReady` — chained: every plugin's hook runs, in
@@ -86,6 +88,15 @@ export function mergePlugins(plugins: ViewerPlugin[]): ViewerPlugin {
 
     const viewerPanel = plugins.find(p => p.viewerPanel != null)?.viewerPanel ?? null
 
+    const codeMeta: NonNullable<ViewerPlugin['codeMeta']> = {}
+    for (const p of plugins) {
+        for (const [standard, provider] of Object.entries(p.codeMeta ?? {})) {
+            if (!(standard in codeMeta)) {
+                codeMeta[standard] = provider
+            }
+        }
+    }
+
     return {
         routes: plugins.flatMap(p => p.routes ?? []),
         navLinks: plugins.flatMap(p => p.navLinks ?? []),
@@ -93,6 +104,7 @@ export function mergePlugins(plugins: ViewerPlugin[]): ViewerPlugin {
         iconLibraries,
         viewerPanel,
         extraSetup,
+        codeMeta,
         async onAppReady(epic, bus) {
             for (const p of plugins) {
                 await p.onAppReady?.(epic, bus)

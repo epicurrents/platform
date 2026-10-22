@@ -1,9 +1,17 @@
-"""The ``hed`` validator: what a code's value may carry under the rules that keep it a closed vocabulary."""
+"""The ``hed`` validator: what a code's value may carry under the rules that keep it a confined vocabulary."""
 
 import pytest
 
-from plugins.hedscore.schema import SCHEMA_PIN
-from plugins.hedscore.validation import MAX_DEPTH, MAX_LENGTH, validate_hed
+from plugins.hedscore.schema import SCHEMA_PIN, load_schema
+from plugins.hedscore.validation import (
+    MAX_DEPTH,
+    MAX_LENGTH,
+    MAX_NUMBERS,
+    MAX_TAGS,
+    NUMERIC_CLASS,
+    NUMERIC_DOMAINS,
+    validate_hed,
+)
 
 PIN = SCHEMA_PIN.as_meta()
 
@@ -58,21 +66,67 @@ class TestPlaceholderValues:
         "value",
         [
             "Intermittent-photic-stimulation/10 Hz",
-            "Intermittent-photic-stimulation/10",
+            "Intermittent-photic-stimulation/2.5 Hz",
             "Feature-amplitude/150 uV",
+            "Feature-amplitude/0 uV",
+            "Feature-frequency/0.25 Hz",
             "Episode-event-count/3",
             "Number-of-RPP-phases/2",
-            "Oxygen-saturation/88.5",
+            "Oxygen-saturation/88",
+            "ECG-QT-period/420 ms",
+            "Time-interval/1.5 s",
+            "Percentage/30",
         ],
     )
-    def test_a_numeric_value_is_accepted(self, value):
+    def test_a_numeric_value_in_its_domain_is_accepted(self, value):
         accepts(value)
 
     def test_a_number_is_required(self):
-        refuses("Intermittent-photic-stimulation/fast", "takes a number")
+        refuses("Intermittent-photic-stimulation/fast", "written plainly")
 
-    def test_a_unit_outside_the_class_is_refused(self):
-        refuses("Intermittent-photic-stimulation/10 s", "not a unit")
+    @pytest.mark.parametrize(
+        ("value", "match"),
+        [
+            ("Intermittent-photic-stimulation/10", "written in Hz"),
+            ("Intermittent-photic-stimulation/10 s", "written in Hz"),
+            ("Feature-amplitude/0.15 mV", "written in uV"),
+            ("ECG-QT-period/0.42 s", "written in ms"),
+            ("Oxygen-saturation/88 Hz", "without a unit"),
+        ],
+    )
+    def test_a_value_is_written_in_its_one_unit(self, value, match):
+        refuses(value, match)
+
+    @pytest.mark.parametrize(
+        "number",
+        ["0150", "150.0", "1.50", "+150", "-150", "1.5e2", ".5", "150.", "1 500", "150,5"],
+    )
+    def test_a_number_has_one_spelling(self, number):
+        refuses(f"Feature-amplitude/{number} uV", "written plainly|written in")
+
+    @pytest.mark.parametrize(
+        ("value", "match"),
+        [
+            ("Feature-amplitude/10001 uV", "from 0 to 10000"),
+            ("Feature-amplitude/19850312 uV", "from 0 to 10000"),
+            ("Number-of-RPP-phases/4", "from 1 to 3"),
+            ("Number-of-RPP-phases/0", "from 1 to 3"),
+            ("Oxygen-saturation/101", "from 0 to 100"),
+        ],
+    )
+    def test_a_value_outside_its_range_is_refused(self, value, match):
+        refuses(value, match)
+
+    @pytest.mark.parametrize(
+        "value",
+        ["Feature-amplitude/150.5 uV", "Feature-frequency/2.125 Hz", "Intermittent-photic-stimulation/10.25 Hz"],
+    )
+    def test_a_value_finer_than_its_decimals_is_refused(self, value):
+        refuses(value, "decimals")
+
+    @pytest.mark.parametrize("value", ["Age/67 year", "Weight/70 kg", "Item-count/3", "Temperature/37 oC"])
+    def test_a_numeric_placeholder_without_a_domain_is_refused(self, value):
+        refuses(value, "not accepted")
 
     @pytest.mark.parametrize(
         "value",
@@ -87,6 +141,53 @@ class TestPlaceholderValues:
     )
     def test_a_text_value_is_refused_whatever_it_says(self, value):
         refuses(value, "text value")
+
+
+class TestSize:
+    def test_the_tag_cap(self):
+        accepts(", ".join(["Spike"] * MAX_TAGS))
+        refuses(", ".join(["Spike"] * (MAX_TAGS + 1)), f"at most {MAX_TAGS} tags")
+
+    def test_the_number_cap(self):
+        accepts(", ".join(["Feature-amplitude/100 uV"] * MAX_NUMBERS))
+        refuses(", ".join(["Feature-amplitude/100 uV"] * (MAX_NUMBERS + 1)), f"at most {MAX_NUMBERS} numeric")
+
+    def test_a_sensor_list_names_a_channel_once(self):
+        refuses("Sensor-list/F7;T7;F7", "each channel once")
+
+
+class TestNumericDomains:
+    """The domain table against the pinned schema, so a release that moves a placeholder fails here."""
+
+    def test_every_domain_names_a_numeric_placeholder_in_its_own_unit_class(self):
+        index = load_schema()
+        for name, domain in NUMERIC_DOMAINS.items():
+            term = index.terms[name]
+            assert term.takes_value and NUMERIC_CLASS in term.value_classes, name
+            assert not term.deprecated and not term.reserved, name
+            if term.unit_classes:
+                units = set().union(*(index.units[unit_class] for unit_class in term.unit_classes))
+                assert domain.unit in units, name
+            else:
+                assert domain.unit is None, name
+            assert domain.low <= domain.high, name
+
+    def test_every_score_numeric_placeholder_has_a_domain(self):
+        index = load_schema()
+        score = {
+            term.name
+            for term in index.terms.values()
+            if term.in_library and term.takes_value and NUMERIC_CLASS in term.value_classes and not term.deprecated
+        }
+        assert score <= set(NUMERIC_DOMAINS)
+
+    def test_the_bounds_and_decimals_are_accepted_exactly(self):
+        for name, domain in NUMERIC_DOMAINS.items():
+            unit = f" {domain.unit}" if domain.unit else ""
+            for bound in (domain.low, domain.high):
+                accepts(f"{name}/{bound.normalize():f}{unit}")
+            if domain.decimals:
+                accepts(f"{name}/{domain.low + 1}.{'1' * domain.decimals}{unit}")
 
 
 class TestComparisons:
@@ -119,11 +220,15 @@ class TestComparisons:
 
 
 class TestFindingGroup:
-    @pytest.mark.parametrize("value", ["ID/100", "ID/512", "ID/999", "(Epileptiform-interictal-activity, Left, ID/104)"])
+    @pytest.mark.parametrize(
+        "value", ["ID/100", "ID/512", "ID/999", "(Epileptiform-interictal-activity, Left, ID/104)"]
+    )
     def test_a_group_number_is_accepted(self, value):
         accepts(value)
 
-    @pytest.mark.parametrize("number", ["0", "7", "99", "099", "0100", "1000", "-100", "100.0", "1e2", "١٠٠", "Anna", ""])
+    @pytest.mark.parametrize(
+        "number", ["0", "7", "99", "099", "0100", "1000", "-100", "100.0", "1e2", "١٠٠", "Anna", ""]
+    )
     def test_any_other_value_is_refused(self, number):
         refuses(f"ID/{number}", "finding group's number")
 

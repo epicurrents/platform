@@ -73,11 +73,24 @@ class TestCodeWrites:
 
 @pytest.mark.django_db
 class TestVocabularyListing:
-    def test_hed_is_listed_at_the_pinned_version_and_open(self, auth_client):
+    def test_hed_is_listed_at_the_pinned_version_confined_and_not_closed(self, auth_client):
         c, _user = auth_client
         listed = {row["standard"]: row for row in c.get(VOCABULARIES_URL).json()}
         assert listed["hed"]["version"] == SCHEMA_PIN.version
         assert listed["hed"]["closed"] is False
+        assert listed["hed"]["confined"] is True
+
+    def test_a_server_side_writer_stamps_the_pin(self):
+        from annotations.vocabularies import get_vocabulary
+
+        vocabulary = get_vocabulary("hed")
+        assert vocabulary.write_meta() == SCHEMA_PIN.as_meta()
+        vocabulary.validator("Spike", vocabulary.write_meta())
+
+    def test_ingest_still_takes_no_hed_code_from_a_file(self):
+        from recordings.container import _accepted_code
+
+        assert _accepted_code("hed", "Spike") is None
 
 
 @pytest.mark.django_db

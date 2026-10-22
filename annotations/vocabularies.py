@@ -36,7 +36,8 @@ class Vocabulary:
     """A registered coding standard: identifier, display label, version, its validator and its optional term names.
 
     ``term_name`` answers the display name of a value the validator accepts, or ``None`` where the standard gives
-    none; a vocabulary registered without it names no terms.
+    none; a vocabulary registered without it names no terms. ``write_meta`` answers the ``meta`` a server-side
+    writer stamps on a code it creates, or is ``None`` where the standard keeps no ``meta``.
     """
 
     standard: str
@@ -45,6 +46,8 @@ class Vocabulary:
     validator: Callable[[str, Any], None]
     term_name: Callable[[str], str | None] | None = None
     closed: bool = False
+    confined: bool = False
+    write_meta: Callable[[], Any] | None = None
 
 
 _REGISTRY: dict[str, Vocabulary] = {}
@@ -58,6 +61,8 @@ def register_vocabulary(
     version: str = "",
     term_name: Callable[[str], str | None] | None = None,
     closed: bool = False,
+    confined: bool = False,
+    write_meta: Callable[[], Any] | None = None,
 ) -> None:
     """Register a validator for ``standard``; call from the owning ``AppConfig.ready()``.
 
@@ -71,9 +76,26 @@ def register_vocabulary(
     fill (HED's ``Description/<text>`` is the counter-example). Ingest accepts a code a file declares only under a
     closed vocabulary, because under an open one the file chooses the value, and code values are exempt from the
     annotation-text rule.
+
+    ``confined`` declares less: every part of a value comes from a domain the validator declares — a term of the
+    vocabulary, a canonical identifier from a closed set, or a number within a range declared for its placeholder, in
+    a unit and at a precision declared with it — and a value is bounded in size. Typed text is never part of one. A
+    closed vocabulary is confined, so ``closed`` implies it. A writer can still choose a plausible number, which is
+    why ingest keeps requiring ``closed``; a gate taking codes a known person wrote may accept a confined one.
+
+    ``write_meta`` returns the ``meta`` a server-side writer stamps on a code of this standard, for a vocabulary whose
+    validator pins its ``meta`` (a schema release), so a row written without a client still validates. A client
+    writing through the API sends its own.
     """
     _REGISTRY[standard] = Vocabulary(
-        standard=standard, label=label, version=version, validator=validator, term_name=term_name, closed=closed
+        standard=standard,
+        label=label,
+        version=version,
+        validator=validator,
+        term_name=term_name,
+        closed=closed,
+        confined=confined or closed,
+        write_meta=write_meta,
     )
 
 

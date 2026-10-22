@@ -917,7 +917,11 @@ class TestRecordingVisibilityGate:
         assert get_federated_read_access_result(peer, "u1", recording).granted is False
 
     def test_generic_annotations_surface_denies_failed_recording(self, user, make_user, auth_client):
-        """The leak the gate closes: the annotations app's list endpoint checks only can_read_object."""
+        """The leak the gate closes: the annotations app's list endpoint reads no annotation of a hidden recording.
+
+        The endpoint answers 404 before the permission check, as the recordings API does, since a client names the
+        recording by its public hash; the gate's own denial is pinned by the access-result tests above.
+        """
         from django.test import Client
 
         reader = make_user()
@@ -929,4 +933,4 @@ class TestRecordingVisibilityGate:
             "/annotations/api/v1/annotations/",
             {"target_content_type_id": ct.pk, "target_object_id": str(recording.pk)},
         )
-        assert response.status_code == 403
+        assert response.status_code == 404

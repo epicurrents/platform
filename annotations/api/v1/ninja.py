@@ -19,6 +19,7 @@ GET           /labels/mine            Caller's labels across all targets.
 PATCH/DELETE  /labels/{hash}          Update or delete a specific label.
 
 POST          /codes/                 Attach a Code to an Event, Interruption, or Label.
+                                      The three also take their codes inline, keyed by standard.
 PATCH/DELETE  /codes/{id}             Update or delete a specific code.
 
 GET           /export                 Bulk export of events / labels as JSON or CSV.
@@ -99,7 +100,34 @@ def _resolve_by_hash(model, object_hash: str, user, *, prefetch=()):
     return qs.filter(author=user).first() or qs.first()
 
 
-def _resolve_target_or_404(content_type_id: int, object_id: str):
+#: The length of an opaque hash identifier: a recording's ``stored_name`` prefix, or an ``object_hash``.
+_HASH_LENGTH = 32
+
+
+def _target_lookup(model_class, object_id: str) -> dict:
+    """The filter that finds the target *object_id* names: by its hash where it is one, by primary key otherwise.
+
+    A client knows a recording by its hash, since no response carries a recording's primary key, so the hash is how a
+    client names one; the primary key stays accepted for server-side callers. A recording's hash is its
+    ``stored_name`` prefix, as the recordings API resolves it, and any other model's is its ``object_hash``.
+    """
+    candidate = (object_id or "").strip()
+    if len(candidate) == _HASH_LENGTH and candidate.isalnum():
+        if model_class._meta.label == "recordings.Recording":
+            return {"stored_name__startswith": f"{candidate.upper()}."}
+        if any(field.name == "object_hash" for field in model_class._meta.get_fields()):
+            return {"object_hash": candidate.upper()}
+    return {"pk": candidate}
+
+
+def _resolve_target_or_404(content_type_id: int, object_id: str, user):
+    """The content type and the object an annotation is attached to; see :func:`_target_lookup` for *object_id*.
+
+    Callers store and filter by ``str(target.pk)``, never by *object_id*, so a row is keyed the same way whichever
+    form named its target. A recording *user* may not see — trashed, FAILED and not theirs, or a release-gated
+    member hidden from them — answers 404 like one that does not exist, as on the recordings API: the permission
+    check would answer 403, which confirms the recording exists to whoever holds its hash.
+    """
     content_type = ContentType.objects.filter(id=content_type_id).first()
     if content_type is None:
         raise HttpError(404, "Target content type not found")
@@ -108,11 +136,27 @@ def _resolve_target_or_404(content_type_id: int, object_id: str):
     if model_class is None:
         raise HttpError(404, "Target model is not available")
 
-    target = model_class.objects.filter(pk=object_id).first()
-    if target is None:
+    try:
+        target = model_class.objects.filter(**_target_lookup(model_class, object_id)).first()
+    except (ValueError, TypeError):
+        target = None
+    if target is None or _recording_hidden(target, user):
         raise HttpError(404, "Target object not found")
 
     return content_type, target
+
+
+def _recording_hidden(target, user) -> bool:
+    """Whether *target* is a recording that answers 404 to *user* on the recordings API."""
+    from recordings.models import Recording
+
+    if not isinstance(target, Recording):
+        return False
+    if target.deleted_at is not None:
+        return True
+    from recordings.api.v1.ninja import _hidden_for_caller
+
+    return _hidden_for_caller(target, user, None)
 
 
 def _list_for_target(
@@ -133,7 +177,7 @@ def _list_for_target(
     the same text. See [annotations/redaction.py](../../redaction.py).
     """
     user = _require_auth(request)
-    content_type, target = _resolve_target_or_404(content_type_id, object_id)
+    content_type, target = _resolve_target_or_404(content_type_id, object_id, user)
 
     terms = get_read_access_result(user=user, obj=target)
     if not terms.granted:
@@ -141,7 +185,7 @@ def _list_for_target(
 
     queryset = model_class.objects.filter(
         target_content_type=content_type,
-        target_object_id=str(object_id),
+        target_object_id=str(target.pk),
     )
     if author_id is not None:
         queryset = queryset.filter(author_id=author_id)
@@ -167,6 +211,66 @@ def _resolve_codeable_parent_or_400(content_type_id: int, object_id: str):
         raise HttpError(404, "Parent annotation not found")
 
     return parent
+
+
+#: ``Code.standard`` is a ``CharField`` of this length; a longer key would reach the database as a 500.
+_STANDARD_MAX_LENGTH = Code._meta.get_field("standard").max_length
+
+
+def _inline_codes(codes: dict | None, *, patch: dict | None = None) -> dict | None:
+    """Validate the inline ``codes`` of a write before anything is written, answering 422 on the first refusal.
+
+    Returns the codes to write, or ``None`` when the write leaves them alone. On a patch the key is taken out of
+    *patch*, so the remaining fields can be set on the row; an explicit ``null`` there is refused, since ``{}`` is
+    how a patch clears the set.
+    """
+    if patch is not None:
+        if "codes" not in patch:
+            return None
+        patch.pop("codes")
+        if codes is None:
+            raise HttpError(422, "codes cannot be null; send {} to remove every code")
+    if codes is None:
+        return None
+    for standard, code in codes.items():
+        if not standard or len(standard) > _STANDARD_MAX_LENGTH:
+            raise HttpError(422, f"a code's standard is 1 to {_STANDARD_MAX_LENGTH} characters")
+        try:
+            validate_code(standard, code.value, code.meta)
+        except ValueError as exc:
+            raise HttpError(422, f"{standard}: {exc}") from exc
+    return codes
+
+
+def _replace_codes(parent, codes: dict) -> None:
+    """Make *parent*'s codes exactly *codes*: one row per standard, changed in place, missing ones deleted.
+
+    Rows are saved one at a time so each change reaches the audit trail through the model signals. Called inside the
+    write's transaction.
+    """
+    content_type = ContentType.objects.get_for_model(type(parent))
+    existing = {
+        code.standard: code for code in Code.objects.filter(content_type=content_type, object_id=str(parent.pk))
+    }
+    for standard, code in existing.items():
+        if standard not in codes:
+            code.delete()
+    for standard, item in codes.items():
+        code = existing.get(standard)
+        if code is None:
+            Code.objects.create(
+                content_type=content_type,
+                object_id=str(parent.pk),
+                standard=standard,
+                value=item.value,
+                meta=item.meta,
+            )
+        elif code.value != item.value or code.meta != item.meta:
+            code.value = item.value
+            code.meta = item.meta
+            code.save()
+    # A prefetched set would serialise the codes as they were before this write.
+    getattr(parent, "_prefetched_objects_cache", {}).pop("codes", None)
 
 
 # ── Serialisers ─────────────────────────────────────────────────────────────
@@ -295,6 +399,13 @@ class AnnotationPatch(Schema):
     content: dict | list | str | int | float | None = None
 
 
+class CodeValueIn(Schema):
+    """One inline code, keyed by its standard in the ``codes`` of an event, interruption or label write."""
+
+    value: str
+    meta: dict | list | str | int | float | None = None  # mirrors Code.meta, a JSONField
+
+
 class EventIn(Schema):
     target_content_type_id: int
     target_object_id: str
@@ -304,6 +415,7 @@ class EventIn(Schema):
     duration: float | None = None
     value: dict | list | str | int | float | None = None
     annotator: str | None = None  # see AnnotationIn.annotator
+    codes: dict[str, CodeValueIn] | None = None
 
 
 class EventPatch(Schema):
@@ -312,6 +424,7 @@ class EventPatch(Schema):
     timestamp: float | None = None
     duration: float | None = None
     value: dict | list | str | int | float | None = None
+    codes: dict[str, CodeValueIn] | None = None  # replaces the set; {} clears it, absent leaves it
 
 
 class InterruptionIn(Schema):
@@ -321,12 +434,14 @@ class InterruptionIn(Schema):
     timestamp: float
     duration: float
     annotator: str | None = None  # see AnnotationIn.annotator
+    codes: dict[str, CodeValueIn] | None = None
 
 
 class InterruptionPatch(Schema):
     object_hash: str | None = None
     timestamp: float | None = None
     duration: float | None = None
+    codes: dict[str, CodeValueIn] | None = None  # see EventPatch.codes
 
 
 class LabelIn(Schema):
@@ -336,12 +451,14 @@ class LabelIn(Schema):
     name: str
     value: dict | list | str | int | float | None = None
     annotator: str | None = None  # see AnnotationIn.annotator
+    codes: dict[str, CodeValueIn] | None = None
 
 
 class LabelPatch(Schema):
     object_hash: str | None = None
     name: str | None = None
     value: dict | list | str | int | float | None = None
+    codes: dict[str, CodeValueIn] | None = None  # see EventPatch.codes
 
 
 class CodeIn(Schema):
@@ -357,6 +474,7 @@ class VocabularyOut(Schema):
     label: str
     version: str
     closed: bool
+    confined: bool
 
 
 class CodePatch(Schema):
@@ -378,12 +496,16 @@ def list_vocabularies(request):
     """List the coding standards this deployment validates, so a client offers an editor only for a registered one.
 
     The list describes the deployment's configuration, not anyone's data, so every authenticated caller may read
-    it. ``closed`` says the standard accepts only enumerated terms and never a value a writer fills in.
+    it. ``closed`` says the standard accepts only enumerated terms and never a value a writer fills in; ``confined``
+    says every part of a value comes from a domain the standard declares, numbers included, and never typed text.
     """
     _require_auth(request)
     vocabularies = registered_vocabularies()
     log_activity(verb="annotations.vocabulary.list", metadata={"vocabulary_count": len(vocabularies)})
-    return [VocabularyOut(standard=v.standard, label=v.label, version=v.version, closed=v.closed) for v in vocabularies]
+    return [
+        VocabularyOut(standard=v.standard, label=v.label, version=v.version, closed=v.closed, confined=v.confined)
+        for v in vocabularies
+    ]
 
 
 @api.get("/content-types", response=list[ContentTypeOut])
@@ -467,7 +589,7 @@ def list_my_annotations(
 @annotations_router.post("/", auth=None)
 def create_annotation(request, payload: AnnotationIn):
     user = _require_auth(request)
-    content_type, target = _resolve_target_or_404(payload.target_content_type_id, payload.target_object_id)
+    content_type, target = _resolve_target_or_404(payload.target_content_type_id, payload.target_object_id, user)
 
     if not can_annotate_object(user=user, obj=target, annotator=payload.annotator):
         raise HttpError(403, "You do not have permission to annotate this object")
@@ -475,7 +597,7 @@ def create_annotation(request, payload: AnnotationIn):
     annotation = Annotation(
         author=user,
         target_content_type=content_type,
-        target_object_id=str(payload.target_object_id),
+        target_object_id=str(target.pk),
         object_hash=payload.object_hash,
         content=payload.content,
     )
@@ -588,15 +710,16 @@ def list_my_events(
 @events_router.post("/", auth=None)
 def create_event(request, payload: EventIn):
     user = _require_auth(request)
-    content_type, target = _resolve_target_or_404(payload.target_content_type_id, payload.target_object_id)
+    content_type, target = _resolve_target_or_404(payload.target_content_type_id, payload.target_object_id, user)
 
     if not can_annotate_object(user=user, obj=target, annotator=payload.annotator):
         raise HttpError(403, "You do not have permission to annotate this object")
+    codes = _inline_codes(payload.codes)
 
     event = Event(
         author=user,
         target_content_type=content_type,
-        target_object_id=str(payload.target_object_id),
+        target_object_id=str(target.pk),
         object_hash=payload.object_hash,
         name=payload.name,
         timestamp=payload.timestamp,
@@ -606,6 +729,8 @@ def create_event(request, payload: EventIn):
     with transaction.atomic():
         event.full_clean()
         event.save()
+        if codes:
+            _replace_codes(event, codes)
         log_activity(verb="annotations.event.create", target=event)
     return _serialize_event(event, withhold_text=False)
 
@@ -625,16 +750,19 @@ def update_event(request, object_hash: str, payload: EventPatch):
         raise HttpError(403, "You do not have permission to modify this event")
 
     patch = payload.model_dump(exclude_unset=True)
+    codes = _inline_codes(payload.codes, patch=patch)
     for field_name, field_value in patch.items():
         setattr(event, field_name, field_value)
 
     with transaction.atomic():
         event.full_clean()
         event.save()
+        if codes is not None:
+            _replace_codes(event, codes)
         log_activity(
             verb="annotations.event.update",
             target=event,
-            metadata={"fields_updated": sorted(patch.keys())},
+            metadata={"fields_updated": sorted([*patch.keys(), *(["codes"] if codes is not None else [])])},
         )
     return _serialize_event(event, withhold_text=False)
 
@@ -713,15 +841,16 @@ def list_my_interruptions(
 @interruptions_router.post("/", auth=None)
 def create_interruption(request, payload: InterruptionIn):
     user = _require_auth(request)
-    content_type, target = _resolve_target_or_404(payload.target_content_type_id, payload.target_object_id)
+    content_type, target = _resolve_target_or_404(payload.target_content_type_id, payload.target_object_id, user)
 
     if not can_annotate_object(user=user, obj=target, annotator=payload.annotator):
         raise HttpError(403, "You do not have permission to annotate this object")
+    codes = _inline_codes(payload.codes)
 
     interruption = Interruption(
         author=user,
         target_content_type=content_type,
-        target_object_id=str(payload.target_object_id),
+        target_object_id=str(target.pk),
         object_hash=payload.object_hash,
         timestamp=payload.timestamp,
         duration=payload.duration,
@@ -729,6 +858,8 @@ def create_interruption(request, payload: InterruptionIn):
     with transaction.atomic():
         interruption.full_clean()
         interruption.save()
+        if codes:
+            _replace_codes(interruption, codes)
         log_activity(verb="annotations.interruption.create", target=interruption)
     return _serialize_interruption(interruption)
 
@@ -748,16 +879,19 @@ def update_interruption(request, object_hash: str, payload: InterruptionPatch):
         raise HttpError(403, "You do not have permission to modify this interruption")
 
     patch = payload.model_dump(exclude_unset=True)
+    codes = _inline_codes(payload.codes, patch=patch)
     for field_name, field_value in patch.items():
         setattr(interruption, field_name, field_value)
 
     with transaction.atomic():
         interruption.full_clean()
         interruption.save()
+        if codes is not None:
+            _replace_codes(interruption, codes)
         log_activity(
             verb="annotations.interruption.update",
             target=interruption,
-            metadata={"fields_updated": sorted(patch.keys())},
+            metadata={"fields_updated": sorted([*patch.keys(), *(["codes"] if codes is not None else [])])},
         )
     return _serialize_interruption(interruption)
 
@@ -834,15 +968,16 @@ def list_my_labels(
 @labels_router.post("/", auth=None)
 def create_label(request, payload: LabelIn):
     user = _require_auth(request)
-    content_type, target = _resolve_target_or_404(payload.target_content_type_id, payload.target_object_id)
+    content_type, target = _resolve_target_or_404(payload.target_content_type_id, payload.target_object_id, user)
 
     if not can_annotate_object(user=user, obj=target, annotator=payload.annotator):
         raise HttpError(403, "You do not have permission to annotate this object")
+    codes = _inline_codes(payload.codes)
 
     label = Label(
         author=user,
         target_content_type=content_type,
-        target_object_id=str(payload.target_object_id),
+        target_object_id=str(target.pk),
         object_hash=payload.object_hash,
         name=payload.name,
         value=payload.value,
@@ -850,6 +985,8 @@ def create_label(request, payload: LabelIn):
     with transaction.atomic():
         label.full_clean()
         label.save()
+        if codes:
+            _replace_codes(label, codes)
         log_activity(verb="annotations.label.create", target=label)
     return _serialize_label(label, withhold_text=False)
 
@@ -869,16 +1006,19 @@ def update_label(request, object_hash: str, payload: LabelPatch):
         raise HttpError(403, "You do not have permission to modify this label")
 
     patch = payload.model_dump(exclude_unset=True)
+    codes = _inline_codes(payload.codes, patch=patch)
     for field_name, field_value in patch.items():
         setattr(label, field_name, field_value)
 
     with transaction.atomic():
         label.full_clean()
         label.save()
+        if codes is not None:
+            _replace_codes(label, codes)
         log_activity(
             verb="annotations.label.update",
             target=label,
-            metadata={"fields_updated": sorted(patch.keys())},
+            metadata={"fields_updated": sorted([*patch.keys(), *(["codes"] if codes is not None else [])])},
         )
     return _serialize_label(label, withhold_text=False)
 

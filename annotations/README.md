@@ -46,13 +46,17 @@ Mounted at `/annotations/api/v1/`. The four annotation types each get the same C
 | Event | `GET /events/` | `POST /events/` | `PATCH /events/{hash}` | `DELETE /events/{hash}` | `GET /events/mine` |
 | Interruption | `GET /interruptions/` | `POST /interruptions/` | `PATCH /interruptions/{hash}` | `DELETE /interruptions/{hash}` | `GET /interruptions/mine` |
 | Label | `GET /labels/` | `POST /labels/` | `PATCH /labels/{hash}` | `DELETE /labels/{hash}` | `GET /labels/mine` |
-| Code | (via parent's `codes` field) | `POST /codes/` | `PATCH /codes/{id}` | `DELETE /codes/{id}` | — |
+| Code | (via parent's `codes` field) | inline, or `POST /codes/` | inline, or `PATCH /codes/{id}` | inline, or `DELETE /codes/{id}` | — |
 
 List endpoints accept `target_content_type_id` + `target_object_id` (required) and optional `author_id` / `limit` / `offset`. `/<type>/mine` lists the caller's own across all targets.
 
+`target_object_id`, on a create or a listing, is the target's 32-character hash or its primary key. A client names a recording by its hash, the `stored_name` prefix the recordings API resolves, because no recording response carries its primary key; a model with an `object_hash`, such as a dataset, is named by that. Rows store the target's primary key whichever form named it. A recording hidden from the caller — trashed, FAILED and not theirs, or a release-gated member they may not see — answers 404 like one that does not exist, as on the recordings API, by either form; the permission check's 403 would confirm to a hash holder that it exists.
+
 `GET /content-types` returns the available `(app_label, model, id)` triples for use as `target_content_type_id`. Filterable by `app_label` / `model`.
 
-`GET /vocabularies` lists the registered coding standards as `{standard, label, version, closed}`, so a client renders an editor only for a standard the deployment validates. Any authenticated caller may read it; it writes an `annotations.vocabulary.list` row with the count.
+An event, interruption or label write takes its codes inline as `codes`, an object keyed by standard whose entries are `{value, meta}`. Each is validated against its vocabulary before anything is written, and the first refusal answers 422 naming the standard. On a create the codes are written with the row; on a patch a `codes` object replaces the row's set, `{}` clears it, an absent key leaves it and an explicit `null` is refused. This is how a client attaches codes: the `/codes/` endpoints name their parent by its primary key, which no response carries.
+
+`GET /vocabularies` lists the registered coding standards as `{standard, label, version, closed, confined}`, so a client renders an editor only for a standard the deployment validates. Any authenticated caller may read it; it writes an `annotations.vocabulary.list` row with the count.
 
 `GET /export` downloads events and labels in bulk, `GET /export/types` lists the types this deployment can export, `GET /export/annotators` maps the exported annotator ids back to identities — see [bulk export](#bulk-export).
 
@@ -157,7 +161,7 @@ All four create-payload schemas (`AnnotationIn`, `EventIn`, `InterruptionIn`, `L
 | `value` | `TextField`. The code value within that system (e.g. `"G40.9"` for ICD-10 epilepsy, `"correct"` / `"incorrect"` for a project mark, a grouped HED string running several hundred characters). Not indexed, so width carries no index consequence. |
 | `meta` | `JSONField(null=True, blank=True)`. Arbitrary structured data accompanying the code (e.g. `{"score": 8.5}`). The API schemas type it as the same JSON union the annotation `value` fields use, so objects round-trip; on PATCH, explicit `null` clears the field while an absent key leaves it unchanged. Keep flat; `meta` is not indexed and shouldn't be used as a hot-path filter target. |
 
-Generic FK pair (`content_type`, `object_id`) targets the parent annotation. A given annotation can have multiple codes from the same or different standards.
+Generic FK pair (`content_type`, `object_id`) targets the parent annotation. An annotation carries at most one code per standard ([`Code` uniqueness](#signals)), which is why the inline `codes` of a write is keyed by standard.
 
 ### Project-specific labelling via `Code`
 
@@ -182,6 +186,13 @@ register_vocabulary("hed", label="HED", version="8.3.0", validator=my_validator,
 ```
 
 The validator receives `(value, meta)` and raises `ValueError` naming the offending term; `create_code` and `update_code` translate that into a 422 before opening their transaction. Update validation runs against the combined prospective row state, so patching only `meta` is still checked against the row's `standard` and `value`. A callable rather than a term list, because vocabulary rules are not always membership — HED has value placeholders and group structure, ICD-10 has check characters. The optional `term_name` answers a value's display name, or `None`; ingest names a `Label` it writes from a footer code with it, and falls back to the code. The core vocabularies register one over their pinned terms.
+
+Two flags describe what a value can carry, and the paths that serve or ingest codes read them:
+
+- **`closed`**: every value is a term from an enumerated list. Ingest accepts a code a file declares only under a closed vocabulary, because a file is untrusted input and a code value is exempt from the annotation-text rule.
+- **`confined`**: every part of a value comes from a domain the validator declares — a term, a canonical identifier from a closed set, or a number within a range declared for its placeholder, in a declared unit and precision — and a value is bounded in size. Typed text is never part of one. Closed implies confined. A writer can still choose a plausible number, so a confined vocabulary is fit for a gate taking codes a known person wrote, such as a project's reviewer set, and not for ingest.
+
+`write_meta` returns the `meta` a server-side writer stamps on a code it creates, for a vocabulary whose validator pins its `meta`, such as a schema release. A client writing through the API sends its own.
 
 Core registers two vocabularies of its own and no external one. `epicurrents.biosignal` is the shared set every biosignal event class in the viewer inherits, entirely acquisition-scoped (what was done, given and observed during a recording that the signal cannot recover: calibration, impedance check, trigger, medication, procedures, body position, level of consciousness, visible signs, noise and devices in the surroundings), and `epicurrents.eeg` is the EEG activation set (eyes closed and open, hyperventilation, photic stimulation per frequency, sensory stimuli) which delegates a value it does not know to the shared one. Both come from JSON files the viewer packages ship; [core_vocabularies.py](core_vocabularies.py) registers pinned copies under [vocabulary/](vocabulary/), and [tests/test_core_vocabularies.py](tests/test_core_vocabularies.py) fails when a copy drifts from its pinned version and digest or from the viewer's file. A term is added in the viewer first and copied here with the pin moved; the copy is never edited on its own. Ingest writes these terms too: the events a file arrives with are translated into them through mappers and tables, fail-closed, with the untranslated written as text-free placeholders ([recordings/README.md → Event translation](../recordings/README.md#event-translation)). Every category in a file carries a scope, and only `acquisition` categories are registered. Neither file carries findings: what a reader concludes from the signal, a cardiac or respiratory state a polygraphic channel displays included, is coded in HED-SCORE, registered as `hed` by the [hedscore plugin](../plugins/hedscore/README.md) where it is enabled, so ingest writes no finding and a vendor's finding marker becomes a placeholder. A code's `meta` is documented by the file (the keys a term expects) and validated by nothing. Design and term tables: [docs/engineering-notes/annotation-event-vocabulary.md](../docs/engineering-notes/annotation-event-vocabulary.md).
 
@@ -245,7 +256,7 @@ All four use `annotation_hash(recording, suffix)` from [recordings/event_transla
 | Hook | How |
 |---|---|
 | Attach project-specific labels/scores to annotations | Use `Code` with `standard = "epicurrents.<project>.<concept>"`. Wrap the interaction in a project API endpoint that hides the `standard` string. |
-| Register a coding-standard vocabulary | `register_vocabulary(standard, label=..., validator=..., version=..., term_name=...)` from [vocabularies.py](vocabularies.py) in the owning `AppConfig.ready()`. |
+| Register a coding-standard vocabulary | `register_vocabulary(standard, label=..., validator=..., version=..., term_name=..., closed=..., confined=..., write_meta=...)` from [vocabularies.py](vocabularies.py) in the owning `AppConfig.ready()`. |
 | Annotate project models | Project models can be annotation targets without any registration — the generic FK accepts any `(content_type, object_id)` pair. Just pass the model's content type ID to the create endpoint. |
 | Make a project model annotatable through the viewer UI | Frontend concern — see the viewer's `DatabaseAPIConnector` setup. |
 

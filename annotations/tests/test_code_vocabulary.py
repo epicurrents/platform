@@ -107,6 +107,23 @@ class TestRegistry:
         finally:
             unregister_vocabulary("named-vocab")
 
+    def test_a_closed_vocabulary_is_confined_and_an_open_one_is_not_unless_declared(self):
+        register_vocabulary("closed-vocab", label="Closed", validator=_terms_validator, closed=True)
+        register_vocabulary("confined-vocab", label="Confined", validator=_terms_validator, confined=True)
+        try:
+            assert get_vocabulary("closed-vocab").confined is True
+            assert get_vocabulary("confined-vocab").confined is True
+            assert get_vocabulary("confined-vocab").closed is False
+        finally:
+            unregister_vocabulary("closed-vocab")
+            unregister_vocabulary("confined-vocab")
+        register_vocabulary("open-vocab", label="Open", validator=_terms_validator)
+        try:
+            assert get_vocabulary("open-vocab").confined is False
+            assert get_vocabulary("open-vocab").write_meta is None
+        finally:
+            unregister_vocabulary("open-vocab")
+
     def test_the_core_vocabularies_name_their_terms(self):
         assert get_vocabulary("epicurrents.eeg").term_name("EEG_ACT_HV") == "Hyperventilation"
         assert get_vocabulary("epicurrents.eeg").term_name("NOT_A_TERM") is None
@@ -202,6 +219,7 @@ class TestVocabularyListing:
             "label": "Test vocabulary",
             "version": "1.0",
             "closed": False,
+            "confined": False,
         }
         assert set(listed) == {v.standard for v in registered_vocabularies()}
 
@@ -209,6 +227,7 @@ class TestVocabularyListing:
         c, _user = auth_client
         listed = {row["standard"]: row for row in c.get(VOCABULARIES_URL).json()}
         assert listed["epicurrents.biosignal"]["closed"] is True
+        assert listed["epicurrents.biosignal"]["confined"] is True
         assert listed["epicurrents.eeg"]["version"] == "2.0"
 
     def test_requires_authentication(self, client):

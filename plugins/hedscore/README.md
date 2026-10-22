@@ -15,11 +15,31 @@ A new release is vendored beside the old one and the pin moved in the same commi
 A `hed` code's `value` is a HED string and its `meta` is the schema pin, `{"schema": {"library": "score", "version": "2.1.0", "with_standard": "8.4.0"}}`, exactly. The rules are narrower than HED's own, because a code's value is served to readers under a de-identifying grant and must not carry typed text:
 
 - Tags in their short form, spelt as the schema spells them. Long forms and extensions are refused.
-- A value only where the placeholder's value class is numeric, with a unit from its unit class: `Intermittent-photic-stimulation/10 Hz`, `Feature-amplitude/150 uV`. Every text placeholder is refused, `Description/#`, `Label/#` and the `Other-…/#` tags included.
+- A value only where the placeholder's value class is numeric and `NUMERIC_DOMAINS` in [validation.py](validation.py) declares a domain for it: one unit, a range and a number of decimals, as below. The number is written plainly in its one spelling, with no sign, exponent, leading zero or trailing fractional zero, so a reading cannot be padded or rescaled to carry other digits: `Intermittent-photic-stimulation/10 Hz`, `Feature-amplitude/150 uV`. A numeric placeholder with no domain is refused, `Age/#` among them, and so is every text placeholder, `Description/#`, `Label/#` and the `Other-…/#` tags included.
 - `Sensor-list` is one exception: its value lists canonical channel labels separated by `;` (`Sensor-list/F7;T7`). A raw acquisition label is refused.
 - `ID` is the other: its value is the number of a finding group, 100 to 999 without leading zeros (`ID/104`), which the viewer's picker writes on every occurrence of one finding within a recording. 0 to 99 are held back for a use not yet defined, and refused until it is, so no stored row takes on that meaning before it exists.
 - Reserved tags (`Onset`, `Duration`, `Definition` and the rest) and deprecated tags are refused. An event's timing belongs to the row.
+- A string holds at most 64 tags and 16 numeric values within its 2000 characters, and a sensor list names a channel once.
 - Groups are checked for balance and emptiness only.
+
+| Placeholder | Unit | Range | Decimals |
+|---|---|---|---|
+| `Feature-amplitude`, `RPP-absolute-amplitude` | `uV` | 0–10 000 | 0 |
+| `Feature-frequency` | `Hz` | 0–1 000 | 2 |
+| `Intermittent-photic-stimulation`, `Myoclonus-rhythmic` | `Hz` | 0–100 | 1 |
+| `Number-of-RPP-phases` | — | 1–3 | 0 |
+| `Episode-event-count` | — | 0–10 000 | 0 |
+| `Apnea`, `Hypopnea` | — (seconds) | 0–600 | 0 |
+| `Apnea-hypopnea-index` | — (per hour) | 0–200 | 1 |
+| `Tachypnea` | — (per minute) | 0–150 | 0 |
+| `Oxygen-saturation`, `Percentage` | — (per cent) | 0–100 | 0 |
+| `ECG-QT-period` | `ms` | 0–2 000 | 0 |
+| `ECG-asystolia` | `s` | 0–600 | 1 |
+| `Time-interval` | `s` | 0–3 600 | 2 |
+
+Every SCORE numeric placeholder has a domain; of the HED standard's own numeric properties only `Time-interval` and `Percentage` do, since the rest describe stimuli, displays and subjects rather than a signal. A new release's numeric placeholder is refused until it is given one, and [test_validation.py](tests/test_validation.py) checks each domain's unit against the placeholder's unit class in the pinned schema.
+
+These rules make `hed` a *confined* vocabulary, which the plugin registers it as, and not a closed one: every part of a value comes from a declared domain and none of it is typed text, but a writer still chooses a reading, and a domain bounds how much a reading can say rather than removing it. A gate taking codes from a known writer, such as a teaching project's reviewer set, may accept it; ingest, which takes codes from files, requires a closed vocabulary and takes no `hed` code ([annotations/README.md → Vocabulary registry](../../annotations/README.md#code--standardised-classification)). The registration's `write_meta` returns the pin, which a server-side writer stamps on a code it creates.
 
 Enforcement is at the API, as for every registered vocabulary ([annotations/vocabularies.py](../../annotations/vocabularies.py)).
 
@@ -43,7 +63,7 @@ The picker's terms are not served. eeg-module generates its index from this plug
 
 [frontend/src/plugins/hedscore/](../../frontend/src/plugins/hedscore/) contributes a provider at `modules.eeg.hedScore.policy` in the viewer setup and nothing else; the picker is the viewer's. The viewer calls it when the picker first opens. It answers `null` when the vocabulary listing has no `hed`, which hides the picker, and otherwise the pin and `allowed_branches`; the picker disables itself when the pin is not the release its index was generated from. A project sets its quick palette beside it, as a list of short-form tags at `modules.eeg.hedScore.palette` in its own `extraSetup`, and the two merge.
 
-A picked finding is stored on the viewer event as `codes.hed`. The viewer saves nothing to this server: a project that posts annotations to `/annotations/api/v1/codes` sends the code with `meta` set to the pin, which eeg-module's `hedSchemaMeta(index.schema)` builds.
+A picked finding is stored on the viewer event as `codes.hed`. The viewer saves nothing to this server: a project that saves the event through the annotations API sends the code in the event's inline `codes` with `meta` set to the pin, which eeg-module's `hedSchemaMeta(index.schema)` builds.
 
 ## Verb registry
 

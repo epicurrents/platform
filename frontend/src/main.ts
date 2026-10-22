@@ -8,6 +8,7 @@ import '@awesome.me/webawesome/dist/styles/webawesome.css'
 import icons from './icons'
 import { plugin } from '#projects/active'
 import { plugin as pluginsPlugin } from '#plugins/active'
+import { registerCodeMetaProviders } from '#lib/annotationCodes'
 // WebAwesome components — imported centrally so Vite pre-bundles them all
 // at startup rather than discovering them lazily per-view (which triggers
 // dep re-optimisation on first load and causes a ~3 min hang).
@@ -66,6 +67,9 @@ setBasePath('/node_modules/@awesome.me/webawesome/dist')
 // Register all FA Pro icons as data URIs so wa-icon never makes a network
 // fetch for icon SVGs — every icon is bundled at build time via icons.ts.
 const mergedIcons: Record<string, string> = { ...icons }
+
+// A standard has one owning vocabulary; the project's provider wins over a plugin's for the same standard.
+registerCodeMetaProviders(plugin.codeMeta, pluginsPlugin.codeMeta)
 
 // Base icons win over the active project's, which win over plugins'. First to
 // register a given name keeps it, so iterate base → project → plugins.
