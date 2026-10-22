@@ -89,6 +89,35 @@ class TestPlaceholderValues:
         refuses(value, "text value")
 
 
+class TestComparisons:
+    """The forms the viewer's finding picker writes a bound, an approximation, a range or a dominance in."""
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            "(Epileptiform-interictal-activity, (Greater-than-or-equal-to, Feature-frequency/2 Hz))",
+            "(Epileptiform-interictal-activity, (Less-than-or-equal-to, Feature-frequency/4 Hz))",
+            "(Epileptiform-interictal-activity, (Approximately-equal-to, Feature-frequency/3.5 Hz))",
+            (
+                "(Epileptiform-interictal-activity, (Greater-than-or-equal-to, Feature-frequency/2 Hz),"
+                " (Less-than-or-equal-to, Feature-frequency/3 Hz))"
+            ),
+            "(Posterior-dominant-rhythm, (Approximately-equal-to, Feature-amplitude/40 uV))",
+            "(Epileptiform-interictal-activity, Left, Right, Asymmetrical, (Left, (Greater-than, Right)))",
+            "(Epileptiform-interictal-activity, Left, Right, Symmetrical)",
+            (
+                "(Epileptiform-interictal-activity, Sensor-list/F7;T7;TP7,"
+                " (Sensor-list/T7, (Greater-than, Sensor-list/F7;TP7)))"
+            ),
+        ],
+    )
+    def test_a_compared_number_is_accepted(self, value):
+        accepts(value)
+
+    def test_a_compared_text_value_is_still_refused(self):
+        refuses("(Spike, (Approximately-equal-to, Feature-stopped-by/sleep))", "text value")
+
+
 class TestSensorList:
     @pytest.mark.parametrize("value", ["Sensor-list/Fp1", "Sensor-list/F7;T7;P7", "Sensor-list/Fp1-F7"])
     def test_canonical_labels_are_accepted(self, value):
