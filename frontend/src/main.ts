@@ -150,6 +150,9 @@ createApp(App)
 // is safe there and registers the real worker in the Django-served build.
 
 if ('serviceWorker' in navigator) {
+    // Whether the update was accepted in this tab. Another tab accepting it moves this one to the
+    // new worker too, and that reload must still meet the viewer's guard, since nobody here chose it.
+    let updateAccepted = false
     const updateSW = registerSW({
         immediate: true,
         onNeedRefresh() {
@@ -159,8 +162,24 @@ if ('serviceWorker' in navigator) {
                 ['A new app version is available.', 'Save unfinished work before reloading the app.'],
                 'brand',
                 0,
-                { label: 'Reload', run: () => { void updateSW(true) } },
+                {
+                    label: 'Reload',
+                    run: () => {
+                        updateAccepted = true
+                        void updateSW(true)
+                    },
+                },
             )
+        },
+        onNeedReload() {
+            // The new worker controls the page. An open viewer guards the document against unloading,
+            // and the reload comes after the click rather than from it, so the guard would hold the
+            // page on the old build. The click was the answer to the toast's warning, so the waiver
+            // is taken here, immediately before the reload, as the guard asks.
+            if (updateAccepted) {
+                window.__EPICURRENTS__?.APP?.allowUnload?.()
+            }
+            window.location.reload()
         },
         onRegisteredSW(_swUrl, registration) {
             // Poll for a new deployment so the prompt can surface MID-SESSION, not only
