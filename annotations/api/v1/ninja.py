@@ -47,6 +47,7 @@ from ninja.errors import HttpError
 
 from activity.audit import log_activity
 from annotations import export as annotation_export
+from annotations.codes import replace_codes
 from annotations.models import Annotation, Code, Event, Interruption, Label
 from annotations.redaction import withheld_row_ids
 from annotations.vocabularies import registered_vocabularies, validate_code
@@ -243,34 +244,8 @@ def _inline_codes(codes: dict | None, *, patch: dict | None = None) -> dict | No
 
 
 def _replace_codes(parent, codes: dict) -> None:
-    """Make *parent*'s codes exactly *codes*: one row per standard, changed in place, missing ones deleted.
-
-    Rows are saved one at a time so each change reaches the audit trail through the model signals. Called inside the
-    write's transaction.
-    """
-    content_type = ContentType.objects.get_for_model(type(parent))
-    existing = {
-        code.standard: code for code in Code.objects.filter(content_type=content_type, object_id=str(parent.pk))
-    }
-    for standard, code in existing.items():
-        if standard not in codes:
-            code.delete()
-    for standard, item in codes.items():
-        code = existing.get(standard)
-        if code is None:
-            Code.objects.create(
-                content_type=content_type,
-                object_id=str(parent.pk),
-                standard=standard,
-                value=item.value,
-                meta=item.meta,
-            )
-        elif code.value != item.value or code.meta != item.meta:
-            code.value = item.value
-            code.meta = item.meta
-            code.save()
-    # A prefetched set would serialise the codes as they were before this write.
-    getattr(parent, "_prefetched_objects_cache", {}).pop("codes", None)
+    """Write validated inline *codes* to *parent* through ``annotations.codes.replace_codes``."""
+    replace_codes(parent, {standard: (code.value, code.meta) for standard, code in codes.items()})
 
 
 # ── Serialisers ─────────────────────────────────────────────────────────────

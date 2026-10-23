@@ -21,6 +21,15 @@ function listing (...standards: string[]) {
     mockGet.mockResolvedValue({ data: standards.map(standard => ({ standard })) } as never)
 }
 
+function confinedListing (confined: string[], open: string[]) {
+    mockGet.mockResolvedValue({
+        data: [
+            ...confined.map(standard => ({ confined: true, standard })),
+            ...open.map(standard => ({ confined: false, standard })),
+        ],
+    } as never)
+}
+
 beforeEach(() => {
     mockGet.mockReset()
     resetAnnotationCodes()
@@ -39,6 +48,13 @@ describe('inlineCodes', () => {
     it('leaves out a standard the deployment does not register, and an empty value', async () => {
         listing('hed')
         expect(await inlineCodes({ hed: '', icd10: 'G40.9' })).toEqual({})
+    })
+
+    it('keeps only confined vocabularies when asked, and every registered one otherwise', async () => {
+        confinedListing(['hed'], ['epicurrents.eeg'])
+        const codes = { 'epicurrents.eeg': 'EEG_ACT_EC', hed: 'Spike' }
+        expect(Object.keys(await inlineCodes(codes, { confinedOnly: true }))).toEqual(['hed'])
+        expect(Object.keys(await inlineCodes(codes)).sort()).toEqual(['epicurrents.eeg', 'hed'])
     })
 
     it('asks nothing for an annotation without codes', async () => {

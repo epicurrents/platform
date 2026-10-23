@@ -5,7 +5,8 @@
  * platform. A host that saves an event or a label sends its codes in the write's own `codes`, each with the `meta` its
  * vocabulary pins, which the vocabulary's owner provides through `ViewerPlugin.codeMeta`. A code whose standard the
  * deployment does not register is left out, so one code the deployment cannot validate does not refuse the whole
- * write under the strict vocabulary setting; the server validates every code it is sent.
+ * write under the strict vocabulary setting; the server validates every code it is sent. A writer that accepts only
+ * confined vocabularies, whose values carry no typed text, asks for those alone.
  *
  * @package epicurrents-frontend
  */
@@ -22,7 +23,8 @@ export interface InlineCode {
 }
 
 let providers: Record<string, CodeMetaProvider> = {}
-let registered: Promise<Set<string>> | null = null
+/** Each registered standard, mapped to whether its vocabulary is confined. */
+let registered: Promise<Map<string, boolean>> | null = null
 
 /**
  * Register the `meta` providers of the active project and plugins. The first to name a standard keeps it.
@@ -42,8 +44,8 @@ export function registerCodeMetaProviders (...sources: (Record<string, CodeMetaP
 /** The standards the deployment registers, read once per page and read again after a failed read. */
 function registeredStandards () {
     if (!registered) {
-        registered = http.get<{ standard: string }[]>(VOCABULARIES_URL).then(
-            response => new Set(response.data.map(vocabulary => vocabulary.standard))
+        registered = http.get<{ confined?: boolean, standard: string }[]>(VOCABULARIES_URL).then(
+            response => new Map(response.data.map(vocabulary => [vocabulary.standard, !!vocabulary.confined]))
         )
         registered.catch(() => {
             registered = null
@@ -57,8 +59,12 @@ function registeredStandards () {
  * the `meta` its provider answers, or `null` where none is provided. Rejects when the vocabulary listing or a provider
  * fails, so the caller retries the write rather than saving the annotation without its codes.
  * @param codes - The annotation's codes, keyed by standard.
+ * @param options - `confinedOnly` leaves out every code whose vocabulary is not confined.
  */
-export async function inlineCodes (codes: Record<string, number | string> | null | undefined) {
+export async function inlineCodes (
+    codes: Record<string, number | string> | null | undefined,
+    options: { confinedOnly?: boolean } = {},
+) {
     const inline: Record<string, InlineCode> = {}
     const entries = Object.entries(codes ?? {}).filter(([, value]) => value !== '' && value !== null)
     if (!entries.length) {
@@ -66,7 +72,8 @@ export async function inlineCodes (codes: Record<string, number | string> | null
     }
     const standards = await registeredStandards()
     for (const [standard, value] of entries) {
-        if (!standards.has(standard)) {
+        const confined = standards.get(standard)
+        if (confined === undefined || (options.confinedOnly && !confined)) {
             continue
         }
         const provider = providers[standard]

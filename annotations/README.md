@@ -257,6 +257,7 @@ All four use `annotation_hash(recording, suffix)` from [recordings/event_transla
 |---|---|
 | Attach project-specific labels/scores to annotations | Use `Code` with `standard = "epicurrents.<project>.<concept>"`. Wrap the interaction in a project API endpoint that hides the `standard` string. |
 | Register a coding-standard vocabulary | `register_vocabulary(standard, label=..., validator=..., version=..., term_name=..., closed=..., confined=..., write_meta=...)` from [vocabularies.py](vocabularies.py) in the owning `AppConfig.ready()`. |
+| Write an annotation's codes from a project endpoint | `replace_codes(parent, {standard: (value, meta)})` from [codes.py](codes.py), inside the write's transaction, after the endpoint has decided which codes it accepts; it validates nothing. The core API's inline `codes` go through it, so the rows and their audit trail are the same on either path. |
 | Annotate project models | Project models can be annotation targets without any registration — the generic FK accepts any `(content_type, object_id)` pair. Just pass the model's content type ID to the create endpoint. |
 | Make a project model annotatable through the viewer UI | Frontend concern — see the viewer's `DatabaseAPIConnector` setup. |
 
