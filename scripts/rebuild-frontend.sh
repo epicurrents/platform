@@ -4,7 +4,7 @@
 # Usage:
 #   ./scripts/rebuild-frontend.sh             — assume viewer dist/ is current, build platform only
 #   ./scripts/rebuild-frontend.sh --viewer    — also rebuild the viewer's per-workspace dist outputs
-#                                                via `npm run build:tsc-all` (~1–2 min) and the builder
+#                                                via `npm run build:tsc-all` (~1–2 min), the interface bundle and the builder
 #                                                edition from the checkout. Needed after a clean clone
 #                                                or any change to viewer source. Without it the edition
 #                                                stays as the pinned release left it.
@@ -45,6 +45,13 @@ if [ "$REBUILD_VIEWER" = true ]; then
     cd frontend/viewer
     npm run build:tsc-all
     ok "Viewer tsc outputs current"
+
+    # The interface has no build:tsc, so build:tsc-all skips it, and the builder edition reads it
+    # through its package exports — the vite bundle under interface/dist, not its source. Without
+    # this the edition keeps whatever interface was last bundled, however recent the checkout.
+    info "Rebuilding the viewer interface bundle"
+    ( cd interface && npm run build )
+    ok "interface/dist current"
 
     info "Rebuilding pyodide-service worker bundle (webpack umd + copy:scripts)"
     ( cd epicurrents/pyodide-service && npm run build )
