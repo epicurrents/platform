@@ -215,12 +215,15 @@ class Code(models.Model):
 
 
 class Event(AnnotationBase):
-    """Time-stamped event annotation with optional name, duration, and value."""
+    """Time-stamped event annotation with optional name, duration, and value.
+
+    The name is empty for an event its codes name, such as a finding coded and given no label of its own.
+    """
 
     def __str__(self) -> str:
         return f"Event({self.object_hash} name={self.name!r} t={self.timestamp})"
 
-    name = models.CharField(max_length=255)
+    name = models.CharField(max_length=255, blank=True, default="")
     timestamp = models.FloatField()
     duration = models.FloatField(null=True, blank=True)
     value = models.JSONField(null=True, blank=True)

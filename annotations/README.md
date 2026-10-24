@@ -11,7 +11,7 @@ All four extend the abstract `AnnotationBase`, which provides the generic FK tar
 | Type | Purpose | Type-specific fields |
 |---|---|---|
 | `Annotation` | Free-form structured note bundling arbitrary JSON content. The "everything else" type — use when none of the others fit. | `name`, `content` (JSONField) |
-| `Event` | Time-stamped event at a specific position in a signal. Optional duration (point-in-time when null). | `name`, `timestamp`, `duration?`, `value?`, `event_class` (project-write-only: absent from the core `EventIn` / `EventPatch` schemas, written by project endpoints and read by export) |
+| `Event` | Time-stamped event at a specific position in a signal. Optional duration (point-in-time when null). | `name` (may be empty, for an event its codes name), `timestamp`, `duration?`, `value?`, `event_class` (project-write-only: absent from the core `EventIn` / `EventPatch` schemas, written by project endpoints and read by export) |
 | `Interruption` | Signal interruption / gap in a recording. | `timestamp`, `duration` |
 | `Label` | Named label with optional structured value. Distinct from `Event` in that it's not necessarily time-positioned. | `name`, `value?` |
 
@@ -54,7 +54,7 @@ List endpoints accept `target_content_type_id` + `target_object_id` (required) a
 
 `GET /content-types` returns the available `(app_label, model, id)` triples for use as `target_content_type_id`. Filterable by `app_label` / `model`.
 
-An event, interruption or label write takes its codes inline as `codes`, an object keyed by standard whose entries are `{value, meta}`. Each is validated against its vocabulary before anything is written, and the first refusal answers 422 naming the standard. On a create the codes are written with the row; on a patch a `codes` object replaces the row's set, `{}` clears it, an absent key leaves it and an explicit `null` is refused. This is how a client attaches codes: the `/codes/` endpoints name their parent by its primary key, which no response carries.
+An event, interruption or label write takes its codes inline as `codes`, an object keyed by standard whose entries are `{value, meta}`. Each is validated against its vocabulary before anything is written, and the first refusal answers 422 naming the standard. On a create the codes are written with the row; on a patch a `codes` object replaces the row's set, `{}` clears it, an absent key leaves it and an explicit `null` is refused. This is how a client attaches codes: the `/codes/` endpoints name their parent by its primary key, which no response carries. A write the model's own validation refuses, such as a label without a name, answers 422 with the model's message per field.
 
 `GET /vocabularies` lists the registered coding standards as `{standard, label, version, closed, confined}`, so a client renders an editor only for a standard the deployment validates. Any authenticated caller may read it; it writes an `annotations.vocabulary.list` row with the count.
 

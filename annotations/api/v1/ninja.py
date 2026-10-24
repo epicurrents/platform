@@ -38,6 +38,7 @@ import json
 
 from django.conf import settings
 from django.contrib.contenttypes.models import ContentType
+from django.core.exceptions import ValidationError
 from django.db import transaction
 from django.http import HttpResponse
 from django.utils import timezone
@@ -216,6 +217,15 @@ def _resolve_codeable_parent_or_400(content_type_id: int, object_id: str):
 
 #: ``Code.standard`` is a ``CharField`` of this length; a longer key would reach the database as a 500.
 _STANDARD_MAX_LENGTH = Code._meta.get_field("standard").max_length
+
+
+def _full_clean(instance) -> None:
+    """Validate *instance* against its model, answering 422 with the model's messages rather than raising a 500."""
+    try:
+        instance.full_clean()
+    except ValidationError as exc:
+        detail = "; ".join(f"{field}: {' '.join(messages)}" for field, messages in exc.message_dict.items())
+        raise HttpError(422, detail) from exc
 
 
 def _inline_codes(codes: dict | None, *, patch: dict | None = None) -> dict | None:
@@ -577,7 +587,7 @@ def create_annotation(request, payload: AnnotationIn):
         content=payload.content,
     )
     with transaction.atomic():
-        annotation.full_clean()
+        _full_clean(annotation)
         annotation.save()
         log_activity(verb="annotations.annotation.create", target=annotation)
     return _serialize_annotation(annotation, withhold_text=False)
@@ -602,7 +612,7 @@ def update_annotation(request, object_hash: str, payload: AnnotationPatch):
         setattr(annotation, field_name, field_value)
 
     with transaction.atomic():
-        annotation.full_clean()
+        _full_clean(annotation)
         annotation.save()
         log_activity(
             verb="annotations.annotation.update",
@@ -702,7 +712,7 @@ def create_event(request, payload: EventIn):
         value=payload.value,
     )
     with transaction.atomic():
-        event.full_clean()
+        _full_clean(event)
         event.save()
         if codes:
             _replace_codes(event, codes)
@@ -730,7 +740,7 @@ def update_event(request, object_hash: str, payload: EventPatch):
         setattr(event, field_name, field_value)
 
     with transaction.atomic():
-        event.full_clean()
+        _full_clean(event)
         event.save()
         if codes is not None:
             _replace_codes(event, codes)
@@ -831,7 +841,7 @@ def create_interruption(request, payload: InterruptionIn):
         duration=payload.duration,
     )
     with transaction.atomic():
-        interruption.full_clean()
+        _full_clean(interruption)
         interruption.save()
         if codes:
             _replace_codes(interruption, codes)
@@ -859,7 +869,7 @@ def update_interruption(request, object_hash: str, payload: InterruptionPatch):
         setattr(interruption, field_name, field_value)
 
     with transaction.atomic():
-        interruption.full_clean()
+        _full_clean(interruption)
         interruption.save()
         if codes is not None:
             _replace_codes(interruption, codes)
@@ -958,7 +968,7 @@ def create_label(request, payload: LabelIn):
         value=payload.value,
     )
     with transaction.atomic():
-        label.full_clean()
+        _full_clean(label)
         label.save()
         if codes:
             _replace_codes(label, codes)
@@ -986,7 +996,7 @@ def update_label(request, object_hash: str, payload: LabelPatch):
         setattr(label, field_name, field_value)
 
     with transaction.atomic():
-        label.full_clean()
+        _full_clean(label)
         label.save()
         if codes is not None:
             _replace_codes(label, codes)
