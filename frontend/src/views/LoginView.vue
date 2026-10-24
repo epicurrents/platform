@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { onMounted, reactive, ref } from 'vue'
+import { nextTick, onMounted, reactive, ref, watch } from 'vue'
 import { useRouter, useRoute } from 'vue-router'
 import axios from 'axios'
 import { t } from '#i18n'
@@ -31,6 +31,25 @@ const resetMessage = ref<string | null>(null)
 const resetRateLimited = ref(false)
 
 const oidcProviders = ref<OIDCProvider[]>([])
+
+// Rendered by exactly one of the two code prompts at a time, so one ref serves both.
+const codeInput = ref<HTMLElement | null>(null)
+
+/**
+ * Put the cursor in the code input. An authenticator code is valid for seconds, so the prompt should not cost a
+ * click. wa-input ignores the autofocus attribute when its host is mounted through v-if, so focus is moved once Vue
+ * has flushed the new node.
+ */
+async function focusCodeInput () {
+    await nextTick()
+    codeInput.value?.focus()
+}
+
+watch(mode, (next) => {
+    if (next === 'twofactor' || next === 'enrol') {
+        focusCodeInput()
+    }
+})
 
 onMounted(async () => {
     // Don't present the sign-in form to a visitor who already holds a valid session
@@ -139,6 +158,7 @@ async function submitCode () {
             error.value = t('Too many incorrect codes. Please wait a few minutes and sign in again.', SCOPE)
         } else {
             error.value = t('That code was not accepted. Check your authenticator and try again.', SCOPE)
+            focusCodeInput()
         }
     } finally {
         loading.value = false
@@ -213,6 +233,7 @@ function toggleForgot () {
             <wa-input
                 autocomplete="one-time-code"
                 :label="t('Code from your authenticator', SCOPE)"
+                ref="codeInput"
                 required
                 size="s"
                 type="text"
@@ -258,6 +279,7 @@ function toggleForgot () {
             <wa-input
                 autocomplete="one-time-code"
                 :label="t('Verification code', SCOPE)"
+                ref="codeInput"
                 required
                 size="s"
                 type="text"
