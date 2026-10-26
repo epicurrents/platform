@@ -27,6 +27,10 @@ const here = fileURLToPath(new URL('.', import.meta.url))
  */
 export function buildAliases(project?: string): Record<string, string> {
     return {
+        // The viewer interface's detachable window, compiled from source: it is the one piece of the interface
+        // the SPA renders itself, and it shares the viewer's single window slot through a global, so the two
+        // bundles carrying it still show one window at a time.
+        '@epicurrents/interface/window': resolve(here, './viewer/interface/src/app/windows/index.ts'),
         // The viewer's scoped-event-log, so project code firing user-facing
         // announcements goes through the same Log pipeline the viewer's
         // App.vue listens on.

@@ -29,6 +29,8 @@
        * themselves are type-only, so no bundler alias is needed alongside these. */
       "@epicurrents/interface": ["./viewer/interface/dist/setups/index"],
       "@epicurrents/interface/modules/*": ["./viewer/interface/dist/app/modules/*/index"],
+      /* The detachable window is compiled from source (build-aliases.ts), so it is checked from source too. */
+      "@epicurrents/interface/window": ["./viewer/interface/src/app/windows/index"],
       /* Viewer utility packages (workspace siblings of epicurrents/*). */
       "scoped-event-bus/*": ["./viewer/util/scoped-event-bus/*"],
       "scoped-event-log": ["./viewer/util/scoped-event-log/dist/index"],
