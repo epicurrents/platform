@@ -3137,6 +3137,9 @@ class SubmissionProfileOut(Schema):
     durations_seconds: list[float]
     required_sidecar_keys: list[str]
     forbidden_sidecar_keys: list[str]
+    min_recording_age_months: int | None
+    # The exact value a contributor's sidecar carries under ``attestation``; null where the profile sets no embargo.
+    attestation: dict | None
 
 
 class SubmissionPoolOut(Schema):

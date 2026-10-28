@@ -35,6 +35,8 @@ function makeProfile(overrides: Partial<SubmissionProfile> = {}): SubmissionProf
         durations_seconds: [10, 20],
         required_sidecar_keys: ['recording_sha256'],
         forbidden_sidecar_keys: ['subject', 'text'],
+        min_recording_age_months: null,
+        attestation: null,
         ...overrides,
     }
 }

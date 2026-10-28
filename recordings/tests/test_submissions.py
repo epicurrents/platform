@@ -14,7 +14,7 @@ from __future__ import annotations
 import hashlib
 import itertools
 import json
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -40,14 +40,17 @@ from recordings.submissions import (
     BLANK_RECORDING,
     BLANK_START_DATE,
     BLANK_START_TIME,
+    ATTESTATION_KEY,
     DEFAULT_FORBIDDEN_SIDECAR_KEYS,
     IngestProfile,
     PoolUnavailable,
     SubmissionRefused,
     Violation,
     accept_submission,
+    attestation,
     can_submit_to_dataset,
     get_ingest_profile,
+    months_after,
     parse_sidecar,
     public_profile,
     register_ingest_profile,
@@ -467,6 +470,8 @@ class TestPoolEndpoints:
             "durations_seconds": [2.0],
             "required_sidecar_keys": ["recording_sha256", "profile_version"],
             "forbidden_sidecar_keys": sorted(DEFAULT_FORBIDDEN_SIDECAR_KEYS),
+            "min_recording_age_months": None,
+            "attestation": None,
         }
         activity = Activity.objects.filter(verb="recordings.submission.pool.list").latest("pk")
         assert activity.metadata == {"returned_count": 1}
@@ -1235,6 +1240,70 @@ class TestReleaseConditions:
     def test_k_and_m_are_not_published_to_contributors(self):
         published = public_profile(_profile(k=5, m=2))
         assert "k" not in published and "m" not in published
+
+
+class TestEmbargo:
+    ATTESTED = {"min_recording_age_months": 12, "source_not_on_platform": True}
+
+    def _codes(self, value=ATTESTED, *, server_built=False, omit=False) -> set[str]:
+        data = _edf()
+        sidecar = _sidecar(data) if omit else _sidecar(data, **{ATTESTATION_KEY: value})
+        return _codes(validate_sidecar(_profile(min_recording_age_months=12), sidecar, data, server_built=server_built))
+
+    def test_the_attestation_of_the_profiles_embargo_passes(self):
+        assert self._codes() == set()
+
+    def test_a_sidecar_without_it_is_refused(self):
+        assert self._codes(omit=True) == {"sidecar_attestation"}
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            {"min_recording_age_months": 24, "source_not_on_platform": True},
+            {"min_recording_age_months": 12, "source_not_on_platform": False},
+            {"min_recording_age_months": 12.0, "source_not_on_platform": True},
+            {"min_recording_age_months": 12, "source_not_on_platform": 1},
+            {"min_recording_age_months": 12},
+            {**ATTESTED, "centre": "x"},
+            True,
+            "12",
+        ],
+        ids=["longer", "false", "float", "one-for-true", "no-statement", "extra-key", "bool", "string"],
+    )
+    def test_anything_but_the_exact_value_is_refused(self, value):
+        # A value the contributor could vary would mark the files of whoever varies it.
+        assert self._codes(value) == {"sidecar_attestation"}
+
+    def test_a_sidecar_the_server_builds_needs_none(self):
+        assert self._codes(omit=True, server_built=True) == set()
+
+    def test_a_profile_without_an_embargo_asks_for_none(self):
+        data = _edf()
+        assert validate_sidecar(_profile(), _sidecar(data), data) == []
+        assert attestation(_profile()) is None
+
+    def test_the_published_profile_names_the_key_and_the_value(self):
+        published = public_profile(_profile(min_recording_age_months=12))
+        assert published["required_sidecar_keys"] == ["recording_sha256", ATTESTATION_KEY, "profile_version"]
+        assert published["min_recording_age_months"] == 12
+        assert published["attestation"] == self.ATTESTED
+
+    @pytest.mark.parametrize("value", [0, -1, 1.5, True, "12"])
+    def test_an_embargo_that_is_not_a_positive_integer_is_refused(self, value):
+        with pytest.raises(ValueError, match="positive integer"):
+            register_ingest_profile(_profile(min_recording_age_months=value))
+
+    @pytest.mark.parametrize(
+        ("moment", "months", "expected"),
+        [
+            (datetime(2026, 10, 28, 12, tzinfo=UTC), 12, datetime(2027, 10, 28, 12, tzinfo=UTC)),
+            (datetime(2026, 1, 31, tzinfo=UTC), 1, datetime(2026, 2, 28, tzinfo=UTC)),
+            (datetime(2026, 11, 30, tzinfo=UTC), 3, datetime(2027, 2, 28, tzinfo=UTC)),
+            (datetime(2027, 12, 15, tzinfo=UTC), 26, datetime(2030, 2, 15, tzinfo=UTC)),
+        ],
+    )
+    def test_months_are_calendar_months(self, moment, months, expected):
+        assert months_after(moment, months) == expected
 
 
 # ---------------------------------------------------------------------------

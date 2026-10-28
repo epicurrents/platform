@@ -6,7 +6,7 @@ bytes that might identify someone from being written anywhere. Every check in
 :func:`validate_file` and :func:`validate_sidecar` is a fingerprint or an identifier the profile
 promised is absent: blanked identification fields as the de-identifier writes them, no
 annotation channel, the channel set and order, the rate, ranges, length, the forbidden sidecar
-keys and the declared hash. Dropping one, or letting a failing check repair the file instead of
+keys, the declared hash and the embargo attestation. Dropping one, or letting a failing check repair the file instead of
 refusing it, admits the site's or the vendor's signature into the pool with every locally
 written test still green. The accept path is the other half: :func:`accept_submission` runs the
 gate before any write, so a refused submission writes no row and no file, and a file the server
@@ -30,8 +30,9 @@ The split is deliberate. The platform owns the checks any pooled dataset needs, 
 that read the EDF header and the sidecar's shape: identification fields blanked exactly
 as the platform's own de-identifier writes them, no annotation channel, the channel set
 and order, the sampling rate, the physical and digital ranges, the length on one of the
-fixed durations, forbidden sidecar keys refused rather than dropped, and the declared hash
-equal to the received bytes. The project owns the profile's values, whatever the sidecar
+fixed durations, forbidden sidecar keys refused rather than dropped, the declared hash
+equal to the received bytes, and the contributor's attestation of the profile's
+embargo. The project owns the profile's values, whatever the sidecar
 must say beyond its shape (``validate_sidecar``) and what happens to the sidecar once the
 recording exists (``ingest``). A deployment that registers no profile has no submission
 path; its upload endpoint and bulk import are untouched.
@@ -44,9 +45,11 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import calendar
 import math
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -81,6 +84,17 @@ DEFAULT_FORBIDDEN_SIDECAR_KEYS: tuple[str, ...] = (
 )
 
 DECLARED_HASH_KEY = "recording_sha256"
+
+#: The sidecar key carrying a contributor's attestation, required where the profile sets an embargo.
+ATTESTATION_KEY = "attestation"
+
+#: The statement, inside the attestation, that the recording the file was exported from is not held on the platform.
+#: An attributed whole beside its excerpt is matchable by content, and the platform cannot check the statement
+#: without making that match.
+SOURCE_NOT_HELD_KEY = "source_not_on_platform"
+
+#: The attested embargo, inside the attestation: the profile's ``min_recording_age_months``, repeated.
+EMBARGO_KEY = "min_recording_age_months"
 
 #: The deepest nesting a sidecar may have. The viewer's sidecar is a few levels deep; a document
 #: nested far past that is not one, and the gate's walk over it would exhaust the stack.
@@ -119,6 +133,11 @@ class IngestProfile:
     keys accepted only in a sidecar the server builds for a file it already holds, never in one a contributor sent,
     so what a project derives from such a key can be trusted to have come from the platform's own records.
 
+    ``min_recording_age_months`` is the embargo: the least time between a recording's acquisition and its export.
+    The platform never sees the acquisition date, so a contributor attests it, with the statement that the source is
+    not held on the platform, in the sidecar's :data:`ATTESTATION_KEY` (see :func:`attestation`). A sidecar the
+    server builds carries none, and the caller of :func:`accept_submission` dates the file instead.
+
     ``k`` and ``m`` are the pool's release conditions. ``k`` is the smallest equivalence class a release run publishes
     from, applied by the project's selector (``library.release.select_by_class_size``); ``m`` is the number of active
     members the pool's contributor group must have before intake opens (``library.pools.set_intake``). ``m`` is a
@@ -146,6 +165,7 @@ class IngestProfile:
     k: int | None = None
     m: int | None = None
     approvals: int | None = None
+    min_recording_age_months: int | None = None
 
     @property
     def all_forbidden_sidecar_keys(self) -> frozenset[str]:
@@ -169,12 +189,13 @@ def register_ingest_profile(profile: IngestProfile) -> None:
     to do so repeatedly.
 
     A profile naming a channel no file can carry is refused here, at boot, rather than by
-    refusing every submission later: see :func:`unsatisfiable_channels`. So is a ``k``, ``m`` or
-    ``approvals`` that is not a positive integer, which no release run or intake check could apply.
+    refusing every submission later: see :func:`unsatisfiable_channels`. So is a ``k``, ``m``,
+    ``approvals`` or ``min_recording_age_months`` that is not a positive integer, which no release run, intake check
+    or attestation could apply.
     """
     if not profile.key or not profile.key.replace("_", "").replace("-", "").replace(".", "").isalnum():
         raise ValueError(f"Ingest profile key {profile.key!r} must be a non-empty identifier.")
-    for name in ("k", "m", "approvals"):
+    for name in ("k", "m", "approvals", "min_recording_age_months"):
         value = getattr(profile, name)
         if value is not None and (isinstance(value, bool) or not isinstance(value, int) or value < 1):
             raise ValueError(f"Ingest profile {profile.key!r} has {name}={value!r}; it must be a positive integer.")
@@ -185,6 +206,24 @@ def register_ingest_profile(profile: IngestProfile) -> None:
             f"an EDF label (at most 16 printable ASCII characters) and be the label the platform resolves it to."
         )
     _PROFILES[profile.key] = profile
+
+
+def attestation(profile: IngestProfile) -> dict[str, Any] | None:
+    """The value a contributor's sidecar must carry under :data:`ATTESTATION_KEY`, or ``None`` with no embargo.
+
+    One value per profile, compared exactly: anything a contributor could vary, an extra key or a longer embargo
+    than asked, would be a mark of its origin.
+    """
+    if profile.min_recording_age_months is None:
+        return None
+    return {EMBARGO_KEY: profile.min_recording_age_months, SOURCE_NOT_HELD_KEY: True}
+
+
+def months_after(moment: datetime, months: int) -> datetime:
+    """*moment* moved *months* calendar months on, the day clamped to the end of a shorter month."""
+    index = moment.month - 1 + months
+    year, month = moment.year + index // 12, index % 12 + 1
+    return moment.replace(year=year, month=month, day=min(moment.day, calendar.monthrange(year, month)[1]))
 
 
 def get_ingest_profile(key: str) -> IngestProfile | None:
@@ -237,8 +276,9 @@ def public_profile(profile: IngestProfile) -> dict[str, Any]:
     """What a contributor's preparation tool needs to produce a file the gate accepts.
 
     Every value the platform checks, with the forbidden sidecar keys in full (the defaults and the
-    profile's own) and the name of the declared-hash key. ``validate_sidecar`` and ``ingest`` are
-    code and are not published; the gate still runs the former on every submission.
+    profile's own), the name of the declared-hash key, and the embargo with the attestation that confirms it.
+    ``validate_sidecar`` and ``ingest`` are code and are not published; the gate still runs the former on every
+    submission.
     """
     return {
         "key": profile.key,
@@ -250,8 +290,14 @@ def public_profile(profile: IngestProfile) -> dict[str, Any]:
         "digital_min": profile.digital_min,
         "digital_max": profile.digital_max,
         "durations_seconds": list(profile.durations_seconds),
-        "required_sidecar_keys": [DECLARED_HASH_KEY, *profile.required_sidecar_keys],
+        "required_sidecar_keys": [
+            DECLARED_HASH_KEY,
+            *([ATTESTATION_KEY] if profile.min_recording_age_months is not None else []),
+            *profile.required_sidecar_keys,
+        ],
         "forbidden_sidecar_keys": sorted(profile.all_forbidden_sidecar_keys),
+        "min_recording_age_months": profile.min_recording_age_months,
+        "attestation": attestation(profile),
     }
 
 
@@ -438,7 +484,8 @@ def validate_sidecar(
     """Check the sidecar's shape, its forbidden keys and its declared hash, then ask the profile.
 
     The profile's ``server_sidecar_keys`` are refused unless *server_built*, which only :func:`accept_submission`
-    sets, for a held copy.
+    sets, for a held copy. The embargo attestation is required unless *server_built*: the server attests nothing, and
+    dates the file instead.
     """
     if not isinstance(sidecar, dict):
         return [Violation("sidecar_shape", "The sidecar must be a JSON object.")]
@@ -466,6 +513,15 @@ def validate_sidecar(
     for key in (DECLARED_HASH_KEY, *profile.required_sidecar_keys):
         if key not in sidecar:
             violations.append(Violation("sidecar_missing_key", f"The sidecar lacks the required key {key!r}."))
+    expected = attestation(profile)
+    if expected is not None and not server_built and not _same_json(sidecar.get(ATTESTATION_KEY), expected):
+        violations.append(
+            Violation(
+                "sidecar_attestation",
+                f"The sidecar must attest that the recording is at least {profile.min_recording_age_months} months "
+                f"old and that its source is not held on the platform.",
+            )
+        )
     declared = sidecar.get(DECLARED_HASH_KEY)
     if isinstance(declared, str) and DECLARED_HASH_KEY in sidecar:
         if declared.strip().lower() != hashlib.sha256(data).hexdigest():
@@ -487,6 +543,18 @@ def validate_sidecar(
             answered = [Violation("sidecar_profile", "The pool's sidecar check could not read this sidecar.")]
         violations.extend(answered)
     return violations
+
+
+def _same_json(value: Any, expected: Any) -> bool:
+    """Whether *value* equals *expected* with the JSON types kept apart, which Python's ``==`` does not: ``True`` is
+    ``1`` and ``12.0`` is ``12`` to it."""
+    if isinstance(expected, dict):
+        return (
+            isinstance(value, dict)
+            and value.keys() == expected.keys()
+            and all(_same_json(value[key], expected[key]) for key in expected)
+        )
+    return type(value) is type(expected) and value == expected
 
 
 def validate_submission(

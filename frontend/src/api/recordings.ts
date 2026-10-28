@@ -183,6 +183,13 @@ export interface SubmissionProfile {
     required_sidecar_keys: string[]
     /** Keys refused anywhere in the sidecar, at any depth. */
     forbidden_sidecar_keys: string[]
+    /** The embargo: the least age of a recording at export, in months, which the contributor attests. */
+    min_recording_age_months: number | null
+    /**
+     * The exact value the sidecar carries under `attestation`, added once the person has confirmed it; null where the
+     * profile sets no embargo.
+     */
+    attestation: Record<string, unknown> | null
 }
 
 /** An open pool the caller may submit to, with the profile a file is prepared against. */

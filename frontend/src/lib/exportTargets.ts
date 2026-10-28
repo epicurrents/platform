@@ -77,6 +77,9 @@ export function violationText(violation: SubmissionViolation): string {
         case 'sampling_rate': {
             return t('The sampling rate differs from the one the pool asks for.', SCOPE)
         }
+        case 'sidecar_attestation': {
+            return t('The pool needs the recording\'s age and its absence from the platform confirmed.', SCOPE)
+        }
         case 'sidecar_forbidden_key': {
             return t('The sidecar carries a key the pool forbids.', SCOPE)
         }
