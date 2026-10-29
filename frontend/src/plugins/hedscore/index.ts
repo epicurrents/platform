@@ -1,5 +1,6 @@
 import type { ViewerPlugin } from '../types'
-import { getHedScorePolicy, hedCodeMeta } from './api'
+import { getHedScorePolicy } from './api'
+import { hedCodeMeta } from './codeMeta'
 
 /**
  * Viewer plugin for the *hedscore* plugin (findings coded in HED-SCORE).

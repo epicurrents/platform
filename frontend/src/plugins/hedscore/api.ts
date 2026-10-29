@@ -4,7 +4,8 @@
  * The picker ships its own terms; what the server says is which of them it accepts. Two reads answer that: the core
  * vocabulary listing says whether `hed` is registered at all, and the plugin's policy endpoint names the schema
  * release the validator pins and the branches it accepts. The `meta` a saved code carries comes from the client's own
- * index instead.
+ * index instead, in `codeMeta.ts`, which this module does not import: the index is viewer build output, and a module
+ * that names it cannot be loaded where the viewer is not built.
  */
 
 import type { HedScorePolicy } from '@epicurrents/interface/modules/eeg'
@@ -51,15 +52,4 @@ export async function getHedScorePolicy (): Promise<HedScorePolicy | null> {
             withStandard: data.with_standard,
         },
     }
-}
-
-/**
- * The `meta` a `hed` code is sent with: the schema release of the term index the picker coded from. Taken from the
- * index rather than from the policy, so a client whose index is a different release than the server's pin is refused
- * rather than stamping the server's release on terms it did not check against. The index is imported on the first
- * call only.
- */
-export async function hedCodeMeta () {
-    const { hedSchemaMeta, loadHedScoreIndex } = await import('#root/viewer/epicurrents/eeg-module/dist/hed/index.js')
-    return hedSchemaMeta((await loadHedScoreIndex()).schema)
 }
