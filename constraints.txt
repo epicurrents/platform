@@ -1,9 +1,12 @@
 # Minimum-version constraints for transitive dependencies with known CVEs.
 # Constraints never install anything; they only bound the resolver when a
 # listed package is pulled in by something else. Sourced from the
-# 2026-07-18 security sweep (pip-audit in CI).
+# 2026-07-18 and 2026-10-29 security sweeps (pip-audit in CI).
 cryptography>=50.0.0
-urllib3>=2.7.0
-aiohttp>=3.14.3
+urllib3>=2.8.0
+aiohttp>=3.14.4
+multidict>=6.9.1
+certifi>=2026.10.19
+pillow>=13.0.0
 idna>=3.18
 pytest>=9.1.1
