@@ -1,6 +1,6 @@
 """Management command — vendor the self-hosted Pyodide runtime and its wheel closure.
 
-Populates the tree that ``settings.PUBLIC_VIEWER_MODES["public"]["setup"]["pyodideAssetPath"]``
+Populates the tree that ``settings.PYODIDE_ASSET_PATH``
 points at, served by ``epicurrents.views.vendor_view``. Without it the viewer's Python
 interpreter cannot start: the worker dynamic-imports ``<path>/pyodide.mjs`` and every
 package resolves from that folder's ``pyodide-lock.json``.
@@ -83,7 +83,7 @@ UPSTREAM_INDEX_TEMPLATE = "https://cdn.jsdelivr.net/pyodide/v{version}/full/"
 
 PYPI_JSON = "https://pypi.org/pypi/{name}/json"
 
-#: The version lives in ``PUBLIC_VIEWER_MODES`` and in the two frontend entry points that
+#: The version lives in ``PYODIDE_ASSET_PATH`` and in the two frontend entry points that
 #: seed the viewer SETUP. This command reads the settings value rather than carrying a
 #: fourth copy, and checks the frontend files agree.
 FRONTEND_VERSION_SITES = (
@@ -106,7 +106,7 @@ class Command(BaseCommand):
         parser.add_argument(
             "--pyodide-version",
             default=None,
-            help="Pyodide version to vendor (default: parsed from the configured pyodideAssetPath).",
+            help="Pyodide version to vendor (default: parsed from PYODIDE_ASSET_PATH).",
         )
         parser.add_argument(
             "--index-url",
@@ -148,14 +148,14 @@ class Command(BaseCommand):
         self._payloads = {}
         version = options["pyodide_version"] or self._configured_version()
         if version is None:
-            # A deployment whose public viewer mode names no asset path loads Pyodide
-            # from the viewer's default CDN, so there is no tree to vendor or to check.
+            # A deployment with an empty PYODIDE_ASSET_PATH loads Pyodide from the
+            # viewer's default CDN, so there is no tree to vendor or to check.
             # Saying so and exiting cleanly matters more than it looks: update.sh runs
             # this after the services are stopped, so an error here is an update that
             # ends with the stack down.
             self.stdout.write(
-                "No pyodideAssetPath is configured in PUBLIC_VIEWER_MODES; the viewer loads Pyodide from "
-                "its default CDN and there is nothing to vendor."
+                "PYODIDE_ASSET_PATH is empty; the viewer loads Pyodide from its default CDN and there is "
+                "nothing to vendor."
             )
             return
         out_dir = (
@@ -234,27 +234,20 @@ class Command(BaseCommand):
     # -- version resolution ---------------------------------------------------------
 
     def _configured_version(self) -> str | None:
-        """Version named by the public viewer mode's ``pyodideAssetPath``.
+        """Version named by ``PYODIDE_ASSET_PATH``.
 
-        ``None`` when no mode names a path at all — that deployment vendors nothing. A
-        path that is present but does not carry a version is an error rather than a
-        no-op, because it means the setting was written and cannot be acted on.
+        ``None`` when the setting is empty — that deployment vendors nothing. A path that
+        is present but does not carry a version is an error rather than a no-op, because
+        it means the setting was written and cannot be acted on.
         """
-        modes = getattr(settings, "PUBLIC_VIEWER_MODES", {}) or {}
-        configured = False
-        for mode in modes.values():
-            path = (mode.get("setup") or {}).get("pyodideAssetPath") or ""
-            if not path:
-                continue
-            configured = True
-            found = _VERSION_IN_PATH.search(path)
-            if found:
-                return found.group("version")
-        if not configured:
+        path = getattr(settings, "PYODIDE_ASSET_PATH", "") or ""
+        if not path:
             return None
+        found = _VERSION_IN_PATH.search(path)
+        if found:
+            return found.group("version")
         raise CommandError(
-            "No pyodideAssetPath of the form /vendor/pyodide/<version>/ is configured in "
-            "PUBLIC_VIEWER_MODES; pass --pyodide-version explicitly."
+            "PYODIDE_ASSET_PATH is not of the form /vendor/pyodide/<version>/; pass --pyodide-version explicitly."
         )
 
     def _warn_on_frontend_drift(self, version: str) -> None:

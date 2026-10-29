@@ -116,8 +116,8 @@ describe('publicSetup', () => {
             expect(setup.useSAB).toBe(false)
         })
 
-        // Three of these stay in PUBLIC_VIEWER_MODES (assetPath is derived by the view, and
-        // vendor_pyodide reads the version back out of pyodideAssetPath). The other two are
+        // Three of these stay on the Python side (assetPath is derived by the view, and
+        // pyodideAssetPath comes from the setting vendor_pyodide reads). The other two are
         // resolved by the viewer whatever the page says, so writing them here would be inert
         // config that reads as if it worked.
         it('invents no value for keys it does not own', async () => {

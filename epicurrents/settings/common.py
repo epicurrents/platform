@@ -559,16 +559,20 @@ PUBLIC_VIEWER_MODES = {
             # agree and this is the half a mode can change. ``assetPath`` is not
             # here: it is always ``lib_path`` and ``public_viewer_view`` derives it.
             "containerId": "viewer",
-            # Serve Pyodide's runtime from our own origin instead of the jsdelivr
-            # CDN (the viewer's default), so the installed app's compute works
-            # offline and is cacheable by the service worker. The version-pinned
-            # "full" distribution is vendored at this path at deploy time, and
-            # ``manage.py vendor_pyodide`` reads the version back out of this value
-            # — which is why it stays here rather than moving into the script.
-            "pyodideAssetPath": "/vendor/pyodide/314.0.2/",
         },
     },
 }
+
+# Serve Pyodide's runtime from our own origin instead of the jsdelivr CDN (the
+# viewer's default), so the viewer's compute works offline, is cacheable by the
+# service worker and loads under the production CSP. The version-pinned
+# distribution is vendored at this path at deploy time, and ``manage.py
+# vendor_pyodide`` reads the version back out of this value. It is a setting of
+# its own rather than a key of a viewer mode because the SPA loads the same tree
+# whatever the modes say: ``public_viewer_view`` adds it to every mode's setup, so
+# a project redefining a mode cannot drop it and leave the deployment unvendored.
+# Empty means the viewer loads Pyodide from its CDN and nothing is vendored.
+PYODIDE_ASSET_PATH = "/vendor/pyodide/314.0.2/"
 
 # Content-Security-Policy + Permissions-Policy, emitted by
 # ``epicurrents.middleware.SecurityHeadersMiddleware``. Empty by default so

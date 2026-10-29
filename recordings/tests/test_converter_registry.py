@@ -9,6 +9,7 @@ the platform does not ship — so the agreement is the thing worth testing, not 
 
 from __future__ import annotations
 
+import shutil
 import subprocess
 from io import StringIO
 from pathlib import Path
@@ -211,6 +212,8 @@ class TestVendoredCheckoutsStayOutOfTheImage:
     def test_every_shipped_converter_is_a_module_not_a_package(self):
         # The re-include covers *.py only; a converter shipped as a package directory
         # would be dropped from the image without anything here noticing.
+        if shutil.which("git") is None:
+            pytest.skip("needs git to list the tracked converters; the web image carries none")
         root = Path("recordings/converters")
         packages = [c.name for c in root.glob("*") if c.is_dir() and not c.name.startswith((".", "__"))]
         tracked = subprocess.run(

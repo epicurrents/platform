@@ -713,6 +713,7 @@ One-paragraph behaviour summaries with pointers to the relevant README for full 
 ## Testing conventions
 
 - **Run**: `pytest` from the repo root (settings auto-selected via `pytest.ini`).
+- **The platform suite runs with no project or plugin active.** `common.py` merges the settings `EPICURRENTS_PROJECT` and `EPICURRENTS_PLUGINS` name, and docker compose passes `.env` into the containers, so on a checkout with a project active the platform suite runs that project's configuration and fails every test of a default the project changes. Blank both (`-e EPICURRENTS_PROJECT= -e EPICURRENTS_PLUGINS=`), as CI does, and run a project's suite separately. A project sweeps its own routes for authentication with [epicurrents/tests/auth_sweep.py](epicurrents/tests/auth_sweep.py); the platform's sweep leaves them out.
 - **Fixtures**: `user`, `superuser`, `auth_client`, `superuser_client`, `make_user`, `make_superuser` are available globally from `conftest.py`.
 - **API tests**: use `client.force_login(user)` + `client.post(url, json.dumps(data), content_type="application/json")`. Helper functions `post_json`, `patch_json`, `delete_json` live in `conftest.py`.
 - **Celery tasks**: `CELERY_TASK_ALWAYS_EAGER=True` runs tasks synchronously; just call the task function directly in tests or use `.delay()` — both work.

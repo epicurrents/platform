@@ -18,8 +18,8 @@ literal does not. The override test still uses literals, since there the mode is
 declared in the test itself.
 
 The rendered blob is a superset of the mode's ``setup``, not a copy of it: the
-view derives ``assetPath`` from ``lib_path``, and the platform's half of the
-setup arrives from ``frontend/src/viewer/publicSetup.ts`` once the browser runs
+view derives ``assetPath`` from ``lib_path`` and adds ``pyodideAssetPath`` from
+``PYODIDE_ASSET_PATH``, and the platform's half of the setup arrives from ``frontend/src/viewer/publicSetup.ts`` once the browser runs
 the script tag, which no server-side test can see. Its own specs live beside it.
 """
 
@@ -29,7 +29,12 @@ import pytest
 from django.conf import settings
 from django.test import RequestFactory, override_settings
 
-from epicurrents.views import _PUBLIC_SETUP_SCRIPT, public_viewer_view
+from epicurrents.views import _DEFAULT_LIB_FILE, _PUBLIC_SETUP_SCRIPT, public_viewer_view
+
+
+def _lib_file(mode: dict) -> str:
+    """The bundle name the view loads for *mode*, which a mode pointing at a per-project build leaves out."""
+    return mode.get("lib_file", _DEFAULT_LIB_FILE)
 
 
 def _rendered_setup(body: str) -> dict:
@@ -67,7 +72,7 @@ def test_enabled_serves_public_mode(client):
     # takes its stylesheet from the same directory, and calls the factory. The
     # bundle name comes from the mode, because the builder edition under /viewer/
     # and the per-project builds under /viewer/<project>/ name theirs differently.
-    assert f"{mode['lib_path']}{mode['lib_file']}" in body
+    assert f"{mode['lib_path']}{_lib_file(mode)}" in body
     assert f"{mode['lib_path']}epicurrents-lib.css" in body
     assert "createEpicurrentsApp()" in body
     # Everything the mode declares is passed through unchanged — the viewer boots
@@ -119,7 +124,7 @@ def test_trailing_slash_serves_public_mode(client):
     mode = settings.PUBLIC_VIEWER_MODES["public"]
     response = client.get("/viewer/public/")
     assert response.status_code == 200
-    assert f"{mode['lib_path']}{mode['lib_file']}" in response.content.decode()
+    assert f"{mode['lib_path']}{_lib_file(mode)}" in response.content.decode()
 
 
 @override_settings(
@@ -133,8 +138,12 @@ def test_mode_without_a_setup_key():
     request = RequestFactory().get("/viewer/bare")
     response = public_viewer_view(request, mode="bare")
     assert response.status_code == 200
-    # The derivation still runs, so the page is not left without an asset root.
-    assert _rendered_setup(response.content.decode()) == {"assetPath": "/viewer/base/"}
+    # The derivations still run, so the page is not left without an asset root or
+    # the vendored Pyodide root.
+    assert _rendered_setup(response.content.decode()) == {
+        "assetPath": "/viewer/base/",
+        "pyodideAssetPath": settings.PYODIDE_ASSET_PATH,
+    }
 
 
 @override_settings(ENABLE_PUBLIC_VIEWER=True)
@@ -157,7 +166,7 @@ def test_public_setup_script_loads_before_the_lib(client):
     mode = settings.PUBLIC_VIEWER_MODES["public"]
     setup_at = body.index("SETUP:")
     script_at = body.index(f'<script src="{_PUBLIC_SETUP_SCRIPT}">')
-    lib_at = body.index(f"{mode['lib_path']}{mode['lib_file']}")
+    lib_at = body.index(f"{mode['lib_path']}{_lib_file(mode)}")
     assert setup_at < script_at < lib_at
 
 
@@ -198,10 +207,10 @@ def test_project_overridable_mode():
     assert '"acc"' in body
     # Project settings REPLACE this key rather than deep-merging it (only
     # _LIST_KEYS and CELERY_BEAT_SCHEDULE merge — see epicurrents/project_loader.py),
-    # so a mode that omits a platform default really does omit it. A project
-    # overriding the viewer opts out of the platform's whole setup, vendored
-    # Pyodide root included, and has to restate whatever it still wants.
-    assert "pyodideAssetPath" not in _rendered_setup(body)
+    # so a mode that omits a platform default really does omit it. The vendored
+    # Pyodide root is not a mode key, so an overriding project keeps it: the SPA
+    # loads that tree whatever the modes say, and vendor_pyodide must populate it.
+    assert _rendered_setup(body)["pyodideAssetPath"] == settings.PYODIDE_ASSET_PATH
     # A mode that names assetPath keeps it; the derivation only fills a gap. Here
     # the two agree anyway, which is the point — a project pointing lib_path at its
     # own build gets a matching assetPath whether it restates one or not.
@@ -211,3 +220,19 @@ def test_project_overridable_mode():
     # project cannot accidentally opt out of by replacing the setup — which also
     # means the lead-field provider survives a project override.
     assert _PUBLIC_SETUP_SCRIPT in body
+
+
+@override_settings(
+    ENABLE_PUBLIC_VIEWER=True,
+    PUBLIC_VIEWER_MODES={"public": {"lib_path": "/viewer/", "setup": {"pyodideAssetPath": "/elsewhere/"}}},
+)
+def test_the_pyodide_setting_wins_over_a_mode():
+    # The page must load the tree vendor_pyodide populates, which the setting names.
+    body = public_viewer_view(RequestFactory().get("/viewer/public"), mode="public").content.decode()
+    assert _rendered_setup(body)["pyodideAssetPath"] == settings.PYODIDE_ASSET_PATH
+
+
+@override_settings(ENABLE_PUBLIC_VIEWER=True, PYODIDE_ASSET_PATH="")
+def test_an_empty_pyodide_setting_leaves_the_viewer_default():
+    body = public_viewer_view(RequestFactory().get("/viewer/public"), mode="public").content.decode()
+    assert "pyodideAssetPath" not in _rendered_setup(body)

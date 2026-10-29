@@ -167,7 +167,13 @@ def public_viewer_view(request, mode=""):
     # ``setup`` is optional because the platform's half of it arrives from
     # publicSetup.ts: a mode that overrides nothing is just a ``lib_path``, and
     # requiring an empty dict beside it would only invite one that is not empty.
+    #
+    # ``pyodideAssetPath`` comes from ``PYODIDE_ASSET_PATH`` and overrides a mode,
+    # because it names the tree ``vendor_pyodide`` populates and a mode naming
+    # another one would point the page at files nothing wrote.
     setup = {"assetPath": config["lib_path"], **(config.get("setup") or {})}
+    if settings.PYODIDE_ASSET_PATH:
+        setup["pyodideAssetPath"] = settings.PYODIDE_ASSET_PATH
     html = _PUBLIC_VIEWER_TEMPLATE.format(
         lib=config["lib_path"],
         lib_file=config.get("lib_file", _DEFAULT_LIB_FILE),

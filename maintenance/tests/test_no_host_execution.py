@@ -12,7 +12,7 @@ from pathlib import Path
 
 import pytest
 
-from epicurrents.tests.test_api_auth_sweep import _iter_operations
+from epicurrents.tests.auth_sweep import iter_operations
 
 APP_DIR = Path(__file__).resolve().parent.parent
 
@@ -107,7 +107,7 @@ class TestEveryEndpointIsGated:
     def _maintenance_operations(self):
         found = [
             (path, methods, view)
-            for path, methods, view in _iter_operations()
+            for path, methods, view in iter_operations()
             if "api/v1/maintenance/" in path and view.__name__ not in self.PUBLIC_VIEWS
         ]
         assert len(found) >= 9, "the maintenance API must be mounted for this scan to mean anything"
@@ -116,7 +116,7 @@ class TestEveryEndpointIsGated:
     def test_the_only_public_view_is_the_lock_probe_and_it_writes_nothing(self):
         public = [
             (path, methods, view)
-            for path, methods, view in _iter_operations()
+            for path, methods, view in iter_operations()
             if "api/v1/maintenance/" in path and view.__name__ in self.PUBLIC_VIEWS
         ]
         assert [(path.rstrip("/").rsplit("/", 1)[-1], list(methods)) for path, methods, _ in public] == [

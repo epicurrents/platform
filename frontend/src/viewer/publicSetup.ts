@@ -69,7 +69,7 @@ const EEG_MODULE_DEFAULTS: EegModuleConfiguration = {
  * `assetPath`, `containerId` and `pyodideAssetPath` stay on the Python side instead — the first
  * two because they pair with the mode's `lib_path` and the template's container element, the third
  * because the deploy step writes that tree and `manage.py vendor_pyodide` reads the version back
- * out of the setting.
+ * out of `PYODIDE_ASSET_PATH`, which the view adds to every mode.
  */
 const SETUP_DEFAULTS: Record<string, unknown> = {
     // The page sets its own COOP/COEP, so it is cross-origin isolated whatever the rest of the

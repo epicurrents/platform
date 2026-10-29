@@ -271,8 +271,8 @@ class TestIdempotence:
 
 
 class TestConfiguredVersion:
-    def test_version_is_read_from_the_public_viewer_mode(self, settings, index, tmp_path):
-        settings.PUBLIC_VIEWER_MODES = {"public": {"setup": {"pyodideAssetPath": "/vendor/pyodide/9.9.9/"}}}
+    def test_version_is_read_from_the_setting(self, settings, index, tmp_path):
+        settings.PYODIDE_ASSET_PATH = "/vendor/pyodide/9.9.9/"
         settings.VENDOR_DIR = tmp_path
         index.add_distribution_package("numpy")
         monkey = pytest.MonkeyPatch()
@@ -284,11 +284,11 @@ class TestConfiguredVersion:
             monkey.undo()
         assert (tmp_path / "pyodide" / "9.9.9" / "pyodide-lock.json").is_file()
 
-    def test_no_configured_path_means_nothing_to_vendor(self, settings, tmp_path, capsys):
-        # A project that redefines the public mode without an asset path loads
-        # Pyodide from the CDN. update.sh runs this with the services stopped, so
-        # an error here is an update that ends with the stack down.
-        settings.PUBLIC_VIEWER_MODES = {"public": {"setup": {"containerId": "viewer"}}}
+    def test_an_empty_setting_means_nothing_to_vendor(self, settings, tmp_path, capsys):
+        # A deployment that empties the setting loads Pyodide from the CDN. update.sh
+        # runs this with the services stopped, so an error here is an update that ends
+        # with the stack down.
+        settings.PYODIDE_ASSET_PATH = ""
         settings.VENDOR_DIR = str(tmp_path)
         call_command("vendor_pyodide", "--check")
         call_command("vendor_pyodide")
@@ -296,8 +296,15 @@ class TestConfiguredVersion:
         assert "nothing to vendor" in out
         assert not any(tmp_path.iterdir()), "a no-op must write nothing"
 
+    def test_a_project_redefining_the_public_mode_still_vendors(self, settings):
+        # The SPA loads the vendored tree whatever the modes say, so a project that
+        # replaces the public mode wholesale must not turn vendoring off with it.
+        settings.PYODIDE_ASSET_PATH = "/vendor/pyodide/9.9.9/"
+        settings.PUBLIC_VIEWER_MODES = {"public": {"lib_path": "/viewer/course/", "setup": {"containerId": "viewer"}}}
+        assert vendor_pyodide.Command()._configured_version() == "9.9.9"
+
     def test_an_unparseable_setting_is_an_error(self, settings):
-        settings.PUBLIC_VIEWER_MODES = {"public": {"setup": {"pyodideAssetPath": "/vendor/"}}}
+        settings.PYODIDE_ASSET_PATH = "/vendor/"
         with pytest.raises(CommandError, match="pass --pyodide-version"):
             call_command("vendor_pyodide", check=True)
 
