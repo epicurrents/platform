@@ -243,7 +243,7 @@ Built on F and G, in the edu repository, after the platform has its profile and 
 - The recording class follows from the profile, so the profile's `ingest` writes it as a coded label. That makes it the one row the project derives beyond the sidecar.
 - The profile's sidecar check refuses a sidecar without exactly one band and one sex from the class's lists, a sex where the class collects none, or a class of its own.
 
-The release side, the embargo attestation and the at-least-one-event rule remain, and are listed in the project's dataset note.
+The release side and the embargo attestation followed, and a sidecar needs no events (decided 2026-10-29); the project's dataset note records each.
 
 ### H2. Configuring a submission pool (planned and built 2026-09-26)
 
