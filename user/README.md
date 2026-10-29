@@ -36,6 +36,10 @@ It is a separate model rather than fields on `User` for two reasons. Every write
 
 Both `secret` and `backup_codes` are registered with `register_masked_fields` and `register_subject_pii` in `UserConfig.ready`.
 
+### `Affiliation`
+
+Marks an auth group as an [affiliation](#affiliations). Holds the group and nothing else.
+
 ### `UserPreference`
 
 A client's settings for one user, stored as an opaque JSON blob under a `scope` string. One row per `(user, scope)`, enforced by a uniqueness constraint.
@@ -84,6 +88,7 @@ Mounted at `/api/v1/user/`. Full request/response detail in [api/v1/ninja.py](ap
 | `is_staff`, `is_superuser` | Both exposed so the frontend can gate UI elements. The auth store derives `isStaff` (true when either flag is set) and `isSuperuser` (true only when `is_superuser`). |
 | `is_2fa_enabled` | Whether a confirmed second factor gates this account's password login. An unconfirmed enrolment reads as `false`. |
 | `roles` | Project-supplied roles the user inherits through group membership, keyed by the role key the active project registered (e.g. a teaching project's `course_role` → `["instructor"]`). Read through the [project-role registry](#project-roles) — the user app imports no project. Empty map when the deployment defines no roles. |
+| `affiliations` | Names of the [affiliations](#affiliations) the account belongs to. `UserOut` describes the caller only, so this reaches the account holder and no one else. |
 | `external_provider` | Display name of the identity provider this account signs in through, or `null`. Set only for an account that also has no local password; see [Externally authenticated accounts](#externally-authenticated-accounts). The profile page reads it to decide whether to render a change-password form at all. |
 
 `UserSearchOut` is a smaller shape returned by `/search`: `id`, `username`, `first_name`, `last_name`. No `email` is exposed (it's PII that doesn't need to leak through search auto-complete).
@@ -111,11 +116,11 @@ The one endpoint below with no client is `PUT /admin/groups/{id}/members`. Both 
 | `DELETE` | `/admin/accounts/{id}/2fa` | Superuser | Remove an account's second factor, for a lost authenticator. Step-up in the body; 409 on the caller's own account. See [Two-factor authentication](#two-factor-authentication-totp). |
 | `PUT` | `/admin/accounts/{id}/groups` | Superuser | Replace one account's group membership. Step-up when it adds a group. |
 | `GET` | `/admin/groups` | Staff | Groups with member and grant counts, their project roles, and `dedicated_to` naming the feature that owns a [dedicated group](#dedicated-groups). |
-| `POST` | `/admin/groups` | Superuser | Create a group. |
-| `PATCH` | `/admin/groups/{id}` | Superuser | Rename a group and/or set its [project roles](#project-roles); a role on a dedicated group answers 409. Step-up when a role is set to a value. |
-| `DELETE` | `/admin/groups/{id}` | Superuser | Delete a group, refused while grants target it and for a dedicated group. |
+| `POST` | `/admin/groups` | Superuser | Create a group, or with `affiliation: true` an [affiliation](#affiliations). |
+| `PATCH` | `/admin/groups/{id}` | Superuser | Rename a group and/or set its [project roles](#project-roles); a role that does not apply to the group's kind answers 409. Step-up when a role is set to a value. |
+| `DELETE` | `/admin/groups/{id}` | Superuser | Delete a group or an affiliation, refused while grants target it and for a group another feature owns. |
 | `PUT` | `/admin/groups/{id}/members` | Superuser | Replace one group's membership. Step-up when it adds a member. |
-| `GET` | `/admin/roles` | Staff | Project-supplied roles this deployment defines. |
+| `GET` | `/admin/roles` | Staff | Project-supplied roles this deployment defines, each with the `group_kind` it applies to. |
 
 Five rules the surface enforces, each of which has a test that fails without it:
 
@@ -189,11 +194,27 @@ Core calls the registry when serialising a user (`roles` on `UserOut` / `Account
 
 `roles` in a group PATCH is a partial map: an absent key is left alone, so a client that does not know a project's role exists cannot clear it. There is no per-account role write — assigning a role is a membership change.
 
+A provider applies to ordinary groups unless it sets `group_kind` to a kind of [dedicated group](#dedicated-groups), and then it applies to groups of that kind only. Setting a role on a group it does not apply to raises `RoleNotApplicable` in `write_group_role`, which the endpoint answers with a 409 before asking for step-up; clearing one is allowed anywhere, so a role that predates a group's kind can go. `/admin/roles` serves `group_kind`, and the group form renders the selectors whose kind matches the group's `dedicated_to.kind`. Affiliations are the kind this exists for.
+
+## Affiliations
+
+An affiliation is a group recording the organisation its members belong to: a hospital, a university. It is a fact about an account, not a permission, and it grants nothing. [affiliations.py](affiliations.py) holds it.
+
+It stays a group so it reuses what groups have. Membership is managed on the account page and audited there, and core already exports it to the subject and erases it with the account, so the `Affiliation` marker holds no personal data and needs no registration of its own. Moderators managing one affiliation's members would build on the same membership.
+
+**It grants nothing.** An affiliation registers as a [dedicated group](#dedicated-groups) of kind `affiliation` that owns itself (`dedicated_to.object_hash` is empty), so no access grant can target it and `GET /groups` leaves it out. Unlike other dedicated groups it is deleted on the account surface like an ordinary group, its marker with it.
+
+**A group becomes one at creation or never.** `POST /admin/groups` with `affiliation: true` creates both rows in one transaction. There is no conversion, since an existing group may already carry the grants an affiliation must not. Every rollback of the marker is refused, for the same reason in both directions.
+
+**A project gives an affiliation a meaning** through a role scoped to it, `group_kind="affiliation"`. The teaching project marks which affiliation counts as an account's institution that way. A role meant for ordinary groups never lands on an affiliation, and an affiliation's role never lands on an ordinary group.
+
+**Who sees it.** The account holder sees their own on `UserOut.affiliations` and the profile page, and the account surface shows it to staff. No other surface serves it.
+
 ## Dedicated groups
 
 Some groups exist for one purpose another feature owns, and must grant nothing else. A [submission pool](../library/README.md#submission-pools)'s contributor group is the first: its members joined it to submit to one dataset, and a grant or a role on it would hand every contributor something beyond that. [dedicated_groups.py](dedicated_groups.py) is the registry: the owning app registers a resolver from its `AppConfig.ready()` with `register_dedicated_group_resolver(kind, resolver)`, where `resolver` takes group primary keys and returns a `DedicatedGroup` (`kind`, and the owner's `object_hash` and `name`) for each it owns. `dedicated_groups(ids)` answers in batch for the listings, `dedicated_group(id)` for one.
 
-Core then refuses the three ways a group acquires meaning elsewhere, each at its own endpoint: an access grant targeting it (the dataset grant endpoint and the upload's `group_access` answer 400, and `GET /groups` leaves it out), a project role written on it (409; clearing stays allowed), and deleting it (409). `GroupDetailOut.dedicated_to` names the owner, and the group admin page shows a banner in place of the role selectors. A grant or role that reaches a dedicated group through any other path is the owning feature's check to report.
+Core then refuses the three ways a group acquires meaning elsewhere, each at its own endpoint: an access grant targeting it (the dataset grant endpoint and the upload's `group_access` answer 400, and `GET /groups` leaves it out), a project role written on it unless the role is [scoped to its kind](#project-roles) (409; clearing stays allowed), and deleting it (409) unless it is an [affiliation](#affiliations). `GroupDetailOut.dedicated_to` names the owner, and the group admin page shows a banner in place of the role selectors. A grant or role that reaches a dedicated group through any other path is the owning feature's check to report.
 
 ## Security mechanisms
 
@@ -446,6 +467,7 @@ None directly — the user app reads `FRONTEND_URL`, `DEFAULT_FROM_EMAIL`, and t
 |---|---|
 | Add fields to the user model | Don't subclass `User`. Add a `OneToOneField(User)` profile model in your project. Access via the reverse relation you name. |
 | Add a password validator | Extend `AUTH_PASSWORD_VALIDATORS` from your project's `settings.py`. The list is one of the append-merged settings, so your additions sit after the built-in validators. |
+| Give an affiliation a meaning | Register a `RoleProvider` with `group_kind="affiliation"` — see [affiliations](#affiliations). |
 | Add a project-specific role | Attach the role to a group (a `OneToOneField(Group)` carrier model in your project, `GroupRole` say) and register a `RoleProvider` for it — see [project roles](#project-roles). Registering is what makes the role readable on `UserOut` (inherited through membership) and settable on groups from the account surface without core importing the project. Don't conflate with `is_staff` / `is_superuser` unless the role really maps to one of those tiers — see [epicurrents/README.md](../epicurrents/README.md#cross-app-rules-this-app-enforces). |
 
 ## Tests

@@ -53,6 +53,7 @@ from activity.audit import log_activity
 from epicurrents.auth import enforce_session_csrf
 from epicurrents.security_log import get_client_ip, log_security_event
 from user import lockout
+from user.affiliations import affiliation_names
 from user.api.v1.accounts import router as accounts_router
 from user.api.v1.two_factor import router as two_factor_router
 from user.identity import is_externally_authenticated, provider_label
@@ -183,6 +184,8 @@ class UserOut(Schema):
     is_superuser: bool
     is_2fa_enabled: bool = False
     roles: dict[str, list[str]] = {}
+    #: The affiliations the account belongs to, by name (user/affiliations.py). Served to the account holder only.
+    affiliations: list[str] = []
     #: The identity provider this account signs in through, or null for an
     #: account with a password of its own. The profile page reads it to decide
     #: whether to offer a change-password form at all: without it the form is
@@ -298,6 +301,7 @@ def _serialize_user(user) -> dict:
         "is_superuser": user.is_superuser,
         "is_2fa_enabled": active_credential(user) is not None,
         "roles": read_roles(user),
+        "affiliations": affiliation_names(user),
         "external_provider": provider_label(user) if is_externally_authenticated(user) else None,
     }
 

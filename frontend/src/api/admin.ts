@@ -80,7 +80,7 @@ export interface AccountUpdate extends StepUpCredentials {
 
 /** What owns a dedicated group, which then carries no grant or role and is removed with its owner. */
 export interface DedicatedGroupOwner {
-    /** Stable token for the owning feature, e.g. `submission_pool`. */
+    /** Stable token for the owning feature, e.g. `submission_pool`, or `affiliation` for a group that owns itself. */
     kind: string
     name: string
     object_hash: string
@@ -102,6 +102,8 @@ export interface RoleProvider {
     key: string
     label: string
     choices: string[][]
+    /** The `dedicated_to.kind` of the groups the role applies to; null for ordinary groups. */
+    group_kind?: string | null
 }
 
 /** Paging window for the account roster. The endpoint returns a bare list, so there is no total to read. */
@@ -211,9 +213,23 @@ export async function listGroups(): Promise<GroupDetail[]> {
     return response.data
 }
 
-export async function createGroup(name: string): Promise<GroupDetail> {
-    const response = await http.post<GroupDetail>('/api/v1/user/admin/groups', { name })
+/**
+ * Create a group.
+ * @param name - the group's name, unique regardless of case.
+ * @param affiliation - make the group an affiliation, which grants nothing; it stays one until deleted.
+ */
+export async function createGroup(name: string, affiliation = false): Promise<GroupDetail> {
+    const response = await http.post<GroupDetail>('/api/v1/user/admin/groups', { name, affiliation })
     return response.data
+}
+
+/**
+ * The providers whose roles apply to `group`: those scoped to its kind of dedicated group, or the unscoped ones for
+ * an ordinary group.
+ */
+export function rolesForGroup(providers: RoleProvider[], group: GroupDetail): RoleProvider[] {
+    const kind = group.dedicated_to?.kind ?? null
+    return providers.filter(provider => (provider.group_kind ?? null) === kind)
 }
 
 /**
@@ -232,7 +248,10 @@ export async function updateGroup(
     return response.data
 }
 
-/** Delete a group. Refused with 409 while access grants still target it. */
+/**
+ * Delete a group or an affiliation. Refused with 409 while access grants still target it, and for a group another
+ * feature owns.
+ */
 export async function deleteGroup(groupId: number): Promise<void> {
     await http.delete(`/api/v1/user/admin/groups/${groupId}`)
 }

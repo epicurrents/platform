@@ -474,6 +474,9 @@ onMounted(load)
                         @change="toggleGroup(group.id, $event)"
                     >
                         {{ group.name }}
+                        <span v-if="group.dedicated_to?.kind === 'affiliation'" class="group-kind">
+                            {{ t('Affiliation', SCOPE) }}
+                        </span>
                     </wa-checkbox>
                 </div>
                 <div v-if="canWrite && groups.length" class="form-actions">
@@ -658,6 +661,12 @@ onMounted(load)
 </template>
 
 <style scoped>
+.group-kind {
+    color: var(--wa-color-text-quiet);
+    font-size: var(--wa-font-size-s);
+    margin-left: var(--wa-space-2xs);
+}
+
 .admin-section {
     margin-bottom: var(--wa-space-xl);
 }

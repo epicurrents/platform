@@ -39,6 +39,8 @@ const profileLoading = ref(false)
  * password they never had.
  */
 const externalProvider = computed(() => authStore.user?.external_provider ?? null)
+/** The organisations the account belongs to, set by an administrator. */
+const affiliations = computed(() => authStore.user?.affiliations ?? [])
 
 const passwordError = ref<string | null>(null)
 const passwordSuccess = ref(false)
@@ -287,6 +289,16 @@ async function submitPassword () {
                     </form>
                 </section>
 
+                <section v-if="affiliations.length" class="profile-section">
+                    <h2>{{ t('Affiliations', SCOPE) }}</h2>
+                    <p class="profile-hint">
+                        {{ t('The organisations your account belongs to. An administrator sets them.', SCOPE) }}
+                    </p>
+                    <ul class="profile-affiliations">
+                        <li v-for="name in affiliations" :key="name">{{ name }}</li>
+                    </ul>
+                </section>
+
                 <section class="profile-section">
                     <h2>{{ t('Change password', SCOPE) }}</h2>
                     <p v-if="externalProvider" class="profile-hint">
@@ -492,6 +504,11 @@ async function submitPassword () {
     color: var(--wa-color-text-quiet);
     font-size: 0.875rem;
     margin: 0;
+}
+
+.profile-affiliations {
+    margin: 0;
+    padding-left: 1.25rem;
 }
 
 .enrolment,

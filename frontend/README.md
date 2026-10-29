@@ -221,6 +221,8 @@ There is no account deletion control anywhere in the surface. [`erase_user`](../
 
 **A dedicated group shows its owner instead of its roles.** `GroupDetail.dedicated_to` names the feature that owns a group ([user/README.md → Dedicated groups](../user/README.md#dedicated-groups)); `AdminGroupView` then shows a banner, a submission pool's with a link to its dataset, and renders no role selector, so its save sends no role map. `AdminGroupsView` badges a pool group and offers no delete action on a dedicated one. Membership is managed as for any group.
 
+**An affiliation is the one dedicated group the operator makes.** The new-group dialog creates one ([user/README.md → Affiliations](../user/README.md#affiliations)); the roster badges it and offers its delete, the group page explains it in place of the owner banner, and the account page marks it in the group list. The profile page lists the caller's own affiliations from `AuthUser.affiliations`.
+
 Two shapes to know before changing these views. `GET /admin/accounts` returns a bare list with no total, so paging can show "there is more" but not "N of M" — a full page is the entire signal. And there is no single-group read endpoint, so `AdminGroupView` resolves its group out of the group roster, and reads the account roster to name its members; the server caps that at 500, and the view says how many of the group's `member_count` it could show when the two disagree.
 
 ### Maintenance
@@ -245,6 +247,8 @@ The consequence worth stating plainly: **roles need no project-supplied frontend
 
 The trap is the write. `GroupDetailOut.roles` carries an entry for **every** registered key including the nulls, and `PATCH /admin/groups/{id}` reads an explicit `null` as "clear this role" while leaving an absent key untouched. Seeding a reactive form object from the group payload and submitting it back wholesale — the natural Vue idiom — therefore sends a padded map that clears every role the form did not render. It is harmless only while `/admin/roles` and the group payload agree, and stops being harmless exactly when the roles call fails or returns stale data. Build the payload with `rolesPayload(renderedKeys, values)` from [src/api/admin.ts](src/api/admin.ts), which carries the rendered keys and nothing else and maps the blank option to `null` — an empty string is not among a provider's declared choices and the server rejects it with a 400. Regression coverage in [src/api/admin.test.ts](src/api/admin.test.ts), which asserts on the request body rather than the resulting state, since a state assertion passes in the configuration where the bug is dormant.
 
+**Which selectors render is the provider's `group_kind` against the group's `dedicated_to.kind`.** `rolesForGroup` in [src/api/admin.ts](src/api/admin.ts) is the single filter: unscoped roles on an ordinary group, those scoped to affiliations on an affiliation, none on a group another feature owns. The group page seeds and sends only those keys, so the payload stays bounded by what was rendered.
+
 A rejected role value aborts the rename with it — the server writes both in one transaction — so `AdminGroupView` saves name and roles together and reports one outcome. Reporting the rename as saved and the role as failed would be untrue.
 
 ## API Modules (`src/api/`)
@@ -255,7 +259,7 @@ A rejected role value aborts the rename with it — the server writes both in on
 | `library.ts` | `/api/v1/library/` | Collections, datasets, their items and access rights |
 | `annotations.ts` | `/annotations/api/v1/` | Content-type lookup, annotation CRUD |
 | `user.ts` | `/api/v1/user/` | Login, logout, me, password change |
-| `admin.ts` | `/api/v1/user/admin/` | Account and group administration; `rolesPayload` builds the partial role map |
+| `admin.ts` | `/api/v1/user/admin/` | Account and group administration; `rolesPayload` builds the partial role map, `rolesForGroup` picks the roles a group takes |
 | `notifications.ts` | `/api/v1/notifications/` | VAPID key, push subscription |
 | `maintenance.ts` | `/api/v1/maintenance/` | Lock probe, status, operation registry, jobs (request, cancel, verify, rollback, abandon), packages; `isFeatureDisabled` reads the gate's 404, `erasureConflict` the 409 that asks for erasures to be acknowledged |
 

@@ -29,6 +29,10 @@
  * a group holding a role a confirmed action. The changed set is a subset of
  * the rendered keys, so the padded-map clear stays impossible.
  *
+ * The selectors rendered are the roles that apply to this kind of group: the
+ * unscoped ones on an ordinary group, those scoped to affiliations on an
+ * affiliation, and none on a group another feature owns.
+ *
  * @package    epicurrents-platform
  */
 import { computed, onMounted, reactive, ref } from 'vue'
@@ -37,6 +41,7 @@ import {
     listAccounts,
     listGroups,
     listRoleProviders,
+    rolesForGroup,
     rolesPayload,
     updateGroup,
     type Account,
@@ -79,11 +84,17 @@ const roleValues = reactive<Record<string, string>>({})
 
 const canWrite = computed(() => authStore.isSuperuser)
 
+/** The roles that apply to this group, which are the only selectors rendered and the only keys ever sent. */
+const groupRoles = computed(() => group.value ? rolesForGroup(roleProviders.value, group.value) : [])
+
 /**
- * Nothing role-shaped renders on a deployment whose active project registers none, nor on a group another feature
- * owns, which the server refuses a role on.
+ * Nothing role-shaped renders on a deployment whose active project registers none, nor on a group no registered role
+ * applies to, such as one another feature owns.
  */
-const hasRoles = computed(() => roleProviders.value.length > 0 && !group.value?.dedicated_to)
+const hasRoles = computed(() => groupRoles.value.length > 0)
+
+/** Whether the group is an affiliation, which records where its members belong and grants nothing. */
+const isAffiliation = computed(() => group.value?.dedicated_to?.kind === 'affiliation')
 
 /** The pool this group feeds, when a submission pool owns it. */
 const pool = computed(() => {
@@ -127,7 +138,7 @@ function setGroup (loaded: GroupDetail) {
  * clear. Reading it through the provider list is what bounds the write.
  */
 function seedRoleValues (loaded: GroupDetail, providers: RoleProvider[]) {
-    for (const provider of providers) {
+    for (const provider of rolesForGroup(providers, loaded)) {
         roleValues[provider.key] = loaded.roles[provider.key] ?? ''
     }
 }
@@ -183,7 +194,7 @@ async function save () {
     // blank option to null, which is how "no role" is expressed — an empty
     // string is not one of a provider's declared choices and the server rejects it.
     const roles = hasRoles.value
-        ? changedRoles(rolesPayload(roleProviders.value.map(provider => provider.key), roleValues), current.roles)
+        ? changedRoles(rolesPayload(groupRoles.value.map(provider => provider.key), roleValues), current.roles)
         : {}
     const payload = {
         name: form.name.trim(),
@@ -252,6 +263,9 @@ onMounted(load)
                     {{ t('Open the dataset', SCOPE) }}
                 </router-link>
             </wa-callout>
+            <wa-callout v-else-if="isAffiliation" class="admin-owner-callout" variant="neutral">
+                {{ t('This group is an affiliation: it records the organisation its members belong to and grants nothing. No access grant can target it, and it carries only the roles that apply to affiliations.', SCOPE) }}
+            </wa-callout>
             <wa-callout v-else-if="group.dedicated_to" class="admin-owner-callout" variant="neutral">
                 {{ t('This group belongs to another feature. It carries no access grant or role, and it is removed with its owner.', SCOPE) }}
             </wa-callout>
@@ -269,7 +283,7 @@ onMounted(load)
                         :label="t('Name', SCOPE)"
                         v-wa="[form, 'name']"
                     ></wa-input>
-                    <wa-select v-for="provider in (hasRoles ? roleProviders : [])"
+                    <wa-select v-for="provider in groupRoles"
                         :key="provider.key"
                         :disabled="!canWrite"
                         :label="provider.label"

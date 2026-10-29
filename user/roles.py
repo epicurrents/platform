@@ -14,6 +14,12 @@ Core calls :func:`read_roles` when serialising a user, :func:`read_group_roles`
 when serialising groups, and :func:`write_group_role` when the account surface
 assigns or clears a group's role; core never knows what a role means.
 
+A provider applies to ordinary groups unless it names a kind of dedicated group
+(``user.dedicated_groups``) in ``group_kind``, and then it applies to groups of
+that kind only. Affiliations are the kind this exists for: a project gives an
+affiliation a meaning through a role scoped to them, and a role meant for
+ordinary groups can never land on one.
+
 The registry is deliberately thin. It holds no state beyond the providers, does
 no validation of its own beyond the declared choices, and has no opinion about
 who may set a role — the endpoint's ``_require_superuser`` guard is the access
@@ -48,6 +54,11 @@ class RoleProvider:
     choices: tuple[tuple[str, str], ...]
     read_groups: Callable[[Sequence[Any]], dict[int, str]]
     write_group: Callable[[Any, str | None], None]
+    group_kind: str | None = None
+
+
+class RoleNotApplicable(Exception):
+    """A role was set on a group of a kind its provider does not apply to."""
 
 
 def register_role_provider(provider: RoleProvider) -> None:
@@ -109,17 +120,36 @@ def read_group_roles(groups: Sequence[Any]) -> dict[int, dict[str, str | None]]:
     return result
 
 
+def group_kind(group: Any) -> str | None:
+    """The kind of dedicated group *group* is, or ``None`` for an ordinary group."""
+    from user.dedicated_groups import dedicated_group
+
+    owner = dedicated_group(group.pk)
+    return owner.kind if owner is not None else None
+
+
+def role_applies(key: str, kind: str | None) -> bool:
+    """Whether the provider registered under *key* applies to groups of *kind*. ``False`` for an unknown key."""
+    provider = _ROLE_PROVIDERS.get(key)
+    return provider is not None and provider.group_kind == kind
+
+
 def write_group_role(group: Any, key: str, value: str | None) -> None:
     """Set or clear one registered role on *group*. ``None`` clears.
 
-    Raises ``KeyError`` when no provider owns *key* and ``ValueError`` when
-    *value* is outside the provider's declared choices. Both are the endpoint's
-    to translate into a 400 — validating here rather than in the endpoint keeps
-    a project from having to re-check what it already declared.
+    Raises ``KeyError`` when no provider owns *key*, ``ValueError`` when
+    *value* is outside the provider's declared choices, and
+    :class:`RoleNotApplicable` when *value* sets a role on a group of a kind the
+    provider does not apply to. Each is the endpoint's to translate — validating
+    here rather than in the endpoint keeps a project from having to re-check
+    what it already declared. Clearing is allowed on any group, so a role that
+    predates a group's kind can still be removed.
     """
     provider = _ROLE_PROVIDERS.get(key)
     if provider is None:
         raise KeyError(key)
     if value is not None and value not in {choice for choice, _label in provider.choices}:
         raise ValueError(value)
+    if value is not None and provider.group_kind != group_kind(group):
+        raise RoleNotApplicable(key)
     provider.write_group(group, value)

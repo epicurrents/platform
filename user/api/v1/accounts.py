@@ -50,10 +50,20 @@ from activity.audit import log_activity, record_modify_change, serialize_instanc
 from epicurrents.auth import enforce_session_csrf
 from epicurrents.models import AccessRight
 from epicurrents.security_log import get_client_ip, log_security_event
+from user.affiliations import AFFILIATION_KIND
 from user.audit_digests import GROUP_MEMBERSHIP_DIGEST_KEY, compute_group_membership_digest
 from user.dedicated_groups import dedicated_group, dedicated_groups
 from user.identity import is_externally_authenticated, provider_label
-from user.roles import get_role_providers, read_group_roles, read_roles, write_group_role
+from user.models import Affiliation
+from user.roles import (
+    RoleNotApplicable,
+    get_role_providers,
+    group_kind,
+    read_group_roles,
+    read_roles,
+    role_applies,
+    write_group_role,
+)
 from user.stepup import confirm_step_up
 from user.tasks import mail_deliverable, send_welcome_email
 from user.two_factor import active_credential
@@ -179,9 +189,11 @@ class GroupMembershipIn(StepUpIn):
 
 
 class GroupIn(Schema):
-    """Group create payload."""
+    """Group create payload. ``affiliation`` makes the group an affiliation (user/affiliations.py), which it then
+    stays until it is deleted."""
 
     name: str
+    affiliation: bool = False
 
 
 class GroupUpdateIn(StepUpIn):
@@ -221,11 +233,16 @@ class GroupDetailOut(Schema):
 
 
 class RoleProviderOut(Schema):
-    """A project-supplied role and the values it accepts."""
+    """A project-supplied role, the values it accepts, and the kind of dedicated group it applies to.
+
+    ``group_kind`` is null for a role on ordinary groups; otherwise the role applies to groups whose
+    ``dedicated_to.kind`` matches, and to no other.
+    """
 
     key: str
     label: str
     choices: list[list[str]]
+    group_kind: str | None = None
 
 
 def _require_auth(request):
@@ -393,7 +410,13 @@ def list_role_providers(request):
     providers = get_role_providers()
     log_activity(verb="user.role.list", metadata={"returned_count": len(providers)})
     return [
-        {"key": p.key, "label": p.label, "choices": [[value, label] for value, label in p.choices]} for p in providers
+        {
+            "key": p.key,
+            "label": p.label,
+            "choices": [[value, label] for value, label in p.choices],
+            "group_kind": p.group_kind,
+        }
+        for p in providers
     ]
 
 
@@ -826,15 +849,22 @@ def list_group_details(request):
 
 @router.post("/groups", response={201: GroupDetailOut})
 def create_group(request, payload: GroupIn):
-    """Create a group."""
+    """Create a group, or with ``affiliation`` an affiliation.
+
+    A group becomes an affiliation here or never: converting an existing group would leave the access grants it
+    already carries standing on something that must grant nothing.
+    """
     _require_superuser(request)
     name = payload.name.strip()
     if not name:
         raise HttpError(400, "Group name is required.")
     if Group.objects.filter(name__iexact=name).exists():
         raise HttpError(409, "A group with that name already exists.")
-    group = Group.objects.create(name=name)
-    log_activity(verb="user.group.create", target=group)
+    with transaction.atomic():
+        group = Group.objects.create(name=name)
+        if payload.affiliation:
+            Affiliation.objects.create(group=group)
+    log_activity(verb="user.group.create", target=group, metadata={"affiliation": payload.affiliation})
     return 201, _serialize_group(group, member_count=0, grant_count=0)
 
 
@@ -860,10 +890,17 @@ def update_group(request, group_id: int, payload: GroupUpdateIn):
         raise HttpError(404, "Group not found.")
 
     granted_roles = sorted(key for key, value in (payload.roles or {}).items() if value is not None)
-    # A dedicated group means one thing; a role would give its members another.
-    # Clearing stays allowed, so a role that predates the group's owner can go.
-    # Refused before step-up, so a request that cannot succeed spends no attempt.
-    if granted_roles and dedicated_group(group.pk) is not None:
+    # A dedicated group means one thing; a role would give its members another, unless the role is scoped to that
+    # kind of group, as an affiliation's are. Clearing stays allowed, so a role that predates the group's owner can
+    # go. Refused before step-up, so a request that cannot succeed spends no attempt; an unknown key is left to the
+    # write below, which answers it with a 400.
+    kind = group_kind(group)
+    known = {provider.key for provider in get_role_providers()}
+    if any(key in known and not role_applies(key, kind) for key in granted_roles):
+        if kind is None:
+            raise HttpError(409, "That role applies to another kind of group.")
+        if kind == AFFILIATION_KIND:
+            raise HttpError(409, "An affiliation carries only the roles a project scopes to affiliations.")
         raise HttpError(409, "This group exists for one purpose and carries no project role.")
     if granted_roles:
         _step_up(request, actor, password=payload.password, totp_code=payload.totp_code)
@@ -889,6 +926,8 @@ def update_group(request, group_id: int, payload: GroupUpdateIn):
                 raise HttpError(400, f"Unknown role '{key}' for this deployment.") from exc
             except ValueError as exc:
                 raise HttpError(400, f"'{value}' is not an accepted value for role '{key}'.") from exc
+            except RoleNotApplicable as exc:
+                raise HttpError(409, f"The role '{key}' does not apply to this group.") from exc
             roles_changed.append(key)
 
     log_activity(
@@ -913,7 +952,7 @@ def update_group(request, group_id: int, payload: GroupUpdateIn):
 
 @router.delete("/groups/{group_id}", response=dict)
 def delete_group(request, group_id: int):
-    """Delete a group, unless access grants still name it.
+    """Delete a group, unless access grants still name it. An affiliation is deleted here too, its marker with it.
 
     Deleting a group that grants stand on would revoke access for everyone in it
     at once, and the ``AccessRight`` rows would cascade away with it — so the
@@ -924,7 +963,8 @@ def delete_group(request, group_id: int):
     group = Group.objects.filter(pk=group_id).first()
     if group is None:
         raise HttpError(404, "Group not found.")
-    if dedicated_group(group.pk) is not None:
+    owner = dedicated_group(group.pk)
+    if owner is not None and owner.kind != AFFILIATION_KIND:
         raise HttpError(409, "This group belongs to another feature and is removed with it, not here.")
 
     grant_count = AccessRight.objects.filter(access_target_group=group).count()

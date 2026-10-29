@@ -27,7 +27,7 @@ vi.mock('#lib/http', () => ({
     errorDetail: (_error: unknown, fallback: string) => fallback,
 }))
 
-import { rolesPayload, updateGroup, type GroupDetail } from '#api/admin'
+import { rolesForGroup, rolesPayload, updateGroup, type GroupDetail, type RoleProvider } from '#api/admin'
 import { changedRoles } from '#lib/stepUp'
 import { http } from '#lib/http'
 
@@ -114,5 +114,28 @@ describe('an unchanged role form', () => {
         await updateGroup(GROUP.id, { name: 'Renamed', ...(Object.keys(roles).length ? { roles } : {}) })
         const body = mockPatch.mock.calls[0]?.[1] as Record<string, unknown>
         expect(body).toEqual({ name: 'Renamed' })
+    })
+})
+
+describe('rolesForGroup', () => {
+    const PROVIDERS: RoleProvider[] = [
+        { key: 'demo_widget_tier', label: 'Widget tier', choices: [], group_kind: null },
+        { key: 'demo_colour', label: 'Demo colour', choices: [] },
+        { key: 'demo_flag', label: 'Demo flag', choices: [], group_kind: 'affiliation' },
+    ]
+    const keys = (group: GroupDetail) => rolesForGroup(PROVIDERS, group).map(provider => provider.key)
+
+    it('gives an ordinary group the unscoped roles', () => {
+        expect(keys({ ...GROUP, dedicated_to: null })).toEqual(['demo_widget_tier', 'demo_colour'])
+    })
+
+    it('gives an affiliation only the roles scoped to affiliations', () => {
+        const affiliation = { ...GROUP, dedicated_to: { kind: 'affiliation', name: 'Some group', object_hash: '' } }
+        expect(keys(affiliation)).toEqual(['demo_flag'])
+    })
+
+    it('gives a group another feature owns no role', () => {
+        const pool = { ...GROUP, dedicated_to: { kind: 'submission_pool', name: 'Pool', object_hash: 'abc' } }
+        expect(keys(pool)).toEqual([])
     })
 })

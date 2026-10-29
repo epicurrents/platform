@@ -19,6 +19,9 @@ class UserConfig(AppConfig):
 
         Group membership additionally gets a derived-state digester, because it
         lives in an M2M table the audit signals never see.
+
+        Affiliations register as dedicated groups, and their marker rows refuse
+        every rollback (user/affiliations.py).
         """
         # Imported for the @register side effect, as activity.checks is: the
         # subject-export registry is validated against the real schema at
@@ -64,6 +67,13 @@ class UserConfig(AppConfig):
             owner_field="user_id",
             pii_fields={"values"},
         )
+
+        from activity.audit import register_rollback_guard
+        from user.affiliations import AFFILIATION_KIND, refuse_affiliation_rollback, resolve_affiliations
+        from user.dedicated_groups import register_dedicated_group_resolver
+
+        register_dedicated_group_resolver(AFFILIATION_KIND, resolve_affiliations)
+        register_rollback_guard("user.affiliation", refuse_affiliation_rollback)
 
         from user.audit_digests import (
             GROUP_MEMBERSHIP_DIGEST_KEY,

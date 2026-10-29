@@ -10,6 +10,9 @@ optional second login factor.
 ``UserPreference`` stores a client's per-user settings as an opaque JSON
 blob, keyed by a scope string so unrelated clients cannot collide.
 
+``Affiliation`` marks an auth group as an affiliation: the organisation its members belong to, which grants
+nothing. See user/affiliations.py.
+
 ``ExternalIdentity`` links a local ``User`` to an account at an external
 OpenID Connect provider (Microsoft Entra ID today). It is keyed on the
 provider-issued ``subject`` claim — an opaque, pairwise pseudonymous
@@ -160,3 +163,23 @@ class UserPreference(models.Model):
 
     def __str__(self):
         return f"{self.scope} preferences -> {self.user_id}"
+
+
+class Affiliation(models.Model):
+    """Marks an auth group as an affiliation: the organisation its members belong to.
+
+    The group stays an ordinary group for membership, which the account surface manages and audits, and which core
+    already exports and erases with the account; this row holds the group id and nothing else. An affiliation is a
+    dedicated group (``user.dedicated_groups``), so no access grant can target it and only a role scoped to
+    affiliations can be written on it. A group is made an affiliation when it is created and stays one until it is
+    deleted.
+    """
+
+    group = models.OneToOneField(
+        "auth.Group",
+        on_delete=models.CASCADE,
+        related_name="affiliation",
+    )
+
+    def __str__(self):
+        return f"Affiliation(group={self.group_id})"

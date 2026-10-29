@@ -7,6 +7,10 @@
  * `AccessRight` rows away with it, leaving no record of what was withdrawn.
  * The count is shown on every row so that refusal is never a surprise.
  *
+ * An affiliation is created here as a kind of group and stays one until deleted.
+ * It grants nothing, so it is deletable like an ordinary group, where a group
+ * another feature owns is removed with its owner.
+ *
  * @package    epicurrents-platform
  */
 import { computed, onMounted, reactive, ref } from 'vue'
@@ -38,7 +42,7 @@ const loadError = ref('')
 const showCreate = ref(false)
 const creating = ref(false)
 const createError = ref('')
-const createForm = reactive({ name: '' })
+const createForm = reactive({ affiliation: false, name: '' })
 
 const deletingGroup = ref<GroupDetail | null>(null)
 const deleteLoading = ref(false)
@@ -91,6 +95,7 @@ function openGroup (group: GroupDetail) {
 function openCreate () {
     createError.value = ''
     createForm.name = ''
+    createForm.affiliation = false
     showCreate.value = true
 }
 
@@ -107,7 +112,7 @@ async function confirmCreate () {
     createError.value = ''
     creating.value = true
     try {
-        const group = await createGroup(createForm.name.trim())
+        const group = await createGroup(createForm.name.trim(), createForm.affiliation)
         showCreate.value = false
         showToast(t('Group {name} created.', SCOPE, { name: group.name }), 'success')
         router.push({ name: 'admin-group', params: { id: String(group.id) } })
@@ -152,6 +157,11 @@ async function confirmDelete () {
     }
 }
 
+/** Whether the row offers deletion: ordinary groups and affiliations, never a group another feature owns. */
+function isDeletable (group: GroupDetail) {
+    return !group.dedicated_to || group.dedicated_to.kind === 'affiliation'
+}
+
 function handleGroupAction (event: Event, group: GroupDetail) {
     const value = (event as CustomEvent<{ item: { value: string } }>).detail.item.value
     if (value === 'delete') {
@@ -180,7 +190,7 @@ onMounted(load)
         <AdminTabs active="groups" />
 
         <wa-callout variant="neutral">
-            {{ t('Groups carry access grants and project roles. Members inherit both through membership.', SCOPE) }}
+            {{ t('Groups carry access grants and project roles. Members inherit both through membership. An affiliation is a group that records where its members belong and grants nothing.', SCOPE) }}
         </wa-callout>
 
         <wa-spinner v-if="loading" class="loading-center"></wa-spinner>
@@ -214,6 +224,12 @@ onMounted(load)
                         <wa-badge v-if="group.dedicated_to?.kind === 'submission_pool'" appearance="outlined" variant="brand">
                             {{ t('Submission pool', SCOPE) }}
                         </wa-badge>
+                        <wa-badge v-else-if="group.dedicated_to?.kind === 'affiliation'"
+                            appearance="outlined"
+                            variant="brand"
+                        >
+                            {{ t('Affiliation', SCOPE) }}
+                        </wa-badge>
                     </div>
                     <span class="list-row-meta">
                         {{ t('{count} members', SCOPE, { count: group.member_count }) }}
@@ -221,7 +237,7 @@ onMounted(load)
                     <span class="list-row-meta">
                         {{ t('{count} grants', SCOPE, { count: group.grant_count }) }}
                     </span>
-                    <div v-if="canWrite && !group.dedicated_to" class="list-row-actions">
+                    <div v-if="canWrite && isDeletable(group)" class="list-row-actions">
                         <wa-dropdown
                             placement="bottom-end"
                             @click.stop
@@ -251,6 +267,9 @@ onMounted(load)
                 {{ createError }}
             </wa-callout>
             <wa-input :label="t('Group name', SCOPE)" required v-wa="[createForm, 'name']"></wa-input>
+            <wa-checkbox v-wa="[createForm, 'affiliation']">
+                {{ t('An affiliation: records the organisation its members belong to and grants nothing', SCOPE) }}
+            </wa-checkbox>
         </div>
         <div slot="footer" class="form-actions">
             <wa-button

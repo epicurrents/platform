@@ -94,6 +94,8 @@ interface MockUser {
     is_2fa_enabled: boolean
     /** Identity provider this account signs in through, or null for a local account. */
     external_provider?: string | null
+    /** Names of the affiliations the account belongs to. */
+    affiliations?: string[]
 }
 
 interface MockRecording {
@@ -214,6 +216,8 @@ interface MockAuthGroup {
     memberIds: number[]
     /** Access grants targeting this group. Non-zero makes a delete return 409. */
     grantCount: number
+    /** An affiliation: grants nothing, carries only the roles scoped to affiliations. */
+    affiliation?: boolean
 }
 
 interface MockJob {
@@ -314,7 +318,13 @@ const MOCK_ROLE_PROVIDERS = [
         label: 'Demo colour',
         choices: [['puce', 'Puce'], ['chartreuse', 'Chartreuse']],
     },
-]
+    {
+        key: 'demo_flag',
+        label: 'Demo flag',
+        choices: [['flagged', 'Flagged']],
+        group_kind: 'affiliation',
+    },
+] as { key: string, label: string, choices: string[][], group_kind?: string }[]
 
 /** Tracks which pending recordings have been polled once (to simulate processing). */
 const _pendingFlipped = new Set<string>()
@@ -465,6 +475,7 @@ function buildSeed(): MockState {
         is_staff: true,
         is_superuser: true,
         is_2fa_enabled: false,
+        affiliations: ['Example Clinic'],
     }
 
     const recordings: MockRecording[] = [
@@ -849,7 +860,7 @@ function buildSeed(): MockState {
         {
             id: 1,
             name: 'Reviewers',
-            roles: { demo_widget_tier: 'tier_alpha', demo_colour: null },
+            roles: { demo_widget_tier: 'tier_alpha', demo_colour: null, demo_flag: null },
             memberIds: [1, 2],
             // Non-zero, so deleting this group is refused the way the real API refuses it.
             grantCount: 2,
@@ -857,9 +868,17 @@ function buildSeed(): MockState {
         {
             id: 2,
             name: 'Trainees',
-            roles: { demo_widget_tier: null, demo_colour: 'chartreuse' },
+            roles: { demo_widget_tier: null, demo_colour: 'chartreuse', demo_flag: null },
             memberIds: [3],
             grantCount: 0,
+        },
+        {
+            id: 3,
+            name: 'Example Clinic',
+            roles: { demo_widget_tier: null, demo_colour: null, demo_flag: 'flagged' },
+            memberIds: [1],
+            grantCount: 0,
+            affiliation: true,
         },
     ]
 
@@ -1233,7 +1252,7 @@ function groupOut(group: MockAuthGroup) {
         member_count: group.memberIds.length,
         grant_count: group.grantCount,
         roles: { ...group.roles },
-        dedicated_to: null,
+        dedicated_to: group.affiliation ? { kind: 'affiliation', object_hash: '', name: group.name } : null,
     }
 }
 
@@ -1712,6 +1731,7 @@ export async function handleMock(
                 roles: Object.fromEntries(MOCK_ROLE_PROVIDERS.map(p => [p.key, null])),
                 memberIds: [],
                 grantCount: 0,
+                affiliation: body.affiliation === true,
             }
             _state.authGroups.push(group)
             return send(res, 201, groupOut(group))
@@ -1735,6 +1755,9 @@ export async function handleMock(
                         if (!provider) return send(res, 400, { detail: `Unknown role: ${key}.` })
                         if (value !== null && !provider.choices.some(choice => choice[0] === value)) {
                             return send(res, 400, { detail: `"${value}" is not a valid value for ${key}.` })
+                        }
+                        if (value !== null && (provider.group_kind ?? null) !== (group.affiliation ? 'affiliation' : null)) {
+                            return conflict(res, `The role '${key}' does not apply to this group.`)
                         }
                     }
                 }
