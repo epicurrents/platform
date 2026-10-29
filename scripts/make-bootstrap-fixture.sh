@@ -1918,7 +1918,7 @@ COMMONTAIL
     DC_PIN_VERSION="$(sed -n 's/^ *DC_VERSION="\(v[0-9.]*\)".*/\1/p' "$REPO_ROOT/scripts/bootstrap-podman.sh")"
     DC_PIN_X86="$(sed -n 's/^ *x86_64) *DC_SHA256="\([0-9a-f]\{64\}\)".*/\1/p' "$REPO_ROOT/scripts/bootstrap-podman.sh")"
     DC_PIN_ARM="$(sed -n 's/^ *aarch64) *DC_SHA256="\([0-9a-f]\{64\}\)".*/\1/p' "$REPO_ROOT/scripts/bootstrap-podman.sh")"
-    [ -n "$DC_PIN_VERSION" ] && [ -n "$DC_PIN_X86" ] && [ -n "$DC_PIN_ARM" ] \
+    [[ -n "$DC_PIN_VERSION" && -n "$DC_PIN_X86" && -n "$DC_PIN_ARM" ]] \
         || die "Could not read the docker-compose pin from scripts/bootstrap-podman.sh for INSTALL-RHEL.md."
     sed -e "s/@DC_VERSION@/${DC_PIN_VERSION}/g" -e "s/@DC_SHA_X86@/${DC_PIN_X86}/g" -e "s/@DC_SHA_ARM@/${DC_PIN_ARM}/g" \
         > "$DEST/INSTALL-RHEL.md" <<'RHEL'

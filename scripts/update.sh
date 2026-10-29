@@ -1327,7 +1327,7 @@ prune_snapshots_by_age() {
     cutoff="$(utc_stamp_days_ago "$days")"
     [ ! -f "$UNFINISHED_MARKER" ] || keep_name="$(cat "$UNFINISHED_MARKER" 2>/dev/null || true)"
     for d in "$BACKUP_DIR"/*; do
-        [ -d "$d" ] && [ ! -L "$d" ] || continue
+        [[ -d "$d" && ! -L "$d" ]] || continue
         name="$(basename "$d")"
         [[ "$name" =~ ^[A-Za-z0-9][A-Za-z0-9_-]*-([0-9]{8}-[0-9]{6})$ ]] || continue
         stamp="${BASH_REMATCH[1]}"
