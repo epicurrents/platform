@@ -29,9 +29,13 @@ def _validator(value, meta):
         raise ValueError("meta must be the pin")
 
 
+def _strip(value):
+    return value.strip() if isinstance(value, str) else value
+
+
 @pytest.fixture
 def pinned_vocabulary():
-    register_vocabulary("test-pinned", label="Pinned", validator=_validator, confined=True)
+    register_vocabulary("test-pinned", label="Pinned", validator=_validator, confined=True, canonicalise=_strip)
     yield
     unregister_vocabulary("test-pinned")
 
@@ -71,6 +75,16 @@ class TestCreate:
         row = model.objects.get(object_hash="C" * 32)
         assert _codes(row) == {"test-pinned": ("Spike", PIN)}
         assert [(code["standard"], code["value"]) for code in resp.json()["codes"]] == [("test-pinned", "Spike")]
+
+    def test_a_code_is_written_in_its_canonical_spelling(
+        self, auth_client, recording, pinned_vocabulary, url, model, fields
+    ):
+        c, _user = auth_client
+        payload = _target(recording, **fields, codes={"test-pinned": {"value": " Spike ", "meta": PIN}})
+        resp = post_json(c, url, payload)
+        assert resp.status_code == 200, resp.content
+        assert _codes(model.objects.get(object_hash="C" * 32)) == {"test-pinned": ("Spike", PIN)}
+        assert [code["value"] for code in resp.json()["codes"]] == ["Spike"]
 
     def test_a_refused_code_writes_nothing(self, auth_client, recording, pinned_vocabulary, url, model, fields):
         c, _user = auth_client

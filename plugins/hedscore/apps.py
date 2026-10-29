@@ -22,7 +22,7 @@ class HedscoreConfig(PluginConfig):
         from annotations.vocabularies import register_vocabulary
         from plugins.hedscore import checks  # noqa: F401
         from plugins.hedscore.schema import SCHEMA_PIN, load_schema
-        from plugins.hedscore.validation import validate_hed
+        from plugins.hedscore.validation import canonicalise_hed, validate_hed
 
         load_schema()
         register_vocabulary(
@@ -32,4 +32,5 @@ class HedscoreConfig(PluginConfig):
             validator=validate_hed,
             confined=True,
             write_meta=SCHEMA_PIN.as_meta,
+            canonicalise=canonicalise_hed,
         )

@@ -16,7 +16,7 @@ account that is not one person's, such as a classroom's shared account, with :fu
 by an account many people use records nothing about any of them.
 
 The binding version is cached for :data:`BINDING_CACHE_SECONDS`, and an account's acceptance of it in its session, so
-the gate costs no query on most requests. Publishing clears the cache entry, which reaches every process through a
+the gate costs no query on most requests. Publishing rewrites the cache entry, which reaches every process through a
 shared cache such as production's Redis; with a per-process cache, other processes pick it up when the entry expires.
 A cache that cannot be reached is skipped for the database, so the gate stays closed rather than failing the request.
 """
@@ -114,20 +114,31 @@ def binding_agreement_pk() -> int | None:
         logger.warning("The cache could not be read; the user agreement gate reads the database.", exc_info=True)
         cached = None
     if cached is None:
-        pk = UserAgreement.objects.filter(reaccept=True).order_by("-pk").values_list("pk", flat=True).first()
-        cached = pk if pk is not None else _NOT_PUBLISHED
+        cached = _binding_pk_from_database()
         try:
-            cache.set(BINDING_CACHE_KEY, cached, BINDING_CACHE_SECONDS)
+            # add, not set: a reader that read the database just before a publish must not put the old version back
+            # over the one the publish wrote.
+            cache.add(BINDING_CACHE_KEY, cached, BINDING_CACHE_SECONDS)
         except Exception:
             logger.warning("The cache could not be written; the user agreement gate reads the database.", exc_info=True)
     return cached or None
 
 
-def _clear_binding_cache() -> None:
+def _binding_pk_from_database() -> int:
+    pk = UserAgreement.objects.filter(reaccept=True).order_by("-pk").values_list("pk", flat=True).first()
+    return pk if pk is not None else _NOT_PUBLISHED
+
+
+def _refresh_binding_cache() -> None:
+    """Write the binding version into the cache once a publish has committed.
+
+    Written rather than deleted, so a reader that missed the entry before the commit and writes what it read after
+    it finds the entry taken; the two together are what makes a shared cache gate on the new version at once.
+    """
     try:
-        cache.delete(BINDING_CACHE_KEY)
+        cache.set(BINDING_CACHE_KEY, _binding_pk_from_database(), BINDING_CACHE_SECONDS)
     except Exception:
-        logger.warning("The cache could not be cleared; a new agreement binds once the entry expires.", exc_info=True)
+        logger.warning("The cache could not be written; a new agreement binds once the entry expires.", exc_info=True)
 
 
 def has_accepted(user, binding_pk: int | None = None) -> bool:
@@ -180,7 +191,7 @@ def check_publication(version: str, text: str, *, reaccept: bool = True) -> str:
 def publish(version: str, text: str, *, reaccept: bool = True) -> UserAgreement:
     """Publish a new version of the agreement, after :func:`check_publication`.
 
-    The binding version's cache entry is cleared after the commit, so a shared cache gates on the new version at once.
+    The binding version's cache entry is rewritten after the commit, so a shared cache gates on the new version at once.
     """
     version = check_publication(version, text, reaccept=reaccept)
     agreement = UserAgreement.objects.create(
@@ -189,7 +200,7 @@ def publish(version: str, text: str, *, reaccept: bool = True) -> UserAgreement:
         digest=text_digest(text),
         reaccept=reaccept,
     )
-    transaction.on_commit(_clear_binding_cache)
+    transaction.on_commit(_refresh_binding_cache)
     return agreement
 
 

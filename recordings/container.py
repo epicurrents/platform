@@ -306,22 +306,24 @@ def footer_label_codes(footer: dict) -> list[list[tuple[str, str]]]:
 
 
 def _accepted_code(standard: str, value: str):
-    """The vocabulary registered for *standard* when it accepts *value*, else ``None``: the registry, fail-closed.
+    """The vocabulary registered for *standard* and the spelling of *value* it stores when it accepts the value, else
+    ``None``: the registry, fail-closed.
 
     Unlike the API's ``validate_code``, an unregistered standard is refused whatever the strict-vocabulary setting
     says, because a code nobody validates is text a file supplied. So is a code under a vocabulary not registered
     as ``closed``: only an enumerated set keeps a file from choosing the value.
     """
-    from annotations.vocabularies import get_vocabulary
+    from annotations.vocabularies import canonical_value, get_vocabulary
 
     vocabulary = get_vocabulary(standard)
     if vocabulary is None or not vocabulary.closed:
         return None
     try:
+        value = canonical_value(vocabulary, value)
         vocabulary.validator(value, None)
     except Exception:  # a validator is project code, so any failure of it refuses the code
         return None
-    return vocabulary
+    return vocabulary, value
 
 
 def _term_name(vocabulary, value: str) -> str | None:
@@ -356,11 +358,12 @@ def save_footer_labels(recording, footer: dict) -> tuple[int, int]:
     system_user = None
     recording_ct = label_ct = None
     for index, codes in enumerate(declared):
-        accepted = [
-            (standard, value, vocabulary)
-            for standard, value in codes
-            if (vocabulary := _accepted_code(standard, value))
-        ]
+        accepted = []
+        for standard, value in codes:
+            found = _accepted_code(standard, value)
+            if found is not None:
+                vocabulary, stored = found
+                accepted.append((standard, stored, vocabulary))
         if not accepted:
             skipped += 1
             continue

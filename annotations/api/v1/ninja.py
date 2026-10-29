@@ -247,7 +247,8 @@ def _inline_codes(codes: dict | None, *, patch: dict | None = None) -> dict | No
         if not standard or len(standard) > _STANDARD_MAX_LENGTH:
             raise HttpError(422, f"a code's standard is 1 to {_STANDARD_MAX_LENGTH} characters")
         try:
-            validate_code(standard, code.value, code.meta)
+            # The vocabulary's canonical spelling is what gets written.
+            code.value = validate_code(standard, code.value, code.meta)
         except ValueError as exc:
             raise HttpError(422, f"{standard}: {exc}") from exc
     return codes
@@ -1036,7 +1037,7 @@ def create_code(request, payload: CodeIn):
         raise HttpError(403, "You do not have permission to add codes to this annotation")
 
     try:
-        validate_code(payload.standard, payload.value, payload.meta)
+        payload.value = validate_code(payload.standard, payload.value, payload.meta)
     except ValueError as exc:
         raise HttpError(422, str(exc)) from exc
 
@@ -1078,7 +1079,7 @@ def update_code(request, code_id: int, payload: CodePatch):
         setattr(code, field_name, field_value)
 
     try:
-        validate_code(code.standard, code.value, code.meta)
+        code.value = validate_code(code.standard, code.value, code.meta)
     except ValueError as exc:
         raise HttpError(422, str(exc)) from exc
 

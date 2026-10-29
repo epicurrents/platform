@@ -98,7 +98,14 @@ def subject_vocabulary():
         if value not in SUBJECT_TERMS:
             raise ValueError(f"term {value!r} is not in {SUBJECT}")
 
-    register_vocabulary(SUBJECT, label="Fixture subject", validator=validate, term_name=SUBJECT_TERMS.get, closed=True)
+    register_vocabulary(
+        SUBJECT,
+        label="Fixture subject",
+        validator=validate,
+        term_name=SUBJECT_TERMS.get,
+        closed=True,
+        canonicalise=lambda value: value.strip() if isinstance(value, str) else value,
+    )
     yield
     unregister_vocabulary(SUBJECT)
 
@@ -434,6 +441,12 @@ class TestSaveLabels:
         assert save_footer_labels(recording, {"labels": [_label(codes={SUBJECT: "SEX_F"})]}) == (1, 0)
         (label,) = _labels(recording)
         assert (label.name, label.value) == ("Female", "SEX_F")
+
+    def test_a_declared_code_is_stored_in_the_spelling_its_vocabulary_keeps(self, recording, subject_vocabulary):
+        assert save_footer_labels(recording, {"labels": [_label(codes={SUBJECT: " SEX_F "})]}) == (1, 0)
+        (label,) = _labels(recording)
+        assert (label.name, label.value) == ("Female", "SEX_F")
+        assert _label_codes(label) == [(SUBJECT, "SEX_F")]
 
     def test_an_open_vocabulary_is_refused_even_when_it_accepts_the_value(self, recording):
         # A file chooses the value of a code it declares, and a code value is exempt from the annotation-text

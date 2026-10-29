@@ -16,6 +16,7 @@
 import { computed, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import AdminTabs from '#components/AdminTabs.vue'
+import PagingControls from '#components/PagingControls.vue'
 import StepUpFields from '#components/StepUpFields.vue'
 import { createAccount, listAccounts, type Account } from '#api/admin'
 import { useDialog } from '#composables/useDialog'
@@ -274,26 +275,13 @@ onUnmounted(() => clearTimeout(searchTimer))
             </div>
         </div>
 
-        <div v-if="!loading && !loadError" class="admin-paging">
-            <wa-button
-                appearance="plain"
-                :disabled="!hasPrevPage"
-                size="s"
-                @click="prevPage"
-            >
-                <wa-icon name="arrow-left" slot="start"></wa-icon>
-                {{ t('Previous', SCOPE) }}
-            </wa-button>
-            <wa-button
-                appearance="plain"
-                :disabled="!hasNextPage"
-                size="s"
-                @click="nextPage"
-            >
-                {{ t('Next', SCOPE) }}
-                <wa-icon name="arrow-right" slot="end"></wa-icon>
-            </wa-button>
-        </div>
+        <PagingControls
+            v-if="!loading && !loadError"
+            :has-next="hasNextPage"
+            :has-prev="hasPrevPage"
+            @next="nextPage"
+            @prev="prevPage"
+        ></PagingControls>
     </main>
 
     <wa-dialog :label="t('New account', SCOPE)" :open="createDialog.open.value" @wa-hide.self="createDialog.onHide">
@@ -374,11 +362,5 @@ onUnmounted(() => clearTimeout(searchTimer))
     display: flex;
     flex-direction: column;
     gap: var(--wa-space-s);
-}
-
-.admin-paging {
-    display: flex;
-    justify-content: space-between;
-    margin-top: var(--wa-space-m);
 }
 </style>

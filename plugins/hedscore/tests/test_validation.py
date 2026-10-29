@@ -10,6 +10,7 @@ from plugins.hedscore.validation import (
     MAX_TAGS,
     NUMERIC_CLASS,
     NUMERIC_DOMAINS,
+    canonicalise_hed,
     validate_hed,
 )
 
@@ -273,6 +274,49 @@ class TestStructure:
 
     def test_the_value_must_be_a_string(self):
         refuses(3, "non-empty string")
+
+
+class TestCanonicalForm:
+    @pytest.mark.parametrize(
+        ("written", "canonical"),
+        [
+            ("Spike", "Spike"),
+            ("(Spike, Left)", "(Spike, Left)"),
+            (" Spike ,Left,  Sensor-list/F7;T7 ", "Spike, Left, Sensor-list/F7;T7"),
+            ("(Spike,\tLeft\n, Feature-frequency/10   Hz)", "(Spike, Left, Feature-frequency/10 Hz)"),
+            ("(Spike, Spike, Left, Spike)", "(Spike, Left)"),
+            ("(Spike, (Left, Right), (Left, Right))", "(Spike, (Left, Right))"),
+            ("((Spike))", "Spike"),
+            ("(Spike, (Left), ((Sensor-list/F7)))", "(Spike, Left, Sensor-list/F7)"),
+            ("(Spike, (Left, (Greater-than, Right)))", "(Spike, (Left, (Greater-than, Right)))"),
+        ],
+    )
+    def test_one_spelling_per_meaning(self, written, canonical):
+        assert canonicalise_hed(written) == canonical
+
+    def test_the_order_of_the_tags_is_kept(self):
+        assert canonicalise_hed("(Left, Spike)") == "(Left, Spike)"
+
+    def test_the_canonical_form_is_a_fixed_point(self):
+        value = "(Spike, Left, (Left, (Greater-than, Right)), Sensor-list/F7;T7, ID/104)"
+        assert canonicalise_hed(value) == value
+        assert canonicalise_hed(canonicalise_hed(" ( Spike ,Left , (Left) ) ")) == canonicalise_hed(
+            " ( Spike ,Left , (Left) ) "
+        )
+
+    @pytest.mark.parametrize("value", ["(Spike", "Spike, ()", "Spike (Left)", "", "  ", 3])
+    def test_what_cannot_be_read_is_refused(self, value):
+        with pytest.raises(ValueError):
+            canonicalise_hed(value)
+
+    def test_the_length_is_capped_before_the_string_is_read(self):
+        with pytest.raises(ValueError, match="at most"):
+            canonicalise_hed("(" * (MAX_LENGTH + 1))
+
+    def test_the_registered_vocabulary_stores_the_canonical_form(self):
+        from annotations.vocabularies import validate_code
+
+        assert validate_code("hed", " (Spike,  Spike, (Left)) ", PIN) == "(Spike, Left)"
 
 
 class TestMeta:

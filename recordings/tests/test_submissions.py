@@ -36,11 +36,11 @@ from recordings.models import Recording, SubmissionFile, SubmissionLedger
 from recordings.processors.edf import _build_clean_header, parse_edf_header, parse_signal_infos
 from recordings.processors.redither import REDITHER_VERSION
 from recordings.submissions import (
+    ATTESTATION_KEY,
     BLANK_PATIENT,
     BLANK_RECORDING,
     BLANK_START_DATE,
     BLANK_START_TIME,
-    ATTESTATION_KEY,
     DEFAULT_FORBIDDEN_SIDECAR_KEYS,
     IngestProfile,
     PoolUnavailable,

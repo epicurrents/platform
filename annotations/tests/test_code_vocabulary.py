@@ -41,6 +41,25 @@ def test_vocabulary():
     unregister_vocabulary("test-vocab")
 
 
+def _spaced_validator(value, meta):
+    if value not in {"Seizure", "Spike"}:
+        raise ValueError(f"term {value!r} is not in the spaced vocabulary")
+
+
+def _collapse(value):
+    """The spaced vocabulary's one spelling: surrounding and repeated whitespace removed."""
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("a value is a non-empty string")
+    return " ".join(value.split())
+
+
+@pytest.fixture
+def spaced_vocabulary():
+    register_vocabulary("test-spaced", label="Spaced", validator=_spaced_validator, canonicalise=_collapse)
+    yield
+    unregister_vocabulary("test-spaced")
+
+
 @pytest.fixture
 def event(db, user):
     recording = baker.make("recordings.Recording", author=user)
@@ -98,6 +117,17 @@ class TestRegistry:
     def test_strict_mode_still_accepts_registered_standard(self, test_vocabulary):
         validate_code("test-vocab", "Artifact", None)
 
+    def test_validate_code_returns_the_value_it_was_given_without_a_canonicaliser(self, test_vocabulary):
+        assert validate_code("test-vocab", "Seizure", None) == "Seizure"
+        assert validate_code("nobody-registered", " as typed ", None) == " as typed "
+
+    def test_a_canonicaliser_runs_before_the_validator_and_its_result_is_returned(self, spaced_vocabulary):
+        assert validate_code("test-spaced", "  Seizure ", None) == "Seizure"
+        with pytest.raises(ValueError, match="not in the spaced vocabulary"):
+            validate_code("test-spaced", " Sei zure ", None)
+        with pytest.raises(ValueError, match="a value is a non-empty string"):
+            validate_code("test-spaced", 3, None)
+
     def test_a_vocabulary_names_no_terms_unless_it_registers_a_lookup(self, test_vocabulary):
         assert get_vocabulary("test-vocab").term_name is None
         assert get_vocabulary("nobody-registered-this") is None
@@ -136,6 +166,13 @@ class TestCreateCodeValidation:
         resp = post_json(c, CODES_URL, _payload(event))
         assert resp.status_code == 200, resp.content
         assert Code.objects.filter(pk=resp.json()["id"]).exists()
+
+    def test_the_canonical_spelling_is_what_is_written_and_served(self, auth_client, event, spaced_vocabulary):
+        c, _user = auth_client
+        resp = post_json(c, CODES_URL, _payload(event, standard="test-spaced", value="  Seizure\t"))
+        assert resp.status_code == 200, resp.content
+        assert resp.json()["value"] == "Seizure"
+        assert Code.objects.get(pk=resp.json()["id"]).value == "Seizure"
 
     def test_invalid_term_returns_422_and_writes_nothing(self, auth_client, event, test_vocabulary):
         c, _user = auth_client
@@ -178,6 +215,14 @@ class TestUpdateCodeValidation:
         c, _user = auth_client
         code = self._code(event)
         resp = patch_json(c, f"{CODES_URL}{code.pk}", {"value": "Spike"})
+        assert resp.status_code == 200, resp.content
+        code.refresh_from_db()
+        assert code.value == "Spike"
+
+    def test_a_patched_value_is_saved_in_its_canonical_spelling(self, auth_client, event, spaced_vocabulary):
+        c, _user = auth_client
+        code = self._code(event, standard="test-spaced")
+        resp = patch_json(c, f"{CODES_URL}{code.pk}", {"value": " Spike  "})
         assert resp.status_code == 200, resp.content
         code.refresh_from_db()
         assert code.value == "Spike"

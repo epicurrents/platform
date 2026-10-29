@@ -976,12 +976,11 @@ def delete_group(request, group_id: int):
         )
 
     member_count = group.user_set.count()
-    name = group.name
-    group.delete()
-    log_activity(
-        verb="user.group.delete",
-        metadata={"group_name": name, "member_count": member_count},
-    )
+    with transaction.atomic():
+        # Targeted before the delete, while the row is there to target. The name stays out of the metadata: it is a
+        # label the operator typed, and an affiliation's is an organisation's; the row's own delete record carries it.
+        log_activity(verb="user.group.delete", target=group, metadata={"member_count": member_count})
+        group.delete()
     return {"status": "deleted"}
 
 

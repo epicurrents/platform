@@ -37,7 +37,9 @@ class Vocabulary:
 
     ``term_name`` answers the display name of a value the validator accepts, or ``None`` where the standard gives
     none; a vocabulary registered without it names no terms. ``write_meta`` answers the ``meta`` a server-side
-    writer stamps on a code it creates, or is ``None`` where the standard keeps no ``meta``.
+    writer stamps on a code it creates, or is ``None`` where the standard keeps no ``meta``. ``canonicalise`` rewrites
+    a value into the one spelling the standard stores, before validation, or is ``None`` where every accepted value
+    already has one.
     """
 
     standard: str
@@ -48,6 +50,7 @@ class Vocabulary:
     closed: bool = False
     confined: bool = False
     write_meta: Callable[[], Any] | None = None
+    canonicalise: Callable[[str], str] | None = None
 
 
 _REGISTRY: dict[str, Vocabulary] = {}
@@ -63,6 +66,7 @@ def register_vocabulary(
     closed: bool = False,
     confined: bool = False,
     write_meta: Callable[[], Any] | None = None,
+    canonicalise: Callable[[str], str] | None = None,
 ) -> None:
     """Register a validator for ``standard``; call from the owning ``AppConfig.ready()``.
 
@@ -86,6 +90,13 @@ def register_vocabulary(
     ``write_meta`` returns the ``meta`` a server-side writer stamps on a code of this standard, for a vocabulary whose
     validator pins its ``meta`` (a schema release), so a row written without a client still validates. A client
     writing through the API sends its own.
+
+    ``canonicalise`` takes a value and returns the spelling the standard stores, or raises ``ValueError`` where the
+    value cannot be read at all; :func:`validate_code` applies it before the validator and returns its result, which
+    is what every writer stores. It is for a standard whose grammar admits more than one spelling of the same
+    meaning, such as HED's whitespace, repeated tags and redundant grouping: each spelling the writer may choose is
+    a place to put something other than the meaning, and a confined vocabulary is one where no such place is left.
+    The rules are the standard's own, since what is a redundant spelling differs by grammar.
     """
     _REGISTRY[standard] = Vocabulary(
         standard=standard,
@@ -96,6 +107,7 @@ def register_vocabulary(
         closed=closed,
         confined=confined or closed,
         write_meta=write_meta,
+        canonicalise=canonicalise,
     )
 
 
@@ -114,12 +126,13 @@ def registered_vocabularies() -> list[Vocabulary]:
     return sorted(_REGISTRY.values(), key=lambda v: v.standard)
 
 
-def validate_code(standard: str, value: str, meta: Any) -> None:
-    """Validate ``(value, meta)`` against the vocabulary registered for ``standard``.
+def validate_code(standard: str, value: str, meta: Any) -> str:
+    """Validate ``(value, meta)`` against the vocabulary registered for ``standard`` and return the value to store.
 
     Raises ``ValueError`` when the registered validator rejects the pair, or — only under
     ``ANNOTATION_CODE_STRICT_VOCABULARY`` — when no vocabulary is registered for ``standard``.
-    Returns silently otherwise.
+    Returns the value in the vocabulary's canonical spelling otherwise, which is ``value`` itself for a vocabulary
+    that registers no ``canonicalise``; a writer stores what this returns, never what it was given.
     """
     from django.conf import settings
 
@@ -129,5 +142,17 @@ def validate_code(standard: str, value: str, meta: Any) -> None:
             raise ValueError(
                 f"unknown coding standard {standard!r}: this deployment accepts only registered vocabularies"
             )
-        return
+        return value
+    value = canonical_value(vocabulary, value)
     vocabulary.validator(value, meta)
+    return value
+
+
+def canonical_value(vocabulary: Vocabulary, value: str) -> str:
+    """The spelling of ``value`` that ``vocabulary`` stores: its ``canonicalise`` applied, or ``value`` without one.
+
+    Raises ``ValueError`` as the hook does; the result is what the validator sees and what a writer stores.
+    """
+    if vocabulary.canonicalise is None:
+        return value
+    return vocabulary.canonicalise(value)

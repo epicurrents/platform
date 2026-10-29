@@ -42,10 +42,10 @@ The registry is inert until a profile is registered from a project's ``apps.py::
 
 from __future__ import annotations
 
+import calendar
 import hashlib
 import json
 import logging
-import calendar
 import math
 from collections.abc import Callable
 from dataclasses import dataclass, field

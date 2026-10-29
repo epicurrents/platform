@@ -5,18 +5,22 @@ from django.db import migrations, models
 
 
 class Migration(migrations.Migration):
-
     dependencies = [
-        ('auth', '0012_alter_user_first_name_max_length'),
-        ('user', '0002_user_email_self_asserted'),
+        ("auth", "0012_alter_user_first_name_max_length"),
+        ("user", "0002_user_email_self_asserted"),
     ]
 
     operations = [
         migrations.CreateModel(
-            name='Affiliation',
+            name="Affiliation",
             fields=[
-                ('id', models.BigAutoField(auto_created=True, primary_key=True, serialize=False, verbose_name='ID')),
-                ('group', models.OneToOneField(on_delete=django.db.models.deletion.CASCADE, related_name='affiliation', to='auth.group')),
+                ("id", models.BigAutoField(auto_created=True, primary_key=True, serialize=False, verbose_name="ID")),
+                (
+                    "group",
+                    models.OneToOneField(
+                        on_delete=django.db.models.deletion.CASCADE, related_name="affiliation", to="auth.group"
+                    ),
+                ),
             ],
         ),
     ]

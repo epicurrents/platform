@@ -21,6 +21,7 @@ A `hed` code's `value` is a HED string and its `meta` is the schema pin, `{"sche
 - Reserved tags (`Onset`, `Duration`, `Definition` and the rest) and deprecated tags are refused. An event's timing belongs to the row.
 - A string holds at most 64 tags and 16 numeric values within its 2000 characters, and a sensor list names a channel once.
 - Groups are checked for balance and emptiness only.
+- A string is stored in one spelling. `canonicalise_hed`, registered as the vocabulary's `canonicalise` and applied before the validator, joins the tags of a group with `, ` and no other whitespace, drops a tag or group repeated within its group, and replaces a group of one member by the member, so `( Spike,Spike , (Left) )` is stored as `(Spike, Left)`. Tags keep their written order: the viewer's picker writes one order, finding first, and the readable form follows it, which leaves the order the one spelling choice a writer still has.
 
 | Placeholder | Unit | Range | Decimals |
 |---|---|---|---|

@@ -24,6 +24,11 @@ text through that exemption. So the rules below are narrower than HED's own.
 - **A string is bounded in size:** at most ``MAX_TAGS`` tags, ``MAX_NUMBERS`` numeric values and ``MAX_LENGTH``
   characters, and a sensor list names a channel once.
 - **``meta`` is the schema pin**, exactly, so every stored row names the release it was validated against.
+- **A string is stored in one spelling.** :func:`canonicalise_hed`, registered as the vocabulary's ``canonicalise``
+  and applied before the validator, writes the tags of each group separated by ``, `` with no other whitespace,
+  drops a tag or group repeated within its group, and unwraps a group that holds one member, so neither spacing,
+  repetition nor redundant grouping can carry anything. The order of the tags within a group is kept as written:
+  the viewer's picker writes one order, and the readable form follows it.
 
 Together the rules make ``hed`` a confined vocabulary in the registry's sense: every part of a value comes from a
 declared domain and none of it is typed text. A writer can still choose a plausible reading, and the domains bound
@@ -131,19 +136,69 @@ def _split_top_level(text: str) -> list[str]:
     return stripped
 
 
-def _tags(text: str, depth: int = 0) -> list[str]:
-    """Every tag in *text*, groups flattened."""
+#: A parsed HED string: a tag is a ``str``, a group the list of its members.
+_Node = str | list
+
+
+def _parse(text: str, depth: int = 0) -> list[_Node]:
+    """The tags and groups of *text*, a tag's whitespace collapsed to single spaces."""
     if depth > MAX_DEPTH:
         raise ValueError(f"groups nest at most {MAX_DEPTH} deep")
-    tags = []
+    nodes: list[_Node] = []
     for part in _split_top_level(text):
         if part.startswith("(") and part.endswith(")"):
-            tags.extend(_tags(part[1:-1], depth + 1))
+            nodes.append(_parse(part[1:-1], depth + 1))
         elif "(" in part or ")" in part:
             raise ValueError(f"malformed group in the HED string near {part!r}")
         else:
-            tags.append(part)
+            nodes.append(" ".join(part.split()))
+    return nodes
+
+
+def _tags(text: str) -> list[str]:
+    """Every tag in *text*, groups flattened."""
+    tags: list[str] = []
+
+    def walk(nodes: list[_Node]) -> None:
+        for node in nodes:
+            if isinstance(node, list):
+                walk(node)
+            else:
+                tags.append(node)
+
+    walk(_parse(text))
     return tags
+
+
+def _canonical(nodes: list[_Node]) -> list[_Node]:
+    """*nodes* with every group reduced to its one form: no repeated member, and no group holding a single member."""
+    reduced: list[_Node] = []
+    for node in nodes:
+        if isinstance(node, list):
+            node = _canonical(node)
+            while isinstance(node, list) and len(node) == 1:
+                node = node[0]
+        if node not in reduced:
+            reduced.append(node)
+    return reduced
+
+
+def _render(nodes: list[_Node]) -> str:
+    return ", ".join(f"({_render(node)})" if isinstance(node, list) else node for node in nodes)
+
+
+def canonicalise_hed(value: Any) -> str:
+    """*value* in the one spelling the platform stores; the registered ``hed`` canonicaliser.
+
+    Raises ``ValueError`` where the string cannot be read, as the validator would. Whitespace within a tag collapses
+    to single spaces and the tags of a group are joined with ``, ``; a tag or group repeated within its group is
+    dropped, keeping the first; a group holding one member is replaced by that member. Tags keep their written order.
+    """
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("a HED code's value is a non-empty string")
+    if len(value) > MAX_LENGTH:
+        raise ValueError(f"a HED string is at most {MAX_LENGTH} characters")
+    return _render(_canonical(_parse(value)))
 
 
 def _check_numeric(term: Term, value: str) -> None:
