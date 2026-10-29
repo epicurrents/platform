@@ -5,6 +5,7 @@ import ToastStack from '#components/ToastStack.vue'
 import AppLogo from '#components/AppLogo.vue'
 import StepUpDialog from '#components/StepUpDialog.vue'
 import { t } from '#i18n'
+import { setAgreementRefusalHandler } from '#lib/agreementGate'
 import { showToast } from '#lib/toast'
 import { getViewerSetup, setViewerSetup } from '#lib/viewerGlobal'
 import type { EpicurrentsGlobal } from '@epicurrents/core/dist/types'
@@ -25,6 +26,28 @@ const themeStore = useThemeStore()
 const route = useRoute()
 const router = useRouter()
 
+/** Set while a refusal is being handled, so the refusals of a view's parallel requests move to the page once. */
+let agreementRedirectPending = false
+
+/**
+ * Take an account the API refused for want of an accepted user agreement to the agreement page. The guard does this
+ * before navigation; this covers a version published while the account was signed in, which a request notices first.
+ * The page to return to is read before anything is awaited, while the route is still the one that was refused.
+ */
+async function onAgreementRefused () {
+    if (agreementRedirectPending || route.name === 'agreement') {
+        return
+    }
+    agreementRedirectPending = true
+    const redirect = route.fullPath
+    try {
+        await authStore.refresh()
+        await router.push({ name: 'agreement', query: { redirect } })
+    } finally {
+        agreementRedirectPending = false
+    }
+}
+
 // Bridge the viewer's callouts into the platform's showToast stack.
 //
 // The viewer ships as a UMD bundle that embeds its own `scoped-event-log`
@@ -38,6 +61,7 @@ const router = useRouter()
 // shares the existing viewer namespace; future host hooks (e.g. `confirm`,
 // `progress`) belong on the same object.
 onMounted(() => {
+    setAgreementRefusalHandler(onAgreementRefused)
     deploymentStore.init()
     // Ask the public lock probe once, so a page opened during maintenance says so before a request is refused.
     maintenanceStore.init()
@@ -71,6 +95,7 @@ onMounted(() => {
 })
 
 onUnmounted(() => {
+    setAgreementRefusalHandler(null)
     // Clear the slot on hot-reload / teardown so a stale closure can't leak
     // a reference to a destroyed component instance.
     if (window.__EPICURRENTS__) {
@@ -163,7 +188,10 @@ const navLinks = computed(() => {
 })
 
 const showNavigation = computed(() => {
-    return authStore.isAuthenticated && route.name !== 'viewer' && !route.meta.fullscreen
+    return authStore.isAuthenticated
+        && !authStore.agreementRequired
+        && route.name !== 'viewer'
+        && !route.meta.fullscreen
 })
 
 /** A superuser is exempt while an update awaits confirmation, and is told what that exemption costs. */

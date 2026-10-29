@@ -51,6 +51,7 @@ Contact for privacy questions: `[FILL: email address]`.
 | A record of every action you take in the application: what you read, created, changed or deleted, when, and from which interface | Automatically | Reconstructing who did what to clinical data — a requirement of processing health data, not an optional feature | `[FILL]` |
 | Free text you write: annotation content, collection and dataset names, tags | You | Providing the service | `[FILL]` |
 | Client settings, e.g. your chosen montage | You | Restoring your preferences on another machine | `[FILL]` |
+| Which versions of the user agreement you accepted, and when | You, when you accept | Showing that you accepted the terms in force | `[FILL — commonly contract]` |
 | Push notification endpoint and encryption keys, if you enable notifications | Your browser | Delivering notifications you asked for | `[FILL — commonly consent]` |
 
 `[Conditional — delete unless OIDC_ENABLED: ]` If you sign in through `[FILL: provider name]`, that provider tells us an opaque identifier for you, your email address, your name, and the tenant you belong to. We do not receive your password.

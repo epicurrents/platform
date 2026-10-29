@@ -621,6 +621,9 @@ To check the table against the tree, walk the AST for `log_activity` / `with_sys
 | `user.account.password.set` | `set_account_password` |
 | `user.account.read` | `get_account` |
 | `user.account.update` | `update_account` |
+| `user.agreement.accept` | `accept_agreement_endpoint` |
+| `user.agreement.publish` | `publish_agreement` (command) |
+| `user.agreement.read` | `agreement_endpoint` |
 | `user.group.create` | `create_group` |
 | `user.group.delete` | `delete_group` |
 | `user.group.list` | `list_groups`, `list_group_details` |

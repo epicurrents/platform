@@ -52,6 +52,7 @@ from ninja.errors import HttpError
 from activity.audit import log_activity
 from epicurrents.auth import enforce_session_csrf
 from epicurrents.security_log import get_client_ip, log_security_event
+from user import agreement as user_agreement
 from user import lockout
 from user.affiliations import affiliation_names
 from user.api.v1.accounts import router as accounts_router
@@ -192,6 +193,9 @@ class UserOut(Schema):
     #: rendered, the submission is refused, and the person is left reading an
     #: error about a password they never had.
     external_provider: str | None = None
+    #: True while the account has not accepted the deployment's binding user agreement; until it does, the API answers
+    #: 403 with code ``agreement_required`` to everything but the exempt routes in user/agreement.py.
+    agreement_required: bool = False
 
 
 class LoginResultOut(Schema):
@@ -303,6 +307,7 @@ def _serialize_user(user) -> dict:
         "roles": read_roles(user),
         "affiliations": affiliation_names(user),
         "external_provider": provider_label(user) if is_externally_authenticated(user) else None,
+        "agreement_required": user_agreement.acceptance_required(user),
     }
 
 
@@ -658,6 +663,83 @@ def me_endpoint(request):
         log_activity(verb="user.profile.read", target=user)
         return {"authenticated": True, "user": _serialize_user(user)}
     return {"authenticated": False, "user": None}
+
+
+class AgreementOut(Schema):
+    """The deployment's user agreement as currently shown.
+
+    ``version`` and ``text`` are null while none is published. ``accepted`` is true when nothing is asked of the
+    caller, so always while none is published, and false for a caller without a session otherwise.
+    """
+
+    published: bool
+    version: str | None = None
+    text: str | None = None
+    published_at: str | None = None
+    #: Whether the caller's acceptance covers the binding version, so nothing is asked of them.
+    accepted: bool = False
+    #: The latest version the caller accepted, which differs from ``version`` after a correction.
+    accepted_version: str | None = None
+    accepted_at: str | None = None
+
+
+class AgreementAcceptIn(Schema):
+    """The version the caller read, which must still be the one shown."""
+
+    version: str = Field(max_length=64)
+
+
+@api.get("/agreement", response=AgreementOut)
+def agreement_endpoint(request):
+    """The current user agreement, readable without a session so that anyone deciding whether to use an account can.
+
+    An account that has not accepted it still reaches this endpoint; the gate exempts it.
+    """
+    agreement = user_agreement.current_agreement()
+    user = getattr(request, "user", None)
+    signed_in = bool(user and user.is_authenticated)
+    log_activity(verb="user.agreement.read", target=agreement)
+    if agreement is None:
+        return {"published": False, "accepted": True}
+    out = {
+        "published": True,
+        "version": agreement.version,
+        "text": agreement.text,
+        "published_at": agreement.published_at.isoformat(),
+    }
+    if signed_in:
+        latest = user.agreement_acceptances.order_by("-agreement_id").first()
+        out["accepted"] = not user_agreement.acceptance_required(user)
+        if latest is not None:
+            out["accepted_version"] = latest.version
+            out["accepted_at"] = latest.accepted_at.isoformat()
+    return out
+
+
+@api.post("/agreement/accept", response=UserOut)
+def accept_agreement_endpoint(request, payload: AgreementAcceptIn):
+    """Accept the user agreement shown, and return the account with ``agreement_required`` cleared.
+
+    Refused with 409 when ``version`` is no longer the one shown, since a version published while the caller was
+    reading must be read before it is accepted, and for an exempt account, whose acceptance would say nothing about
+    anyone. Accepting again records nothing new.
+    """
+    user = _require_auth(request)
+    agreement = user_agreement.current_agreement()
+    if agreement is None:
+        raise HttpError(404, "No user agreement is published.")
+    if user_agreement.is_exempt(user):
+        raise HttpError(409, "This account is not asked to accept the user agreement.")
+    if payload.version != agreement.version:
+        raise HttpError(409, "A newer version of the user agreement has been published. Read it before accepting.")
+    with transaction.atomic():
+        user_agreement.accept(user, agreement)
+        log_activity(
+            verb="user.agreement.accept",
+            target=agreement,
+            metadata={"digest": agreement.digest},
+        )
+    return _serialize_user(user)
 
 
 @api.patch("/me", response=UserOut)

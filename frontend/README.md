@@ -205,6 +205,7 @@ A target reports its outcome as a message rather than throwing, and the gate's 4
 | `/admin/maintenance/:id` | `AdminMaintenanceJobView` | Maintenance job — timeline, log, confirm / roll back / cancel (staff) |
 | `/profile` | `ProfileView` | User profile / password change |
 | `/login` | `LoginView` | Login form |
+| `/agreement` | `AgreementView` | The deployment's [user agreement](#the-user-agreement), read by anyone and accepted by an account before it can use anything else |
 | `/reset-password` | `ResetPasswordView` | Password reset confirmation |
 
 ### Administration
@@ -234,6 +235,10 @@ The lock is the other half. [src/lib/http.ts](src/lib/http.ts) carries a respons
 **Only the public lock probe decides the lock has lifted.** `GET /api/v1/maintenance/lock` answers 200 to anyone, in every phase and with the feature off, with `locked` and the phase. The store asks it once at start-up (so a page opened during maintenance shows the banner before anything is refused) and then every ten seconds while the platform is suspended, every thirty while an update awaits confirmation, or after a refusal's `Retry-After` bounded to a minute, and not while the tab is hidden. Never use another request as the release signal: a superuser's `GET /me` passes during a lock, so reading its 200 as "back" reloads the page in a loop. The phase toast is persistent and is dismissed when the phase changes or the lock lifts. Regression coverage in [src/stores/maintenance.test.ts](src/stores/maintenance.test.ts).
 
 The job page polls through `usePolling`, backing off from three to ten seconds while nothing changes, and counts the confirmation window down against the server's clock (`server_now` from the status) rather than the browser's. It keeps polling after a confirmation or rollback was requested until the agent acts on it, and after a failed first load, which a restart answers with errors for a while.
+
+### The user agreement
+
+Once a deployment publishes a user agreement, an account whose `agreement_required` is true reaches nothing else. The guard sends it to `/agreement` from every route with `requiresAuth`, before the staff and superuser checks, with `?redirect=` naming where it was going, and the nav bar stays hidden until it accepts. A version published during a session is noticed by a request instead: the API answers `403 {"code": "agreement_required"}`, [src/lib/agreementGate.ts](src/lib/agreementGate.ts) reports it from the HTTP wrapper, and `App.vue` refreshes the account and moves to the page. The route itself needs no session, so the redirect cannot loop and the agreement can be read before signing in. The text is the deployment's Markdown, rendered with raw HTML disabled. The mechanism and the publishing command are in [user/README.md → User agreement](../user/README.md#user-agreement).
 
 ### Password reset and invitation links
 

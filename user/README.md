@@ -40,6 +40,10 @@ Both `secret` and `backup_codes` are registered with `register_masked_fields` an
 
 Marks an auth group as an [affiliation](#affiliations). Holds the group and nothing else.
 
+### `UserAgreement` and `UserAgreementAcceptance`
+
+One published version of the deployment's [user agreement](#user-agreement) (`version`, `text`, its SHA-256 `digest`, `reaccept`, `published_at`), and an account's acceptance of one (`user`, `agreement`, and the agreement's `version` and `digest` repeated, `accepted_at`). An acceptance goes with the account; a version that has been accepted is protected from deletion. Neither is ever edited, and rollback is refused for both.
+
 ### `UserPreference`
 
 A client's settings for one user, stored as an opaque JSON blob under a `scope` string. One row per `(user, scope)`, enforced by a uniqueness constraint.
@@ -67,6 +71,8 @@ Mounted at `/api/v1/user/`. Full request/response detail in [api/v1/ninja.py](ap
 | `POST` | `/me/2fa/confirm` | Activate a pending enrolment with a code from the authenticator. Returns the recovery codes, the only time they are shown. |
 | `POST` | `/me/2fa/backup-codes` | Discard the caller's unused recovery codes and issue a fresh set. Requires the password. |
 | `POST` | `/me/2fa/disable` | Remove the caller's second factor. Requires the password. |
+| `GET` | `/agreement` | The [user agreement](#user-agreement) as currently shown, and the caller's acceptance of it. Readable without a session. |
+| `POST` | `/agreement/accept` | Accept the version shown, named by `version`; 409 when a newer one was published meanwhile. Returns `UserOut`. |
 | `GET` | `/me` | Auth-state probe: always HTTP 200 with `{ authenticated, user }` — `user` is the serialized profile when signed in, `null` otherwise. Returning logged-out as a 200 rather than a 401 keeps the SPA's per-boot probe out of the console error stream. |
 | `PATCH` | `/me` | Update `email`, `first_name`, or `last_name`. Changing `email` needs [step-up](#security-mechanisms) (`password`, plus `totp_code` when a factor is enrolled), because the address is where a reset link goes. |
 | `POST` | `/me/change-password` | Change the current password. Keeps the session alive via `update_session_auth_hash`. |
@@ -89,6 +95,7 @@ Mounted at `/api/v1/user/`. Full request/response detail in [api/v1/ninja.py](ap
 | `is_2fa_enabled` | Whether a confirmed second factor gates this account's password login. An unconfirmed enrolment reads as `false`. |
 | `roles` | Project-supplied roles the user inherits through group membership, keyed by the role key the active project registered (e.g. a teaching project's `course_role` → `["instructor"]`). Read through the [project-role registry](#project-roles) — the user app imports no project. Empty map when the deployment defines no roles. |
 | `affiliations` | Names of the [affiliations](#affiliations) the account belongs to. `UserOut` describes the caller only, so this reaches the account holder and no one else. |
+| `agreement_required` | True while the account has not accepted the binding version of the [user agreement](#user-agreement). |
 | `external_provider` | Display name of the identity provider this account signs in through, or `null`. Set only for an account that also has no local password; see [Externally authenticated accounts](#externally-authenticated-accounts). The profile page reads it to decide whether to render a change-password form at all. |
 
 `UserSearchOut` is a smaller shape returned by `/search`: `id`, `username`, `first_name`, `last_name`. No `email` is exposed (it's PII that doesn't need to leak through search auto-complete).
@@ -195,6 +202,26 @@ Core calls the registry when serialising a user (`roles` on `UserOut` / `Account
 `roles` in a group PATCH is a partial map: an absent key is left alone, so a client that does not know a project's role exists cannot clear it. There is no per-account role write — assigning a role is a membership change.
 
 A provider applies to ordinary groups unless it sets `group_kind` to a kind of [dedicated group](#dedicated-groups), and then it applies to groups of that kind only. Setting a role on a group it does not apply to raises `RoleNotApplicable` in `write_group_role`, which the endpoint answers with a 409 before asking for step-up; clearing one is allowed anywhere, so a role that predates a group's kind can go. `/admin/roles` serves `group_kind`, and the group form renders the selectors whose kind matches the group's `dedicated_to.kind`. Affiliations are the kind this exists for.
+
+## User agreement
+
+A deployment can require every account to accept its user agreement before using anything else. Nothing happens until it publishes one, and the text is the deployment's own, never part of the repository: a project ships a template (the edu project's is [projects/edu/docs/user-agreement-template.md](../projects/edu/docs/user-agreement-template.md)), and the operator fills in a copy outside the history and publishes it from the host.
+
+```sh
+docker compose exec -T web python manage.py publish_agreement --label 2026-11 < local/user-agreement.md
+```
+
+**Every version is kept.** `publish_agreement` stores the text with its digest, and an acceptance points at the version it accepted and repeats its label and digest, so what each account agreed to stays provable after later versions and travels with the database backups. A label is published once; a change is a new label. The run is audited under `user.agreement.publish` with the row's id and the digest, not the label an operator typed.
+
+**The binding version** is the latest one published with `reaccept` set, which is the default. An account must have accepted it, or a version published after it. `--no-reaccept` publishes a correction: it is the text shown from then on, a new account accepts it, and an account that accepted the version it corrects is not asked again. That is for a typo or a broken link, never for a change to what anyone agreed to.
+
+**The gate** is `AgreementGateMiddleware` in [agreement.py](agreement.py), after `AuthenticationMiddleware` and before the audit middleware, so a refusal writes no `Activity` row. It answers `403 {"code": "agreement_required"}` to every API request from a session account that has not accepted, except on the exempt routes: `GET /me`, the two agreement endpoints, `/logout`, the sign-in, second-factor, OIDC and password-reset endpoints, which replace a session rather than use it, the `DELETE` of a push subscription that signing out sends, and the operational paths in `ACTIVITY_PATH_SKIP_LIST`. A route is exempt for the methods it is registered with only, so `PATCH /me` waits for the agreement. A request without a session, whether a federated peer's, a share-token holder's or an anonymous caller's, is not gated: it has no account to accept with, and its grants decide what it reaches. A signed-in browser opening a share link is gated as its account is. Superusers are gated like everyone else. The refusal is not logged as a security event: the account is authenticated and authorised, and what it lacks is an acceptance it can give on the next page.
+
+**A project extends it** from its `AppConfig.ready()`. `register_exempt_route(pattern, methods)` exempts an endpoint an account must reach before it accepts, such as one that signs the browser in as another account. `register_exemption(predicate)` exempts an account that is not one person's: an acceptance by an account many people share records nothing about any of them, so such an account is refused if it tries. The session remembers an acceptance and never an exemption, so an account that stops being exempt is gated on its next request.
+
+**In the SPA**, the route guard sends an account with `agreement_required` to `/agreement` from every route that needs a session, with `?redirect=` naming where it was going, and the HTTP wrapper does the same when a request is refused, which is how a version published during a session is noticed. The page is public, so the agreement can be read before signing in.
+
+Accepting the agreement is not consent to processing personal data. The privacy notice states the basis for each purpose, and an agreement links to it rather than repeating it.
 
 ## Affiliations
 
@@ -480,6 +507,9 @@ The `make_user` / `make_superuser` fixtures live in the root [conftest.py](../co
 
 ## Gotchas
 
+- **An endpoint an account must reach before accepting is registered with `register_exempt_route`.** Everything else under an API mount is refused until the account accepts, including a new endpoint nobody thought about, which is the direction the gate is meant to fail in.
+- **The binding version is cached for 60 seconds.** Publishing clears the entry, which reaches every process through production's Redis cache; with a per-process cache, as in development, another process goes on answering with the previous version until its entry expires. A cache that cannot be reached is skipped for the database, so the gate stays closed rather than failing every request. An account's acceptance is cached in its session and re-checked whenever the binding version changes.
+- **The option is `--label`, not `--version`,** which Django's management commands already take.
 - **`update_session_auth_hash` on password change.** `change_password_endpoint` calls this after `set_password` so the active session survives the change. Without it the user would be logged out immediately. Mirror the call in any future endpoint that mutates the password.
 - **The 429 response on `/reset-password` is per-address, not per-IP.** Two different email addresses from the same IP are independent. Different addresses produce different cache keys.
 - **The `_RESET_RATE_WINDOW` has a frontend twin.** `LoginView.vue` has the same duration baked in (countdown timer + error copy). Change both or the UX diverges.

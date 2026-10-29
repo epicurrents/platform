@@ -10,6 +10,7 @@ import AdminGroupsView from '#views/AdminGroupsView.vue'
 import AdminGroupView from '#views/AdminGroupView.vue'
 import AdminMaintenanceJobView from '#views/AdminMaintenanceJobView.vue'
 import AdminMaintenanceView from '#views/AdminMaintenanceView.vue'
+import AgreementView from '#views/AgreementView.vue'
 import AnnotationExportView from '#views/AnnotationExportView.vue'
 import CollectionView from '#views/CollectionView.vue'
 import DatasetView from '#views/DatasetView.vue'
@@ -51,6 +52,15 @@ export const router = createRouter({
             component: LoginView,
             meta: {
                 title: 'Sign in',
+            },
+        },
+        {
+            // Public, so the agreement can be read before signing in, and so the guard's redirect here cannot loop.
+            path: '/agreement',
+            name: 'agreement',
+            component: AgreementView,
+            meta: {
+                title: 'User agreement',
             },
         },
         {

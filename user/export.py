@@ -123,6 +123,9 @@ RELATION_HANDLING: dict[str, _Handling] = {
     # registry strips anyway; listing the safe fields explicitly means a new
     # column on this model is omitted until someone decides it is safe.
     "user.twofactorcredential:user": _export("confirmed_at", "created_at", title="Two-factor authentication"),
+    "user.useragreementacceptance:user": _export(
+        "version", "digest", "accepted_at", title="User agreement versions you accepted"
+    ),
     "notifications.pushsubscription:user": _export("endpoint", "created_at", title="Push notification subscriptions"),
     # ── What the subject created ─────────────────────────────────────────────
     # original_name is masked in the audit trail as author-private PHI, not as a

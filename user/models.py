@@ -10,6 +10,9 @@ optional second login factor.
 ``UserPreference`` stores a client's per-user settings as an opaque JSON
 blob, keyed by a scope string so unrelated clients cannot collide.
 
+``UserAgreement`` is one published version of the deployment's user agreement, and ``UserAgreementAcceptance`` records
+that an account accepted it. See user/agreement.py.
+
 ``Affiliation`` marks an auth group as an affiliation: the organisation its members belong to, which grants
 nothing. See user/affiliations.py.
 
@@ -183,3 +186,52 @@ class Affiliation(models.Model):
 
     def __str__(self):
         return f"Affiliation(group={self.group_id})"
+
+
+class UserAgreement(models.Model):
+    """One published version of the deployment's user agreement.
+
+    The text is the deployment's own and never part of the repository; ``publish_agreement`` stores it here, so the
+    exact words every acceptance refers to survive later versions and travel with the database backups. ``digest`` is
+    the SHA-256 of ``text``. A version published with ``reaccept`` false is a correction: it is shown from then on, and
+    an acceptance of an earlier version still counts. The platform never edits or deletes a published row, and a
+    version someone accepted cannot be deleted.
+    """
+
+    version = models.CharField(max_length=64, unique=True)
+    text = models.TextField()
+    digest = models.CharField(max_length=64)
+    reaccept = models.BooleanField(default=True)
+    published_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["pk"]
+
+    def __str__(self):
+        return f"UserAgreement({self.version})"
+
+
+class UserAgreementAcceptance(models.Model):
+    """An account's acceptance of one version of the user agreement.
+
+    ``version`` and ``digest`` repeat the agreement's own, so the row says what was accepted without a join. The row
+    goes with the account; the agreement it points at is protected from deletion.
+    """
+
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="agreement_acceptances",
+    )
+    agreement = models.ForeignKey(UserAgreement, on_delete=models.PROTECT, related_name="acceptances")
+    version = models.CharField(max_length=64)
+    digest = models.CharField(max_length=64)
+    accepted_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(fields=["user", "agreement"], name="uniq_agreement_acceptance_user_agreement"),
+        ]
+
+    def __str__(self):
+        return f"UserAgreementAcceptance({self.version} -> {self.user_id})"

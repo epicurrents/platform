@@ -82,6 +82,11 @@ MIDDLEWARE = [
     # audit middleware so a throttled flood creates no Activity rows. Fails open;
     # gated by API_THROTTLE_ENABLED. See epicurrents/throttle.py.
     "epicurrents.middleware.ApiThrottleMiddleware",
+    # Answers 403 to an API request from an account that has not accepted the
+    # deployment's user agreement; inert until one is published. After
+    # AuthenticationMiddleware, which it reads, and before the audit middleware,
+    # so a refusal writes no Activity row. See user/agreement.py.
+    "user.agreement.AgreementGateMiddleware",
     "epicurrents.middleware.ApiActivityLoggingMiddleware",
     # Keeps a pool submission's body in memory: installs a memory-only upload
     # handler on the submission route before anything parses the body, and

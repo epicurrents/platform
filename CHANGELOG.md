@@ -8,6 +8,10 @@ Entries are written for the person deciding whether to upgrade, so the ones that
 
 ## [Unreleased]
 
+### Added
+
+- **A user agreement every account accepts before using the platform.** `manage.py publish_agreement --label <label>` publishes a version from a file or standard input, kept with its digest (migration `user.0004`); from then on `AgreementGateMiddleware` answers `403 {"code": "agreement_required"}` to every API request from a session account that has not accepted the binding version, except on its exempt routes: `GET /me`, the new `GET /api/v1/user/agreement` and `POST /api/v1/user/agreement/accept`, `/logout`, the sign-in, second-factor, OIDC and password-reset endpoints, and the `DELETE` of a push subscription. `--no-reaccept` publishes a correction that earlier acceptances still cover. `UserOut` gains `agreement_required`, and the SPA gains the `/agreement` page, to which the guard and the HTTP wrapper send an account that has not accepted. A deployment that publishes nothing sees no change; a project endpoint that must answer an account before it accepts registers with `user.agreement.register_exempt_route`, and an account that is not one person's with `register_exemption`. [user/README.md → User agreement](user/README.md#user-agreement).
+
 ## [0.1.3] — 2026-10-26
 
 ### Added

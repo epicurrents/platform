@@ -108,4 +108,22 @@ describe('authGuard', () => {
         expect(result).toBe(true)
         expect(mockFetchMe).not.toHaveBeenCalled()
     })
+
+    it('sends an account that has not accepted the user agreement to the agreement page', async () => {
+        mockFetchMe.mockResolvedValue({ ...STUDENT, agreement_required: true })
+        const result = await authGuard(route({ requiresAuth: true }))
+        expect(result).toEqual({ name: 'agreement', query: { redirect: '/target' } })
+    })
+
+    it('sends an unaccepted account to the agreement page before a role check', async () => {
+        mockFetchMe.mockResolvedValue({ ...STUDENT, agreement_required: true })
+        const result = await authGuard(route({ requiresAuth: true, requiresStaff: true }))
+        expect(result).toEqual({ name: 'agreement', query: { redirect: '/target' } })
+    })
+
+    it('lets an account that has accepted through', async () => {
+        mockFetchMe.mockResolvedValue({ ...STUDENT, agreement_required: false })
+        const result = await authGuard(route({ requiresAuth: true }))
+        expect(result).toBe(true)
+    })
 })

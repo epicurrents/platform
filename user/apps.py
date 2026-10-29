@@ -3,6 +3,16 @@
 from django.apps import AppConfig
 
 
+def refuse_agreement_rollback(change, existing_obj) -> str:
+    """The rollback guard for ``user.useragreement``: every rollback is refused."""
+    return "A user agreement is published with publish_agreement, and a published version is never changed."
+
+
+def refuse_acceptance_rollback(change, existing_obj) -> str:
+    """The rollback guard for ``user.useragreementacceptance``: every rollback is refused."""
+    return "An acceptance of the user agreement is made by the account holder, not by rollback."
+
+
 class UserConfig(AppConfig):
     """Django app configuration for the custom User model."""
 
@@ -21,7 +31,8 @@ class UserConfig(AppConfig):
         lives in an M2M table the audit signals never see.
 
         Affiliations register as dedicated groups, and their marker rows refuse
-        every rollback (user/affiliations.py).
+        every rollback (user/affiliations.py). Published agreement versions and
+        acceptances refuse every rollback as well (user/agreement.py).
         """
         # Imported for the @register side effect, as activity.checks is: the
         # subject-export registry is validated against the real schema at
@@ -68,12 +79,24 @@ class UserConfig(AppConfig):
             pii_fields={"values"},
         )
 
+        # When an account accepted the agreement says what its holder did and when, as a seen marker does; the row
+        # goes with the account, and the trail's copies are scrubbed with it.
+        register_subject_pii(
+            "user.useragreementacceptance",
+            owner_field="user_id",
+            pii_fields={"accepted_at"},
+        )
+
         from activity.audit import register_rollback_guard
         from user.affiliations import AFFILIATION_KIND, refuse_affiliation_rollback, resolve_affiliations
         from user.dedicated_groups import register_dedicated_group_resolver
 
         register_dedicated_group_resolver(AFFILIATION_KIND, resolve_affiliations)
         register_rollback_guard("user.affiliation", refuse_affiliation_rollback)
+        # A published version is the record of what was accepted, and an acceptance is the account holder's own act;
+        # neither is restored or removed by rollback.
+        register_rollback_guard("user.useragreement", refuse_agreement_rollback)
+        register_rollback_guard("user.useragreementacceptance", refuse_acceptance_rollback)
 
         from user.audit_digests import (
             GROUP_MEMBERSHIP_DIGEST_KEY,

@@ -29,6 +29,7 @@ ANONYMOUS_ALLOWLIST = {
     ("epicurrents.api.v1.ninja", "readiness"): "unauthenticated readiness probe for orchestration",
     ("maintenance.api.v1.ninja", "get_lock"): "maintenance flag probe the signed-out SPA polls for the release",
     ("notifications.api.v1.ninja", "vapid_public_key"): "the VAPID public key is public by definition",
+    ("user.api.v1.ninja", "agreement_endpoint"): "the user agreement is read before an account accepts it, or exists",
     ("user.api.v1.ninja", "auth_config"): "pre-login discovery of enabled login providers",
     ("user.api.v1.ninja", "login_endpoint"): "login is how a session begins",
     ("user.api.v1.ninja", "login_two_factor_endpoint"): "second step of the login flow",

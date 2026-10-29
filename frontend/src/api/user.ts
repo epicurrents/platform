@@ -16,6 +16,43 @@ export interface AuthUser {
     affiliations?: string[]
     /** Display name of the identity provider this account signs in through, or null for an account with its own password. Set only when the account has no local password, so a change-password form is pointless for it. */
     external_provider?: string | null
+    /**
+     * True while the account has not accepted the deployment's user agreement; the API refuses it everything else
+     * until it does.
+     */
+    agreement_required?: boolean
+}
+
+/** The deployment's user agreement as currently shown, and the caller's own acceptance of it. */
+export interface UserAgreement {
+    /** False while the deployment has published no agreement; every other field is then empty. */
+    published: boolean
+    version: string | null
+    /** The agreement in Markdown, as the deployment published it. */
+    text: string | null
+    published_at: string | null
+    /** Whether nothing is asked of the caller: their acceptance covers the binding version, or none is published. */
+    accepted: boolean
+    /** The latest version the caller accepted, which differs from `version` after a correction. */
+    accepted_version: string | null
+    accepted_at: string | null
+}
+
+/** Read the user agreement. Answers without a session, so the page shows it to anyone. */
+export async function fetchAgreement(): Promise<UserAgreement> {
+    const response = await http.get<UserAgreement>('/api/v1/user/agreement')
+    return response.data
+}
+
+/**
+ * Accept the user agreement and resolve to the account with `agreement_required` cleared. Rejects with 409 when a
+ * newer version was published since the caller read `version`.
+ *
+ * @param version - the version the caller read and is accepting.
+ */
+export async function acceptAgreement(version: string): Promise<AuthUser> {
+    const response = await http.post<AuthUser>('/api/v1/user/agreement/accept', { version })
+    return response.data
 }
 
 /** Profile edit. `password` and `totp_code` are the step-up credentials, required only when the address changes. */

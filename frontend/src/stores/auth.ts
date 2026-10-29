@@ -1,6 +1,7 @@
 import { defineStore } from 'pinia'
 import { ref, computed } from 'vue'
 import {
+    acceptAgreement as apiAcceptAgreement,
     fetchMe,
     login as apiLogin,
     logout as apiLogout,
@@ -28,6 +29,8 @@ export const useAuthStore = defineStore('auth', () => {
     const isAuthenticated = computed(() => user.value !== null)
     const isStaff = computed(() => user.value?.is_staff === true || user.value?.is_superuser === true)
     const isSuperuser = computed(() => user.value?.is_superuser === true)
+    /** Whether the account must accept the deployment's user agreement before it can use anything else. */
+    const agreementRequired = computed(() => user.value?.agreement_required === true)
     /** How the signed-in account confirms a sensitive request: which credentials the step-up prompt asks for. */
     const stepUp = computed(() => stepUpInfoFor(user.value))
 
@@ -128,6 +131,15 @@ export const useAuthStore = defineStore('auth', () => {
         return result.backup_codes ?? null
     }
 
+    /**
+     * Accept the user agreement the account was shown, and take the updated account from the answer.
+     *
+     * @param version - the version the account read; a newer one published meanwhile makes the call reject with 409.
+     */
+    async function acceptAgreement (version: string) {
+        user.value = await apiAcceptAgreement(version)
+    }
+
     async function logout() {
         // Remove subscription before clearing the session so the DELETE request
         // is still authenticated.
@@ -142,6 +154,7 @@ export const useAuthStore = defineStore('auth', () => {
         isAuthenticated,
         isStaff,
         isSuperuser,
+        agreementRequired,
         stepUp,
         init,
         refresh,
@@ -149,5 +162,6 @@ export const useAuthStore = defineStore('auth', () => {
         completeTwoFactor,
         startEnrolment,
         logout,
+        acceptAgreement,
     }
 })

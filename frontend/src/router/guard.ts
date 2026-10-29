@@ -17,7 +17,9 @@ import { useAuthStore } from '#stores/auth'
  * via `meta.requiresAuth`, `meta.requiresAuthUnlessToken` (a `?token=` share
  * credential exempts the auth check), `meta.requiresStaff` and
  * `meta.requiresSuperuser`; the last two mirror the nav-link flags of the same
- * names, so a link hidden from a user is also a URL refused to them.
+ * names, so a link hidden from a user is also a URL refused to them. An account
+ * that has not accepted the user agreement is sent to the agreement page from
+ * every such route, as the API refuses it everything those routes would load.
  *
  * When the memoised auth store reads unauthenticated, the guard re-validates
  * against the server before redirecting to login. The store can be stale in two
@@ -44,6 +46,10 @@ export async function authGuard (to: RouteLocationNormalized): Promise<true | { 
 
     if (!authStore.isAuthenticated) {
         return { name: 'login', query: { redirect: to.fullPath } }
+    }
+
+    if (authStore.agreementRequired) {
+        return { name: 'agreement', query: { redirect: to.fullPath } }
     }
 
     if (to.meta.requiresStaff && !authStore.isStaff) {

@@ -1,4 +1,5 @@
 import axios from 'axios'
+import { isAgreementRefusal, reportAgreementRefusal } from '#lib/agreementGate'
 import { isMaintenanceNotice, parseRetryAfter, recordMaintenanceNotice } from '#lib/maintenanceLock'
 
 /**
@@ -27,6 +28,8 @@ export const http = axios.create({
  * it refuses; recording that here, below the stores, is what lets every view
  * react through one store instead of each request handler checking for it.
  * The error still rejects, so a caller that was writing sees its write fail.
+ * A refusal for want of an accepted user agreement is reported the same way
+ * (#lib/agreementGate).
  */
 http.interceptors.response.use(
     (response) => response,
@@ -35,6 +38,9 @@ http.interceptors.response.use(
         const response = (error as Rejected)?.response
         if (response?.status === 503 && isMaintenanceNotice(response.data)) {
             recordMaintenanceNotice(response.data, parseRetryAfter(response.headers?.['retry-after']))
+        }
+        if (response?.status === 403 && isAgreementRefusal(response.data)) {
+            reportAgreementRefusal()
         }
         return Promise.reject(error)
     },

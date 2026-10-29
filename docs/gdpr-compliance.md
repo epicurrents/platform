@@ -38,6 +38,7 @@ without extending this table.
 | `user.ExternalIdentity` | OIDC `sub`, cached email | Life of account | Cascade + audit scrub |
 | `user.TwoFactorCredential` | TOTP shared secret, recovery-code hashes (authentication credentials bound to one account — not identity data, but account-linked secrets) | Life of the second factor / account | Cascade + audit scrub; `secret` and `backup_codes` masked in audit at write time |
 | `user.UserPreference` | Client settings blob (no personal data by design — the write endpoint accepts only setting-shaped keys and primitive values) | Life of account | Cascade + audit scrub; `values` registered for scrubbing so a badly named client setting cannot strand data in the permanent trail |
+| `user.UserAgreementAcceptance` | Which version of the deployment's user agreement an account accepted, with its digest and the time; the versions themselves (`user.UserAgreement`) hold the deployment's text and no personal data | Life of account | Cascade + audit scrub (`accepted_at` registered); exported under `user` (Art. 15); rollback refused ([user/README.md → User agreement](../user/README.md#user-agreement)) |
 | `user.Affiliation` + group membership | Which organisation an account belongs to, as membership of a group marked as an affiliation; the marker row holds the group id only | Life of the membership / account | Membership leaves with the account and is in the Art. 15 export as group membership; the marker carries no personal data. Shown to the account holder and the account surface only ([user/README.md → Affiliations](../user/README.md#affiliations)) |
 | `notifications.PushSubscription` | Device endpoint, encryption keys | Life of subscription / account | Cascade + audit scrub; keys masked in audit |
 | `maintenance.MaintenanceJob` / `MaintenancePackage` | Which account requested a maintenance operation or uploaded an update package (`SET_NULL` links; the rows otherwise hold operation keys, states, hashes and versions, and a celery-tier job's captured command output) | Life of the row (the audit record of a platform operation; no automatic purge) | Link nulled with the account, rows kept; both relations registered for the Art. 15 export; `output` masked in audit at write time |
@@ -155,7 +156,8 @@ Tracked in [ROADMAP.md](../ROADMAP.md) with the `Privacy` / `Federation` /
   the operator can publish it anywhere, but nothing links it from the sign-in
   page or shows it at account creation, which is where Art. 13 expects it —
   so whether a subject actually receives it currently depends on the operator
-  wiring it up outside the platform.
+  wiring it up outside the platform. A deployment's user agreement, which every
+  account reads before using the platform, can link it; nothing makes it do so.
 - Remote federated subjects have no sweep command; media crosses federation
   raw.
 - The append-only remote backup repository expires nothing until it is compacted from the remote side, which no deployment does by default. Until the remote's administrator runs `borg compact` on a schedule ([operations.md → Expire the remote repository](operations.md#expire-the-remote-repository)), a deployment with `BORG_REMOTE_REPO` set keeps erased data there indefinitely, and the retention it states to subjects is untrue for that copy.

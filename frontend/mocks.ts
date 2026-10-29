@@ -1517,6 +1517,19 @@ export async function handleMock(
         return send(res, 200, { enabled: false, confirmed_at: null, backup_codes_remaining: 0 })
     }
 
+    // No agreement is published in the mock deployment, so nothing gates the mock user.
+    if (path === '/api/v1/user/agreement' && method === 'GET') {
+        return send(res, 200, {
+            published: false,
+            version: null,
+            text: null,
+            published_at: null,
+            accepted: true,
+            accepted_version: null,
+            accepted_at: null,
+        })
+    }
+
     if (path === '/api/v1/user/me') {
         if (!isLoggedIn(req)) return send(res, 401, { detail: 'Authentication credentials were not provided.' })
         // GET answers with the auth-state envelope, matching the backend: the
