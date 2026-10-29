@@ -135,7 +135,11 @@ def test_fixed_orientation_positive_moment_is_positive_above_the_source():
     lf1, src1, ch_names, _ = compute_eeg_lead_field("standard_1020", grid_resolution_mm=10.0, n_orient=1)
     positions = mne.channels.make_standard_montage("standard_1020").get_positions()["ch_pos"]
     electrodes = np.array([positions[name] for name in ch_names])
-    depth = np.linalg.norm(src1 - center, axis=1)
-    for k in np.argsort(depth)[-20:]:
+    # Only a source above the sphere centre has the electrode cap on the side its outward moment points to; one below
+    # it reads negative at its nearest electrode, correctly. The grid is regular, so many sources share a radius: every
+    # source tied at the cut is taken, or an unstable sort would choose among them differently on each platform.
+    above = np.flatnonzero(src1[:, 2] > center[2])
+    radius = np.linalg.norm(src1[above] - center, axis=1)
+    for k in above[radius >= np.sort(radius)[-20]]:
         nearest = int(np.argmin(np.linalg.norm(electrodes - src1[k], axis=1)))
         assert lf1[nearest, k] > 0, f"source {k} at {src1[k]} reads {lf1[nearest, k]} at {ch_names[nearest]}"
