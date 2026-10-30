@@ -21,6 +21,7 @@ from pathlib import Path
 from celery import shared_task
 from django.conf import settings
 from django.contrib.contenttypes.models import ContentType
+from django.db import transaction
 from django.utils import timezone
 
 logger = logging.getLogger(__name__)
@@ -49,6 +50,11 @@ def _write_final_recording_transition(*, recording, update_fields: dict) -> None
     one ``record_modify_change`` row carrying the ``SignalInfo`` digest
     in ``extra_payload``.
 
+    Also where a hypnogram's scoring settles: ``pending_scoring`` is cleared on
+    every transition and becomes coded events on one to READY, in one transaction
+    with the status and the audit row, so that the stages and the study arrive
+    together or not at all.
+
     Reads the pre-update state from a fresh ``Recording.objects.get``
     rather than ``serialize_instance(recording)`` — by the time this
     helper is called both callers have already mutated the in-memory
@@ -66,25 +72,30 @@ def _write_final_recording_transition(*, recording, update_fields: dict) -> None
         DEIDENTIFICATION_RECORD_KEY,
         build_deidentification_record,
     )
+    from recordings.hypnogram import write_hypnogram
     from recordings.models import Recording
 
-    before_state = serialize_instance(Recording.objects.get(pk=recording.pk))
-    Recording.objects.filter(pk=recording.pk).update(**update_fields)
-    recording.refresh_from_db()
-    extra_payload = {SIGNAL_INFO_DIGEST_KEY: compute_signal_info_digest(recording)}
-    # The process record rides on the same row as the digest: the versions
-    # stamped on the meta row and the ingest overrides in force at this moment,
-    # which nothing else retains. A FAILED transition has no meta row and gets
-    # no record, because no pass wrote the file.
-    record = build_deidentification_record(recording)
-    if record is not None:
-        extra_payload[DEIDENTIFICATION_RECORD_KEY] = record
-    record_modify_change(
-        actor=None,
-        obj=recording,
-        before_state=before_state,
-        extra_payload=extra_payload,
-    )
+    with transaction.atomic():
+        stored = Recording.objects.get(pk=recording.pk)
+        before_state = serialize_instance(stored)
+        Recording.objects.filter(pk=recording.pk).update(**update_fields, pending_scoring=None)
+        recording.refresh_from_db()
+        if stored.pending_scoring and recording.status == Recording.Status.READY:
+            write_hypnogram(recording, stored.pending_scoring)
+        extra_payload = {SIGNAL_INFO_DIGEST_KEY: compute_signal_info_digest(recording)}
+        # The process record rides on the same row as the digest: the versions
+        # stamped on the meta row and the ingest overrides in force at this moment,
+        # which nothing else retains. A FAILED transition has no meta row and gets
+        # no record, because no pass wrote the file.
+        record = build_deidentification_record(recording)
+        if record is not None:
+            extra_payload[DEIDENTIFICATION_RECORD_KEY] = record
+        record_modify_change(
+            actor=None,
+            obj=recording,
+            before_state=before_state,
+            extra_payload=extra_payload,
+        )
 
 
 def _determine_modality(signal_infos) -> str:
@@ -125,6 +136,8 @@ def _save_edf_results(recording, result, *, events_from_sidecar: bool = False) -
       sidecar wrote the same events into its EDF, and the sidecar seam, which
       keeps the vendor's event type, has written the rows for them; the
       footer of the viewer's container owns its rows the same way.
+      Stages are left out when a hypnogram file is waiting to score the
+      recording (``recordings.hypnogram``), and stay in the raw record below.
     - One :class:`~annotations.models.Annotation` row (name "Original
       annotations") when embedded text events or gaps are present: the raw
       record, holding what the file said.
@@ -232,12 +245,13 @@ def _save_edf_results(recording, result, *, events_from_sidecar: bool = False) -
     # A converter's sidecar carries the same events with their types, and then
     # the sidecar seam has written the rows: a second set here would put every
     # event on the recording twice.
+    sources = [SourceEvent(onset=onset, duration=anno.duration, label=anno.label) for anno, onset in positioned]
+    if recording.pending_scoring:
+        from recordings.hypnogram import without_stages
+
+        sources = without_stages(sources)
     if not events_from_sidecar:
-        write_source_events(
-            recording,
-            [SourceEvent(onset=onset, duration=anno.duration, label=anno.label) for anno, onset in positioned],
-            hash_prefix="original-annotation",
-        )
+        write_source_events(recording, sources, hash_prefix="original-annotation")
 
     # ── "Original annotations" Annotation (only when there is content) ────
     # The raw record of what the file said, which the Event rows above do not
@@ -415,6 +429,7 @@ def _process_recording_body(*, recording, recording_id, staging_path, preserve_a
         sidecar_data: dict | None = None
 
         from recordings.converters.sidecar import sidecar_carries_events
+        from recordings.modalities import PSG, ModalityError, ensure_continuous_file
         from recordings.pipelines import (
             dispatch_convert_failed,
             dispatch_post_convert,
@@ -508,11 +523,18 @@ def _process_recording_body(*, recording, recording_id, staging_path, preserve_a
         # ── Format-specific processing ────────────────────────────────────────
         format_error: str | None = None
 
-        # The upload API is EEG-only; set modality unconditionally so that
-        # channel-label heuristics (e.g. an ECG channel present alongside EEG
-        # channels) cannot override the recording type.
-        modality = "eeg"
-        if ext in _EDF_EXTENSIONS:
+        # The declared modality stands, defaulting to EEG, so that channel-label
+        # heuristics (e.g. an ECG channel present alongside EEG channels) cannot
+        # override the recording type. Checked before the de-identification pass: a
+        # refused study keeps the bytes as uploaded for failed-mode preservation.
+        modality = recording.modality or "eeg"
+        if modality == PSG:
+            try:
+                ensure_continuous_file(permanent_path)
+            except ModalityError as exc:
+                format_error = str(exc)
+                logger.warning("process_recording: recording %d refused: %s", recording_id, exc)
+        if format_error is None and ext in _EDF_EXTENSIONS:
             try:
                 from recordings.pipelines import get_pipeline
                 from recordings.processors.edf import EdfParseError, process_edf_file
@@ -551,7 +573,9 @@ def _process_recording_body(*, recording, recording_id, staging_path, preserve_a
                     # processing that follows fail.
                     stash_source_bytes(recording, permanent_path)
                     footer = detach_footer(permanent_path)
-                result = process_edf_file(permanent_path, strip_annotation_text=strip_annotation_text)
+                result = process_edf_file(
+                    permanent_path, strip_annotation_text=strip_annotation_text, keep_reference=modality == PSG
+                )
                 if footer is not None:
                     recording.file_size = permanent_path.stat().st_size
                     recording.save(update_fields=["file_size"])
@@ -665,24 +689,30 @@ def _process_recording_body(*, recording, recording_id, staging_path, preserve_a
 
         from notifications.tasks import send_push_to_user
 
-        if format_error:
-            send_push_to_user.delay(
-                user_id=recording.author_id,
-                title="Recording could not be processed",
-                body=(
-                    f'"{_push_display_name(recording)}" was saved but could not be fully '
-                    "processed (unsupported or damaged format). "
-                    "You can still download the original file."
-                ),
-                data={"type": "recording_failed", "recording_id": recording_id},
-            )
-        else:
-            send_push_to_user.delay(
-                user_id=recording.author_id,
-                title="Recording ready",
-                body=f'"{_push_display_name(recording)}" has been processed and is ready.',
-                data={"type": "recording_ready", "recording_id": recording_id},
-            )
+        # The recording has settled, so a notification that cannot be queued must
+        # not reach the handler below, which would unlink a finished file and mark
+        # the row FAILED beside the stages it has just written.
+        try:
+            if format_error:
+                send_push_to_user.delay(
+                    user_id=recording.author_id,
+                    title="Recording could not be processed",
+                    body=(
+                        f'"{_push_display_name(recording)}" was saved but could not be fully '
+                        "processed (unsupported or damaged format). "
+                        "You can still download the original file."
+                    ),
+                    data={"type": "recording_failed", "recording_id": recording_id},
+                )
+            else:
+                send_push_to_user.delay(
+                    user_id=recording.author_id,
+                    title="Recording ready",
+                    body=f'"{_push_display_name(recording)}" has been processed and is ready.',
+                    data={"type": "recording_ready", "recording_id": recording_id},
+                )
+        except Exception:
+            logger.warning("process_recording: notification for recording %d not queued.", recording_id, exc_info=True)
 
         return {"recording_id": recording_id, "status": final_status}
 
@@ -721,7 +751,8 @@ def _process_recording_body(*, recording, recording_id, staging_path, preserve_a
             if failed is not None:
                 failed.status = Recording.Status.FAILED
                 failed.processing_error = (f"Unexpected processing error: {exc}")[:4096]
-                failed.save(update_fields=["status", "processing_error"])
+                failed.pending_scoring = None
+                failed.save(update_fields=["status", "processing_error", "pending_scoring"])
         except Exception:
             logger.exception(
                 "process_recording: could not mark recording %d FAILED",

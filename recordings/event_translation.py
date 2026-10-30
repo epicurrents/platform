@@ -34,6 +34,12 @@ Two kinds of mapper, tried in this order until one answers:
 the vendor's vocabulary: under it the raw record and the placeholders are not written, and a translated event's
 code is written without ``meta``. Translated events are written, because such an event carries the platform's own
 term and a timestamp and nothing from the file besides.
+
+Scoring terms are the exception to that reasoning, and written accordingly. An ``epicurrents.psg`` term is a scorer's
+reading rather than something that happened during the recording, and its value is served under a de-identifying
+grant, so a file's hypnogram reaches such a reader and can be counted into sleep and apnea measures. That is what a
+study is shared for, and no other recording should acquire it because of a string in its annotations: a scoring term
+is written only on a recording declared ``psg``, and anywhere else the event is left untranslated.
 """
 
 from __future__ import annotations
@@ -403,7 +409,12 @@ def placeholder_name(source: SourceEvent) -> str:
 
 
 def write_source_events(
-    recording, sources: list[SourceEvent], *, hash_prefix: str, discard_text: bool | None = None
+    recording,
+    sources: list[SourceEvent],
+    *,
+    hash_prefix: str,
+    discard_text: bool | None = None,
+    scoring_accepted: bool = False,
 ) -> int:
     """Write one ``Event`` row per source event on *recording*, translated where anything translates it.
 
@@ -411,14 +422,17 @@ def write_source_events(
     ``"<hash_prefix>:<index>"``, so a seam called once per ingest writes distinct hashes. Under
     ``RECORDINGS_DISCARD_EMBEDDED_ANNOTATIONS`` the placeholders are skipped, only translated events are written and
     their codes carry no ``meta``, which a Python mapper may have filled from the source's text; *discard_text* set
-    to a bool decides it instead of the setting, and the pooled ingest sets it. Returns the number of translated
-    events.
+    to a bool decides it instead of the setting, and the pooled ingest sets it. *scoring_accepted* says scoring terms
+    were already accepted for this recording under a ``psg`` declaration, so that a change of modality while they wait
+    for ingest does not cost them. Returns the number of translated events.
     """
     from django.conf import settings
     from django.contrib.contenttypes.models import ContentType
 
+    from annotations.core_vocabularies import SCORING_STANDARD
     from annotations.models import Code, Event
     from epicurrents.system_user import get_system_user
+    from recordings.modalities import PSG
 
     discard = (
         getattr(settings, "RECORDINGS_DISCARD_EMBEDDED_ANNOTATIONS", False) if discard_text is None else discard_text
@@ -429,6 +443,13 @@ def write_source_events(
     translated = 0
     for index, source in enumerate(sources):
         term = translate_source_event(source)
+        if (
+            term is not None
+            and term.standard == SCORING_STANDARD
+            and recording.modality != PSG
+            and not scoring_accepted
+        ):
+            term = None
         if term is None and discard:
             continue
         if system_user is None:

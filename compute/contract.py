@@ -83,8 +83,9 @@ class SignalWindow:
     fs: float  # sampling rate, Hz
     t0_s: float  # absolute start time of this window in the recording, seconds
     n_samples: int
-    #: Optional per-channel modality (``eeg``/``eog``/``emg``/``ekg``/``trig``/
-    #: ``misc``), parallel to ``channels`` — empty when the caller does not
+    #: Optional per-channel modality (``eeg``/``eog``/``emg``/``ekg`` or an auxiliary
+    #: type, ``trig``/``misc``/``resp``/``spo2``/``ppg``/``temp``), parallel to
+    #: ``channels`` — empty when the caller does not
     #: distinguish types. Lets a multimodal processor select the channels it
     #: understands without guessing.
     channel_types: tuple[str, ...] = ()

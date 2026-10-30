@@ -36,6 +36,11 @@ Usage
     ``flat``
         Only process files in the top-level directory.
 
+``--modality``
+    Declare every imported recording as this modality. With ``psg``, a file holding only annotations is read as a
+    hypnogram rather than imported: it joins the study in its directory with the same subject field and start time
+    as coded events, and is not copied. One that cannot be paired with exactly one study is reported and left alone.
+
 ``--public-source``
     Record every imported recording as taken from this published dataset, as
     a DOI or an http(s) URL (``Recording.public_source``). Refused when the
@@ -86,6 +91,8 @@ from django.core.management.base import BaseCommand, CommandError
 from django.db import transaction
 from django.utils import timezone
 
+from recordings.hypnogram import pair_hypnograms, read_header_block, read_hypnogram
+from recordings.modalities import PSG, ModalityError, ensure_continuous_file, normalise_modality
 from recordings.public_source import normalise_public_source
 
 logger = logging.getLogger(__name__)
@@ -104,6 +111,9 @@ def _new_stored_name(suffix: str) -> str:
 
 class Command(BaseCommand):
     help = "Import EDF/BDF files, and any format a registered converter handles, from a directory into Epicurrents."
+
+    #: The modality `--modality` declares, empty to leave it to the channel vote.
+    _modality = ""
 
     def add_arguments(self, parser):
         parser.add_argument(
@@ -169,6 +179,15 @@ class Command(BaseCommand):
             help="Assert that the files to be linked are already de-identified. Required by --link.",
         )
         parser.add_argument(
+            "--modality",
+            default="",
+            metavar="MODALITY",
+            help=(
+                "Declare every imported recording as this modality instead of voting on its channels. "
+                "A polysomnography (psg) must be continuous; a file with interruptions fails."
+            ),
+        )
+        parser.add_argument(
             "--public-source",
             default="",
             metavar="DOI_OR_URL",
@@ -214,6 +233,7 @@ class Command(BaseCommand):
             pipeline.header.strip_annotation_text = False
         try:
             public_source = normalise_public_source(options["public_source"])
+            self._modality = normalise_modality(options["modality"])
         except ValueError as exc:
             raise CommandError(str(exc))
         link = bool(options["link"])
@@ -254,6 +274,9 @@ class Command(BaseCommand):
                 # One job never holds both kinds of recording: a resumed job keeps the mode it was created in.
                 mode = "--link" if job.link else "without --link"
                 raise CommandError(f"Job {job.pk} was created {mode}; resume it the same way.")
+            if self._modality and self._modality != job.modality:
+                raise CommandError(f"Job {job.pk} was created with modality {job.modality!r}; it keeps it.")
+            self._modality = job.modality
             self.stdout.write(f"Resuming job {job.pk} (source={job.source_path!r}, pipeline={job.pipeline_label!r}).")
         else:
             job = ImportJob.objects.create(
@@ -262,6 +285,7 @@ class Command(BaseCommand):
                 pipeline_label=options["pipeline"],
                 structure=structure,
                 link=link,
+                modality=self._modality,
             )
             self.stdout.write(f"Created {'link' if link else 'import'} job {job.pk}.")
 
@@ -330,6 +354,13 @@ class Command(BaseCommand):
         from recordings.models import ImportJob, ImportJobFile
 
         edf_files = self._collect_files(source_path, job.structure, link=job.link)
+        self._hypnograms: dict[Path, Path] = {}
+        if self._modality == PSG:
+            edf_files, self._hypnograms, unpaired = pair_hypnograms(edf_files)
+            for path in unpaired:
+                self.stdout.write(self.style.WARNING(f"  UNPAIRED {path.relative_to(source_path)}"))
+            if self._hypnograms:
+                self.stdout.write(f"Paired {len(self._hypnograms)} hypnogram(s) with their studies.")
         self.stdout.write(f"Found {len(edf_files)} file(s) to import.")
 
         # Ensure an ImportJobFile row exists for every discovered file.
@@ -535,6 +566,9 @@ class Command(BaseCommand):
         from recordings.models import stored_original_name
         from recordings.processors.edf import process_edf_file
 
+        # Before anything is copied, so that a hypnogram that cannot stand fails the file as it found it.
+        hypnogram = self._read_hypnogram(abs_path)
+
         # ── Compute source file hash ──────────────────────────────────────────
         hasher = hashlib.sha256()
         with abs_path.open("rb") as fh:
@@ -583,6 +617,14 @@ class Command(BaseCommand):
                     edf_hasher.update(chunk)
             file_hash = edf_hasher.hexdigest()
 
+        if self._modality == PSG:
+            try:
+                ensure_continuous_file(Path(source_for_edf))
+            except ModalityError:
+                if source_for_edf is not abs_path:
+                    shutil.rmtree(convert_tmp, ignore_errors=True)
+                raise
+
         # ── Copy to permanent storage ─────────────────────────────────────────
         # Upper-case hex, as on the upload path: the API resolves a recording by matching the URL hash against
         # this name case-sensitively, so a lower-case name is unreachable on Postgres.
@@ -610,6 +652,7 @@ class Command(BaseCommand):
             result = process_edf_file(
                 permanent_path,
                 strip_annotation_text=pipeline.header.strip_annotation_text,
+                keep_reference=self._modality == PSG,
             )
         except Exception:
             permanent_path.unlink(missing_ok=True)
@@ -625,6 +668,7 @@ class Command(BaseCommand):
             result=result,
             footer=footer,
             sidecar_data=sidecar_data_from_converter,
+            hypnogram=hypnogram,
             public_source=public_source,
             fields={
                 "original_name": stored_original_name(original_name_for_db, suffix),
@@ -661,11 +705,14 @@ class Command(BaseCommand):
         resolved = resolve_linked_source(abs_path)
         if str(resolved) in self._already_linked():
             raise LinkedSourceError(f"{resolved} is already linked.")
+        if self._modality == PSG:
+            ensure_continuous_file(resolved)
+        hypnogram = self._read_hypnogram(abs_path)
         before = resolved.stat()
         data = resolved.read_bytes()
         # The bytes are served unaltered, so the digest of the source is also the digest of the stored file.
         digest = hashlib.sha256(data).hexdigest()
-        result = read_linked_edf(resolved, data)
+        result = read_linked_edf(resolved, data, keep_reference=self._modality == PSG)
         del data
         after = resolved.stat()
         if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
@@ -685,6 +732,7 @@ class Command(BaseCommand):
             result=result,
             footer=None,
             sidecar_data=None,
+            hypnogram=hypnogram,
             public_source=public_source,
             fields={
                 "original_name": stored_original_name(resolved.name, suffix),
@@ -700,6 +748,15 @@ class Command(BaseCommand):
         )
         self._already_linked().add(str(resolved))
         return recording
+
+    def _read_hypnogram(self, abs_path: Path) -> list[dict] | None:
+        """The scoring of the hypnogram paired with the study at *abs_path*, read while its raw header is at hand."""
+        path = self._hypnograms.get(abs_path)
+        if path is None:
+            return None
+        with abs_path.open("rb") as handle:
+            block = read_header_block(handle)
+        return read_hypnogram(path.read_bytes(), block)
 
     def _already_linked(self) -> set[str]:
         """The paths of the active linked recordings, read once per run and kept current as the run links more.
@@ -727,6 +784,7 @@ class Command(BaseCommand):
         result,
         footer,
         sidecar_data,
+        hypnogram: list[dict] | None = None,
         public_source: str,
         fields: dict,
         stored_hash: str,
@@ -756,6 +814,8 @@ class Command(BaseCommand):
             recording = Recording.objects.create(
                 author=owner,
                 public_source=public_source,
+                modality=self._modality,
+                pending_scoring=hypnogram,
                 status=Recording.Status.PROCESSING,
                 **fields,
             )
@@ -784,7 +844,7 @@ class Command(BaseCommand):
                     )
 
             # Compute content_hash (mirrors process_recording task logic).
-            modality = _determine_modality(result.signal_infos)
+            modality = self._modality or _determine_modality(result.signal_infos)
             recording.status = Recording.Status.READY
             recording.modality = modality
             payload = serialize_instance(recording)

@@ -99,6 +99,15 @@ from epicurrents.text_hygiene import NameWarningOut, name_warnings
 from federation.audit import log_federation_access
 from federation.auth import try_federation_auth
 from federation.limits import QuotaExceeded, check_peer_download_limits
+from recordings.hypnogram import (
+    MAX_HYPNOGRAM_BYTES,
+    HypnogramError,
+    fails_as_recording,
+    read_header_block,
+    read_hypnogram,
+)
+from recordings.linked import linked_file_change
+from recordings.modalities import PSG, ModalityError, ensure_continuous_file, normalise_modality
 from recordings.models import Recording, stored_original_name
 from recordings.pipelines import get_converter
 from recordings.public_source import normalise_public_source
@@ -693,8 +702,9 @@ def _compute_download_sizes_for_peer(recordings, peer, remote_user_id, meta_by_p
     terms_by_id = get_federated_access_terms(peer, remote_user_id, recording_ct, [r.pk for r in recordings])
     middleware_object_ids = {object_id for object_id, terms in terms_by_id.items() if terms.apply_middleware}
 
-    # Server-side pipeline for the API scope — identical to what download_recording uses.
-    pipeline = _build_serve_pipeline()
+    # Server-side pipeline for the API scope: the same stages download_recording uses, and sized
+    # alike for every recording because the header pass is isometric.
+    pipeline = _build_serve_pipeline(None)
 
     result = {}
     for recording in recordings:
@@ -887,7 +897,7 @@ def _serve_recording_file(request, file_path: Path, filename: str):
     return response
 
 
-def _build_serve_pipeline():
+def _build_serve_pipeline(recording):
     """Return the API-scope middleware pipeline used for download and size computation.
 
     Always applies :class:`~federation.middleware.DeidentifyEDFHeader` followed
@@ -899,6 +909,14 @@ def _build_serve_pipeline():
     :func:`_compute_download_sizes_for_peer`, and
     :func:`_serve_recording_slice` all call this function so that the
     pipeline stays in sync across every serving path.
+
+    *recording* is required so a new serving path has to say what it serves: the header pass is
+    re-run on the way out, and a pass that strips references renames a study's ``C4-M1`` to ``C4``,
+    which a montage then references a second time. A file this platform wrote already holds the
+    labels it should have, so the pass keeps them, whatever the modality says now: it can change
+    after the file was written. A linked file was never rewritten, so its labels are worked out
+    here, and its modality cannot change to or from ``psg``. The size computation passes ``None``,
+    since the pass is isometric.
     """
     from federation.middleware import (
         DeidentifyEDFHeader,
@@ -906,7 +924,12 @@ def _build_serve_pipeline():
         StripAnnotationTextMiddleware,
     )
 
-    return MiddlewarePipeline([DeidentifyEDFHeader(), StripAnnotationTextMiddleware()]).for_scope("api")
+    keep_reference = recording is not None and (
+        recording.storage != recording.Storage.LINKED or recording.modality == PSG
+    )
+    return MiddlewarePipeline(
+        [DeidentifyEDFHeader(keep_reference=keep_reference), StripAnnotationTextMiddleware()]
+    ).for_scope("api")
 
 
 def _serve_recording_with_middleware(request, file_path: Path, filename: str, recording) -> object:
@@ -940,7 +963,7 @@ def _serve_recording_with_middleware(request, file_path: Path, filename: str, re
     race; never fires for ``status=READY`` because successful processing
     always writes meta.
     """
-    pipeline = _build_serve_pipeline()
+    pipeline = _build_serve_pipeline(recording)
 
     if pipeline.is_empty:
         return _serve_recording_file(request, file_path, filename)
@@ -1193,6 +1216,7 @@ def _serve_recording_slice(
     input_record_size: int,
     apply_middleware: bool,
     pipeline=None,
+    recording=None,
 ) -> object:
     """Stream a time-range slice as a self-contained EDF/BDF file.
 
@@ -1215,7 +1239,7 @@ def _serve_recording_slice(
 
     if pipeline is None:
         if apply_middleware:
-            pipeline = _build_serve_pipeline()
+            pipeline = _build_serve_pipeline(recording)
         else:
             pipeline = MiddlewarePipeline([])
 
@@ -1399,10 +1423,38 @@ def _clamp_annotation(
     return sliced_ts, sliced_dur
 
 
+def _read_upload_hypnogram(file, hypnogram, extension: str, modality: str) -> list[dict] | None:
+    """The scoring of the hypnogram sent with an upload, refused before a byte of either file is staged.
+
+    Read here rather than in the worker because the study's raw header is what aligns it, and the hypnogram is not
+    kept: see ``recordings.hypnogram``. Also refuses a zero-duration annotation file sent as the recording itself, the
+    one shape ingest can only fail, on the grounds that the reason is more use now than a failed row is later.
+    """
+    if extension not in _EDF_EXTENSIONS:
+        if hypnogram is not None:
+            raise HttpError(400, "A hypnogram can only accompany an EDF or BDF recording.")
+        return None
+    block = read_header_block(file)
+    file.seek(0)
+    if fails_as_recording(block):
+        raise HttpError(400, "This file holds annotations and no signals. Upload it as the hypnogram of its recording.")
+    if hypnogram is None:
+        return None
+    if modality != PSG:
+        raise HttpError(400, "A hypnogram can only accompany a polysomnography.")
+    if hypnogram.size > MAX_HYPNOGRAM_BYTES:
+        raise HttpError(413, "This file is too large to be a hypnogram.")
+    try:
+        return read_hypnogram(hypnogram.read(), block)
+    except HypnogramError as exc:
+        raise HttpError(400, str(exc))
+
+
 @api.post("/upload", response={202: RecordingUploadOut})
 def upload_recording(
     request,
     file: UploadedFile = File(...),
+    hypnogram: UploadedFile | None = File(None),
     user_access: str | None = None,
     group_access: str | None = None,
     share_token: str | None = None,
@@ -1411,6 +1463,7 @@ def upload_recording(
     preserve_annotations: bool = False,
     display_name: str | None = None,
     public_source: str | None = None,
+    modality: str | None = None,
 ):
     """Save uploaded file to staging and enqueue background processing.
 
@@ -1424,7 +1477,8 @@ def upload_recording(
     here (or via a later PATCH). ``warnings`` flags a label that looks like
     an identifier; the upload is accepted either way. ``public_source`` is the
     DOI or URL of the published dataset the data was taken from, refused with
-    400 when it is neither.
+    400 when it is neither. ``hypnogram`` is a file of scored stages for a
+    study declared ``psg``, which joins it as coded events and is not kept.
     """
 
     user = _require_auth(request)
@@ -1432,6 +1486,7 @@ def upload_recording(
     group_assignments = _parse_target_access_list(group_access, "group_access")
     try:
         normalized_public_source = normalise_public_source(public_source)
+        declared_modality = normalise_modality(modality)
     except ValueError as exc:
         raise HttpError(400, str(exc))
     if any(target_id == user.pk for target_id, _ in user_assignments):
@@ -1471,6 +1526,7 @@ def upload_recording(
             f"Unsupported file type {extension or '(none)'!r}. Upload {supported}, "
             f"or a format with a registered converter.",
         )
+    hypnogram_events = _read_upload_hypnogram(file, hypnogram, extension, declared_modality)
 
     stored_name = f"{secrets.token_hex(16).upper()}{extension}"
     while (staging_root / stored_name).exists():
@@ -1551,6 +1607,8 @@ def upload_recording(
             original_name=name_for_db,
             display_name=normalized_display_name,
             public_source=normalized_public_source,
+            modality=declared_modality,
+            pending_scoring=hypnogram_events,
             stored_name=stored_name,
             file_extension=extension,
             file_size=total_size,
@@ -1626,6 +1684,8 @@ def upload_recording(
                 "granted_user_access_count": len(user_assignments),
                 "granted_group_access_count": len(group_assignments),
                 "granted_share_token": bool(normalized_share_token),
+                # The file is not kept, so this is the record that one was given.
+                "hypnogram_given": hypnogram is not None,
             },
         )
 
@@ -2819,6 +2879,7 @@ def slice_recording(
         header_size=header_size,
         input_record_size=input_record_size,
         apply_middleware=apply_middleware,
+        recording=recording,
     )
 
 
@@ -2907,7 +2968,23 @@ def update_recording(request, hash: str, payload: RecordingPatchIn):
         recording.display_name = normalized or None
         fields_updated.append("display_name")
     if payload.modality is not None:
-        recording.modality = payload.modality.strip().lower()
+        declared = payload.modality.strip().lower()
+        # Only a change is validated: a value the channel vote stored stays saveable, because
+        # the edit dialog sends the field back whether or not it was touched.
+        if declared != recording.modality:
+            try:
+                declared = normalise_modality(declared)
+                if recording.storage == recording.Storage.LINKED and PSG in (declared, recording.modality):
+                    # Its labels were worked out at import from this value, and the file holds no others.
+                    raise ModalityError("A linked recording cannot change to or from a polysomnography.")
+                if declared == PSG:
+                    changed = linked_file_change(recording)
+                    if changed:
+                        raise ModalityError(changed)
+                    ensure_continuous_file(Path(recording.file_path))
+            except ModalityError as exc:
+                raise HttpError(400, str(exc))
+        recording.modality = declared
         fields_updated.append("modality")
     if payload.public_source is not None:
         try:

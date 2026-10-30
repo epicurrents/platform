@@ -1,8 +1,9 @@
 <script setup lang="ts">
-import { reactive, ref, computed, shallowRef, onMounted, onUnmounted } from 'vue'
+import { reactive, ref, computed, shallowRef, onMounted, onUnmounted, watch } from 'vue'
 import { onBeforeRouteLeave, useRouter } from 'vue-router'
 import { t } from '#i18n'
 import { useRecordingsStore } from '#stores/recordings'
+import { pairHypnograms, type HypnogramPairing } from '#lib/hypnogramPairing'
 import { showToast } from '#lib/toast'
 import {
     treeFromInputEvent,
@@ -53,6 +54,10 @@ const input = reactive({
 // Hidden file input refs
 const filesInputRef = ref<HTMLInputElement | null>(null)
 const folderInputRef = ref<HTMLInputElement | null>(null)
+const hypnogramInputRef = ref<HTMLInputElement | null>(null)
+
+// Scored stages chosen by hand for a lone study. A batch pairs its own, below.
+const hypnogram = shallowRef<File | null>(null)
 
 // Drop zone state
 const isDragOver = ref(false)
@@ -72,12 +77,44 @@ function onPickerSelect (selection: PickerSelection) {
     showPicker.value = false
 }
 
-const totalFiles = computed(() => countFiles(tree.value))
-const willCreateCollections = computed(() => hasFolders(tree.value))
+// ---------------------------------------------------------------------------
+// Hypnogram pairing
+// ---------------------------------------------------------------------------
+
+// A study's hypnogram arrives in the same selection, so what gets uploaded is the
+// selection less its hypnograms. Only for a study: under any other modality a
+// hypnogram is an ordinary file and the server says what it thinks of it.
+const pairing = shallowRef<HypnogramPairing | null>(null)
+const pairingBusy = ref(false)
+let pairingRun = 0
+
+const uploadable = computed(() => pairing.value?.tree ?? tree.value)
+const pairedCount = computed(() => pairing.value?.hypnograms.size ?? 0)
+const unpairedCount = computed(() => pairing.value?.unpairedCount ?? 0)
+
+watch([tree, () => input.modality], async ([selection, modality]) => {
+    const run = ++pairingRun
+    pairing.value = null
+    if (modality !== 'psg' || countFiles(selection) < 2) {
+        pairingBusy.value = false
+        return
+    }
+    pairingBusy.value = true
+    const result = await pairHypnograms(selection)
+    // A newer selection may have overtaken this one while its headers were read.
+    if (run === pairingRun) {
+        pairing.value = result
+        pairingBusy.value = false
+    }
+})
+
+const totalFiles = computed(() => countFiles(uploadable.value))
+const willCreateCollections = computed(() => hasFolders(uploadable.value))
 
 // A display name is offered only for a lone recording; a batch names each file
 // by its own hash-prefix fallback instead.
-const isSingleFile = computed(() => totalFiles.value === 1 && tree.value.rootFolders.length === 0)
+const isSingleFile = computed(() => totalFiles.value === 1 && uploadable.value.rootFolders.length === 0)
+const offerHypnogram = computed(() => isSingleFile.value && input.modality === 'psg' && pairedCount.value === 0)
 
 // ---------------------------------------------------------------------------
 // Root-file pagination (preview stage only)
@@ -85,14 +122,14 @@ const isSingleFile = computed(() => totalFiles.value === 1 && tree.value.rootFol
 
 const ROOT_PAGE_SIZE = 50
 const rootFilePage = ref(0)
-const totalRootFilePages = computed(() => Math.ceil(tree.value.rootFiles.length / ROOT_PAGE_SIZE))
-const showRootFilePagination = computed(() => tree.value.rootFiles.length > ROOT_PAGE_SIZE)
+const totalRootFilePages = computed(() => Math.ceil(uploadable.value.rootFiles.length / ROOT_PAGE_SIZE))
+const showRootFilePagination = computed(() => uploadable.value.rootFiles.length > ROOT_PAGE_SIZE)
 const visibleRootFiles = computed(() => {
     if (!showRootFilePagination.value) {
-        return tree.value.rootFiles
+        return uploadable.value.rootFiles
     }
     const start = rootFilePage.value * ROOT_PAGE_SIZE
-    return tree.value.rootFiles.slice(start, start + ROOT_PAGE_SIZE)
+    return uploadable.value.rootFiles.slice(start, start + ROOT_PAGE_SIZE)
 })
 
 // ---------------------------------------------------------------------------
@@ -151,6 +188,17 @@ function onFolderChange (event: Event) {
     }
 }
 
+function onHypnogramChange () {
+    hypnogram.value = hypnogramInputRef.value?.files?.[0] ?? null
+    if (hypnogramInputRef.value) {
+        hypnogramInputRef.value.value = ''
+    }
+}
+
+function clearHypnogram () {
+    hypnogram.value = null
+}
+
 function onDragOver (event: DragEvent) {
     event.preventDefault()
     isDragOver.value = true
@@ -172,6 +220,7 @@ async function onDrop (event: DragEvent) {
 function clearSelection () {
     tree.value = { rootFiles: [], rootFolders: [] }
     rejectedCount.value = 0
+    hypnogram.value = null
     stage.value = 'select'
     // Drop the finished batch (if any) so the next upload starts from a clean
     // slate — see `currentBatch` doc on the store for the carryover failure
@@ -189,6 +238,10 @@ function triggerFileSelect () {
 
 function triggerFolderSelect () {
     folderInputRef.value?.click()
+}
+
+function triggerHypnogramSelect () {
+    hypnogramInputRef.value?.click()
 }
 
 function openPicker () {
@@ -226,19 +279,26 @@ async function startUpload () {
         const modality = input.modality
         const preserveAnnotations = input.preserveAnnotations
         const preserveFolderHierarchy = input.preserveFolderHierarchy
+        const hypnograms = new Map(pairing.value?.hypnograms)
+        const loneStudy = uploadable.value.rootFiles[0]
+        if (offerHypnogram.value && hypnogram.value && loneStudy) {
+            hypnograms.set(loneStudy.file, hypnogram.value)
+        }
         if (willCreateCollections.value) {
-            await store.uploadTree(tree.value, {
+            await store.uploadTree(uploadable.value, {
                 parentCollectionId,
                 modality,
                 preserveAnnotations,
                 preserveFolderHierarchy,
+                hypnograms,
             })
         } else {
-            await store.uploadBatch(tree.value.rootFiles, {
+            await store.uploadBatch(uploadable.value.rootFiles, {
                 parentCollectionId,
                 modality,
                 preserveAnnotations,
                 displayName: input.displayName.trim() || undefined,
+                hypnograms,
             })
         }
     } catch {
@@ -454,8 +514,42 @@ function phaseIconClass (phase: string | undefined) {
                     v-wa="[input, 'modality']"
                 >
                     <wa-option value="eeg" selected>{{ t('EEG', SCOPE) }}</wa-option>
+                    <wa-option value="psg">{{ t('Polysomnography', SCOPE) }}</wa-option>
                     <wa-option value="acc">{{ t('Accelerometry', SCOPE) }}</wa-option>
                 </wa-select>
+
+                <wa-callout v-if="pairedCount > 0" variant="brand" class="gap">
+                    <wa-icon name="circle-check" slot="icon"></wa-icon>
+                    {{ t('{count} hypnogram(s) matched to their studies.', SCOPE, { count: pairedCount }) }}
+                </wa-callout>
+                <wa-callout v-if="unpairedCount > 0" variant="warning" class="gap">
+                    <wa-icon name="triangle-exclamation" slot="icon"></wa-icon>
+                    {{ t('{count} hypnogram(s) could not be matched to one study by subject and start time, and will not be uploaded.', SCOPE, { count: unpairedCount }) }}
+                </wa-callout>
+
+                <!-- A hypnogram is aligned on the study's raw header, which ingest
+                     blanks, so it can only be given here, with the study. -->
+                <div v-if="offerHypnogram" class="location-row gap">
+                    <wa-icon class="icon-file" name="file-music"></wa-icon>
+                    <span class="location-row__label">
+                        <span class="location-row__prefix">{{ t('Hypnogram:', SCOPE) }}</span>
+                        <span v-if="hypnogram" class="location-row__name">{{ hypnogram.name }}</span>
+                        <span v-else class="location-row__root">{{ t('None', SCOPE) }}</span>
+                    </span>
+                    <wa-button v-if="hypnogram" appearance="plain" size="s" @click="clearHypnogram">
+                        {{ t('Remove', SCOPE) }}
+                    </wa-button>
+                    <wa-button appearance="filled-outlined" size="s" variant="brand" @click="triggerHypnogramSelect">
+                        {{ t('Choose', SCOPE) }}
+                    </wa-button>
+                    <input
+                        ref="hypnogramInputRef"
+                        accept=".edf,.bdf"
+                        class="hidden-input"
+                        type="file"
+                        @change="onHypnogramChange"
+                    />
+                </div>
 
                 <wa-checkbox class="gap" v-wa="[input, 'preserveAnnotations']">
                     {{ t('Preserve original annotations in file', SCOPE) }}
@@ -562,7 +656,7 @@ function phaseIconClass (phase: string | undefined) {
                         </span>
                     </wa-tree-item>
                     <file-tree-item
-                        v-for="folder in tree.rootFolders"
+                        v-for="folder in uploadable.rootFolders"
                         :key="folder.name"
                         :folder="folder"
                     />
@@ -574,7 +668,7 @@ function phaseIconClass (phase: string | undefined) {
                     :class="{ 'upload-tree--flat': !willCreateCollections }"
                 >
                     <wa-tree-item
-                        v-for="leaf in tree.rootFiles"
+                        v-for="leaf in uploadable.rootFiles"
                         :key="leaf.relativePath || leaf.file.name"
                         class="item"
                     >
@@ -588,7 +682,7 @@ function phaseIconClass (phase: string | undefined) {
                         </div>
                     </wa-tree-item>
                     <file-tree-item
-                        v-for="folder in tree.rootFolders"
+                        v-for="folder in uploadable.rootFolders"
                         :key="folder.name"
                         :folder="folder"
                         :file-phases="filePhases"
@@ -606,7 +700,7 @@ function phaseIconClass (phase: string | undefined) {
                     <wa-icon name="xmark" slot="start"></wa-icon>
                     {{ t('Clear', SCOPE) }}
                 </wa-button>
-                <wa-button variant="brand" @click="startUpload">
+                <wa-button :disabled="pairingBusy" variant="brand" @click="startUpload">
                     <wa-icon name="cloud-arrow-up" slot="start"></wa-icon>
                     {{ t('Start upload', SCOPE) }}
                 </wa-button>

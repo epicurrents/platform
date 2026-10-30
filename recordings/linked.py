@@ -69,7 +69,7 @@ def resolve_linked_source(path: Path) -> Path:
     return resolved
 
 
-def read_linked_edf(path: Path, data: bytes):
+def read_linked_edf(path: Path, data: bytes, *, keep_reference: bool = False):
     """Parse the bytes *data* read from the linked EDF/BDF file at *path*, returning an ``EdfProcessingResult``.
 
     The caller reads the file once and passes the bytes, so a large archive is read once for both its digest
@@ -105,7 +105,7 @@ def read_linked_edf(path: Path, data: bytes):
             "bytes do not account for."
         )
     annotations, gaps = parse_annotations(data, header, signal_infos)
-    deidentify_signal_infos(signal_infos)
+    deidentify_signal_infos(signal_infos, keep_reference=keep_reference)
     for position, info in enumerate(signal_infos):
         info.source_index = position
     return EdfProcessingResult(

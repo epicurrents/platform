@@ -242,7 +242,11 @@ def reset_ingest_profiles() -> None:
 
 
 def gate_label(label: str) -> str:
-    """The label the gate compares a channel labelled ``label`` by, exactly as :func:`validate_file` derives it."""
+    """The label the gate compares a channel labelled ``label`` by, as :func:`validate_file` derives it.
+
+    Read from the label alone. A file's unit and transducer can narrow a channel further, but a stored name
+    resolves to itself whatever they say, and a profile lists stored names.
+    """
     from recordings.processors.channel_labels import classify_channel
     from recordings.processors.edf import extract_signal_type
 

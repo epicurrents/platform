@@ -136,6 +136,11 @@ class Recording(models.Model):
     # rather than a person. Lives here for the same reason as ``power_line_frequency``:
     # a reprocess rebuilds ``RecordingMeta`` and would drop it.
     public_source = models.CharField(max_length=512, blank=True, default="")
+    # The scoring read from a hypnogram file, ``{onset, duration, code}`` per event, until ingest settles. Written as
+    # coded events by the READY transition and cleared by every end of processing, so a reader of the recording never
+    # holds a stage of a study they cannot yet read, and a refused study has none. Here rather than in the task
+    # message, because no erasure path reaches the broker; withheld from the audit trail in ``RecordingsConfig``.
+    pending_scoring = models.JSONField(null=True, blank=True, default=None)
 
     # Reverse GenericRelations so hard-delete (purge) cascades cleanly through
     # every reference row that targets this recording via a GenericForeignKey.
@@ -389,6 +394,9 @@ class ImportJob(models.Model):
     # Whether the job registers files in place (``--link``) rather than copying them. Fixed at
     # creation: a resumed job keeps its mode, so one job never holds both kinds of recording.
     link = models.BooleanField(default=False)
+    # Declared with ``--modality``, empty to leave it to the channel vote. Kept here so a resumed run
+    # cannot send the rest of a job's files back to the vote.
+    modality = models.CharField(max_length=32, blank=True, default="")
     status = models.CharField(
         max_length=16,
         choices=Status.choices,

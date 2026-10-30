@@ -361,7 +361,8 @@ RECORDINGS_DISCARD_SOURCE_CHANNEL_METADATA = env_bool("RECORDINGS_DISCARD_SOURCE
 # string stays only in the raw record. The format is documented on
 # recordings.event_translation.load_table, the mechanism in
 # recordings/README.md → Event translation.
-RECORDING_EVENT_TRANSLATIONS: list[str] = []
+RECORDING_EVENT_TRANSLATIONS: list[str] = ["recordings/translations/sleep-stages.json"]
+RECORDING_CHANNEL_RULES: list[str] = []
 
 #   RECORDING_PIPELINES = {
 #       "web":    {"header": {"strip_annotation_text": False}},

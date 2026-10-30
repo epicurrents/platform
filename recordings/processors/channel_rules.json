@@ -1,0 +1,55 @@
+{
+    "version": 1,
+    "description": "Auxiliary channel roles, tried in order; the first rule whose conditions hold names the channel. Labels are compared whole after the modality prefix and any reference are removed, with case and separators ignored. Conditional rules come before the unconditional rule for the same label. The format is documented on recordings.processors.channel_labels.parse_channel_rules.",
+    "rules": [
+        {"type": "trig", "canonical": "Photic", "label": ["Photic", "Phot", "Photic Stim", "Flash", "Strobe"]},
+        {"type": "trig", "canonical": "Event", "label": ["Event", "Events", "Event button", "Event marker", "Marker", "Mark"]},
+        {"type": "trig", "canonical": "Trigger", "label": ["Trig", "Trigger", "TTL", "Stim"]},
+        {"type": "trig", "canonical": "Status", "label": ["Status"]},
+        {"type": "trig", "canonical": "Sync", "label": ["Sync"]},
+
+        {"type": "resp", "canonical": "Resp oronasal", "label": ["Flow", "Flusso", "Airflow", "Resp flow"], "transducer": ["therm"]},
+        {"type": "resp", "canonical": "Resp nasal", "label": ["Flow", "Flusso", "Airflow", "Resp flow"], "transducer": ["press", "cannula"]},
+        {"type": "resp", "canonical": "Resp nasal", "label": ["Flow", "Flusso", "Airflow", "Resp flow"], "unit": ["cmH2O", "hPa"]},
+        {
+            "type": "resp",
+            "canonical": "Resp oronasal",
+            "label": ["Therm", "Thermistor", "Termistore", "Thermocouple", "Oronasal", "Oronasal therm", "Oronasal thermal", "Oral therm", "Oral thermistor", "Flow therm", "Therm flow", "Resp oro-nasal", "Resp thermistor"]
+        },
+        {
+            "type": "resp",
+            "canonical": "Resp nasal",
+            "label": ["Nasal", "Nasal pressure", "Nasal pres", "Nasal press", "Nasal flow", "Nasal cannula", "Nasal P", "Cannula", "Cannula flow", "Flow cannula", "Pres", "Press", "Pressure", "PTAF", "Resp nasal pressure"]
+        },
+        {"type": "resp", "canonical": "Resp PAP", "label": ["CFlow", "CPAP flow", "PAP flow", "Flow CPAP", "Flow PAP", "Therapy flow"]},
+        {"type": "resp", "canonical": "PAP pressure", "label": ["CPAP", "CPAP pressure", "CPAP press", "CPres", "PAP", "PAP pressure", "PAP press", "Mask pressure", "Mask pres", "Mask press", "Press mask"]},
+        {"type": "resp", "canonical": "Resp", "label": ["Resp", "Respiration", "Airflow", "Flow", "Flusso", "Resp flow", "Flow patient", "New air", "NAF"]},
+        {
+            "type": "resp",
+            "canonical": "Thorax",
+            "label": ["Thor", "Thorax", "Thoracic", "Torace", "Tho", "Chest", "Thor res", "Thor effort", "Thorax effort", "Thorax belt", "Belt thorax", "Effort tho", "Effort thor", "Effort thorax", "RIP thor", "RIP thorax", "RIP thora", "Resp thorax", "Resp chest"]
+        },
+        {
+            "type": "resp",
+            "canonical": "Abdomen",
+            "label": ["Abd", "Abdo", "Abdomen", "Abdominal", "Addome", "Adddome", "Abdo res", "Abd res", "Abdo effort", "Abd effort", "Abdomen effort", "Abdomen belt", "Belt abdomen", "Effort abd", "Effort abdo", "Effort abdomen", "RIP abd", "RIP abdo", "RIP abdom", "RIP abdomen", "Resp abdomen", "Resp abdominal"]
+        },
+        {"type": "resp", "canonical": "Resp sum", "label": ["Sum", "RIP sum", "Sum RIP", "Sum effort", "Effort sum", "Resp sum"]},
+        {"type": "resp", "canonical": "EtCO2", "label": ["EtCO2", "End tidal CO2", "End-tidal CO2", "CO2", "Capno", "Capnography"]},
+        {"type": "resp", "canonical": "TcCO2", "label": ["TcCO2", "TcpCO2", "PtcCO2", "Transcutaneous CO2"]},
+
+        {"type": "spo2", "canonical": "SpO2", "label": ["SpO2", "SaO2", "OSat", "Ox sat", "Oxygen saturation", "Oximetry", "Sat", "SaO2 finger", "SpO2 finger"]},
+        {"type": "misc", "canonical": "SpO2 status", "label": ["Stat"], "transducer": ["oxim"]},
+        {"type": "misc", "canonical": "SpO2 status", "label": ["Ox stat", "Ox status", "Oximeter status"]},
+        {"type": "ppg", "canonical": "PPG", "label": ["Pleth", "Plethysmogram", "PPG", "Pulse wave"]},
+        {"type": "misc", "canonical": "HR", "label": ["HR", "Heart rate", "Pulse rate", "PR bpm"]},
+        {"type": "misc", "canonical": "Pulse", "label": ["Pulse"]},
+
+        {"type": "misc", "canonical": "Snore", "label": ["Snore", "Snoring", "Snore mic", "Snore microphone"]},
+        {"type": "misc", "canonical": "Sound", "label": ["Sound", "Sound trachea", "Mic", "Microphone"]},
+        {"type": "misc", "canonical": "Position", "label": ["Pos", "Position", "Posizione", "Bodypos", "Body", "Body pos", "Body position"]},
+        {"type": "temp", "canonical": "Temp", "label": ["Temp", "Temperature", "Temp rectal", "Temp skin", "Body temp"]},
+        {"type": "misc", "canonical": "Light", "label": ["Light", "Light sternum", "Lux"]},
+        {"type": "misc", "canonical": "Impedance", "label": ["Imp", "Impedance"]}
+    ]
+}

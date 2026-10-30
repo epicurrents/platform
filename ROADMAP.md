@@ -110,6 +110,7 @@ The two security entries below were gated on the evidence host, which is now in 
 - Federation — bind the serving-relevant query parameters of the slice endpoints (`bnd` covers the `Range` header, so a captured download token cannot be widened to pull the whole file, but `/{hash}/slice` and `/{hash}/file/slice` take their time range in the query, which is deliberately unbound because intermediaries rewrite it. The escalation is bounded — a peer holding a token for one slice is already authorised for the whole object, so redirecting it between slices grants nothing new — which is why this is a consistency item rather than a hole. The fix is to fold the named parameters into the `bnd` digest rather than binding the query wholesale; nothing in the platform mints a token for those endpoints today, so the work is only worth doing alongside a client that uses them)
 - Testing — narrow the `require_fuse` marker to the tests that actually need a POSIX host (the whole of [federation/tests/test_fuse_fs.py](federation/tests/test_fuse_fs.py) is gated on libfuse resolving, but the file builds its instances with `object.__new__` precisely so it needs none — its own docstring says so. With the gate lifted, 52 of 58 pass anywhere; the 6 that fail are `TestGetattr` plus `test_getattr_reports_output_file_size`, which call `os.getuid()` and so want a POSIX host rather than libfuse. The cost of the current breadth is that the FUSE client is unverified on any developer machine that is not Linux or macOS — the request-binding work refactored every call site in it with the whole file skipping silently, and the assertions it broke were only found by lifting the gate by hand)
 - Activity — document and auto-handle rollback ordering for cascade deletions
+- Polysomnography — the ingest half is done; the viewer module, scoring and automated staging remain
 - Compute — generalise channel-type assumption beyond EEG (PSG / MEG)
 - Compute — check whether MNE community has already discussed the sphere-centre singularity
 - Compute — MNI152 cortical surface mesh for 3-D source-localisation view
@@ -1006,6 +1007,26 @@ Standard-montage lead fields are small (10-20 ≈ hundreds of KB, mid-density 10
 **Frontend — shipped, and not where this entry expected.** The manifest fetch, the entry lookup, the byte-slicing and the API fallback are all in platform code at [frontend/src/viewer/leadFields.ts](frontend/src/viewer/leadFields.ts): the viewer no longer knows where lead fields come from, because the platform injects a provider into its setup. Three hosts do that injecting, because there are three ways the viewer is launched: the SPA imports the provider ([frontend/src/views/ViewerView.vue](frontend/src/views/ViewerView.vue)), the per-project viewer build bakes it in ([frontend/src/viewer/base.ts](frontend/src/viewer/base.ts)), and the public viewer page loads it as a standalone script ([frontend/src/viewer/publicSetup.ts](frontend/src/viewer/publicSetup.ts)) because its SETUP is JSON and a provider is a function — that script has since grown into the platform-owned half of the page's whole setup. The deploy wiring is in place too: both deploy scripts invoke `generate_compute_static`. The original framing: the lead-field fetch lives in the `frontend/viewer` **git submodule** (separate repo; only its built `dist` is in this tree). Change its acquisition to: fetch `manifest.json` (SW-cached) → find the entry for `(montage, n_orient, grid)` → fetch the `.bin` (SW-cached) → slice into `Float64Array`s using the manifest's `lead_field_bytes`/`src_pos_bytes` → **fall back to the existing `/data/` API on miss** (same blob, lengths from headers). Deployment: none extra — `vendor_view` already serves `/vendor/leadfields/` with the `Cross-Origin-Resource-Policy` header, and the SW `/leadfields/` rule matches on that path segment unchanged. Also decide the final montage set (default `standard_1020`; add whichever 10-10 montage was validated for size).
 
 ---
+
+## 🟢 Polysomnography
+
+Continuous EDF/BDF sleep studies as a modality of their own, `psg`. Decided: a study is declared, never inferred, and an interrupted one is refused; channel names come from our own rule table, modelled on Luna's `CANONICAL` matching with nothing copied from its GPL rule files.
+
+**Done, in [recordings/README.md → Modality](recordings/README.md#modality) and [Channel rules](recordings/README.md#channel-rules):** the upload's `modality` parameter, the continuity check on every route that sets it, the rule table and site tables, de-identification pass version 5, derivations kept for a study.
+
+**Also done:** the `epicurrents.psg` vocabulary, translation of stage annotations, and the `psg-module` package with `PsgRecording`, `PsgStudyLoader`, the setup built from a study's own channels and the `Hypnogram` model, registered in the builder and in [frontend/src/viewer/base.ts](frontend/src/viewer/base.ts).
+
+**Remaining, in order:**
+
+- Publish `epicurrents/psg-module`. `scripts/env.mjs` names it, so a fresh `npm run setup` fails to clone it until the repository exists.
+- Run a study in a browser. Nothing in the viewer half has been, so opening a file, the montage and the rolling path are unverified.
+- Per-channel scales. The plot takes a `sensitivity`, `scale` and `offset.baseline` per channel, and respiratory and DC channels such as SpO2 need them from their physical range.
+- Sleep interface: a hypnogram strip, 30-second epoch paging and keyboard scoring. A study has the `eeg` modality in the viewer, so this goes in the EEG interface or a `psg` interface module.
+- Whole-night trends. `TrendProcessor` reads the live cache, so under the rolling cache a trend covers only what has been loaded.
+- Automated staging: `compute/sleep` as an analysis processor writing `PSG_STAGE_*` codes, instead of the CSV `sleep_stage` writes.
+- Label coverage against more exports. Sleep-EDF and CAP are covered; `DX1-DX2` and `SX1-SX2` stay `MISC_<n>` because the label does not say which muscle.
+- Scoring on overnight EEG. A long EEG may be scored as a study is, but ingest writes scoring terms on a recording declared `psg` only and the viewer's `Hypnogram` belongs to `PsgRecording`. Scoring already survives a change of modality; taking it in and showing it on an EEG needs those two to move, and a row in the anonymisation assessment for the wider exposure.
+- A hypnogram for a study already ingested. A separate file is taken at upload and import only, because aligning it needs the study's raw start time, which ingest blanks. Keeping that time for the author, or accepting a stated offset, would open this.
 
 ## 🟢 Compute — generalise channel-type assumption beyond EEG (PSG / MEG)
 

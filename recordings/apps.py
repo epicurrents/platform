@@ -67,7 +67,7 @@ class RecordingsConfig(AppConfig):
         # withheld values, so a live row keeps its path; the one restore it
         # cannot complete is of a hard-deleted row, whose managed file every
         # deletion path has already unlinked.
-        register_masked_fields("recordings.recording", {"file_path"}, withhold=True)
+        register_masked_fields("recordings.recording", {"file_path", "pending_scoring"}, withhold=True)
         # The bulk-import rows carry the same class of data under different
         # names. `relative_path` is the source filename inside the import tree —
         # `original_name` before a Recording exists — and `source_path` is the

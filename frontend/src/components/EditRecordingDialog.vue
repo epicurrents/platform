@@ -97,6 +97,7 @@ async function submit () {
                 v-wa="[input, 'modality']"
             >
                 <wa-option value="eeg">{{ t('EEG', SCOPE) }}</wa-option>
+                <wa-option value="psg">{{ t('Polysomnography', SCOPE) }}</wa-option>
                 <wa-option value="emg">{{ t('EMG', SCOPE) }}</wa-option>
                 <wa-option value="ecg">{{ t('ECG', SCOPE) }}</wa-option>
                 <wa-option value="eog">{{ t('EOG', SCOPE) }}</wa-option>

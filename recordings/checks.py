@@ -1,15 +1,18 @@
-"""Django system checks for the ingest event translation.
+"""Django system checks for the data tables ingest reads: event translation and channel rules.
 
 A translation table is data a deployment points at from settings, and every way of getting it wrong is quiet at
 runtime: a file that is missing or malformed is skipped with a log line, and a rule whose code no vocabulary has
 never matches, so its events become placeholders and the log says nothing. Both look exactly like a vendor string
 the table does not cover. So the tables are read at ``manage.py check``, which Django runs before ``runserver``
-and ``migrate``, and a malformed one or a literal code outside the pinned vocabularies stops the deployment.
+and ``migrate``, and a malformed one or a literal code outside the pinned vocabularies stops the deployment. A
+channel rule table is the same hazard: one that cannot be used leaves its channels as ``MISC_<n>``, which reads as
+labels nobody wrote a rule for.
 """
 
 from django.core.checks import Error, Tags, register
 
 from recordings.event_translation import EventTranslationError, load_tables
+from recordings.processors.channel_labels import ChannelRuleError, load_site_rules, site_rule_paths
 
 
 @register(Tags.compatibility)
@@ -39,3 +42,19 @@ def check_event_translation_tables(app_configs, **kwargs):
                 )
             )
     return issues
+
+
+@register(Tags.compatibility)
+def check_channel_rule_tables(app_configs, **kwargs):
+    """Every configured site channel table parses, and every name in it is one the platform ships."""
+    try:
+        load_site_rules(site_rule_paths())
+    except ChannelRuleError as error:
+        return [
+            Error(
+                f"RECORDING_CHANNEL_RULES names a table that cannot be used: {error}",
+                hint="The format is documented on recordings.processors.channel_labels.parse_channel_rules.",
+                id="recordings.E003",
+            )
+        ]
+    return []

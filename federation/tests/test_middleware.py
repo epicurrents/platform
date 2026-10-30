@@ -1082,3 +1082,30 @@ class TestBuildSignalContextFromInfos:
         assert ctx_infos.output_record_size == ctx_bytes.output_record_size
         assert ctx_infos.new_header_size == ctx_bytes.new_header_size
         assert ctx_infos.output_file_size == ctx_bytes.output_file_size
+
+
+class TestDeidentifyKeepsReference:
+    def _header(self):
+        from federation.middleware import DeidentifyEDFHeader  # noqa: F401
+        from recordings.testing import make_edf_bytes
+
+        header = bytearray(make_edf_bytes(n_channels=1, n_records=1)[:512])
+        header[256:272] = b"C4-M1".ljust(16)
+        return bytes(header)
+
+    def test_it_keeps_a_derivation_when_told_to(self):
+        from federation.middleware import DeidentifyEDFHeader
+
+        assert DeidentifyEDFHeader(keep_reference=True).transform_header(self._header())[256:272].rstrip() == b"C4-M1"
+
+    def test_it_strips_by_default(self):
+        from federation.middleware import DeidentifyEDFHeader
+
+        assert DeidentifyEDFHeader().transform_header(self._header())[256:272].rstrip() == b"C4"
+
+    def test_it_does_not_keep_what_is_not_a_derivation(self):
+        from federation.middleware import DeidentifyEDFHeader
+
+        header = bytearray(self._header())
+        header[256:272] = b"C4-Smith".ljust(16)
+        assert b"Smith" not in DeidentifyEDFHeader(keep_reference=True).transform_header(bytes(header))

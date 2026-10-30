@@ -4,11 +4,11 @@ import {
     listRecordings,
     uploadRecording,
     getRecordingStatus,
-    updateRecording,
     type Recording,
     type RecordingUpload,
 } from '#api/recordings'
 import { toastNameWarnings } from '#lib/nameWarnings'
+import { showToast } from '#lib/toast'
 import {
     createCollection,
     addCollectionItem,
@@ -168,6 +168,8 @@ export const useRecordingsStore = defineStore('recordings', () => {
             preserveAnnotations?: boolean
             /** Grantee-visible label for a single-file upload; ignored when uploading many. */
             displayName?: string
+            /** The hypnogram of each study that has one, keyed by the study's file. */
+            hypnograms?: Map<File, File>
         },
     ): Promise<BatchUploadState> {
         const batch = _makeBatch(files.map(f => f.relativePath || f.file.name))
@@ -193,7 +195,7 @@ export const useRecordingsStore = defineStore('recordings', () => {
 
         await _runConcurrent(files, UPLOAD_CONCURRENCY, async (leaf) => {
             const key = leaf.relativePath || leaf.file.name
-            await _uploadLeaf(leaf, key, reactiveBatch, collId, recordingCtId, options?.modality, options?.preserveAnnotations, displayName)
+            await _uploadLeaf(leaf, key, reactiveBatch, collId, recordingCtId, options?.modality, options?.preserveAnnotations, displayName, options?.hypnograms?.get(leaf.file))
         })
 
         _finaliseBatch(reactiveBatch)
@@ -232,8 +234,11 @@ export const useRecordingsStore = defineStore('recordings', () => {
              * See frontend/README.md (Folder uploads + PHI) for the policy.
              */
             preserveFolderHierarchy?: boolean
+            /** The hypnogram of each study that has one, keyed by the study's file. */
+            hypnograms?: Map<File, File>
         },
     ): Promise<BatchUploadState> {
+        const hypnograms = options?.hypnograms
         const parentId = options?.parentCollectionId ?? null
         const preserveHierarchy = options?.preserveFolderHierarchy ?? false
 
@@ -251,6 +256,11 @@ export const useRecordingsStore = defineStore('recordings', () => {
                     type: leaf.file.type,
                     lastModified: leaf.file.lastModified,
                 })
+                // A new File is a new key, and a hypnogram must not lose its study to a name collision.
+                const hypnogram = hypnograms?.get(leaf.file)
+                if (hypnogram) {
+                    hypnograms?.set(renamedFile, hypnogram)
+                }
                 return { file: renamedFile, relativePath: newName }
             })
             const batch = _makeBatch(renamed.map(f => f.relativePath || f.file.name))
@@ -267,7 +277,7 @@ export const useRecordingsStore = defineStore('recordings', () => {
 
             await _runConcurrent(renamed, UPLOAD_CONCURRENCY, async (leaf) => {
                 const key = leaf.relativePath || leaf.file.name
-                await _uploadLeaf(leaf, key, reactiveBatch, parentId, recordingCtId, options?.modality, options?.preserveAnnotations)
+                await _uploadLeaf(leaf, key, reactiveBatch, parentId, recordingCtId, options?.modality, options?.preserveAnnotations, undefined, hypnograms?.get(leaf.file))
             })
             _finaliseBatch(reactiveBatch)
             return reactiveBatch
@@ -293,12 +303,12 @@ export const useRecordingsStore = defineStore('recordings', () => {
 
         // Root files: add to the parent collection if one was supplied.
         const rootFileUploads = tree.rootFiles.map(leaf =>
-            _uploadLeaf(leaf, leaf.relativePath || leaf.file.name, reactiveBatch, parentId, recordingCtId, options?.modality, options?.preserveAnnotations),
+            _uploadLeaf(leaf, leaf.relativePath || leaf.file.name, reactiveBatch, parentId, recordingCtId, options?.modality, options?.preserveAnnotations, undefined, hypnograms?.get(leaf.file)),
         )
 
         // Root folders each become a child Collection of parentId.
         const rootFolderUploads = tree.rootFolders.map(folder =>
-            _uploadFolder(folder, parentId, reactiveBatch, recordingCtId, options?.modality, options?.preserveAnnotations),
+            _uploadFolder(folder, parentId, reactiveBatch, recordingCtId, options?.modality, options?.preserveAnnotations, hypnograms),
         )
 
         await Promise.all([...rootFileUploads, ...rootFolderUploads])
@@ -333,6 +343,7 @@ export const useRecordingsStore = defineStore('recordings', () => {
         recordingCtId: number | null,
         modality?: string,
         preserveAnnotations?: boolean,
+        hypnograms?: Map<File, File>,
     ): Promise<void> {
         // Create the collection before uploading its files.
         let collectionId: number | null = null
@@ -350,12 +361,12 @@ export const useRecordingsStore = defineStore('recordings', () => {
         // Upload files in this folder concurrently (bounded).
         await _runConcurrent(folder.files, UPLOAD_CONCURRENCY, async (leaf) => {
             const key = leaf.relativePath || leaf.file.name
-            await _uploadLeaf(leaf, key, batch, collectionId, recordingCtId, modality, preserveAnnotations)
+            await _uploadLeaf(leaf, key, batch, collectionId, recordingCtId, modality, preserveAnnotations, undefined, hypnograms?.get(leaf.file))
         })
 
         // Recurse into sub-folders sequentially to preserve parent→child ordering.
         for (const sub of folder.subfolders) {
-            await _uploadFolder(sub, collectionId, batch, recordingCtId, modality, preserveAnnotations)
+            await _uploadFolder(sub, collectionId, batch, recordingCtId, modality, preserveAnnotations, hypnograms)
         }
     }
 
@@ -372,6 +383,7 @@ export const useRecordingsStore = defineStore('recordings', () => {
         modality?: string,
         preserveAnnotations?: boolean,
         displayName?: string,
+        hypnogram?: File,
     ): Promise<void> {
         const fileState = batch.files.get(key)!
         fileState.phase = 'uploading'
@@ -380,10 +392,16 @@ export const useRecordingsStore = defineStore('recordings', () => {
         try {
             result = await uploadRecording(leaf.file, (pct) => {
                 fileState.progress = pct
-            }, { preserveAnnotations, displayName })
-        } catch {
+            }, { preserveAnnotations, displayName, modality, hypnogram })
+        } catch (error) {
             fileState.phase = 'failed'
             batch.doneFiles++
+            // Refused at the door, such as a hypnogram from another night: nothing was kept, so
+            // there is no recording to carry the reason and this is the only place it can show.
+            const reason = (error as { response?: { data?: { detail?: unknown } } }).response?.data?.detail
+            if (typeof reason === 'string') {
+                showToast(reason, 'danger')
+            }
             return
         }
 
@@ -414,7 +432,7 @@ export const useRecordingsStore = defineStore('recordings', () => {
         activeUploads.value.push(legacyState)
 
         // Poll for processing result.
-        await _pollStatusBatch(hash, legacyState, fileState, batch, modality)
+        await _pollStatusBatch(hash, legacyState, fileState, batch)
     }
 
     async function _pollStatusBatch(
@@ -422,7 +440,6 @@ export const useRecordingsStore = defineStore('recordings', () => {
         legacyState: UploadState,
         fileState: BatchFileState,
         batch: BatchUploadState,
-        modality?: string,
     ): Promise<void> {
         for (let attempt = 0; attempt < POLL_MAX_ATTEMPTS; attempt++) {
             await _sleep(POLL_INTERVAL_MS)
@@ -430,19 +447,20 @@ export const useRecordingsStore = defineStore('recordings', () => {
                 const status = await getRecordingStatus(hash)
                 if (status.status === 'ready' || status.status === 'failed') {
                     const phase = status.status as 'ready' | 'failed'
-                    if (phase === 'ready' && modality) {
-                        try {
-                            await updateRecording(hash, { modality })
-                        } catch {
-                            // Non-fatal: recording is usable even if modality update fails.
-                        }
-                    }
                     fileState.phase = phase
                     fileState.recordingHash = hash
                     legacyState.phase = phase
                     batch.doneFiles++
                     _removeUpload(hash)
                     await load()
+                    if (phase === 'failed') {
+                        // Refused on content, such as a study with an interrupted timeline: the author
+                        // is who this reaches, and the reason is what they need to do anything about it.
+                        const reason = recordings.value.find(r => r.hash === hash)?.processing_error
+                        if (reason) {
+                            showToast(reason, 'danger')
+                        }
+                    }
                     return
                 }
             } catch {

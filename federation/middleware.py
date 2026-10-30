@@ -658,6 +658,10 @@ class DeidentifyEDFHeader(EDFHeaderMiddleware):
 
     targets: frozenset[Scope] = frozenset({"fuse", "api"})
 
+    def __init__(self, *, keep_reference: bool = False) -> None:
+        """*keep_reference* keeps a label's derivation, which a file the platform wrote already shows."""
+        self.keep_reference = keep_reference
+
     def transform_header(self, raw_header: bytes) -> bytes:
         try:
             from recordings.processors.edf import (
@@ -669,7 +673,7 @@ class DeidentifyEDFHeader(EDFHeaderMiddleware):
 
             header = parse_edf_header(raw_header)
             signal_infos = parse_signal_infos(raw_header, header)
-            deidentify_signal_infos(signal_infos)
+            deidentify_signal_infos(signal_infos, keep_reference=self.keep_reference)
             return _build_clean_header(header, signal_infos)
         except Exception:
             logger.exception("EDF header de-identification failed; serving raw header instead")

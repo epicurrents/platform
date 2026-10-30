@@ -11,7 +11,10 @@ copied here is a 422 for a client using it, and a term edited here alone is a va
 recording that the signal cannot recover. ``epicurrents.eeg`` accepts the EEG set's activation procedures and
 delegates a value it does not know to the shared set, so an EEG event may carry a shared term under either standard.
 Neither file carries findings, which are coded in HED-SCORE; the scope filter stays, so a category a file scopes
-``finding`` is left out rather than registered. A code's ``meta`` is not validated: the file names the keys a term
+``finding`` is left out rather than registered. ``epicurrents.psg`` is the one set that holds readings of the signal:
+sleep stages and the events a scorer marks, scoped ``scoring``. It extends HED-SCORE rather than competing with it,
+because a study needs a closed set a file can be translated into, and a term SCORE lacks; a term carries the SCORE
+tag as its crosswalk where SCORE has one. A code's ``meta`` is not validated: the file names the keys a term
 expects as documentation for the writer, and the redaction rule treats the metadata as text whatever it holds.
 
 Why a term is worth more than a name: under a grant carrying ``apply_middleware`` the redaction rule withholds an
@@ -34,6 +37,11 @@ VOCABULARY_DIR = Path(__file__).resolve().parent / "vocabulary"
 
 #: The scope a category must carry for its terms to be accepted as annotation codes.
 ACQUISITION_SCOPE = "acquisition"
+#: The scope of the terms a sleep scorer reads from the signal.
+SCORING_SCOPE = "scoring"
+#: The standard those terms belong to. Unlike an acquisition term, it is a reading of the subject's signal, so ingest
+#: writes it on a declared study only (``recordings.event_translation.write_source_events``).
+SCORING_STANDARD = "epicurrents.psg"
 
 
 @dataclass(frozen=True)
@@ -46,6 +54,8 @@ class VocabularyPin:
     sha256: str
     #: The standard a value is looked up in when this one does not know it.
     fallback: str | None = None
+    #: The scope a category of this file must carry for its terms to be accepted.
+    scope: str = ACQUISITION_SCOPE
 
 
 VOCABULARY_PINS: dict[str, VocabularyPin] = {
@@ -62,6 +72,14 @@ VOCABULARY_PINS: dict[str, VocabularyPin] = {
         sha256="17e6996c0bd1778ffacd79e96fdb7df747725d9f431cd0dc55e8ae228b66c156",
         fallback="epicurrents.biosignal",
     ),
+    SCORING_STANDARD: VocabularyPin(
+        file="psg-events.json",
+        label="Epicurrents polysomnography scoring",
+        version="1.0",
+        sha256="bbef0cb0aba403d42145164fa8566934aa0f4c9c99793a3a7d7a05b23f875500",
+        fallback="epicurrents.biosignal",
+        scope=SCORING_SCOPE,
+    ),
 }
 
 
@@ -76,7 +94,7 @@ def acquisition_codes(standard: str) -> frozenset[str]:
     """The codes of *standard*'s acquisition-scoped categories: the values the registered validator accepts."""
     codes: set[str] = set()
     for category in load_vocabulary(standard)["categories"].values():
-        if category.get("scope") != ACQUISITION_SCOPE:
+        if category.get("scope") != VOCABULARY_PINS[standard].scope:
             continue
         codes.update(term["code"] for term in category["events"].values())
     return frozenset(codes)
@@ -104,9 +122,9 @@ class AcquisitionTerm:
 def _acquisition_terms() -> dict[str, AcquisitionTerm]:
     """Every acquisition-scoped term of every pinned vocabulary, by code. The prefixes keep the codes disjoint."""
     terms: dict[str, AcquisitionTerm] = {}
-    for standard in VOCABULARY_PINS:
+    for standard, pin in VOCABULARY_PINS.items():
         for category in load_vocabulary(standard)["categories"].values():
-            if category.get("scope") != ACQUISITION_SCOPE:
+            if category.get("scope") != pin.scope:
                 continue
             for term in category["events"].values():
                 terms[term["code"]] = AcquisitionTerm(
@@ -118,7 +136,8 @@ def _acquisition_terms() -> dict[str, AcquisitionTerm]:
 def find_acquisition_term(code: str) -> AcquisitionTerm | None:
     """The term *code* names in the pinned vocabularies, under the standard that owns it, or ``None``.
 
-    A finding-scoped term answers ``None`` like an unknown code: ingest writes acquisition events only.
+    A finding-scoped term answers ``None`` like an unknown code: ingest writes what a file can say of itself, which
+    is acquisition events and, in a study, the stages and events its scorer coded.
     """
     return _acquisition_terms().get(code)
 

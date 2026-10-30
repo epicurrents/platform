@@ -377,3 +377,19 @@ def test_a_linked_recording_is_named_as_an_upload_is(superuser, linked_root, sou
     import re
 
     assert re.fullmatch(r"[0-9A-F]{32}\.edf", _linked(superuser, linked_root).stored_name)
+
+
+@pytest.mark.django_db
+def test_a_continuous_study_is_linked_as_one(superuser, linked_root, source):
+    _link(linked_root, superuser.username, modality="psg")
+    assert Recording.objects.get(author=superuser).modality == "psg"
+
+
+@pytest.mark.django_db
+def test_an_interrupted_study_is_not_linked(superuser, linked_root, tmp_path):
+    from recordings.tests.test_edf_processor import _make_edfplus_file
+
+    path = linked_root / "study" / "interrupted.edf"
+    path.write_bytes(_make_edfplus_file(n_records=4, discontinuous=True, onsets=[0.0, 1.0, 30.0, 31.0]))
+    _link(linked_root, superuser.username, modality="psg")
+    assert not Recording.objects.filter(author=superuser).exists()

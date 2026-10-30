@@ -308,12 +308,12 @@ Each `EDFSignalMiddleware` must implement `transform_signal_infos(signal_infos) 
 
 ### Server-side (HTTP API)
 
-The recordings download endpoint always applies `_build_serve_pipeline()` from [recordings/api/v1/ninja.py](../recordings/api/v1/ninja.py), which is hardcoded to:
+The recordings download endpoint always applies `_build_serve_pipeline(recording)` from [recordings/api/v1/ninja.py](../recordings/api/v1/ninja.py), which is hardcoded to:
 
 ```python
 MiddlewarePipeline(
     [
-        DeidentifyEDFHeader(),
+        DeidentifyEDFHeader(keep_reference=...),
         StripAnnotationTextMiddleware(),
     ]
 ).for_scope("api")

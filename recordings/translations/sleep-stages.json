@@ -1,0 +1,110 @@
+{
+    "name": "sleep-stages",
+    "description": "The forms a scored stage takes in an EDF+ annotation, with the Rechtschaffen and Kales stages mapped to their AASM equivalents. Applies on a recording declared psg only: write_source_events leaves a scoring term untranslated anywhere else.",
+    "rules": [
+        {
+            "label": "Sleep stage W",
+            "code": "PSG_STAGE_W"
+        },
+        {
+            "label": "Sleep stage 0",
+            "code": "PSG_STAGE_W"
+        },
+        {
+            "label": "Sleep-S0",
+            "code": "PSG_STAGE_W"
+        },
+        {
+            "label": "SLEEP-W",
+            "code": "PSG_STAGE_W"
+        },
+        {
+            "label": "Sleep stage N1",
+            "code": "PSG_STAGE_N1"
+        },
+        {
+            "label": "Sleep stage 1",
+            "code": "PSG_STAGE_N1"
+        },
+        {
+            "label": "Sleep-S1",
+            "code": "PSG_STAGE_N1"
+        },
+        {
+            "label": "SLEEP-N1",
+            "code": "PSG_STAGE_N1"
+        },
+        {
+            "label": "Sleep stage N2",
+            "code": "PSG_STAGE_N2"
+        },
+        {
+            "label": "Sleep stage 2",
+            "code": "PSG_STAGE_N2"
+        },
+        {
+            "label": "Sleep-S2",
+            "code": "PSG_STAGE_N2"
+        },
+        {
+            "label": "SLEEP-N2",
+            "code": "PSG_STAGE_N2"
+        },
+        {
+            "label": "Sleep stage N3",
+            "code": "PSG_STAGE_N3"
+        },
+        {
+            "label": "Sleep stage 3",
+            "code": "PSG_STAGE_N3"
+        },
+        {
+            "label": "Sleep stage 4",
+            "code": "PSG_STAGE_N3"
+        },
+        {
+            "label": "Sleep-S3",
+            "code": "PSG_STAGE_N3"
+        },
+        {
+            "label": "Sleep-S4",
+            "code": "PSG_STAGE_N3"
+        },
+        {
+            "label": "SLEEP-N3",
+            "code": "PSG_STAGE_N3"
+        },
+        {
+            "label": "Sleep stage R",
+            "code": "PSG_STAGE_REM"
+        },
+        {
+            "label": "Sleep stage REM",
+            "code": "PSG_STAGE_REM"
+        },
+        {
+            "label": "Sleep-REM",
+            "code": "PSG_STAGE_REM"
+        },
+        {
+            "label": "Sleep stage ?",
+            "code": "PSG_STAGE_UNSCORED"
+        },
+        {
+            "label": "Sleep stage unknown",
+            "code": "PSG_STAGE_UNSCORED"
+        },
+        {
+            "label": "Movement time",
+            "code": "PSG_STAGE_UNSCORED"
+        },
+        {
+            "label": "Sleep-MT",
+            "code": "PSG_STAGE_UNSCORED"
+        },
+        {
+            "label": "Sleep-UNKNOWN",
+            "code": "PSG_STAGE_UNSCORED"
+        }
+    ]
+}

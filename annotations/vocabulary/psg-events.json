@@ -1,0 +1,151 @@
+{
+    "standard": "epicurrents.psg",
+    "version": "1.0",
+    "description": "What a sleep study is scored into: the stage of each epoch and the events read from the polygraphic channels. It extends HED-SCORE rather than competing with it. HED-SCORE stays the finding vocabulary of a clinical EEG reading, and a sleep scorer needs terms it does not have, an apnea by its mechanism or a desaturation, and a closed set a file can be translated into. A term takes the HED-SCORE tag as its name where SCORE has one, spelled the way SCORE spells its tags, and carries that tag as its `hed` crosswalk, so a coded study reads across to a SCORE report; a term SCORE lacks is named in the same style and carries no crosswalk. Every category is scoped `scoring`: these are readings of the signal, kept apart from the acquisition sets, which hold what the signal cannot recover. Sleep stages are stored as coded events rather than free-text labels because a code's value is served under a de-identifying grant and a name is not.",
+    "categories": {
+        "SLEEP_STAGE": {
+            "scope": "scoring",
+            "description": "The stage of a scoring epoch. An event covers the epochs it spans, so a scorer's run of one stage and a file's single long stage annotation read the same way.",
+            "events": {
+                "W": {
+                    "code": "PSG_STAGE_W",
+                    "name": "Sleep-stage-W",
+                    "class": "event",
+                    "description": "Wakefulness. SCORE stages sleep and has no term for an awake epoch."
+                },
+                "N1": {
+                    "code": "PSG_STAGE_N1",
+                    "name": "Sleep-stage-N1",
+                    "class": "event",
+                    "standardCodes": {
+                        "hed": "Sleep-stage-N1"
+                    },
+                    "description": "Non-REM stage 1."
+                },
+                "N2": {
+                    "code": "PSG_STAGE_N2",
+                    "name": "Sleep-stage-N2",
+                    "class": "event",
+                    "standardCodes": {
+                        "hed": "Sleep-stage-N2"
+                    },
+                    "description": "Non-REM stage 2."
+                },
+                "N3": {
+                    "code": "PSG_STAGE_N3",
+                    "name": "Sleep-stage-N3",
+                    "class": "event",
+                    "standardCodes": {
+                        "hed": "Sleep-stage-N3"
+                    },
+                    "description": "Non-REM stage 3, slow-wave sleep. Stages 3 and 4 of the older Rechtschaffen and Kales rules both map here."
+                },
+                "REM": {
+                    "code": "PSG_STAGE_REM",
+                    "name": "Sleep-stage-REM",
+                    "class": "event",
+                    "standardCodes": {
+                        "hed": "Sleep-stage-REM"
+                    },
+                    "description": "Rapid eye movement sleep."
+                },
+                "UNSCORED": {
+                    "code": "PSG_STAGE_UNSCORED",
+                    "name": "Sleep-stage-unscored",
+                    "class": "event",
+                    "description": "An epoch that was not or could not be scored, such as one obscured by movement. It counts as neither sleep nor wake."
+                }
+            }
+        },
+        "AROUSAL": {
+            "scope": "scoring",
+            "description": "Cortical arousals from sleep.",
+            "events": {
+                "AROUSAL": {
+                    "code": "PSG_AROUSAL",
+                    "name": "Sleep-related-arousal",
+                    "class": "event",
+                    "standardCodes": {
+                        "hed": "Sleep-related-arousal"
+                    },
+                    "description": "An abrupt shift in EEG frequency during sleep."
+                }
+            }
+        },
+        "RESPIRATORY": {
+            "scope": "scoring",
+            "description": "Respiratory events read from the airflow, effort and oximetry channels. SCORE has one apnea term; the mechanism is what a sleep report turns on, so each carries that term as its crosswalk and keeps the mechanism here.",
+            "events": {
+                "APNEA_OBSTRUCTIVE": {
+                    "code": "PSG_RESP_APNEA_OBSTRUCTIVE",
+                    "name": "Apnea-obstructive",
+                    "class": "event",
+                    "standardCodes": {
+                        "hed": "Apnea"
+                    },
+                    "description": "Cessation of airflow with continued respiratory effort."
+                },
+                "APNEA_CENTRAL": {
+                    "code": "PSG_RESP_APNEA_CENTRAL",
+                    "name": "Apnea-central",
+                    "class": "event",
+                    "standardCodes": {
+                        "hed": "Apnea"
+                    },
+                    "description": "Cessation of airflow without respiratory effort."
+                },
+                "APNEA_MIXED": {
+                    "code": "PSG_RESP_APNEA_MIXED",
+                    "name": "Apnea-mixed",
+                    "class": "event",
+                    "standardCodes": {
+                        "hed": "Apnea"
+                    },
+                    "description": "An apnea beginning without respiratory effort and ending with it."
+                },
+                "HYPOPNEA": {
+                    "code": "PSG_RESP_HYPOPNEA",
+                    "name": "Hypopnea",
+                    "class": "event",
+                    "standardCodes": {
+                        "hed": "Hypopnea"
+                    },
+                    "description": "A reduction in airflow short of an apnea."
+                },
+                "RERA": {
+                    "code": "PSG_RESP_RERA",
+                    "name": "Respiratory-effort-related-arousal",
+                    "class": "event",
+                    "description": "Increased respiratory effort ending in an arousal, without the airflow reduction of a hypopnea."
+                },
+                "DESATURATION": {
+                    "code": "PSG_RESP_DESATURATION",
+                    "name": "Oxygen-desaturation",
+                    "class": "event",
+                    "description": "A fall in oxygen saturation."
+                }
+            }
+        },
+        "LIMB_MOVEMENT": {
+            "scope": "scoring",
+            "description": "Limb movements read from the leg EMG channels.",
+            "events": {
+                "LIMB_MOVEMENT": {
+                    "code": "PSG_LIMB_MOVEMENT",
+                    "name": "Limb-movement",
+                    "class": "event",
+                    "description": "A single limb movement."
+                },
+                "PERIODIC": {
+                    "code": "PSG_LIMB_PERIODIC",
+                    "name": "Sleep-periodic-limb-movement",
+                    "class": "event",
+                    "standardCodes": {
+                        "hed": "Sleep-periodic-limb-movement"
+                    },
+                    "description": "A limb movement belonging to a periodic series."
+                }
+            }
+        }
+    }
+}

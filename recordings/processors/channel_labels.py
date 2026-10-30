@@ -63,7 +63,18 @@ Design:
 
 from __future__ import annotations
 
+import hashlib
+import json
+import logging
 import re
+from collections.abc import Iterable
+from dataclasses import dataclass
+from functools import cache
+from pathlib import Path
+
+from recordings.processors.units import canonical_unit
+
+logger = logging.getLogger(__name__)
 
 # --- 10-10 electrode vocabulary (canonical casing) -------------------------
 # Clinical 10-20 plus the common 10-10 extension. A1/A2 (earlobe) and M1/M2
@@ -173,6 +184,9 @@ _REFERENCE_SUFFIXES: frozenset[str] = frozenset(
 # have its ``_orig`` channels mistaken for duplicate electrodes or vendor junk.
 DERIVED_COPY_SUFFIX = "_orig"
 
+# The bytes of an EDF signal label, which every name written to a stored file has to fit.
+_EDF_LABEL_WIDTH = 16
+
 # The electrophysiological modalities: signals from tissue, with a montage.
 PRIMARY_TYPES: frozenset[str] = frozenset({"eeg", "eog", "emg", "ekg"})
 
@@ -181,9 +195,11 @@ PRIMARY_TYPES: frozenset[str] = frozenset({"eeg", "eog", "emg", "ekg"})
 # heart potentials — so they must never be counted as the recording's modality nor
 # fed to a detector that assumes electrophysiology.
 #
-# ``trig``/``misc`` follow the BIDS ``channels.tsv`` type vocabulary (lower-cased to
-# match the existing tokens), which already had to name exactly these things.
-AUXILIARY_TYPES: frozenset[str] = frozenset({"trig", "misc"})
+# ``trig``/``misc``/``resp``/``ppg``/``temp`` follow the BIDS ``channels.tsv`` type
+# vocabulary (lower-cased to match the existing tokens), which already had to name
+# exactly these things. ``spo2`` is ours: a sleep study reads saturation as a signal of
+# its own, and we found no token for it there.
+AUXILIARY_TYPES: frozenset[str] = frozenset({"trig", "misc", "resp", "spo2", "ppg", "temp"})
 
 # Signal types (already inferred by ``extract_signal_type``) that are never EEG —
 # used both to short-circuit ``canonicalise_label`` and to tell the backfill command
@@ -252,12 +268,13 @@ def _strip_marks(token: str) -> str:
 def _label_parts(label: str) -> list[str]:
     """Split *label*, without its EEG prefix, into its primary and any suffix, marks stripped.
 
-    A suffix follows a hyphen (``Fp1-Ref``, ``Fp1-F7``) or whitespace, the latter only when the
-    trailing word is a known reference (``Fp1 Ref``, ``Fp1 A1``) — so a multi-word label such as
-    ``Resp Chest`` or ``EMG L Tib`` stays one part. Returns ``[]`` when nothing is left.
+    A suffix follows a hyphen or colon (``Fp1-Ref``, ``Fp1-F7``, ``C4:M1``) or whitespace, the
+    latter only when the trailing word is a known reference (``Fp1 Ref``, ``Fp1 A1``) — so a
+    multi-word label such as ``Resp Chest`` or ``EMG L Tib`` stays one part. Returns ``[]`` when
+    nothing is left.
     """
     text = _MODALITY_PREFIX.sub("", label.strip())
-    parts = [p for p in text.split("-") if p.strip()]
+    parts = [p for p in re.split(r"[-:]", text) if p.strip()]
     if len(parts) == 1:
         words = parts[0].split()
         if len(words) > 1 and _strip_marks(words[-1]).upper() in _REFERENCE_SUFFIXES:
@@ -345,12 +362,12 @@ def canonicalise_label_keep_reference(label: str, signal_type: str = "") -> str:
 # raw label). EEG is the only modality that strips a reference (``C3-Cz`` → ``C3``);
 # each modality below has its own collapse rule.
 
-_EOG_LEFT_KEYS = frozenset({"LOC", "EOGL", "LEOG", "E1"})
-_EOG_RIGHT_KEYS = frozenset({"ROC", "EOGR", "REOG", "E2"})
+_EOG_LEFT_KEYS = frozenset({"LOC", "EOGL", "LEOG", "E1", "LEFTEYE"})
+_EOG_RIGHT_KEYS = frozenset({"ROC", "EOGR", "REOG", "E2", "RIGHTEYE"})
 
-_EMG_CHIN_KEYS = frozenset({"CHIN", "CHIN1", "CHIN2", "CHINZ", "SUBMENTAL"})
-_EMG_LEGL_KEYS = frozenset({"LLEG", "LEGL", "LTIB", "TIBL", "LAT"})
-_EMG_LEGR_KEYS = frozenset({"RLEG", "LEGR", "RTIB", "TIBR", "RAT"})
+_EMG_CHIN_KEYS = frozenset({"CHIN", "CHIN1", "CHIN2", "CHIN3", "CHINZ", "SUBMENTAL"})
+_EMG_LEGL_KEYS = frozenset({"LLEG", "LLEG1", "LLEG2", "LEGL", "LEGL1", "LEGL2", "LTIB", "TIBL", "TIBSX", "LAT"})
+_EMG_LEGR_KEYS = frozenset({"RLEG", "RLEG1", "RLEG2", "LEGR", "LEGR1", "LEGR2", "RTIB", "TIBR", "TIBDX", "RAT"})
 _EMG_ARML_KEYS = frozenset({"LARM", "ARML"})
 _EMG_ARMR_KEYS = frozenset({"RARM", "ARMR"})
 # Single-token → EMG site. Derivations (``Chin1-Chin2``) collapse to the site.
@@ -384,7 +401,7 @@ _ECG_LEAD_CANON = {
 
 def _compact(text: str) -> str:
     """Uppercase and drop all separators, for tolerant single-token matching."""
-    return re.sub(r"[\s._/\\-]", "", text).upper()
+    return re.sub(r"[\s._/\\()-]", "", text).upper()
 
 
 _EOG_SIDE_WORDS = {"L": "LOC", "LEFT": "LOC", "R": "ROC", "RIGHT": "ROC"}
@@ -419,6 +436,26 @@ def _eog_side(token: str) -> str:
     return ""
 
 
+def derivation_label(label: str, signal_type: str) -> str:
+    """The derivation an EEG or EOG *label* records, ``C4-M1`` or ``ROC-LOC``, or ``''`` when it names none.
+
+    For a sleep study, where channels are recorded already referenced and the scoring rules name the
+    derivation: subtracting ``M1`` from a stored ``C4`` that was ``C4-M1`` subtracts it twice. Both sides
+    must resolve, so a reference word (``C4-Ref``) carries nothing and names no derivation, and only
+    vocabulary tokens are ever returned.
+    """
+    parts = _label_parts(label)
+    if len(parts) != 2:
+        return ""
+    if signal_type == "eeg":
+        primary, reference = _resolve_token(parts[0]), _resolve_token(parts[1])
+    elif signal_type == "eog":
+        primary, reference = _eog_side(parts[0]), _eog_side(parts[1]) or _resolve_token(parts[1])
+    else:
+        return ""
+    return f"{primary}-{reference}" if primary and reference else ""
+
+
 def _canonicalise_eog(label: str) -> str:
     """``LOC`` / ``ROC`` when a side is named, decided from the primary electrode of a
     derivation (``E1-M2``, ``EOG LOC-A2``) or a side written after a hyphen (``EOG-L``),
@@ -439,9 +476,13 @@ def _canonicalise_eog(label: str) -> str:
 
 def _emg_site(label: str) -> str:
     """The EMG site for *label*, collapsing derivations (``Chin1-Chin2`` → Chin),
-    or '' when nothing matches or the parts disagree."""
-    sites = {_EMG_SITE_BY_KEY.get(_compact(p).removeprefix("EMG")) for p in _label_parts(label)}
+    or '' when nothing matches or the parts disagree. The hyphen of ``L-Leg`` names a side
+    rather than a derivation, so the whole label is tried as well."""
+    parts = _label_parts(label)
+    sites = {_EMG_SITE_BY_KEY.get(_compact(p).removeprefix("EMG").removesuffix("EMG")) for p in parts}
     sites.discard(None)
+    if not sites:
+        return _EMG_SITE_BY_KEY.get(_compact("".join(parts)), "")
     return sites.pop() if len(sites) == 1 else ""
 
 
@@ -531,7 +572,7 @@ def _detect_bare_modality(label: str) -> str:
     key = _compact(parts[0])
     if key in _EOG_LEFT_KEYS or key in _EOG_RIGHT_KEYS:
         return "eog"
-    if key in _EMG_BARE_KEYS:
+    if key in _EMG_BARE_KEYS or _compact("".join(parts)) in _EMG_BARE_KEYS:
         return "emg"
     if key in _ECG_LEAD_CANON:
         return "ekg"
@@ -539,59 +580,119 @@ def _detect_bare_modality(label: str) -> str:
 
 
 # --- Auxiliary role vocabulary ---------------------------------------------
-# Whole-label-core → ``(signal_type, canonical_label)`` for the non-electrophysiological
-# channels a clinical recording carries alongside the montage. Matched only after the
-# modality prefix and any reference suffix are stripped, and only against the *entire*
-# core — the substring matching this table exists to replace.
+# The non-electrophysiological channels a clinical recording carries alongside the
+# montage, named by the rules in ``channel_rules.json``. A rule table rather than a
+# label lookup because a label alone cannot always say what a channel is: ``Flow``
+# is a thermal sensor or a pressure transducer, and the difference decides how an
+# event on it is scored, so a rule may also ask for the unit or the transducer. Matched
+# only after the modality prefix and any reference suffix are
+# stripped, and only against the *entire* core: the substring matching this table
+# exists to replace.
 #
-# Two families:
+# Families:
 #   trig — stimulus and event lines. Their samples encode *when something happened*,
 #          not a biological potential, so an amplitude-based detector reading one is
 #          reading a square wave (this is precisely ``EEG Photic-Ref``).
-#   misc — real transduced measurements that are not brain/eye/muscle/heart potentials.
-#          Usually in their own physical units too (see ``processors.units``).
-_AUX_ROLES: dict[str, tuple[str, str]] = {
-    # Stimulus / trigger / marker lines.
-    "PHOTIC": ("trig", "Photic"),
-    "PHOT": ("trig", "Photic"),
-    "PHOTICSTIM": ("trig", "Photic"),
-    "FLASH": ("trig", "Photic"),
-    "STROBE": ("trig", "Photic"),
-    "EVENT": ("trig", "Event"),
-    "EVENTS": ("trig", "Event"),
-    "MARKER": ("trig", "Event"),
-    "MARK": ("trig", "Event"),
-    "TRIG": ("trig", "Trigger"),
-    "TRIGGER": ("trig", "Trigger"),
-    "TTL": ("trig", "Trigger"),
-    "STIM": ("trig", "Trigger"),
-    "STATUS": ("trig", "Status"),  # BioSemi BDF trigger channel
-    "SYNC": ("trig", "Sync"),
-    # Cardio-respiratory and other transduced aux traces.
-    "PULSE": ("misc", "Pulse"),
-    "SPO2": ("misc", "SpO2"),
-    "SAO2": ("misc", "SpO2"),
-    "OSAT": ("misc", "SpO2"),
-    "PLETH": ("misc", "PPG"),
-    "PPG": ("misc", "PPG"),
-    "RESP": ("misc", "Resp"),
-    "AIRFLOW": ("misc", "Resp"),
-    "FLOW": ("misc", "Resp"),
-    "NASAL": ("misc", "Resp"),
-    "THOR": ("misc", "Thorax"),
-    "THORAX": ("misc", "Thorax"),
-    "CHEST": ("misc", "Thorax"),
-    "ABD": ("misc", "Abdomen"),
-    "ABDOMEN": ("misc", "Abdomen"),
-    "SNORE": ("misc", "Snore"),
-    "POS": ("misc", "Position"),
-    "POSITION": ("misc", "Position"),
-    "BODYPOS": ("misc", "Position"),
-    "TEMP": ("misc", "Temp"),
-    "TEMPERATURE": ("misc", "Temp"),
-    "LIGHT": ("misc", "Light"),
-    "IMP": ("misc", "Impedance"),
-    "IMPEDANCE": ("misc", "Impedance"),
+#   resp, spo2, ppg, temp, misc — real transduced measurements that are not brain,
+#          eye, muscle or heart potentials, usually in their own physical units
+#          (see ``processors.units``).
+_CHANNEL_RULES_PATH = Path(__file__).resolve().parent / "channel_rules.json"
+
+# The rule keys, refused at load when unknown, so a misspelt condition cannot read as a
+# rule without that condition.
+_RULE_KEYS = frozenset({"type", "canonical", "label", "unit", "transducer"})
+_SITE_RULE_KEYS = _RULE_KEYS - {"type"}
+
+
+class ChannelRuleError(ValueError):
+    """A channel rule table cannot be used."""
+
+
+@dataclass(frozen=True)
+class ChannelRule:
+    """One way of recognising a channel: the labels it answers to, and what must hold of the channel."""
+
+    signal_type: str
+    canonical: str
+    labels: frozenset[str]
+    units: frozenset[str] = frozenset()
+    transducers: tuple[str, ...] = ()
+
+    def matches(self, key: str, unit: str, transducer: str) -> bool:
+        """Whether a channel with compacted label *key* and the given fields satisfies this rule."""
+        if key not in self.labels:
+            return False
+        if self.units and canonical_unit(unit) not in self.units:
+            return False
+        return not self.transducers or any(word in transducer.lower() for word in self.transducers)
+
+
+def _parse_rule(raw: object, source: str, *, types: dict[str, str] | None) -> ChannelRule:
+    """Parse one rule. With *types*, a site rule: its type comes from the shipped name it maps to."""
+    if not isinstance(raw, dict):
+        raise ChannelRuleError(f"{source}: a rule must be an object.")
+    unknown = sorted(set(raw) - (_RULE_KEYS if types is None else _SITE_RULE_KEYS))
+    if unknown:
+        raise ChannelRuleError(f"{source}: unknown rule keys {unknown}.")
+    labels = raw.get("label")
+    if not isinstance(labels, list) or not labels or not all(isinstance(item, str) and item for item in labels):
+        raise ChannelRuleError(f"{source}: a rule needs a non-empty list of labels.")
+    canonical = raw.get("canonical")
+    if not isinstance(canonical, str) or not canonical:
+        raise ChannelRuleError(f"{source}: a rule needs a canonical name.")
+    if types is None:
+        signal_type = raw.get("type")
+        if signal_type not in AUXILIARY_TYPES:
+            raise ChannelRuleError(f"{source}: {signal_type!r} is not an auxiliary type.")
+    elif canonical in types:
+        signal_type = types[canonical]
+    else:
+        # What keeps a site's rule from writing the site's own naming into every stored
+        # file, which is the fingerprint the channel-block pass exists to remove.
+        raise ChannelRuleError(f"{source}: {canonical!r} is not a name the platform ships.")
+    transducers = raw.get("transducer", [])
+    if not isinstance(transducers, list) or not all(isinstance(item, str) and item for item in transducers):
+        raise ChannelRuleError(f"{source}: transducer must be a list of words.")
+    units = raw.get("unit", [])
+    if not isinstance(units, list) or not all(isinstance(item, str) and item for item in units):
+        raise ChannelRuleError(f"{source}: unit must be a list of units.")
+    return ChannelRule(
+        signal_type=signal_type,
+        canonical=canonical,
+        labels=frozenset(_compact(label) for label in labels),
+        units=frozenset(units),
+        transducers=tuple(word.lower() for word in transducers),
+    )
+
+
+def parse_channel_rules(raw: object, source: str, *, site: bool = False) -> tuple[ChannelRule, ...]:
+    """Parse a rule table, raising :class:`ChannelRuleError` on anything it cannot use.
+
+    A table is an object with a ``rules`` list, tried in order. A rule names a ``canonical``
+    channel and the ``label`` list it answers to, and may narrow itself with ``unit`` (canonical
+    units, see ``processors.units``) and ``transducer`` (words the transducer field must contain,
+    in either case). A channel missing the field a condition reads fails that condition and falls
+    through to the next rule. The shipped table also gives each rule its ``type``. A *site* table
+    gives none, and its ``canonical`` must be a name the shipped table has: a site teaches the
+    platform new spellings, never new names.
+    """
+    if not isinstance(raw, dict) or not isinstance(raw.get("rules"), list):
+        raise ChannelRuleError(f"{source}: a table must be an object with a rules list.")
+    types = _SHIPPED_TYPES if site else None
+    return tuple(_parse_rule(rule, source, types=types) for rule in raw["rules"])
+
+
+_SHIPPED_TYPES: dict[str, str] = {}
+_SHIPPED_RULES: tuple[ChannelRule, ...] = parse_channel_rules(
+    json.loads(_CHANNEL_RULES_PATH.read_text(encoding="utf-8")), _CHANNEL_RULES_PATH.name
+)
+_SHIPPED_TYPES.update({rule.canonical: rule.signal_type for rule in _SHIPPED_RULES})
+
+# A stored label resolves to itself whatever the file says, because the pass blanks the
+# transducer and the second look at a stored file, the one the serving middleware takes on
+# every de-identified download, must reproduce the first. Checked before any rule.
+_SELF_RESOLVING: dict[str, tuple[str, str]] = {
+    _compact(canonical): (signal_type, canonical) for canonical, signal_type in _SHIPPED_TYPES.items()
 }
 
 # Numbered analogue inputs (``DC1``…``DC12``, ``AUX3``), kept individually because the
@@ -599,30 +700,113 @@ _AUX_ROLES: dict[str, tuple[str, str]] = {
 _NUMBERED_AUX = re.compile(r"^(DC|AUX)(\d{1,2})$")
 
 
-def _aux_role(label: str) -> tuple[str, str]:
+def site_rule_paths() -> list[Path]:
+    """The table files ``RECORDING_CHANNEL_RULES`` names, relative paths resolved against ``BASE_DIR``.
+
+    Empty outside a configured Django process: the module is usable on its own, and the shipped
+    table answers there.
+    """
+    from django.conf import settings
+
+    if not settings.configured:
+        return []
+    base = Path(getattr(settings, "BASE_DIR", "."))
+    paths = []
+    for entry in getattr(settings, "RECORDING_CHANNEL_RULES", None) or []:
+        path = Path(entry)
+        paths.append(path if path.is_absolute() else base / path)
+    return paths
+
+
+def _read_site_tables(paths: Iterable[Path]) -> tuple[tuple[ChannelRule, ...], str]:
+    """The rules of the tables at *paths* and the SHA-256 of the bytes they were parsed from, ``""`` with none."""
+    rules: list[ChannelRule] = []
+    digest = hashlib.sha256()
+    read_any = False
+    for path in paths:
+        try:
+            content = path.read_bytes()
+            raw = json.loads(content)
+        except (OSError, ValueError) as error:
+            raise ChannelRuleError(f"{path}: {error}") from error
+        rules.extend(parse_channel_rules(raw, str(path), site=True))
+        digest.update(content)
+        read_any = True
+    return tuple(rules), digest.hexdigest() if read_any else ""
+
+
+def load_site_rules(paths: Iterable[Path]) -> tuple[ChannelRule, ...]:
+    """Parse the site tables at *paths*, raising :class:`ChannelRuleError` on the first it cannot use."""
+    return _read_site_tables(paths)[0]
+
+
+@cache
+def _cached_site_tables(key: tuple[str, ...]) -> tuple[tuple[ChannelRule, ...], str]:
+    """The rules of one configuration and their digest, kept for the life of the process.
+
+    The system check refuses a deployment whose table cannot be used, so the failure branch is
+    reached only by a table edited under a running worker. It fails closed: the channels the table
+    would have named become ``MISC_<n>``, and with no rules applied there is nothing to name.
+    """
+    try:
+        return _read_site_tables(Path(entry) for entry in key)
+    except ChannelRuleError as error:
+        logger.error("channel rules: site table refused, its channels will not resolve: %s", error)
+        return (), ""
+
+
+def _site_tables() -> tuple[tuple[ChannelRule, ...], str]:
+    return _cached_site_tables(tuple(str(path) for path in site_rule_paths()))
+
+
+def site_rules_digest() -> str:
+    """The digest of the site tables this process applies, or ``""`` with none: what the record seals.
+
+    Taken from the same read as the rules, so a table edited under a running worker cannot be
+    sealed as though it had named the channels.
+    """
+    return _site_tables()[1]
+
+
+def _active_rules() -> tuple[ChannelRule, ...]:
+    """The site's rules, then the shipped ones."""
+    return _site_tables()[0] + _SHIPPED_RULES
+
+
+def _aux_role(label: str, unit: str = "", transducer: str = "") -> tuple[str, str]:
     """Return ``(signal_type, canonical_label)`` for a recognised auxiliary channel,
     or ``('', '')``.
 
     Strips the ``EEG`` modality prefix and a reference suffix first, because these
     channels are routinely recorded referentially against the same reference as the
-    montage (``EEG Photic-Ref``) and so arrive wearing EEG's clothes.
+    montage (``EEG Photic-Ref``) and so arrive wearing EEG's clothes. A hyphen that is
+    left is part of the name (``Resp oro-nasal``, ``Effort-THO``).
     """
     parts = _label_parts(label)
     if len(parts) == 2 and parts[1].upper() in _REFERENCE_SUFFIXES:
         parts = parts[:1]
-    if len(parts) != 1:
+    if not parts:
         return "", ""
-    key = _compact(parts[0])
-    role = _AUX_ROLES.get(key)
-    if role is not None:
-        return role
-    numbered = _NUMBERED_AUX.match(key)
+    key = _compact("".join(parts))
+    resolved = _SELF_RESOLVING.get(key)
+    if resolved is not None:
+        return resolved
+    for rule in _active_rules():
+        if rule.matches(key, unit, transducer):
+            return rule.signal_type, rule.canonical
+    numbered = _NUMBERED_AUX.match(key) if len(parts) == 1 else None
     if numbered:
         return "misc", f"{numbered.group(1)}{int(numbered.group(2))}"
     return "", ""
 
 
-def classify_channel(label: str, prior_type: str = "") -> tuple[str, str]:
+def classify_channel(
+    label: str,
+    prior_type: str = "",
+    *,
+    unit: str = "",
+    transducer: str = "",
+) -> tuple[str, str]:
     """Return ``(signal_type, canonical_label)`` for a raw channel *label*.
 
     Dispatches per modality, conservatively:
@@ -631,10 +815,12 @@ def classify_channel(label: str, prior_type: str = "") -> tuple[str, str]:
       ``Fp1`` and to *upgrade an empty prior_type* to ``eeg`` (a recognised
       electrode is definitionally EEG, a stronger signal than the label-substring
       heuristic).
-    * **Auxiliary** — a label whose core is a known stimulus/trigger/aux token
-      (``Photic``, ``Event``, ``Status``, ``DC1``, ``SpO2``…) is typed ``trig`` or
-      ``misc`` with its own canonical name. Checked **before** a substring-derived
-      ``eeg`` prior, because that substring is exactly what mislabels these.
+    * **Auxiliary** — a label whose core a rule in ``channel_rules.json`` or a site
+      table names (``Photic``, ``Event``, ``Status``, ``SpO2``…), or a numbered input
+      (``DC1``), takes that rule's type and canonical name. *unit* and *transducer* are
+      what a rule may ask of the channel beyond its label. Checked **before** a
+      substring-derived ``eeg`` prior, because that substring is exactly what mislabels
+      these.
     * **Generic input prefix** — ``POL``, ``ECG`` or ``EKG`` followed by a further
       token (``POL T9``, ``ECG EOG+``, ``ECG emg1+``) names an input, not a modality:
       the rest is classified on its own, under its own inferred type, and wins when
@@ -685,9 +871,11 @@ def classify_channel(label: str, prior_type: str = "") -> tuple[str, str]:
         # typed ``misc``, and feeding that (or ``trig``) back in would short-circuit the
         # vocabulary lookup and break re-classification idempotency.
         base_prior = prior_type if prior_type.lower() in _MODALITY_PRIORS else ""
-        _, base_canonical = classify_channel(base, base_prior)
-        if base_canonical:
-            return "misc", f"{base_canonical}{DERIVED_COPY_SUFFIX}"
+        _, base_canonical = classify_channel(base, base_prior, unit=unit, transducer=transducer)
+        derived = f"{base_canonical}{DERIVED_COPY_SUFFIX}"
+        # A name past the label field is cut when stored and no longer reads back as itself.
+        if base_canonical and len(derived) <= _EDF_LABEL_WIDTH:
+            return "misc", derived
         return "misc", ""
 
     generic = _GENERIC_PREFIX.match(label)
@@ -696,7 +884,7 @@ def classify_channel(label: str, prior_type: str = "") -> tuple[str, str]:
         from recordings.processors.edf import extract_signal_type
 
         rest = label[generic.end() :]
-        rest_type, rest_canonical = classify_channel(rest, extract_signal_type(rest))
+        rest_type, rest_canonical = classify_channel(rest, extract_signal_type(rest), unit=unit, transducer=transducer)
         if rest_canonical:
             return rest_type, rest_canonical
         if generic.group(1).lower() in ("ecg", "ekg") and _ecg_shaped(rest):
@@ -708,7 +896,7 @@ def classify_channel(label: str, prior_type: str = "") -> tuple[str, str]:
         return "eeg", eeg
 
     if prior_type.lower() not in _MODALITY_PRIORS:
-        aux_type, aux_canonical = _aux_role(label)
+        aux_type, aux_canonical = _aux_role(label, unit, transducer)
         if aux_type:
             return aux_type, aux_canonical
 

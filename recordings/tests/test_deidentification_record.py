@@ -54,12 +54,16 @@ from recordings.tests.test_edf_processor import _make_edfplus_file
 # (``_PASS_SCOPE_EDF`` and every resolution-side definition in ``channel_labels``); the older pins
 # keep their two-function digest, which is what the scheme recorded when they were written. From
 # version 4 the pass numbers ``MISC_<n>`` in stored order, so ``compute_channel_order`` and the MISC
-# label definitions are inside it too.
+# label definitions are inside it too. From version 5 the auxiliary roles live in
+# ``channel_rules.json``, so the digest covers that file's parsed content as well: a table a
+# source digest cannot see would move the pass's output under an unchanged version. A rule can ask
+# for a unit, so the unit vocabulary in ``processors/units.py`` is inside it too.
 PINNED_SOURCE_DIGESTS = {
     1: "0a9d581ddfab1a3f05ffd1f7b024feff1ae13a4a38302c6173b2f3707d67b4a0",
     2: "742540826cb2490ebfb2dbcd4677ccc1223a14c0eb44270b770e013736d5b79c",
     3: "8252d47cc2ad9a6f0709b939fe9757f407eb59cf9bcb778e991e5ba3093e3a6e",
     4: "f18975887e354c24381acc827e4b372671f8114a5cdfe2d927e69690171252bf",
+    5: "44cbef20cf3291cff77b5bce85b989194560f319a81fcde2274a82a050b098b9",
 }
 _TWO_FUNCTION_VERSIONS = frozenset({1, 2})
 
@@ -144,7 +148,7 @@ def _module_definitions(module) -> list[ast.stmt]:
 
 def _pass_scope_source() -> str:
     """The canonical source of everything inside the pass from version 3, in a fixed order."""
-    from recordings.processors import channel_labels, edf
+    from recordings.processors import channel_labels, edf, units
 
     by_name = {}
     for node in _module_definitions(edf):
@@ -158,6 +162,9 @@ def _pass_scope_source() -> str:
         for node in _module_definitions(channel_labels)
         if not _defined_names(node) <= _OUTSIDE_PASS_CHANNEL_LABELS
     ]
+    rules = json.loads(channel_labels._CHANNEL_RULES_PATH.read_text(encoding="utf-8"))
+    parts.append(json.dumps(rules, sort_keys=True))
+    parts += [ast.unparse(node) for node in _module_definitions(units)]
     return "\n".join(parts)
 
 
@@ -186,6 +193,8 @@ class TestVersionBumpDiscipline:
         for name in ("format_prefiltering", "_SYMBOL_MAP", "_DEFAULT_TYPE_MATCHERS"):
             assert name in scope
         assert "CANONICAL_EEG_ORDER" not in scope
+        assert "Resp oronasal" in scope, "the digest must cover the rule table's content"
+        assert "cmH2O" in scope, "a rule reads the unit vocabulary, so the digest must cover it"
 
     def test_versions_are_never_reused(self):
         assert len(set(PINNED_SOURCE_DIGESTS.values())) == len(PINNED_SOURCE_DIGESTS)
@@ -335,6 +344,7 @@ class TestAuditRecord:
             "deidentification_version": DEIDENTIFICATION_VERSION,
             "annotation_text_preserved": False,
             "channel_order_version": CHANNEL_ORDER_VERSION,
+            "site_channel_rules": "",
             "ingest_overrides": {
                 "RECORDINGS_DISCARD_ORIGINAL_NAME": True,
                 "RECORDINGS_DISCARD_EMBEDDED_ANNOTATIONS": False,

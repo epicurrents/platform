@@ -107,10 +107,13 @@ export async function getRecordingStatus(hash: string): Promise<RecordingStatus>
 export async function uploadRecording(
     file: File,
     onProgress?: (percent: number) => void,
-    options?: { preserveAnnotations?: boolean; displayName?: string },
+    options?: { preserveAnnotations?: boolean; displayName?: string; modality?: string; hypnogram?: File },
 ): Promise<RecordingUpload> {
     const formData = new FormData()
     formData.append('file', file)
+    if (options?.hypnogram) {
+        formData.append('hypnogram', options.hypnogram)
+    }
     if (options?.preserveAnnotations) {
         formData.append('preserve_annotations', 'true')
     }
@@ -119,6 +122,8 @@ export async function uploadRecording(
     }
     const response = await http.post<RecordingUpload>('/recordings/api/v1/upload', formData, {
         headers: { 'Content-Type': 'multipart/form-data' },
+        // Only the files bind from the body; every other parameter of the endpoint is a query parameter.
+        params: options?.modality ? { modality: options.modality } : undefined,
         onUploadProgress(event) {
             if (onProgress && event.total) {
                 onProgress(Math.round((event.loaded / event.total) * 100))

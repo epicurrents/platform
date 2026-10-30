@@ -30,7 +30,7 @@ from django.conf import settings
 from django.contrib.contenttypes.models import ContentType
 from django.utils import timezone
 
-from recordings.processors.channel_labels import CHANNEL_ORDER_VERSION
+from recordings.processors.channel_labels import CHANNEL_ORDER_VERSION, site_rules_digest
 from recordings.processors.edf import DEIDENTIFICATION_VERSION
 
 DEIDENTIFICATION_RECORD_KEY = "deidentification_record"
@@ -83,6 +83,8 @@ def build_deidentification_record(recording) -> dict | None:
         "annotation_text_preserved": meta.annotation_text_preserved,
         "channel_order_version": meta.channel_order_version,
         "ingest_overrides": current_ingest_overrides(),
+        # The stored labels depend on these tables as well as on the pass version.
+        "site_channel_rules": site_rules_digest(),
     }
     if recording.storage == recording.Storage.LINKED:
         # The import refuses to link without the operator's assertion, so every linked record carries it.

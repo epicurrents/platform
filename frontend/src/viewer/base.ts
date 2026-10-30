@@ -30,6 +30,7 @@ import { inlineWorker } from '@epicurrents/core/util'
 import { leadFieldProvider } from './leadFields'
 // Core (modality) module.
 import * as eegModule from '@epicurrents/eeg-module'
+import * as psgModule from '@epicurrents/psg-module'
 // Readers / importers.
 import { EdfExporter, EdfImporter, EdfWorkerSubstitute } from '@epicurrents/edf-reader'
 import { DicomImporter, DicomWorkerSubstitute } from '@epicurrents/dicom-reader'
@@ -95,6 +96,19 @@ const registerBaseModules = ({ app, useSAB, setup, registerInterfaceModule }: Se
     }
     setup.modules.eeg = eegConfig
     registerInterfaceModule('eeg', interfaceEegModule)
+
+    // A study opens in the EEG interface, so `psg` adds importers and no interface module. It has
+    // its own importer instance because an importer holds the study it is loading.
+    const psgEdfImporter = new EdfImporter()
+    psgEdfImporter.setWorkerOverride('eeg', () => {
+        const eegSAB = window.__EPICURRENTS__.RUNTIME!.SETTINGS.getFieldValue('eeg.useMemoryManager')
+        return useSAB && eegSAB ? edfWorker() : new EdfWorkerSubstitute()
+    })
+    const psgExporter = new EdfExporter()
+    psgExporter.setWorkerOverride(edfWriterWorker)
+    const psgLoader = new psgModule.PsgStudyLoader('PsgEdfLoader', ['eeg'], psgEdfImporter, psgExporter)
+    app.registerStudyImporter('psg/edf-file', 'Open polysomnography (EDF)', 'file', psgLoader)
+    app.registerStudyImporter('psg/edf-url', 'Open polysomnography from URL', 'url', psgLoader)
 }
 
 /**

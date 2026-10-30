@@ -298,8 +298,14 @@ def wall_clock_to_data_position(onset: float, gaps: GapMap) -> float:
 # generic input prefixes (``POL``, ``ECG``), polarity marks and whitespace
 # references, keeps ECG sides and numbered EMG apart, recognises bare ECG leads,
 # and numbers ``MISC_<n>`` in stored order — so the stored header reads back as
-# itself; from it on the digest also covers ``compute_channel_order``.
-DEIDENTIFICATION_VERSION = 4
+# itself; from it on the digest also covers ``compute_channel_order``. Version 5
+# names auxiliary channels through ``channel_rules.json``, which the digest also
+# covers, reading the channel's unit and transducer as well as its label, and reads
+# more of the eye, chin and leg spellings: the polysomnography channels resolve instead
+# of falling to ``MISC_<n>``, and ``NASAL`` is stored as ``Resp nasal`` rather than the
+# generic ``Resp``. It also takes ``keep_reference``, under which a study's derivations
+# are stored as recorded.
+DEIDENTIFICATION_VERSION = 5
 
 # Label the de-identification pass writes for a channel that resolved to no
 # canonical name, numbered ``MISC_1``, ``MISC_2``… in stored order.
@@ -431,12 +437,15 @@ def format_prefiltering(highpass: float, lowpass: float, notch: float) -> str:
 # ---------------------------------------------------------------------------
 
 
-def parse_edf_header(data: bytes) -> EdfHeader:
+def parse_edf_header(data: bytes, *, allow_zero_duration: bool = False) -> EdfHeader:
     """Parse the EDF/BDF general header from the first 256 bytes of *data*.
 
     Raises :class:`EdfParseError` only for fields that make further parsing
     impossible (format detection, record count, record duration, signal count).
     All other field errors are silently absorbed so lenient files still load.
+    *allow_zero_duration* admits a record duration of 0, which is legal in a file
+    holding only annotations and meaningless in a recording, so only the reader of
+    such files (``recordings.hypnogram``) sets it.
     """
     mv = memoryview(data)
     offset = 0
@@ -513,7 +522,7 @@ def parse_edf_header(data: bytes) -> EdfHeader:
     # ── Data record duration (8 bytes, seconds) ───────────────────────────
     try:
         data_record_duration = float(_read_field(mv, offset, _FW_REC_DURATION))
-        if data_record_duration == 0:
+        if data_record_duration == 0 and not allow_zero_duration:
             raise EdfParseError("data_record_duration is 0")
     except EdfParseError:
         raise
@@ -624,7 +633,12 @@ def parse_signal_infos(data: bytes, header: EdfHeader) -> list[EdfSignalInfo]:
             # classify_channel refines the text-inferred type: a label that
             # resolves to a 10-10 electrode is typed 'eeg' even when the raw
             # label carried no 'EEG' marker (e.g. a bare 'Fp1').
-            sig_type, canonical = classify_channel(label, extract_signal_type(label))
+            sig_type, canonical = classify_channel(
+                label,
+                extract_signal_type(label),
+                unit=phys_units[i],
+                transducer=transducers[i],
+            )
 
         info = EdfSignalInfo(
             label=label,
@@ -1377,7 +1391,7 @@ def build_header(header: EdfHeader, signal_infos: list[EdfSignalInfo]) -> bytes:
     return general + sections
 
 
-def deidentify_signal_infos(signal_infos: list[EdfSignalInfo]) -> None:
+def deidentify_signal_infos(signal_infos: list[EdfSignalInfo], *, keep_reference: bool = False) -> None:
     """Rewrite the site-fingerprinting per-signal fields in place, capturing originals.
 
     The channel-block counterpart of the subject de-identification in
@@ -1414,6 +1428,14 @@ def deidentify_signal_infos(signal_infos: list[EdfSignalInfo]) -> None:
     ``MISC_<n>``. Non-EEG duplicates (two ``ECG`` channels) are left as-is —
     duplicate labels there match vendor reality and carry no montage identity.
 
+    With *keep_reference*, for a sleep study, an EEG or EOG channel recording a
+    derivation keeps it (``C4-M1``, ``ROC-LOC``, see
+    :func:`~recordings.processors.channel_labels.derivation_label`) rather than
+    being stripped to ``C4``. Only the stored label changes: ``canonical_label`` stays
+    the electrode, which is what a consumer matching channels by name compares. A
+    caller re-running the pass over such a file passes the same flag, or the second
+    look renames the channel.
+
     Originals land in the ``source_*`` attributes before being overwritten.
     Idempotent, including over the stored file read back: canonical labels
     resolve to themselves, kept-reference forms re-collide to themselves, and
@@ -1421,7 +1443,7 @@ def deidentify_signal_infos(signal_infos: list[EdfSignalInfo]) -> None:
     the serving middleware runs on every de-identified download — reproduces the
     same header.
     """
-    from recordings.processors.channel_labels import canonicalise_label_keep_reference
+    from recordings.processors.channel_labels import canonicalise_label_keep_reference, derivation_label
 
     for info in signal_infos:
         info.source_label = info.label
@@ -1434,6 +1456,11 @@ def deidentify_signal_infos(signal_infos: list[EdfSignalInfo]) -> None:
     cleaned: list[str | None] = [
         (info.canonical_label or None) if not info.is_annotation_channel else info.label for info in signal_infos
     ]
+
+    if keep_reference:
+        for i, info in enumerate(signal_infos):
+            if cleaned[i] and not info.is_annotation_channel:
+                cleaned[i] = derivation_label(info.source_label, info.signal_type) or cleaned[i]
 
     # Collision fallback for EEG channels whose canonical names clash.
     counts = Counter(label for label in cleaned if label)
@@ -1846,6 +1873,8 @@ def write_edf(
 def process_edf_file(
     path: Path,
     strip_annotation_text: bool = False,
+    *,
+    keep_reference: bool = False,
 ) -> EdfProcessingResult:
     """Parse, de-identify, normalise, and rewrite a single EDF or BDF file.
 
@@ -1881,7 +1910,7 @@ def process_edf_file(
     # the written header on both paths and the returned signal_infos keep
     # describing the file on disk. The raw values survive in source_* for
     # author-private persistence.
-    deidentify_signal_infos(signal_infos)
+    deidentify_signal_infos(signal_infos, keep_reference=keep_reference)
 
     restructured = normalise_edf_records(path, data, header, signal_infos, annotations, gaps, strip_annotation_text)
     if not restructured:

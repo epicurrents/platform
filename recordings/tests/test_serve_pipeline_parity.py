@@ -11,6 +11,7 @@ these tests pin down.
 
 import ast
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 from django.contrib.contenttypes.models import ContentType
@@ -153,6 +154,52 @@ class TestServePipelineParity:
         status, body = _request_body(client, recording, shape, len(content))
         assert status in (200, 206)
         assert body == content
+
+
+@pytest.mark.django_db
+class TestStudyDerivationsSurviveServing:
+    """The header pass re-runs on the way out, and a path not told the file is a study renames ``C4-M1``."""
+
+    def _study(self, user, make_user, tmp_path, *, modality):
+        reader = make_user()
+        recording, *_ = _make_recording_with_meta(user, tmp_path)
+        path = Path(recording.file_path)
+        content = bytearray(path.read_bytes())
+        content[256:272] = b"C4-M1".ljust(16)
+        path.write_bytes(bytes(content))
+        Recording.objects.filter(pk=recording.pk).update(modality=modality)
+        recording.refresh_from_db()
+        _grant_with_middleware(user, reader, recording)
+        client = Client()
+        client.force_login(reader)
+        return client, recording, len(content)
+
+    @pytest.mark.parametrize("shape", _SERVING_SHAPES)
+    def test_a_study_is_served_as_recorded(self, user, make_user, tmp_path, shape):
+        client, recording, file_size = self._study(user, make_user, tmp_path, modality="psg")
+        status, body = _request_body(client, recording, shape, file_size)
+        assert status in (200, 206)
+        assert body[256:272].rstrip() == b"C4-M1"
+
+    @pytest.mark.parametrize("shape", _SERVING_SHAPES)
+    def test_a_study_declared_something_else_afterwards_still_is_what_the_file_holds(
+        self, user, make_user, tmp_path, shape
+    ):
+        # The rows and the author's bytes still say C4-M1, and a reader given C4 subtracts M1 a second time.
+        client, recording, file_size = self._study(user, make_user, tmp_path, modality="eeg")
+        status, body = _request_body(client, recording, shape, file_size)
+        assert status in (200, 206)
+        assert body[256:272].rstrip() == b"C4-M1"
+
+    @pytest.mark.parametrize("shape", _SERVING_SHAPES)
+    def test_a_linked_eeg_is_still_stripped_as_its_rows_are(self, user, make_user, tmp_path, shape):
+        client, recording, file_size = self._study(user, make_user, tmp_path, modality="eeg")
+        Recording.objects.filter(pk=recording.pk).update(storage=Recording.Storage.LINKED)
+        recording.refresh_from_db()
+        with patch("recordings.linked.linked_file_change", return_value=None):
+            status, body = _request_body(client, recording, shape, file_size)
+        assert status in (200, 206)
+        assert body[256:272].rstrip() == b"C4"
 
 
 class TestSinglePipelineSource:

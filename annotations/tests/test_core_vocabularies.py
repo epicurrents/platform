@@ -31,6 +31,7 @@ VIEWER_FILES = {
     "epicurrents.biosignal": REPO_ROOT
     / "frontend/viewer/epicurrents/core/src/assets/annotation/vocabulary/biosignal-events.json",
     "epicurrents.eeg": REPO_ROOT / "frontend/viewer/epicurrents/eeg-module/src/components/vocabulary/eeg-events.json",
+    "epicurrents.psg": REPO_ROOT / "frontend/viewer/epicurrents/psg-module/src/components/vocabulary/psg-events.json",
 }
 
 

@@ -124,6 +124,7 @@ export default defineConfig(({ mode }) => {
                 { find: /^@epicurrents\/(core|edf-reader|dicom-reader|nic-reader)\/workers\/(.*)$/, replacement: abs('./viewer/epicurrents/') + '$1/umd/$2' },
                 { find: /^@epicurrents\/core\/util$/, replacement: abs('./viewer/epicurrents/core/dist/util/index.js') },
                 { find: /^@epicurrents\/eeg-module$/, replacement: abs('./viewer/epicurrents/eeg-module/dist/index.js') },
+                { find: /^@epicurrents\/psg-module$/, replacement: abs('./viewer/epicurrents/psg-module/dist/index.js') },
                 { find: /^@epicurrents\/edf-reader$/, replacement: abs('./viewer/epicurrents/edf-reader/dist/index.js') },
                 { find: /^@epicurrents\/nic-reader$/, replacement: abs('./viewer/epicurrents/nic-reader/dist/index.js') },
                 { find: /^@epicurrents\/dicom-reader$/, replacement: abs('./viewer/epicurrents/dicom-reader/dist/index.js') },
