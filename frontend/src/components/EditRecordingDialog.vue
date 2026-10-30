@@ -85,7 +85,7 @@ async function submit () {
                 :disabled="loading"
                 :hint="t('Shown to anyone you share this recording with. Leave blank to keep it private.', SCOPE)"
                 :label="t('Display name', SCOPE)"
-                :placeholder="recording?.original_name ?? ''"
+                :placeholder="t('Do not enter patient identifiers', SCOPE)"
                 size="s"
                 type="text"
                 v-wa="[input, 'name']"

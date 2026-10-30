@@ -503,6 +503,7 @@ function phaseIconClass (phase: string | undefined) {
                     :hint="t('Shown to anyone you share this recording with. Leave blank to use a random ID (like ABCD1234) instead of the file name.', SCOPE)"
                     :label="t('Display name', SCOPE)"
                     maxlength="255"
+                    :placeholder="t('Do not enter patient identifiers', SCOPE)"
                     size="s"
                     type="text"
                     v-wa="[input, 'displayName']"
