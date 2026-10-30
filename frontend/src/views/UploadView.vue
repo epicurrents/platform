@@ -502,6 +502,7 @@ function phaseIconClass (phase: string | undefined) {
                     class="gap"
                     :hint="t('Shown to anyone you share this recording with. Leave blank to use a random ID (like ABCD1234) instead of the file name.', SCOPE)"
                     :label="t('Display name', SCOPE)"
+                    maxlength="255"
                     size="s"
                     type="text"
                     v-wa="[input, 'displayName']"
@@ -554,6 +555,15 @@ function phaseIconClass (phase: string | undefined) {
                 <wa-checkbox class="gap" v-wa="[input, 'preserveAnnotations']">
                     {{ t('Preserve original annotations in file', SCOPE) }}
                 </wa-checkbox>
+                <wa-callout v-if="input.preserveAnnotations" variant="warning" class="gap">
+                    <wa-icon name="triangle-exclamation" slot="icon"></wa-icon>
+                    {{
+                        t(
+                            'Annotation text is kept in the stored file. It can contain patient details, and anyone you give access to the original data will be able to read it.',
+                            SCOPE,
+                        )
+                    }}
+                </wa-callout>
 
                 <!-- Hierarchy opt-in — folder uploads are flattened by default to
                      keep on-disk folder names off the server (they routinely

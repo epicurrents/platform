@@ -1377,9 +1377,9 @@ The project side is a session-planning UI that surfaces the extracted annotation
 
 ### Until then
 
-Ingest strips by default, upload preserves nothing by default, and no core code requests preservation; the project that motivated this pins those facts, and the raw-serving posture of its grants, in its own tests. A deployment can now refuse the parameter outright: `RECORDINGS_ALLOW_PRESERVE_ANNOTATIONS=False` makes the upload endpoint, the Celery task and `import_recordings` each reject it. Under the shipped default of `True`, though, nothing stops an author passing it on an individual upload.
+Ingest strips by default, upload preserves nothing by default, and the upload page's checkbox, off by default and with a warning, is the one place core requests preservation; the project that motivated this pins those facts, and the raw-serving posture of its grants, in its own tests. A deployment can now refuse the parameter outright: `RECORDINGS_ALLOW_PRESERVE_ANNOTATIONS=False` makes the upload endpoint, the Celery task and `import_recordings` each reject it. Under the shipped default of `True`, though, nothing stops an author passing it on an individual upload.
 
-Closing that properly needs a persisted marker on `Recording` recording whether the stored file retains annotation text, so the serving path can refuse to hand a retained-text file to a raw grant. There is no such field today, and the only trace is `preserve_annotations` in the `recordings.process` Activity metadata, which is an audit record and has no business gating a serving decision. Add the field with the publication work rather than before it — once publication exists, the flag has no remaining use case and can be retired instead of guarded.
+Closing that properly needs a persisted marker on `Recording` recording whether the stored file retains annotation text, so the serving path can refuse to hand a retained-text file to a raw grant. `RecordingMeta.annotation_text_preserved` is that marker now; the serving path does not yet refuse on it.
 
 ---
 

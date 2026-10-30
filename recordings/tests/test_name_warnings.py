@@ -21,6 +21,53 @@ def _kinds(payload) -> list[tuple[str, str]]:
     return [(row["field"], row["kind"]) for row in payload["warnings"]]
 
 
+def test_a_label_in_the_body_is_stored_and_kept_out_of_the_url(auth_client, tmp_path):
+    client, _ = auth_client
+    upload = io.BytesIO(b"fake edf data")
+    upload.name = "study.edf"
+    with (
+        override_settings(RECORDINGS_STAGING_PATH=str(tmp_path)),
+        patch("recordings.tasks.process_recording.delay"),
+    ):
+        response = client.post(UPLOAD_URL, {"file": upload, "display_name": "MRN 123456789"}, format="multipart")
+    assert response.status_code == 202
+    assert response.json()["display_name"] == "MRN 123456789"
+    assert _kinds(response.json()) == [("display_name", "digit_run")]
+
+
+@pytest.mark.parametrize("sent_in", ["body", "query"])
+def test_an_over_long_label_is_refused_before_anything_is_staged(auth_client, tmp_path, sent_in):
+    # On Postgres it would fail the insert, leaving a staged file no purge or erasure path can reach.
+    client, _ = auth_client
+    upload = io.BytesIO(b"fake edf data")
+    upload.name = "study.edf"
+    fields = {"file": upload}
+    url = UPLOAD_URL
+    if sent_in == "body":
+        fields["display_name"] = "x" * 256
+    else:
+        url = f"{UPLOAD_URL}?display_name={'x' * 256}"
+    with override_settings(RECORDINGS_STAGING_PATH=str(tmp_path)):
+        response = client.post(url, fields, format="multipart")
+    assert response.status_code == 400
+    assert not Recording.objects.exists()
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_the_body_wins_over_the_query(auth_client, tmp_path):
+    client, _ = auth_client
+    upload = io.BytesIO(b"fake edf data")
+    upload.name = "study.edf"
+    with (
+        override_settings(RECORDINGS_STAGING_PATH=str(tmp_path)),
+        patch("recordings.tasks.process_recording.delay"),
+    ):
+        response = client.post(
+            f"{UPLOAD_URL}?display_name=Query", {"file": upload, "display_name": "Body"}, format="multipart"
+        )
+    assert response.json()["display_name"] == "Body"
+
+
 def _upload(client, tmp_path, display_name: str | None):
     staging = tmp_path / "staging"
     uploads = tmp_path / "uploads"

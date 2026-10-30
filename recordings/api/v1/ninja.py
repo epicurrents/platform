@@ -77,7 +77,7 @@ from django.http import FileResponse, HttpResponse, JsonResponse, StreamingHttpR
 from django.utils import timezone
 from django.utils.dateparse import parse_datetime
 from django.utils.http import content_disposition_header
-from ninja import File, NinjaAPI, Query, Schema, UploadedFile
+from ninja import File, Form, NinjaAPI, Query, Schema, UploadedFile
 from ninja.errors import HttpError
 
 from activity.audit import log_activity
@@ -1462,6 +1462,7 @@ def upload_recording(
     share_token_apply_middleware: bool = True,
     preserve_annotations: bool = False,
     display_name: str | None = None,
+    display_name_field: str | None = Form(None, alias="display_name"),
     public_source: str | None = None,
     modality: str | None = None,
 ):
@@ -1474,7 +1475,10 @@ def upload_recording(
     for the recording.  When omitted, the field is left null and responses
     fall back to a hash-prefix default; the original filename is never used
     as the display name unless the author explicitly opts in by passing it
-    here (or via a later PATCH). ``warnings`` flags a label that looks like
+    here (or via a later PATCH). It belongs in the multipart body, which takes
+    precedence: a label is free text, and a query string lands in the access log
+    of every proxy and worker in front of this view. The query form stays for
+    existing API callers. ``warnings`` flags a label that looks like
     an identifier; the upload is accepted either way. ``public_source`` is the
     DOI or URL of the published dataset the data was taken from, refused with
     400 when it is neither. ``hypnogram`` is a file of scored stages for a
@@ -1496,6 +1500,13 @@ def upload_recording(
         # that the requested flags (e.g. apply_middleware) never apply to the
         # author. Refuse instead.
         raise HttpError(400, "user_access must not include the uploading user.")
+
+    # Before the file is streamed: on Postgres an over-long value fails the insert, past the point where a staged file
+    # would be cleaned up, and a staged file with no row is out of reach of every purge and erasure path.
+    normalized_display_name = (display_name_field or display_name or "").strip() or None
+    max_display_name = Recording._meta.get_field("display_name").max_length
+    if normalized_display_name and len(normalized_display_name) > max_display_name:
+        raise HttpError(400, f"display_name must be at most {max_display_name} characters.")
 
     normalized_share_token = (share_token or "").strip() or None
     token_expiration = _parse_optional_expiration(share_token_expires_at)
@@ -1583,8 +1594,6 @@ def upload_recording(
     # processing task only after the transaction commits so the worker can
     # always find the row.
     from recordings.tasks import process_recording
-
-    normalized_display_name = (display_name or "").strip() or None
 
     # Refused rather than silently downgraded: a client wired to always send the
     # flag should find out, instead of uploading recordings that quietly differ

@@ -338,7 +338,9 @@ RECORDINGS_DISCARD_EMBEDDED_ANNOTATIONS = env_bool("RECORDINGS_DISCARD_EMBEDDED_
 # endpoint and ignored at the point of use, so no caller — the API, the import
 # command, or a project calling the task directly — can put clinical free text
 # into a stored recording. Left True by default because a deployment holding its
-# own clinical recordings may legitimately want the original file intact.
+# own clinical recordings may legitimately want the original file intact. The
+# discard setting above governs the rows and not the file, so a deployment that
+# wants neither sets both.
 RECORDINGS_ALLOW_PRESERVE_ANNOTATIONS = env_bool("RECORDINGS_ALLOW_PRESERVE_ANNOTATIONS", default=True)
 
 # Whether to keep each channel's ORIGINAL name, transducer and filter strings and

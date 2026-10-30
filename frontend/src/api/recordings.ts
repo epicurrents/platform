@@ -114,16 +114,18 @@ export async function uploadRecording(
     if (options?.hypnogram) {
         formData.append('hypnogram', options.hypnogram)
     }
-    if (options?.preserveAnnotations) {
-        formData.append('preserve_annotations', 'true')
-    }
+    // In the body and not the query, where a free-text label would reach every access log on the way.
     if (options?.displayName) {
         formData.append('display_name', options.displayName)
     }
     const response = await http.post<RecordingUpload>('/recordings/api/v1/upload', formData, {
         headers: { 'Content-Type': 'multipart/form-data' },
-        // Only the files bind from the body; every other parameter of the endpoint is a query parameter.
-        params: options?.modality ? { modality: options.modality } : undefined,
+        // Besides the files, only `display_name` binds from the body; the rest of the endpoint's parameters are query
+        // parameters, and one put in the form instead is ignored without an error.
+        params: {
+            ...(options?.modality ? { modality: options.modality } : {}),
+            ...(options?.preserveAnnotations ? { preserve_annotations: true } : {}),
+        },
         onUploadProgress(event) {
             if (onProgress && event.total) {
                 onProgress(Math.round((event.loaded / event.total) * 100))
