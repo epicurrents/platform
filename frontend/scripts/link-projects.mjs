@@ -45,7 +45,7 @@ for (const name of readdirSync(projectsDir)) {
         rmSync(link)
     }
     mkdirSync(dirname(link), { recursive: true })
-    symlinkSync(relative(projectFrontend, target), link, 'dir')
+    symlinkSync(relative(projectFrontend, target), link, 'junction')
     linked += 1
 }
 if (linked) {
