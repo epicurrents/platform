@@ -166,6 +166,7 @@ export const useRecordingsStore = defineStore('recordings', () => {
             parentCollectionId?: number | null
             modality?: string
             preserveAnnotations?: boolean
+            channelMap?: string
             /** Grantee-visible label for a single-file upload; ignored when uploading many. */
             displayName?: string
             /** The hypnogram of each study that has one, keyed by the study's file. */
@@ -195,7 +196,7 @@ export const useRecordingsStore = defineStore('recordings', () => {
 
         await _runConcurrent(files, UPLOAD_CONCURRENCY, async (leaf) => {
             const key = leaf.relativePath || leaf.file.name
-            await _uploadLeaf(leaf, key, reactiveBatch, collId, recordingCtId, options?.modality, options?.preserveAnnotations, displayName, options?.hypnograms?.get(leaf.file))
+            await _uploadLeaf(leaf, key, reactiveBatch, collId, recordingCtId, options?.modality, options?.preserveAnnotations, displayName, options?.hypnograms?.get(leaf.file), options?.channelMap)
         })
 
         _finaliseBatch(reactiveBatch)
@@ -225,6 +226,7 @@ export const useRecordingsStore = defineStore('recordings', () => {
             /** Modality to assign to each recording once processing completes. */
             modality?: string
             preserveAnnotations?: boolean
+            channelMap?: string
             /**
              * When false (default) every file is uploaded directly into the
              * parent collection; the on-disk folder names never reach the
@@ -277,7 +279,7 @@ export const useRecordingsStore = defineStore('recordings', () => {
 
             await _runConcurrent(renamed, UPLOAD_CONCURRENCY, async (leaf) => {
                 const key = leaf.relativePath || leaf.file.name
-                await _uploadLeaf(leaf, key, reactiveBatch, parentId, recordingCtId, options?.modality, options?.preserveAnnotations, undefined, hypnograms?.get(leaf.file))
+                await _uploadLeaf(leaf, key, reactiveBatch, parentId, recordingCtId, options?.modality, options?.preserveAnnotations, undefined, hypnograms?.get(leaf.file), options?.channelMap)
             })
             _finaliseBatch(reactiveBatch)
             return reactiveBatch
@@ -303,12 +305,12 @@ export const useRecordingsStore = defineStore('recordings', () => {
 
         // Root files: add to the parent collection if one was supplied.
         const rootFileUploads = tree.rootFiles.map(leaf =>
-            _uploadLeaf(leaf, leaf.relativePath || leaf.file.name, reactiveBatch, parentId, recordingCtId, options?.modality, options?.preserveAnnotations, undefined, hypnograms?.get(leaf.file)),
+            _uploadLeaf(leaf, leaf.relativePath || leaf.file.name, reactiveBatch, parentId, recordingCtId, options?.modality, options?.preserveAnnotations, undefined, hypnograms?.get(leaf.file), options?.channelMap),
         )
 
         // Root folders each become a child Collection of parentId.
         const rootFolderUploads = tree.rootFolders.map(folder =>
-            _uploadFolder(folder, parentId, reactiveBatch, recordingCtId, options?.modality, options?.preserveAnnotations, hypnograms),
+            _uploadFolder(folder, parentId, reactiveBatch, recordingCtId, options?.modality, options?.preserveAnnotations, hypnograms, options?.channelMap),
         )
 
         await Promise.all([...rootFileUploads, ...rootFolderUploads])
@@ -344,6 +346,7 @@ export const useRecordingsStore = defineStore('recordings', () => {
         modality?: string,
         preserveAnnotations?: boolean,
         hypnograms?: Map<File, File>,
+        channelMap?: string,
     ): Promise<void> {
         // Create the collection before uploading its files.
         let collectionId: number | null = null
@@ -361,12 +364,12 @@ export const useRecordingsStore = defineStore('recordings', () => {
         // Upload files in this folder concurrently (bounded).
         await _runConcurrent(folder.files, UPLOAD_CONCURRENCY, async (leaf) => {
             const key = leaf.relativePath || leaf.file.name
-            await _uploadLeaf(leaf, key, batch, collectionId, recordingCtId, modality, preserveAnnotations, undefined, hypnograms?.get(leaf.file))
+            await _uploadLeaf(leaf, key, batch, collectionId, recordingCtId, modality, preserveAnnotations, undefined, hypnograms?.get(leaf.file), channelMap)
         })
 
         // Recurse into sub-folders sequentially to preserve parent→child ordering.
         for (const sub of folder.subfolders) {
-            await _uploadFolder(sub, collectionId, batch, recordingCtId, modality, preserveAnnotations, hypnograms)
+            await _uploadFolder(sub, collectionId, batch, recordingCtId, modality, preserveAnnotations, hypnograms, channelMap)
         }
     }
 
@@ -384,6 +387,7 @@ export const useRecordingsStore = defineStore('recordings', () => {
         preserveAnnotations?: boolean,
         displayName?: string,
         hypnogram?: File,
+        channelMap?: string,
     ): Promise<void> {
         const fileState = batch.files.get(key)!
         fileState.phase = 'uploading'
@@ -392,7 +396,7 @@ export const useRecordingsStore = defineStore('recordings', () => {
         try {
             result = await uploadRecording(leaf.file, (pct) => {
                 fileState.progress = pct
-            }, { preserveAnnotations, displayName, modality, hypnogram })
+            }, { preserveAnnotations, displayName, modality, hypnogram, channelMap })
         } catch (error) {
             fileState.phase = 'failed'
             batch.doneFiles++

@@ -1,0 +1,19 @@
+{
+    "version": 1,
+    "description": "Example channel map for the Noxturnal device",
+    "rules": [
+        {"canonical": "Resp nasal", "label": ["Raw Pressure"]},
+        {"canonical": "Resp limit", "label": ["Flow Limitation"]},
+        {"canonical": "Resp RIP flow", "label": ["cRIP Flow"]},
+        {"canonical": "Resp sum", "label": ["cRIP Sum"]},
+        {"canonical": "Thorax", "label": ["Thorax Fast"]},
+        {"canonical": "Abdomen", "label": ["Abdomen Fast"]},
+        {"canonical": "Thorax raw", "label": ["Thorax Raw", "Inductance Thora"]},
+        {"canonical": "Abdomen raw", "label": ["Abdomen Raw", "Inductance Abdom"]},
+        {"canonical": "SpO2", "label": ["SpO2 B-B"]},
+        {"canonical": "Position angle", "label": ["PosAngle"]},
+        {"canonical": "Sound level", "label": ["Audio Volume dB"]},
+        {"canonical": "Sound", "label": ["Audio Volume"]},
+        {"canonical": "EMG/Leg", "label": ["PLM"]}
+    ]
+}

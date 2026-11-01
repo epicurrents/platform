@@ -32,7 +32,8 @@ from recordings.deidentification_record import (
     INGEST_OVERRIDE_SETTINGS,
     stored_deidentification_record,
 )
-from recordings.models import Recording, RecordingMeta
+from recordings.models import ImportJob, Recording, RecordingMeta
+from recordings.processors import channel_labels
 from recordings.processors.channel_labels import CHANNEL_ORDER_VERSION
 from recordings.processors.edf import (
     DEIDENTIFICATION_VERSION,
@@ -57,13 +58,15 @@ from recordings.tests.test_edf_processor import _make_edfplus_file
 # label definitions are inside it too. From version 5 the auxiliary roles live in
 # ``channel_rules.json``, so the digest covers that file's parsed content as well: a table a
 # source digest cannot see would move the pass's output under an unchanged version. A rule can ask
-# for a unit, so the unit vocabulary in ``processors/units.py`` is inside it too.
+# for a unit, so the unit vocabulary in ``processors/units.py`` is inside it too. A channel map is
+# inside no digest: it is the deployment's, and each recording's record seals the one that named it.
 PINNED_SOURCE_DIGESTS = {
     1: "0a9d581ddfab1a3f05ffd1f7b024feff1ae13a4a38302c6173b2f3707d67b4a0",
     2: "742540826cb2490ebfb2dbcd4677ccc1223a14c0eb44270b770e013736d5b79c",
     3: "8252d47cc2ad9a6f0709b939fe9757f407eb59cf9bcb778e991e5ba3093e3a6e",
     4: "f18975887e354c24381acc827e4b372671f8114a5cdfe2d927e69690171252bf",
     5: "44cbef20cf3291cff77b5bce85b989194560f319a81fcde2274a82a050b098b9",
+    6: "82be1a0df70445928e220b83f249ed31b1416113930ebd932f9458da66fa43f4",
 }
 _TWO_FUNCTION_VERSIONS = frozenset({1, 2})
 
@@ -262,6 +265,16 @@ def _hash(recording):
     return recording.stored_name.split(".", 1)[0]
 
 
+@pytest.fixture
+def channel_map_file(tmp_path):
+    path = tmp_path / "source.json"
+    path.write_text(json.dumps({"rules": [{"canonical": "Thorax", "label": ["Rinta"]}]}), encoding="utf-8")
+    channel_labels._read_channel_map.cache_clear()
+    with override_settings(RECORDING_CHANNEL_MAPS={"source": str(path)}):
+        yield path
+    channel_labels._read_channel_map.cache_clear()
+
+
 @pytest.mark.django_db
 class TestStamping:
     def test_ingest_stamps_the_current_pass_and_the_strip_decision(self, user, tmp_path):
@@ -345,6 +358,7 @@ class TestAuditRecord:
             "annotation_text_preserved": False,
             "channel_order_version": CHANNEL_ORDER_VERSION,
             "site_channel_rules": "",
+            "channel_map": None,
             "ingest_overrides": {
                 "RECORDINGS_DISCARD_ORIGINAL_NAME": True,
                 "RECORDINGS_DISCARD_EMBEDDED_ANNOTATIONS": False,
@@ -353,6 +367,61 @@ class TestAuditRecord:
             },
         }
         assert set(record["ingest_overrides"]) == set(INGEST_OVERRIDE_SETTINGS)
+
+    def test_the_record_names_the_map_that_named_the_channels(self, user, tmp_path, channel_map_file):
+        recording = _ingest(user, tmp_path, channel_map="source")
+        record = stored_deidentification_record(recording)
+        assert record["channel_map"] == {
+            "key": "source",
+            "digest": hashlib.sha256(channel_map_file.read_bytes()).hexdigest(),
+        }
+        assert verify_derived_state(_final_row(recording)).ok is True
+
+    def test_a_map_that_cannot_be_used_fails_the_recording(self, user, tmp_path):
+        recording = _ingest(user, tmp_path, channel_map="absent")
+        assert recording.status == Recording.Status.FAILED
+        assert "absent" in recording.processing_error
+
+    def test_a_map_leaves_no_trace_on_what_a_reader_receives(self, client, user, tmp_path, channel_map_file):
+        recording = _ingest(user, tmp_path, channel_map="source")
+        client.force_login(user)
+        assert "channel_map" not in json.dumps(client.get(f"/recordings/api/v1/{_hash(recording)}").json())
+
+    def test_the_import_command_seals_the_map(self, user, tmp_path, channel_map_file):
+        src = tmp_path / "src"
+        src.mkdir()
+        (src / "rec.edf").write_bytes(_make_edfplus_file(tals_per_record=[[b"+0.0\x14\x14\x00"]]))
+        with override_settings(RECORDINGS_UPLOAD_PATH=str(tmp_path / "uploads")):
+            call_command(
+                "import_recordings",
+                str(src),
+                "--channel-map",
+                "source",
+                username=user.username,
+                structure="flat",
+                stdout=StringIO(),
+                stderr=StringIO(),
+            )
+        job = ImportJob.objects.get()
+        assert job.channel_map == "source"
+        assert stored_deidentification_record(Recording.objects.get(author=user))["channel_map"]["key"] == "source"
+
+    def test_the_import_command_refuses_a_map_it_does_not_have(self, user, tmp_path):
+        with pytest.raises(CommandError, match="No channel map"):
+            call_command("import_recordings", str(tmp_path), "--channel-map", "absent", username=user.username)
+        assert not ImportJob.objects.exists()
+
+    def test_a_linked_file_refuses_a_map(self, superuser, tmp_path, channel_map_file):
+        with pytest.raises(CommandError, match="--channel-map cannot be used with --link"):
+            call_command(
+                "import_recordings",
+                str(tmp_path),
+                "--link",
+                "--source-deidentified",
+                "--channel-map",
+                "source",
+                username=superuser.username,
+            )
 
     def test_the_record_is_read_back_from_the_trail(self, user, tmp_path):
         recording = _ingest(user, tmp_path, preserve_annotations=True)

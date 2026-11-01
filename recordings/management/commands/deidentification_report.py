@@ -192,7 +192,10 @@ class Command(BaseCommand):
                 unstamped += 1
             record = row["audit_record"] or {}
             flag = "behind " if row["behind"] else ""
+            mapped = record.get("channel_map")
             overrides = f"{flag}{_overrides_abbrev(record.get('ingest_overrides'))}"
+            if mapped:
+                overrides = f"{overrides} map={mapped['key']}"
             self.stdout.write(
                 f"{row['hash']:32}  {row['deidentification_version']:>4}  {row['channel_order_version']:>5}  "
                 f"{_TEXT_STATES[row['annotation_text_preserved']]:15}  {overrides:60}  {source}"

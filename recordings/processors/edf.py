@@ -83,7 +83,7 @@ from itertools import accumulate
 from pathlib import Path
 from typing import NamedTuple
 
-from recordings.processors.channel_labels import classify_channel
+from recordings.processors.channel_labels import ChannelMap, classify_channel
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -304,8 +304,13 @@ def wall_clock_to_data_position(onset: float, gaps: GapMap) -> float:
 # more of the eye, chin and leg spellings: the polysomnography channels resolve instead
 # of falling to ``MISC_<n>``, and ``NASAL`` is stored as ``Resp nasal`` rather than the
 # generic ``Resp``. It also takes ``keep_reference``, under which a study's derivations
-# are stored as recorded.
-DEIDENTIFICATION_VERSION = 5
+# are stored as recorded. Version 6 narrows the shipped vocabulary to generic English and
+# international terms, moving the Italian spellings out to a channel map, stops reading bare
+# ``Pressure`` as nasal pressure and capnography as an end-tidal value, adds the names the other
+# signals of a study needed, names a trace in a unit of resistance ``Impedance`` whatever its label,
+# names a channel an ``EMG`` transducer describes ``EMG``, applies a channel map chosen for the
+# file, and reads a UTF-8 header field as UTF-8.
+DEIDENTIFICATION_VERSION = 6
 
 # Label the de-identification pass writes for a channel that resolved to no
 # canonical name, numbered ``MISC_1``, ``MISC_2``… in stored order.
@@ -364,10 +369,17 @@ def _read_field(data: bytes | memoryview, offset: int, width: int) -> str:
     Latin-1 (ISO-8859-1) is used because it covers all 256 byte values and
     preserves characters like µ (0xB5) and ° (0xB0) as their Unicode
     equivalents.  This allows :func:`_ascii_clean` to apply its symbol table
-    correctly before dropping residual non-ASCII bytes.
+    correctly before dropping residual non-ASCII bytes. Some exporters write
+    UTF-8 instead, so a field that is valid UTF-8 is read as UTF-8: a degree sign
+    would otherwise reach the cleaner as two characters and be stored as ``Adeg``.
+    Latin-1 text is very unlikely to happen to be valid UTF-8 once it holds a
+    non-ASCII byte, and pure ASCII reads the same either way.
     """
     raw = bytes(data[offset : offset + width])
-    return raw.decode("latin-1").strip()
+    try:
+        return raw.decode("utf-8").strip()
+    except UnicodeDecodeError:
+        return raw.decode("latin-1").strip()
 
 
 def _floats_nearly_equal(a: float, b: float, decimals: int = 10) -> bool:
@@ -557,11 +569,13 @@ def parse_edf_header(data: bytes, *, allow_zero_duration: bool = False) -> EdfHe
 # ---------------------------------------------------------------------------
 
 
-def parse_signal_infos(data: bytes, header: EdfHeader) -> list[EdfSignalInfo]:
+def parse_signal_infos(data: bytes, header: EdfHeader, *, channel_map: ChannelMap | None = None) -> list[EdfSignalInfo]:
     """Parse the per-channel (signal) sections of the EDF/BDF header.
 
     Reads starting at byte 256 (after the general header). Each section
     consists of *ns* consecutive fixed-width fields for all channels.
+    *channel_map* is the map chosen for a file at ingest; a stored file needs
+    none, since its labels resolve to themselves.
 
     Returns an empty list (non-fatal) if the buffer is too short.
     """
@@ -638,6 +652,7 @@ def parse_signal_infos(data: bytes, header: EdfHeader) -> list[EdfSignalInfo]:
                 extract_signal_type(label),
                 unit=phys_units[i],
                 transducer=transducers[i],
+                channel_map=channel_map,
             )
 
         info = EdfSignalInfo(
@@ -1391,6 +1406,15 @@ def build_header(header: EdfHeader, signal_infos: list[EdfSignalInfo]) -> bytes:
     return general + sections
 
 
+def _same_primary(label: str, name: str) -> bool:
+    """Whether *label*, read from a source label, records the electrode *name* resolved to.
+
+    A channel map can name a channel against its label, and the map decides: a derivation read back
+    from the label would otherwise store the electrode the map corrected.
+    """
+    return bool(label) and label.partition("-")[0] == name.partition("-")[0]
+
+
 def deidentify_signal_infos(signal_infos: list[EdfSignalInfo], *, keep_reference: bool = False) -> None:
     """Rewrite the site-fingerprinting per-signal fields in place, capturing originals.
 
@@ -1460,7 +1484,9 @@ def deidentify_signal_infos(signal_infos: list[EdfSignalInfo], *, keep_reference
     if keep_reference:
         for i, info in enumerate(signal_infos):
             if cleaned[i] and not info.is_annotation_channel:
-                cleaned[i] = derivation_label(info.source_label, info.signal_type) or cleaned[i]
+                derivation = derivation_label(info.source_label, info.signal_type)
+                if _same_primary(derivation, cleaned[i]):
+                    cleaned[i] = derivation
 
     # Collision fallback for EEG channels whose canonical names clash.
     counts = Counter(label for label in cleaned if label)
@@ -1468,7 +1494,7 @@ def deidentify_signal_infos(signal_infos: list[EdfSignalInfo], *, keep_reference
         if info.is_annotation_channel or not cleaned[i] or counts[cleaned[i]] < 2 or info.signal_type != "eeg":
             continue
         with_reference = canonicalise_label_keep_reference(info.source_label, info.signal_type)
-        if with_reference:
+        if _same_primary(with_reference, cleaned[i]):
             cleaned[i] = with_reference
 
     # Uniqueness sweep: an EEG label still duplicated (true duplicate channels in
@@ -1875,6 +1901,7 @@ def process_edf_file(
     strip_annotation_text: bool = False,
     *,
     keep_reference: bool = False,
+    channel_map: ChannelMap | None = None,
 ) -> EdfProcessingResult:
     """Parse, de-identify, normalise, and rewrite a single EDF or BDF file.
 
@@ -1902,7 +1929,7 @@ def process_edf_file(
     data = path.read_bytes()
 
     header = parse_edf_header(data)
-    signal_infos = parse_signal_infos(data, header)
+    signal_infos = parse_signal_infos(data, header, channel_map=channel_map)
     annotations, gaps = parse_annotations(data, header, signal_infos)
 
     # Channel-block de-identification, after annotation parsing (which reads the

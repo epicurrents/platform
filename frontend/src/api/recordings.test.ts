@@ -19,6 +19,11 @@ describe('uploadRecording', () => {
         mockPost.mockResolvedValue({ data: {} })
     })
 
+    it('names the channel map in the query', async () => {
+        await uploadRecording(new File(['x'], 'a.edf'), undefined, { channelMap: 'source' })
+        expect(mockPost.mock.calls[0][2]?.params).toEqual({ channel_map: 'source' })
+    })
+
     it('sends the flags where the endpoint binds them', async () => {
         await uploadRecording(file, undefined, { modality: 'psg', preserveAnnotations: true })
         expect(request().params).toEqual({ modality: 'psg', preserve_annotations: true })

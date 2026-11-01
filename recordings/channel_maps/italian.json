@@ -1,0 +1,16 @@
+{
+    "version": 1,
+    "description": "Example channel map for Italian language",
+    "rules": [
+        {"canonical": "Resp oronasal", "label": ["Flusso", "Airflow"], "transducer": ["therm"]},
+        {"canonical": "Resp nasal", "label": ["Flusso"], "transducer": ["press", "cannula"]},
+        {"canonical": "Resp nasal", "label": ["Flusso"], "unit": ["cmH2O", "hPa"]},
+        {"canonical": "Resp", "label": ["Flusso"]},
+        {"canonical": "Resp oronasal", "label": ["Termistore"]},
+        {"canonical": "Thorax", "label": ["Torace"]},
+        {"canonical": "Abdomen", "label": ["Addome", "Adddome"]},
+        {"canonical": "Position", "label": ["Posizione"]},
+        {"canonical": "EMG/LegL", "label": ["TIB Sx", "TibSx", "EMG Tib Sx"]},
+        {"canonical": "EMG/LegR", "label": ["TIB Dx", "TibDx", "EMG Tib Dx"]}
+    ]
+}

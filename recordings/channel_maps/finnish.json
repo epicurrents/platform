@@ -1,0 +1,18 @@
+{
+    "version": 1,
+    "description": "Example channel map for Finnish language",
+    "rules": [
+        {"canonical": "EMG/Chin", "label": ["Leuka"]},
+        {"canonical": "EMG/ChinRef", "label": ["Leuka ref"]},
+        {"canonical": "EMG/LegL", "label": ["Jalka/L"]},
+        {"canonical": "EMG/LegR", "label": ["Jalka/R"]},
+        {"canonical": "EMG/Diaph", "label": ["Pallea pysty", "Pallea vaaka"]},
+        {"canonical": "Resp CO2", "label": ["Kapno"]},
+        {"canonical": "EtCO2", "label": ["Kapno ET"]},
+        {"canonical": "TcCO2", "label": ["TCM4"]},
+        {"canonical": "Position", "label": ["PositionSen"]},
+        {"canonical": "Position manual", "label": ["ManPosition"]},
+        {"canonical": "Light manual", "label": ["ManLights"]},
+        {"canonical": "HR", "label": ["Derived HR"]}
+    ]
+}

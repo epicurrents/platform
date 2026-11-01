@@ -579,6 +579,7 @@ To check the table against the tree, walk the AST for `log_activity` / `with_sys
 | `recordings.access.list` | `list_recording_access` |
 | `recordings.access.revoke` | `revoke_recording_access` |
 | `recordings.annotations.list` | `list_recording_annotations` |
+| `recordings.channel_map.list` | `list_channel_maps` |
 | `recordings.deidentification_report` | `handle` † |
 | `recordings.download` | `download_recording` |
 | `recordings.download.slice` | `slice_recording` |

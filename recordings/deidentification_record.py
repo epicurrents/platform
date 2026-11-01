@@ -9,9 +9,9 @@ and keep that documentation. The platform's record has three parts, and this mod
 - ``RecordingMeta.annotation_text_preserved`` — whether the stored file keeps the annotation
   text it arrived with. Stamped together with the version, so it means nothing on a ``0`` row.
 - ``deidentification_record`` in the READY transition's audit ``extra_payload`` — the two values
-  above, the channel-order version, and the ingest privacy overrides in force at the time. The
-  audit row is tamper-evident, so the record cannot be edited after the fact, and the overrides
-  are kept nowhere else once the deployment's settings change.
+  above, the channel-order version, the ingest privacy overrides in force at the time, and the
+  site tables and any channel map that named the channels. The audit row is tamper-evident, so
+  the record cannot be edited after the fact, and the overrides and the map are kept nowhere else.
 
 A linked recording (``recordings.linked``) is the exception to all three: no pass wrote its file,
 which is the operator's and was de-identified by whoever produced it. Its versions are ``0``, its
@@ -69,11 +69,13 @@ def _meta_for(recording):
     return RecordingMeta.objects.filter(content_type=ct, object_id=str(recording.pk)).first()
 
 
-def build_deidentification_record(recording) -> dict | None:
+def build_deidentification_record(recording, channel_map=None) -> dict | None:
     """Return the record to seal into the recording's READY audit row, or ``None`` without a meta row.
 
     A recording with no ``RecordingMeta`` was not written by the pass — a FAILED ingest, or a
-    format the platform stores without processing — so there is nothing to record.
+    format the platform stores without processing — so there is nothing to record. *channel_map*
+    is the map chosen for the file, a fact of this ingest that nothing else keeps: a stored label
+    does not say what named it.
     """
     meta = _meta_for(recording)
     if meta is None:
@@ -85,6 +87,7 @@ def build_deidentification_record(recording) -> dict | None:
         "ingest_overrides": current_ingest_overrides(),
         # The stored labels depend on these tables as well as on the pass version.
         "site_channel_rules": site_rules_digest(),
+        "channel_map": {"key": channel_map.key, "digest": channel_map.digest} if channel_map else None,
     }
     if recording.storage == recording.Storage.LINKED:
         # The import refuses to link without the operator's assertion, so every linked record carries it.

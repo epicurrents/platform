@@ -4,28 +4,38 @@ The de-identification pass writes the name a rule gives into the stored file and
 ``MISC_<n>``, so a rule decides both what a reader can tell a channel is and what leaves the source's naming behind.
 """
 
+import hashlib
+import io
 import json
 import logging
 import struct
+from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 from django.core.management import call_command
 from django.core.management.base import SystemCheckError
-from django.test import override_settings
+from django.test import TestCase, override_settings
 
+from recordings.models import Recording
 from recordings.processors import channel_labels
 from recordings.processors.channel_labels import (
     _SHIPPED_RULES,
     _SHIPPED_TYPES,
     AUXILIARY_TYPES,
+    ChannelMap,
     ChannelRuleError,
     classify_channel,
     derivation_label,
+    get_channel_map,
+    parse_channel_map,
     parse_channel_rules,
     site_rules_digest,
 )
 from recordings.processors.edf import (
     _SW_LABEL,
+    _ascii_clean,
+    _read_field,
     deidentify_signal_infos,
     extract_signal_type,
     parse_edf_header,
@@ -33,6 +43,7 @@ from recordings.processors.edf import (
     process_edf_file,
 )
 from recordings.tasks import _determine_modality
+from recordings.tests.test_edf_processor import _make_edfplus_file
 
 
 def _classified(label, **fields):
@@ -71,12 +82,19 @@ SENSOR_CASES = [
     ("Mic", ("misc", "Sound")),
     ("POSITION", ("misc", "Position")),
     ("Temp rectal", ("temp", "Temp")),
-    ("Flusso", ("resp", "Resp")),
-    ("TERMISTORE", ("resp", "Resp oronasal")),
-    ("TORACE", ("resp", "Thorax")),
-    ("ADDOME", ("resp", "Abdomen")),
-    ("ADDDOME", ("resp", "Abdomen")),
-    ("Posizione", ("misc", "Position")),
+    ("Saturation", ("spo2", "SpO2")),
+    ("Pulse Waveform", ("ppg", "PPG")),
+    ("Audio", ("misc", "Sound")),
+    ("CO2", ("resp", "Resp CO2")),
+    ("Capnography", ("resp", "Resp CO2")),
+    ("Resp Imp", ("resp", "Resp imp")),
+    ("Respiratory Rate", ("resp", "Resp rate")),
+    ("RIP Flow", ("resp", "Resp RIP flow")),
+    ("Flow Limitation", ("resp", "Resp limit")),
+    ("Thorax Raw", ("resp", "Thorax raw")),
+    ("PTT", ("misc", "PTT")),
+    ("X Axis", ("misc", "Accel X")),
+    ("BCG", ("misc", "BCG")),
     ("Light sternum", ("misc", "Light")),
     ("Event button", ("trig", "Event")),
 ]
@@ -97,8 +115,13 @@ POLYGRAPHIC_CASES = [
     ("LLeg1", ("emg", "EMG/LegL")),
     ("RLeg1", ("emg", "EMG/LegR")),
     ("LLeg1-LLeg2", ("emg", "EMG/LegL")),
-    ("TIB Dx", ("emg", "EMG/LegR")),
-    ("TIB Sx", ("emg", "EMG/LegL")),
+    ("Left Leg", ("emg", "EMG/LegL")),
+    ("Right Leg", ("emg", "EMG/LegR")),
+    ("EMG Leg", ("emg", "EMG/Leg")),
+    ("Chin-Ref", ("emg", "EMG/Chin")),
+    ("EMG/ChinRef", ("emg", "EMG/ChinRef")),
+    ("Diaphragm", ("emg", "EMG/Diaph")),
+    ("EMG", ("emg", "EMG")),
 ]
 
 
@@ -110,6 +133,19 @@ def test_a_spelling_reaches_its_name(label, expected):
 @pytest.mark.parametrize("label", ["Sensor 7", "EEG1", "Flow X", "LAT", "Leg", "PR", "DX1-DX2", "SX1-SX2"])
 def test_an_unknown_or_ambiguous_label_stays_unnamed(label):
     assert _classified(label)[1] == ""
+
+
+@pytest.mark.parametrize(
+    "label",
+    ["Flusso", "Termistore", "Torace", "Addome", "Adddome", "Posizione", "TIB Sx", "TIB Dx", "Leuka", "Jalka/L"],
+)
+def test_a_local_spelling_is_left_to_a_channel_map(label):
+    assert _classified(label)[1] == ""
+
+
+def test_a_bare_pressure_is_not_called_nasal():
+    # Therapy and raw transducer pressures are written the same way, and the difference decides how an event is scored.
+    assert _classified("Pressure")[1] == ""
 
 
 class TestConditions:
@@ -124,7 +160,7 @@ class TestConditions:
         assert _classified("Flow", unit="cmH2O") == ("resp", "Resp nasal")
 
     def test_a_transducer_written_in_another_language_still_says_pressure(self):
-        assert _classified("Flusso", transducer="Pressione") == ("resp", "Resp nasal")
+        assert _classified("Flow", transducer="Pressione") == ("resp", "Resp nasal")
 
     def test_an_oximeter_status_line_is_told_from_a_trigger_by_its_transducer(self):
         assert _classified("STAT", transducer="Oximeter") == ("misc", "SpO2 status")
@@ -133,6 +169,44 @@ class TestConditions:
     def test_a_flow_channel_with_no_evidence_stays_generic(self):
         assert _classified("Flow") == ("resp", "Resp")
         assert _classified("Flow", unit="uV", transducer="AgAgCl") == ("resp", "Resp")
+
+
+class TestHeaderEncoding:
+    @pytest.mark.parametrize(
+        ("raw", "expected"), [(b"\xc2\xb0", "deg"), (b"\xb0", "deg"), (b"\xc2\xb5V", "uV"), (b"\xb5V", "uV")]
+    )
+    def test_a_unit_survives_either_encoding(self, raw, expected):
+        assert _ascii_clean(_read_field(raw.ljust(8), 0, 8)) == expected
+
+
+class TestImpedance:
+    @pytest.mark.parametrize("label", ["E1-M2 (Imp)", "EKG Impedance", "C3-M2 (Imp)", "1-2 (Imp)", "Left Leg Impedan"])
+    def test_a_unit_of_resistance_names_an_impedance_trace(self, label):
+        assert _classified(label, unit="Ohm") == ("misc", "Impedance")
+        assert _classified(label, unit="kOhm") == ("misc", "Impedance")
+
+    @pytest.mark.parametrize(("label", "expected"), [("LOC", ("eog", "LOC")), ("MISC_4", ("", ""))])
+    def test_a_stored_name_stays_what_an_earlier_pass_wrote(self, label, expected):
+        # The serving middleware classifies the stored file on every download, with its unit intact.
+        assert _classified(label, unit="Ohm") == expected
+
+    def test_a_respiration_signal_measured_by_impedance_is_a_signal(self):
+        assert _classified("Resp Imp", unit="V") == ("resp", "Resp imp")
+
+
+class TestEmgTransducer:
+    @pytest.mark.parametrize("label", ["Leuka", "Jalka/L", "Pallea pysty", "EEG Muscle", "EMG Tibialis"])
+    def test_a_label_naming_nothing_takes_the_modality_the_transducer_states(self, label):
+        assert _classified(label, transducer="EMG") == ("emg", "EMG")
+
+    @pytest.mark.parametrize(
+        ("label", "expected"), [("Chin", "EMG/Chin"), ("C3", "C3"), ("Snore", "Snore"), ("EKG", "ECG")]
+    )
+    def test_a_label_that_names_the_channel_outweighs_the_field(self, label, expected):
+        assert _classified(label, transducer="EMG")[1] == expected
+
+    def test_the_word_must_stand_alone(self):
+        assert _classified("Leuka", transducer="Temgard probe") == ("", "")
 
 
 class TestTable:
@@ -264,6 +338,167 @@ class TestSiteRules:
             assert site_rules_digest() == ""
 
 
+def _channel_map(rules, key="source"):
+    return parse_channel_map({"rules": rules}, "test", key=key, digest="d" * 64)
+
+
+class TestChannelMaps:
+    def test_a_label_is_matched_whole_and_in_either_case(self):
+        mapped = _channel_map([{"canonical": "EMG/Chin", "label": ["Leuka"]}])
+        assert classify_channel("LEUKA", channel_map=mapped) == ("emg", "EMG/Chin")
+        assert classify_channel("Leuka ref", channel_map=mapped) == ("", "")
+
+    def test_a_map_decides_before_every_inference(self):
+        mapped = _channel_map([{"canonical": "EMG/Chin", "label": ["1", "F3"]}])
+        assert classify_channel("F3", "eeg", channel_map=mapped) == ("emg", "EMG/Chin")
+        assert classify_channel("1", channel_map=mapped) == ("emg", "EMG/Chin")
+
+    def test_separators_are_significant(self):
+        mapped = _channel_map([{"canonical": "EMG/Chin", "label": ["1-2"]}])
+        assert classify_channel("1 2", channel_map=mapped) == ("", "")
+
+    def test_a_condition_narrows_the_rule_and_a_miss_falls_through(self):
+        mapped = _channel_map([{"canonical": "Resp nasal", "label": ["Virta"], "unit": ["cmH2O"]}])
+        assert classify_channel("Virta", unit="cmH2O", channel_map=mapped) == ("resp", "Resp nasal")
+        assert classify_channel("Virta", unit="V", channel_map=mapped) == ("", "")
+
+    @pytest.mark.parametrize("encoding", ["latin-1", "utf-8"])
+    def test_an_accented_label_matches_in_either_header_encoding(self, encoding):
+        mapped = _channel_map([{"canonical": "Position", "label": ["Asento pää"]}])
+        field = "Asento pää".encode(encoding).ljust(_SW_LABEL)
+        assert classify_channel(_read_field(field, 0, _SW_LABEL), channel_map=mapped) == ("misc", "Position")
+
+    @pytest.mark.parametrize(
+        "canonical",
+        [
+            "EMG/Chin",
+            "EMG/Leg",
+            "EMG/Diaph",
+            "LOC",
+            "ECG",
+            "II",
+            "C4",
+            "A1",
+            "Resp CO2",
+            "Position manual",
+            "Impedance",
+        ],
+    )
+    def test_every_kind_of_shipped_name_is_a_target(self, canonical):
+        mapped = _channel_map([{"canonical": canonical, "label": ["Sensor"]}])
+        assert classify_channel("Sensor", channel_map=mapped) == (_SHIPPED_TYPES[canonical], canonical)
+
+    @pytest.mark.parametrize(
+        "rule",
+        [
+            {"canonical": "Ward 7 belt", "label": ["Belt"]},
+            {"type": "eeg", "canonical": "Thorax", "label": ["Belt"]},
+            {"canonical": "Thorax", "label": ["A label longer than the field"]},
+            {"canonical": "Thorax", "label": ["   "]},
+            {"canonical": "Thorax", "label": []},
+        ],
+    )
+    def test_an_unusable_rule_is_refused(self, rule):
+        with pytest.raises(ChannelRuleError):
+            _channel_map([rule])
+
+    @pytest.mark.parametrize("raw", [[], {"rule": []}, "rules"])
+    def test_an_unusable_table_is_refused(self, raw):
+        with pytest.raises(ChannelRuleError):
+            parse_channel_map(raw, "test", key="source")
+
+    def test_a_key_that_is_not_configured_is_refused(self):
+        with pytest.raises(ChannelRuleError, match="No channel map"):
+            get_channel_map("absent")
+
+    def test_the_digest_is_of_the_bytes_read(self, tmp_path):
+        path = tmp_path / "source.json"
+        path.write_text(json.dumps({"rules": [{"canonical": "Thorax", "label": ["Rinta"]}]}), encoding="utf-8")
+        channel_labels._read_channel_map.cache_clear()
+        with override_settings(RECORDING_CHANNEL_MAPS={"source": str(path)}):
+            assert get_channel_map("source").digest == hashlib.sha256(path.read_bytes()).hexdigest()
+        channel_labels._read_channel_map.cache_clear()
+
+    @pytest.mark.parametrize("table", ["{", json.dumps({"rules": [{"canonical": "Ward 7 belt", "label": ["Belt"]}]})])
+    def test_the_check_refuses_a_map_it_cannot_use(self, tmp_path, table):
+        path = tmp_path / "source.json"
+        path.write_text(table, encoding="utf-8")
+        channel_labels._read_channel_map.cache_clear()
+        with override_settings(RECORDING_CHANNEL_MAPS={"source": str(path)}):
+            with pytest.raises(SystemCheckError, match="recordings.E004"):
+                call_command("check")
+        channel_labels._read_channel_map.cache_clear()
+
+    def test_the_check_refuses_a_key_it_would_seal(self, tmp_path):
+        path = tmp_path / "source.json"
+        path.write_text(json.dumps({"rules": []}), encoding="utf-8")
+        channel_labels._read_channel_map.cache_clear()
+        with override_settings(RECORDING_CHANNEL_MAPS={"Ward 7": str(path)}):
+            with pytest.raises(SystemCheckError, match="recordings.E004"):
+                call_command("check")
+        channel_labels._read_channel_map.cache_clear()
+
+    @pytest.mark.parametrize("key", ["italian", "nox", "finnish"])
+    def test_a_shipped_example_parses(self, key):
+        path = Path(channel_labels.__file__).resolve().parents[1] / "channel_maps" / f"{key}.json"
+        assert isinstance(parse_channel_map(json.loads(path.read_bytes()), key, key=key), ChannelMap)
+
+    def test_the_italian_labels_are_reachable_through_their_map(self):
+        path = Path(channel_labels.__file__).resolve().parents[1] / "channel_maps" / "italian.json"
+        mapped = parse_channel_map(json.loads(path.read_bytes()), "italian", key="italian")
+        for label, expected in [
+            ("FLUSSO", "Resp"),
+            ("TERMISTORE", "Resp oronasal"),
+            ("TORACE", "Thorax"),
+            ("ADDDOME", "Abdomen"),
+            ("Posizione", "Position"),
+            ("TIB Sx", "EMG/LegL"),
+        ]:
+            assert classify_channel(label, channel_map=mapped)[1] == expected
+
+
+@pytest.mark.django_db
+class TestChannelMapEndpoints:
+    URL = "/recordings/api/v1"
+
+    def _upload(self, client, tmp_path, query=""):
+        (tmp_path / "staging").mkdir(exist_ok=True)
+        upload = io.BytesIO(_make_edfplus_file())
+        upload.name = "study.edf"
+        with (
+            override_settings(RECORDINGS_STAGING_PATH=str(tmp_path / "staging")),
+            patch("recordings.tasks.process_recording.delay") as delay,
+            TestCase.captureOnCommitCallbacks(execute=True),
+        ):
+            response = client.post(f"{self.URL}/upload{query}", {"file": upload}, format="multipart")
+        return response, delay
+
+    @override_settings(RECORDING_CHANNEL_MAPS={"source": "a.json", "other": "b.json"})
+    def test_the_keys_are_listed_and_nothing_else(self, auth_client):
+        client, _ = auth_client
+        response = client.get(f"{self.URL}/channel-maps")
+        assert response.status_code == 200
+        assert response.json() == ["other", "source"]
+
+    def test_the_list_is_not_public(self, client):
+        assert client.get(f"{self.URL}/channel-maps").status_code == 401
+
+    @override_settings(RECORDING_CHANNEL_MAPS={"source": "a.json"})
+    def test_the_upload_hands_the_task_the_key(self, auth_client, tmp_path):
+        client, _ = auth_client
+        response, delay = self._upload(client, tmp_path, "?channel_map=source")
+        assert response.status_code == 202
+        assert delay.call_args.kwargs["channel_map"] == "source"
+
+    def test_an_unknown_map_is_refused_before_anything_is_staged(self, auth_client, tmp_path):
+        client, _ = auth_client
+        response, delay = self._upload(client, tmp_path, "?channel_map=absent")
+        assert response.status_code == 400
+        delay.assert_not_called()
+        assert not list((tmp_path / "staging").iterdir())
+        assert not Recording.objects.exists()
+
+
 def _psg_file(path, signals):
     """Write a plain EDF of one second with one ``(label, unit, transducer, samples)`` per signal."""
     fields = [
@@ -342,6 +577,70 @@ class TestThroughThePass:
         deidentify_signal_infos(infos)
         assert [i.label for i in infos] == labels
         assert [i.signal_type for i in infos] == types
+
+
+class TestMappedFile:
+    SIGNALS = [
+        ("Leuka", "uV", "EMG", 256),
+        ("Kapno", "", "", 32),
+        ("E1-M2 (Imp)", "Ohm", "", 1),
+        ("Jalka/L", "uV", "EMG", 256),
+        ("Vendor spare 3", "", "", 1),
+    ]
+
+    def _stored(self, tmp_path, channel_map=None):
+        path = tmp_path / "study.edf"
+        _psg_file(path, self.SIGNALS)
+        result = process_edf_file(path, channel_map=channel_map)
+        return path.read_bytes(), result
+
+    def test_the_stored_file_holds_the_mapped_names_and_nothing_of_the_source(self, tmp_path):
+        mapped = _channel_map(
+            [{"canonical": "EMG/Chin", "label": ["Leuka"]}, {"canonical": "Resp CO2", "label": ["Kapno"]}]
+        )
+        stored, result = self._stored(tmp_path, mapped)
+        infos = parse_signal_infos(stored, parse_edf_header(stored))
+        assert {i.label for i in infos} == {"EMG/Chin", "EMG", "Resp CO2", "Impedance", "MISC_1"}
+        for word in (b"Leuka", b"Kapno", b"Jalka", b"Vendor spare"):
+            assert word not in stored
+        assert {i.source_label for i in result.signal_infos} == {s[0] for s in self.SIGNALS}
+
+    def test_the_stored_file_needs_no_map_to_read_back(self, tmp_path):
+        mapped = _channel_map(
+            [{"canonical": "EMG/Chin", "label": ["Leuka"]}, {"canonical": "Resp CO2", "label": ["Kapno"]}]
+        )
+        stored, _ = self._stored(tmp_path, mapped)
+        infos = parse_signal_infos(stored, parse_edf_header(stored))
+        labels = [i.label for i in infos]
+        types = [i.signal_type for i in infos]
+        deidentify_signal_infos(infos)
+        assert [i.label for i in infos] == labels
+        assert [i.signal_type for i in infos] == types
+
+    def test_a_map_outweighs_the_derivation_its_label_spells(self, tmp_path):
+        path = tmp_path / "study.edf"
+        _psg_file(path, [("E1-M2", "uV", "", 256), ("E2-M1", "uV", "", 256), ("O1-M2", "uV", "", 256)])
+        swapped = _channel_map(
+            [{"canonical": "ROC", "label": ["E1-M2"]}, {"canonical": "LOC", "label": ["E2-M1"]}],
+        )
+        process_edf_file(path, keep_reference=True, channel_map=swapped)
+        stored = path.read_bytes()
+        labels = [i.label for i in parse_signal_infos(stored, parse_edf_header(stored))]
+        assert sorted(labels) == ["LOC", "O1-M2", "ROC"]
+
+    def test_a_channel_mapped_onto_an_electrode_it_collides_with_stays_unique(self, tmp_path):
+        path = tmp_path / "study.edf"
+        _psg_file(path, [("C4", "uV", "", 256), ("Fp1-A1", "uV", "", 256)])
+        process_edf_file(path, channel_map=_channel_map([{"canonical": "C4", "label": ["Fp1-A1"]}]))
+        stored = path.read_bytes()
+        labels = [i.label for i in parse_signal_infos(stored, parse_edf_header(stored))]
+        assert sorted(labels) == ["C4", "MISC_1"]
+
+    def test_a_file_without_a_map_keeps_what_the_field_states(self, tmp_path):
+        stored, _ = self._stored(tmp_path)
+        labels = [i.label for i in parse_signal_infos(stored, parse_edf_header(stored))]
+        assert labels.count("EMG") == 2
+        assert "Impedance" in labels
 
 
 class TestKeepReference:

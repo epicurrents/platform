@@ -12,7 +12,13 @@ labels nobody wrote a rule for.
 from django.core.checks import Error, Tags, register
 
 from recordings.event_translation import EventTranslationError, load_tables
-from recordings.processors.channel_labels import ChannelRuleError, load_site_rules, site_rule_paths
+from recordings.processors.channel_labels import (
+    ChannelRuleError,
+    channel_map_paths,
+    get_channel_map,
+    load_site_rules,
+    site_rule_paths,
+)
 
 
 @register(Tags.compatibility)
@@ -58,3 +64,21 @@ def check_channel_rule_tables(app_configs, **kwargs):
             )
         ]
     return []
+
+
+@register(Tags.compatibility)
+def check_channel_maps(app_configs, **kwargs):
+    """Every configured channel map parses, and every name in it is one the platform ships."""
+    errors = []
+    for key in channel_map_paths():
+        try:
+            get_channel_map(key)
+        except ChannelRuleError as error:
+            errors.append(
+                Error(
+                    f"RECORDING_CHANNEL_MAPS names a map that cannot be used: {error}",
+                    hint="The format is documented on recordings.processors.channel_labels.parse_channel_map.",
+                    id="recordings.E004",
+                )
+            )
+    return errors

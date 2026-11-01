@@ -107,7 +107,13 @@ export async function getRecordingStatus(hash: string): Promise<RecordingStatus>
 export async function uploadRecording(
     file: File,
     onProgress?: (percent: number) => void,
-    options?: { preserveAnnotations?: boolean; displayName?: string; modality?: string; hypnogram?: File },
+    options?: {
+        preserveAnnotations?: boolean
+        displayName?: string
+        modality?: string
+        hypnogram?: File
+        channelMap?: string
+    },
 ): Promise<RecordingUpload> {
     const formData = new FormData()
     formData.append('file', file)
@@ -125,6 +131,7 @@ export async function uploadRecording(
         params: {
             ...(options?.modality ? { modality: options.modality } : {}),
             ...(options?.preserveAnnotations ? { preserve_annotations: true } : {}),
+            ...(options?.channelMap ? { channel_map: options.channelMap } : {}),
         },
         onUploadProgress(event) {
             if (onProgress && event.total) {
@@ -219,6 +226,12 @@ export type SubmissionResult =
 /** The open pools the signed-in person may submit to, each with its published profile. */
 export async function listSubmissionPools(): Promise<SubmissionPool[]> {
     const response = await http.get<SubmissionPool[]>('/recordings/api/v1/submissions/pools')
+    return response.data
+}
+
+/** The channel maps an upload may name, for a source whose labels the platform does not read by itself. */
+export async function listChannelMaps(): Promise<string[]> {
+    const response = await http.get<string[]>('/recordings/api/v1/channel-maps')
     return response.data
 }
 

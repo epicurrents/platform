@@ -397,6 +397,8 @@ class ImportJob(models.Model):
     # Declared with ``--modality``, empty to leave it to the channel vote. Kept here so a resumed run
     # cannot send the rest of a job's files back to the vote.
     modality = models.CharField(max_length=32, blank=True, default="")
+    # The key of the channel map named with ``--channel-map``, kept for the same reason.
+    channel_map = models.CharField(max_length=64, blank=True, default="")
     status = models.CharField(
         max_length=16,
         choices=Status.choices,

@@ -485,7 +485,7 @@ class TestUpload:
         client, _ = auth_client
         _, delay = self._upload(client, tmp_path, hypnogram=_hypnogram())
         assert delay.call_args.args == (Recording.objects.get().pk,)
-        assert delay.call_args.kwargs == {"preserve_annotations": False}
+        assert delay.call_args.kwargs == {"preserve_annotations": False, "channel_map": ""}
 
     def test_the_hypnogram_is_not_staged(self, auth_client, tmp_path):
         client, _ = auth_client

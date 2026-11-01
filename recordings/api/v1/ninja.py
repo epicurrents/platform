@@ -110,6 +110,7 @@ from recordings.linked import linked_file_change
 from recordings.modalities import PSG, ModalityError, ensure_continuous_file, normalise_modality
 from recordings.models import Recording, stored_original_name
 from recordings.pipelines import get_converter
+from recordings.processors.channel_labels import channel_map_paths
 from recordings.public_source import normalise_public_source
 
 logger = logging.getLogger(__name__)
@@ -1465,6 +1466,7 @@ def upload_recording(
     display_name_field: str | None = Form(None, alias="display_name"),
     public_source: str | None = None,
     modality: str | None = None,
+    channel_map: str | None = None,
 ):
     """Save uploaded file to staging and enqueue background processing.
 
@@ -1507,6 +1509,10 @@ def upload_recording(
     max_display_name = Recording._meta.get_field("display_name").max_length
     if normalized_display_name and len(normalized_display_name) > max_display_name:
         raise HttpError(400, f"display_name must be at most {max_display_name} characters.")
+
+    # Refused here rather than in the task, where the recording would fail after the transfer.
+    if channel_map and channel_map not in channel_map_paths():
+        raise HttpError(400, "channel_map names no map on this deployment.")
 
     normalized_share_token = (share_token or "").strip() or None
     token_expiration = _parse_optional_expiration(share_token_expires_at)
@@ -1700,7 +1706,10 @@ def upload_recording(
 
         recording_id = recording.pk
         _preserve = preserve_annotations
-        transaction.on_commit(lambda: process_recording.delay(recording_id, preserve_annotations=_preserve))
+        _channel_map = channel_map or ""
+        transaction.on_commit(
+            lambda: process_recording.delay(recording_id, preserve_annotations=_preserve, channel_map=_channel_map)
+        )
 
     return 202, {
         "original_name": recording.original_name,
@@ -1784,6 +1793,15 @@ def recording_status(request, hash: str):
         metadata={"status": recording.status},
     )
     return {"status": recording.status}
+
+
+@api.get("/channel-maps", response=list[str])
+def list_channel_maps(request):
+    """The keys of the channel maps an upload may name, for choosing one when a source's labels need it."""
+    _require_auth(request)
+    keys = sorted(channel_map_paths())
+    log_activity(verb="recordings.channel_map.list", metadata={"returned_count": len(keys)})
+    return keys
 
 
 @api.get("/", response=list[RecordingOut])

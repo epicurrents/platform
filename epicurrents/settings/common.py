@@ -366,6 +366,10 @@ RECORDINGS_DISCARD_SOURCE_CHANNEL_METADATA = env_bool("RECORDINGS_DISCARD_SOURCE
 RECORDING_EVENT_TRANSLATIONS: list[str] = ["recordings/translations/sleep-stages.json"]
 RECORDING_CHANNEL_RULES: list[str] = []
 
+# Channel maps a file can be ingested under, by key: exact tables of one source's labels, chosen
+# per upload or import rather than applied to everything. See recordings/README.md → Channel maps.
+RECORDING_CHANNEL_MAPS: dict[str, str] = {}
+
 #   RECORDING_PIPELINES = {
 #       "web":    {"header": {"strip_annotation_text": False}},
 #       "import": {"header": {"strip_annotation_text": True}},

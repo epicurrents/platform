@@ -38,7 +38,7 @@ _EDF_EXTENSIONS = {".edf", ".bdf"}
 _annotation_hash = annotation_hash
 
 
-def _write_final_recording_transition(*, recording, update_fields: dict) -> None:
+def _write_final_recording_transition(*, recording, update_fields: dict, channel_map=None) -> None:
     """Apply ``update_fields`` to ``recording`` and emit the final audit row.
 
     Shared by ``process_recording`` (Celery) and ``import_recordings``
@@ -61,7 +61,7 @@ def _write_final_recording_transition(*, recording, update_fields: dict) -> None
     ``recording`` to compute the new content_hash, so serialising the
     instance would produce a "before" that already matches the "after"
     and the diff would silently omit the transition. The extra SELECT
-    is the price of correctness.
+    is the price of correctness. *channel_map* is the map that named the channels, for the record.
     """
     from activity.audit import record_modify_change, serialize_instance
     from recordings.audit_digests import (
@@ -87,7 +87,7 @@ def _write_final_recording_transition(*, recording, update_fields: dict) -> None
         # stamped on the meta row and the ingest overrides in force at this moment,
         # which nothing else retains. A FAILED transition has no meta row and gets
         # no record, because no pass wrote the file.
-        record = build_deidentification_record(recording)
+        record = build_deidentification_record(recording, channel_map=channel_map)
         if record is not None:
             extra_payload[DEIDENTIFICATION_RECORD_KEY] = record
         record_modify_change(
@@ -307,7 +307,7 @@ def _push_display_name(recording) -> str:
 
 
 @shared_task
-def process_recording(recording_id: int, preserve_annotations: bool = False):
+def process_recording(recording_id: int, preserve_annotations: bool = False, channel_map: str = ""):
     """Move a staged recording to permanent storage and process its format.
 
     Called immediately after upload. The file sits in RECORDINGS_STAGING_PATH
@@ -325,7 +325,10 @@ def process_recording(recording_id: int, preserve_annotations: bool = False):
     and rewritten; signal metadata, gaps, and embedded annotations are stored.
     A file the viewer exported as a container (an EDF with a JSON footer, see
     :mod:`recordings.container`) has its footer detached first, and the events
-    and interruptions the footer carries are stored from it.
+    and interruptions the footer carries are stored from it. *channel_map* is the
+    key of a configured map for the file's own labels; one that can no longer be
+    used fails the recording rather than leaving its channels unnamed without a
+    word.
     If format processing fails the recording is kept but marked as FAILED so
     the user is not misled into thinking the file is ready to open in the
     viewer. The original file is always preserved so users can still download
@@ -375,10 +378,11 @@ def process_recording(recording_id: int, preserve_annotations: bool = False):
             recording_id=recording_id,
             staging_path=staging_path,
             preserve_annotations=preserve_annotations,
+            channel_map_key=channel_map,
         )
 
 
-def _process_recording_body(*, recording, recording_id, staging_path, preserve_annotations):
+def _process_recording_body(*, recording, recording_id, staging_path, preserve_annotations, channel_map_key=""):
     """Execute the recording-processing body inside an open audited scope.
 
     Extracted so the outer task can manage the ``with_system_activity``
@@ -522,6 +526,7 @@ def _process_recording_body(*, recording, recording_id, staging_path, preserve_a
 
         # ── Format-specific processing ────────────────────────────────────────
         format_error: str | None = None
+        channel_map = None
 
         # The declared modality stands, defaulting to EEG, so that channel-label
         # heuristics (e.g. an ECG channel present alongside EEG channels) cannot
@@ -537,6 +542,7 @@ def _process_recording_body(*, recording, recording_id, staging_path, preserve_a
         if format_error is None and ext in _EDF_EXTENSIONS:
             try:
                 from recordings.pipelines import get_pipeline
+                from recordings.processors.channel_labels import get_channel_map
                 from recordings.processors.edf import EdfParseError, process_edf_file
 
                 pipeline = get_pipeline("web")
@@ -573,8 +579,13 @@ def _process_recording_body(*, recording, recording_id, staging_path, preserve_a
                     # processing that follows fail.
                     stash_source_bytes(recording, permanent_path)
                     footer = detach_footer(permanent_path)
+                if channel_map_key:
+                    channel_map = get_channel_map(channel_map_key)
                 result = process_edf_file(
-                    permanent_path, strip_annotation_text=strip_annotation_text, keep_reference=modality == PSG
+                    permanent_path,
+                    strip_annotation_text=strip_annotation_text,
+                    keep_reference=modality == PSG,
+                    channel_map=channel_map,
                 )
                 if footer is not None:
                     recording.file_size = permanent_path.stat().st_size
@@ -678,6 +689,7 @@ def _process_recording_body(*, recording, recording_id, staging_path, preserve_a
                 "modality": modality,
                 "processing_error": (format_error or "")[:4096],
             },
+            channel_map=channel_map,
         )
 
         logger.info(

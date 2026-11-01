@@ -12,6 +12,7 @@ Usage
         [--reprocess]
         [--resume | --discard]
         [--link --source-deidentified]
+        [--channel-map KEY]
 
 ``source_path``
     Directory containing EDF/BDF files (and optional ``.json`` sidecars). A file the viewer exported as a
@@ -49,6 +50,10 @@ Usage
 ``--reprocess``
     Re-process files already marked ``DONE`` in the current (resumed) job.
     Skipped by default.
+
+``--channel-map``
+    Name each file's channels with a map from ``RECORDING_CHANNEL_MAPS`` before the shipped rules.
+    A resumed job keeps the map it was created with. Refused with ``--link``.
 
 ``--link``
     Register EDF/BDF files in place instead of copying them (``recordings.linked``).
@@ -93,6 +98,7 @@ from django.utils import timezone
 
 from recordings.hypnogram import pair_hypnograms, read_header_block, read_hypnogram
 from recordings.modalities import PSG, ModalityError, ensure_continuous_file, normalise_modality
+from recordings.processors.channel_labels import ChannelRuleError, get_channel_map
 from recordings.public_source import normalise_public_source
 
 logger = logging.getLogger(__name__)
@@ -188,6 +194,15 @@ class Command(BaseCommand):
             ),
         )
         parser.add_argument(
+            "--channel-map",
+            default="",
+            metavar="KEY",
+            help=(
+                "Name the channels of every imported file with this map from RECORDING_CHANNEL_MAPS, "
+                "before the shipped rules. Refused with --link, whose files are never rewritten."
+            ),
+        )
+        parser.add_argument(
             "--public-source",
             default="",
             metavar="DOI_OR_URL",
@@ -268,6 +283,13 @@ class Command(BaseCommand):
                 self.stdout.write(f"Discarded job {existing.pk}.")
                 existing = None
 
+        if options["channel_map"]:
+            # Before any job row exists, as a mistyped modality is.
+            try:
+                get_channel_map(options["channel_map"])
+            except ChannelRuleError as exc:
+                raise CommandError(str(exc))
+
         if existing and options["resume"]:
             job = existing
             if job.link != link:
@@ -277,6 +299,9 @@ class Command(BaseCommand):
             if self._modality and self._modality != job.modality:
                 raise CommandError(f"Job {job.pk} was created with modality {job.modality!r}; it keeps it.")
             self._modality = job.modality
+            if options["channel_map"] and options["channel_map"] != job.channel_map:
+                raise CommandError(f"Job {job.pk} was created with channel map {job.channel_map!r}; it keeps it.")
+            channel_map_key = job.channel_map
             self.stdout.write(f"Resuming job {job.pk} (source={job.source_path!r}, pipeline={job.pipeline_label!r}).")
         else:
             job = ImportJob.objects.create(
@@ -286,8 +311,17 @@ class Command(BaseCommand):
                 structure=structure,
                 link=link,
                 modality=self._modality,
+                channel_map=options["channel_map"],
             )
+            channel_map_key = options["channel_map"]
             self.stdout.write(f"Created {'link' if link else 'import'} job {job.pk}.")
+
+        self._channel_map = None
+        if channel_map_key:
+            try:
+                self._channel_map = get_channel_map(channel_map_key)
+            except ChannelRuleError as exc:
+                raise CommandError(str(exc))
 
         self._run_job(job, source_path, pipeline, owner, options["reprocess"], public_source=public_source)
 
@@ -309,6 +343,9 @@ class Command(BaseCommand):
             raise CommandError("--link registers files for a superuser only; the owner is not one.")
         if options["preserve_annotations"]:
             raise CommandError("--preserve-annotations has no meaning with --link: a linked file is never stripped.")
+        if options["channel_map"]:
+            # A linked file keeps its own labels, and every path that reads it classifies them again, with no map.
+            raise CommandError("--channel-map cannot be used with --link: a map names channels in a rewritten file.")
         if not getattr(settings, "RECORDINGS_ALLOW_PRESERVE_ANNOTATIONS", True):
             # A linked file keeps its annotation text, which this deployment forbids a stored file to do.
             raise CommandError(
@@ -653,6 +690,7 @@ class Command(BaseCommand):
                 permanent_path,
                 strip_annotation_text=pipeline.header.strip_annotation_text,
                 keep_reference=self._modality == PSG,
+                channel_map=self._channel_map,
             )
         except Exception:
             permanent_path.unlink(missing_ok=True)
@@ -863,6 +901,7 @@ class Command(BaseCommand):
                     "stored_hash": stored_hash,
                     "modality": modality,
                 },
+                channel_map=self._channel_map,
             )
 
             # AccessRight — owner gets full access.

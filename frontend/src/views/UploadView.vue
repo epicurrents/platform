@@ -3,6 +3,7 @@ import { reactive, ref, computed, shallowRef, onMounted, onUnmounted, watch } fr
 import { onBeforeRouteLeave, useRouter } from 'vue-router'
 import { t } from '#i18n'
 import { useRecordingsStore } from '#stores/recordings'
+import { listChannelMaps } from '#api/recordings'
 import { pairHypnograms, type HypnogramPairing } from '#lib/hypnogramPairing'
 import { showToast } from '#lib/toast'
 import {
@@ -40,6 +41,8 @@ const tree = shallowRef<UploadTree>({ rootFiles: [], rootFolders: [] })
 const rejectedCount = ref(0)
 const input = reactive({
     modality: 'eeg',
+    // Empty leaves the channels to the shipped rules.
+    channelMap: '',
     // Grantee-visible label for a single-file upload; blank falls back to an
     // random hash-prefix ID, keeping a PHI-bearing filename off the server.
     displayName: '',
@@ -55,6 +58,9 @@ const input = reactive({
 const filesInputRef = ref<HTMLInputElement | null>(null)
 const folderInputRef = ref<HTMLInputElement | null>(null)
 const hypnogramInputRef = ref<HTMLInputElement | null>(null)
+
+// The channel maps this deployment offers. The picker is not shown without one.
+const channelMaps = ref<string[]>([])
 
 // Scored stages chosen by hand for a lone study. A batch pairs its own, below.
 const hypnogram = shallowRef<File | null>(null)
@@ -278,6 +284,7 @@ async function startUpload () {
         const parentCollectionId = targetCollection.value?.id ?? null
         const modality = input.modality
         const preserveAnnotations = input.preserveAnnotations
+        const channelMap = input.channelMap || undefined
         const preserveFolderHierarchy = input.preserveFolderHierarchy
         const hypnograms = new Map(pairing.value?.hypnograms)
         const loneStudy = uploadable.value.rootFiles[0]
@@ -291,6 +298,7 @@ async function startUpload () {
                 preserveAnnotations,
                 preserveFolderHierarchy,
                 hypnograms,
+                channelMap,
             })
         } else {
             await store.uploadBatch(uploadable.value.rootFiles, {
@@ -299,6 +307,7 @@ async function startUpload () {
                 preserveAnnotations,
                 displayName: input.displayName.trim() || undefined,
                 hypnograms,
+                channelMap,
             })
         }
     } catch {
@@ -377,8 +386,14 @@ onBeforeRouteLeave(() => {
     })
 })
 
-onMounted(() => {
+onMounted(async () => {
     window.addEventListener('beforeunload', onBeforeUnload)
+    try {
+        channelMaps.value = await listChannelMaps()
+    } catch {
+        // Uploading works without one, and the shipped rules still apply.
+        channelMaps.value = []
+    }
 })
 
 onUnmounted(() => {
@@ -518,6 +533,18 @@ function phaseIconClass (phase: string | undefined) {
                     <wa-option value="eeg" selected>{{ t('EEG', SCOPE) }}</wa-option>
                     <wa-option value="psg">{{ t('Polysomnography', SCOPE) }}</wa-option>
                     <wa-option value="acc">{{ t('Accelerometry', SCOPE) }}</wa-option>
+                </wa-select>
+
+                <wa-select
+                    v-if="channelMaps.length > 0"
+                    class="gap"
+                    :hint="t('For files whose channel labels the platform does not read by itself.', SCOPE)"
+                    :label="t('Channel map', SCOPE)"
+                    size="s"
+                    v-wa="[input, 'channelMap']"
+                >
+                    <wa-option value="" selected>{{ t('None', SCOPE) }}</wa-option>
+                    <wa-option v-for="key in channelMaps" :key="key" :value="key">{{ key }}</wa-option>
                 </wa-select>
 
                 <wa-callout v-if="pairedCount > 0" variant="brand" class="gap">

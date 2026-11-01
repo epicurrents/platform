@@ -48,6 +48,7 @@
  *
  *   GET    /recordings/api/v1/
  *   POST   /recordings/api/v1/upload
+ *   GET    /recordings/api/v1/channel-maps
  *   GET    /recordings/api/v1/status/{hash}
  *   GET    /recordings/api/v1/{hash}
  *   PATCH  /recordings/api/v1/{hash}
@@ -2201,6 +2202,10 @@ export async function handleMock(
         }
         recs.sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime())
         return send(res, 200, recs.slice(offset, offset + limit).map(recordingOut))
+    }
+
+    if (path === '/recordings/api/v1/channel-maps' && method === 'GET') {
+        return send(res, 200, ['example-source'])
     }
 
     if (path === '/recordings/api/v1/upload' && method === 'POST') {
