@@ -937,8 +937,15 @@ def search_users(request, q: str):
 
     Only ``id``, ``username``, ``first_name``, and ``last_name`` are returned —
     no email or other sensitive fields.  Inactive users are excluded.
+
+    With ``USER_SEARCH_REQUIRES_STAFF`` on, staff and superusers only: the search
+    is what resolves a user id to a name, and a deployment whose workflows keep
+    the parties to a case unnamed has no sharing flow that needs it.
     """
-    _require_auth(request)
+    user = _require_auth(request)
+    if settings.USER_SEARCH_REQUIRES_STAFF and not (user.is_staff or user.is_superuser):
+        log_security_event("permission.denied", permission="user.search", actor_id=user.pk)
+        raise HttpError(403, "Staff access required")
     if len(q.strip()) < 2:
         raise HttpError(400, "Search query must be at least 2 characters.")
     User = get_user_model()

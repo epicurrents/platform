@@ -660,3 +660,38 @@ class TestUserAuditTrail:
 
         activity = Activity.objects.filter(verb="user.group.list").latest("created_at")
         assert activity.metadata["returned_count"] >= 1
+
+
+@pytest.mark.django_db
+class TestUserSearchStaffOnly:
+    """``USER_SEARCH_REQUIRES_STAFF`` keeps the one id-to-name surface to staff."""
+
+    def test_a_plain_account_is_refused(self, auth_client, make_user, settings, caplog):
+        import logging
+
+        settings.USER_SEARCH_REQUIRES_STAFF = True
+        caplog.set_level(logging.WARNING, logger="epicurrents.security")
+        c, _ = auth_client
+        make_user(username="alice_smith")
+        resp = c.get(f"{SEARCH_URL}?q=alice")
+        assert resp.status_code == 403
+        record = [r for r in caplog.records if r.name == "epicurrents.security"][-1]
+        assert record.security_event_type == "permission.denied" and record.permission == "user.search"
+
+    def test_staff_still_searches(self, make_user, settings):
+        from django.test import Client
+
+        settings.USER_SEARCH_REQUIRES_STAFF = True
+        staff = make_user(is_staff=True)
+        make_user(username="alice_smith")
+        c = Client()
+        c.force_login(staff)
+        resp = c.get(f"{SEARCH_URL}?q=alice")
+        assert resp.status_code == 200
+        assert "alice_smith" in [u["username"] for u in resp.json()]
+
+    def test_off_by_default(self, auth_client, make_user, settings):
+        assert settings.USER_SEARCH_REQUIRES_STAFF is False
+        c, _ = auth_client
+        make_user(username="alice_smith")
+        assert c.get(f"{SEARCH_URL}?q=alice").status_code == 200

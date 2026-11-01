@@ -268,38 +268,59 @@ def _serialize_code(code: Code, *, withhold_meta: bool = False) -> dict:
     ``standard`` and ``value`` stay: a code's value is checked against a registered
     vocabulary, so it names a concept rather than describing a subject. ``meta`` is
     the one part nobody validates, so it follows the annotation text it hangs off.
+    ``id`` is what the code endpoints take; the parent is the row the code is served
+    under, so its primary key is not repeated here.
 
     Unlike the annotation serialisers, the flag defaults — the two code endpoints
     return a code the caller has just written to their own annotation.
     """
     return {
         "id": code.pk,
-        "content_type_id": code.content_type_id,
-        "object_id": code.object_id,
         "standard": code.standard,
         "value": code.value,
         "meta": None if withhold_meta else code.meta,
     }
 
 
-def _serialize_base(obj) -> dict:
+def _target_ref(obj, target=None) -> dict:
+    """The row's target as ``target_type`` (``"app.model"``) and ``target_hash``, never its primary key.
+
+    A recording is named by its hash, the ``stored_name`` prefix the recordings API resolves, and a model with an
+    ``object_hash`` by that; a target with neither has no public name and serves ``null``. Pass *target* where the
+    caller has resolved it; a listing across targets prefetches ``target_object`` instead.
+    """
+    if target is None:
+        target = obj.target_object
+    content_type = obj.target_content_type
+    ref = {"target_type": f"{content_type.app_label}.{content_type.model}", "target_hash": None}
+    if target is None:
+        return ref
+    stored_name = getattr(target, "stored_name", None)
+    if isinstance(stored_name, str) and stored_name:
+        ref["target_hash"] = stored_name.split(".", 1)[0]
+    else:
+        object_hash = getattr(target, "object_hash", None)
+        ref["target_hash"] = object_hash if isinstance(object_hash, str) and object_hash else None
+    return ref
+
+
+def _serialize_base(obj, *, target=None) -> dict:
     return {
         "author_id": obj.author_id,
-        "target_content_type_id": obj.target_content_type_id,
-        "target_object_id": obj.target_object_id,
+        **_target_ref(obj, target),
         "object_hash": obj.object_hash,
         "content_hash": obj.content_hash,
     }
 
 
-def _serialize_annotation(annotation: Annotation, *, withhold_text: bool) -> dict:
+def _serialize_annotation(annotation: Annotation, *, withhold_text: bool, target=None) -> dict:
     """Serialise one annotation bundle, without its content when *withhold_text*.
 
     ``withhold_text`` is keyword-only and has no default, so a new call site cannot
     serialise annotation text without deciding whether this caller may read it.
     :func:`annotations.redaction.withheld_row_ids` is what answers that.
     """
-    base = _serialize_base(annotation)
+    base = _serialize_base(annotation, target=target)
     if withhold_text:
         return {**base, "value": None, "text_withheld": True}
     content = annotation.content
@@ -313,14 +334,14 @@ def _serialize_annotation(annotation: Annotation, *, withhold_text: bool) -> dic
     return {**base, "value": content}
 
 
-def _serialize_event(event: Event, *, withhold_text: bool) -> dict:
+def _serialize_event(event: Event, *, withhold_text: bool, target=None) -> dict:
     """Serialise one event, without its name and value when *withhold_text*.
 
     Timing and codes stay: they carry no free text from the source file. See
     :func:`_serialize_annotation` on why the flag is keyword-only and undefaulted.
     """
     return {
-        **_serialize_base(event),
+        **_serialize_base(event, target=target),
         "name": "" if withhold_text else event.name,
         "timestamp": event.timestamp,
         "duration": event.duration,
@@ -330,7 +351,7 @@ def _serialize_event(event: Event, *, withhold_text: bool) -> dict:
     }
 
 
-def _serialize_interruption(interruption: Interruption, *, withhold_meta: bool = False) -> dict:
+def _serialize_interruption(interruption: Interruption, *, withhold_meta: bool = False, target=None) -> dict:
     """Serialise one interruption, without its codes' ``meta`` when *withhold_meta*.
 
     An interruption carries no text of its own — a start and a duration — so nothing
@@ -338,20 +359,20 @@ def _serialize_interruption(interruption: Interruption, *, withhold_meta: bool =
     carry, which is text like any other.
     """
     return {
-        **_serialize_base(interruption),
+        **_serialize_base(interruption, target=target),
         "timestamp": interruption.timestamp,
         "duration": interruption.duration,
         "codes": [_serialize_code(c, withhold_meta=withhold_meta) for c in interruption.codes.all()],
     }
 
 
-def _serialize_label(label: Label, *, withhold_text: bool) -> dict:
+def _serialize_label(label: Label, *, withhold_text: bool, target=None) -> dict:
     """Serialise one label, without its name and value when *withhold_text*.
 
     See :func:`_serialize_annotation` on why the flag is keyword-only and undefaulted.
     """
     return {
-        **_serialize_base(label),
+        **_serialize_base(label, target=target),
         "name": "" if withhold_text else label.name,
         "value": None if withhold_text else label.value,
         "codes": [_serialize_code(c, withhold_meta=withhold_text) for c in label.codes.all()],
@@ -553,7 +574,7 @@ def list_annotations(
         },
     )
     withheld = withheld_row_ids(rows, caller=request.user, terms=terms)
-    return [_serialize_annotation(row, withhold_text=row.pk in withheld) for row in rows]
+    return [_serialize_annotation(row, withhold_text=row.pk in withheld, target=target) for row in rows]
 
 
 @annotations_router.get("/mine", auth=None)
@@ -563,7 +584,11 @@ def list_my_annotations(
     offset: int = Query(0, ge=0),
 ):
     user = _require_auth(request)
-    rows = list(Annotation.objects.filter(author=user).order_by("-created_at")[offset : offset + limit])
+    rows = list(
+        Annotation.objects.filter(author=user)
+        .prefetch_related("target_object")
+        .order_by("-created_at")[offset : offset + limit]
+    )
     log_activity(
         verb="annotations.annotation.mine",
         metadata={"limit": limit, "offset": offset, "returned_count": len(rows)},
@@ -672,7 +697,7 @@ def list_events(
         },
     )
     withheld = withheld_row_ids(rows, caller=request.user, terms=terms)
-    return [_serialize_event(row, withhold_text=row.pk in withheld) for row in rows]
+    return [_serialize_event(row, withhold_text=row.pk in withheld, target=target) for row in rows]
 
 
 @events_router.get("/mine", auth=None)
@@ -683,7 +708,9 @@ def list_my_events(
 ):
     user = _require_auth(request)
     rows = list(
-        Event.objects.filter(author=user).prefetch_related("codes").order_by("-created_at")[offset : offset + limit]
+        Event.objects.filter(author=user)
+        .prefetch_related("codes", "target_object")
+        .order_by("-created_at")[offset : offset + limit]
     )
     log_activity(
         verb="annotations.event.mine",
@@ -802,7 +829,7 @@ def list_interruptions(
     )
     # The row itself holds no text, but the codes hanging off it can.
     withheld = withheld_row_ids(rows, caller=request.user, terms=terms)
-    return [_serialize_interruption(row, withhold_meta=row.pk in withheld) for row in rows]
+    return [_serialize_interruption(row, withhold_meta=row.pk in withheld, target=target) for row in rows]
 
 
 @interruptions_router.get("/mine", auth=None)
@@ -814,7 +841,7 @@ def list_my_interruptions(
     user = _require_auth(request)
     rows = list(
         Interruption.objects.filter(author=user)
-        .prefetch_related("codes")
+        .prefetch_related("codes", "target_object")
         .order_by("-created_at")[offset : offset + limit]
     )
     log_activity(
@@ -930,7 +957,7 @@ def list_labels(
         },
     )
     withheld = withheld_row_ids(rows, caller=request.user, terms=terms)
-    return [_serialize_label(row, withhold_text=row.pk in withheld) for row in rows]
+    return [_serialize_label(row, withhold_text=row.pk in withheld, target=target) for row in rows]
 
 
 @labels_router.get("/mine", auth=None)
@@ -941,7 +968,9 @@ def list_my_labels(
 ):
     user = _require_auth(request)
     rows = list(
-        Label.objects.filter(author=user).prefetch_related("codes").order_by("-created_at")[offset : offset + limit]
+        Label.objects.filter(author=user)
+        .prefetch_related("codes", "target_object")
+        .order_by("-created_at")[offset : offset + limit]
     )
     log_activity(
         verb="annotations.label.mine",

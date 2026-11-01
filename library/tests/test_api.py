@@ -1,6 +1,7 @@
 """API integration tests for the library app (Collections and Datasets)."""
 
 import json
+import secrets
 
 import pytest
 from django.contrib.contenttypes.models import ContentType
@@ -2688,3 +2689,65 @@ class TestLibraryAuditTrail:
         activity = Activity.objects.filter(verb="library.tag.item.remove").latest("created_at")
         assert activity.target_content_type_id == self._ti_ct().pk
         assert activity.target_object_id == str(item_pk)
+
+
+@pytest.mark.django_db
+class TestShareGuardsAndGatedLinks:
+    """A share guard keeps a held object out of every dataset, and a gated dataset takes no share token."""
+
+    def _recording(self, user, name="held"):
+        from recordings.models import Recording
+
+        return Recording.objects.create(
+            author=user, original_name=f"{name}.edf", stored_name=f"{secrets.token_hex(16).upper()}.edf",
+            file_extension=".edf", file_size=1, file_path="/tmp/x.edf", file_hash="a" * 64,
+            content_hash="b" * 64, status=Recording.Status.READY, display_name=name,
+        )
+
+    @pytest.fixture
+    def guard(self):
+        from epicurrents import granting
+
+        guard = lambda obj: "Held by a workflow" if obj.display_name == "held" else None  # noqa: E731
+        granting.register_share_guard("recordings.recording", guard)
+        try:
+            yield guard
+        finally:
+            granting._SHARE_GUARDS["recordings.recording"].remove(guard)
+
+    def test_a_held_recording_is_refused_on_add_create_and_export(self, auth_client, guard):
+        c, user = auth_client
+        held = self._recording(user)
+        free = self._recording(user, name="free")
+        ct = ContentType.objects.get_for_model(held, for_concrete_model=False)
+        dataset = baker.make(Dataset, author=user)
+        AccessRight.objects.create(
+            content_type=ContentType.objects.get_for_model(dataset, for_concrete_model=False),
+            object_id=str(dataset.pk), access_giver=user, access_target=user,
+            can_read=True, can_write=True, can_share=True,
+        )
+        refused = post_json(c, f"{DS_BASE}{dataset.pk}/items/", {"content_type_id": ct.pk, "object_id": str(held.pk)})
+        assert refused.status_code == 409 and "Held" in refused.json()["detail"]
+        assert post_json(c, f"{DS_BASE}{dataset.pk}/items/", {"content_type_id": ct.pk, "object_id": str(free.pk)}).status_code == 201
+
+        created = post_json(c, DS_BASE, {"name": "Around", "recording_hashes": [held.stored_name.split(".")[0]]})
+        assert created.status_code == 409
+        assert not Dataset.objects.filter(name="Around").exists()
+
+        collection = baker.make(Collection, author=user)
+        CollectionItem.objects.create(collection=collection, content_type=ct, object_id=str(held.pk))
+        exported = post_json(c, _url(collection.pk, "export/"), {"name": "Exported"})
+        assert exported.status_code in (200, 201), exported.content
+        assert not DatasetItem.objects.filter(dataset__name="Exported", object_id=str(held.pk)).exists()
+
+    def test_a_release_gated_dataset_takes_no_share_token(self, auth_client):
+        c, user = auth_client
+        dataset = baker.make(Dataset, author=user, release_gated=True)
+        AccessRight.objects.create(
+            content_type=ContentType.objects.get_for_model(dataset, for_concrete_model=False),
+            object_id=str(dataset.pk), access_giver=user, access_target=user,
+            can_read=True, can_write=True, can_share=True,
+        )
+        resp = post_json(c, f"{DS_BASE}{dataset.pk}/access/", {"public_share_token": "tok-" * 8, "can_read": True})
+        assert resp.status_code == 409
+        assert not AccessRight.objects.filter(public_share_token__startswith="tok-").exists()

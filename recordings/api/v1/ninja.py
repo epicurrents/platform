@@ -84,6 +84,7 @@ from activity.audit import log_activity
 from epicurrents.api.schemas import AccessRightOut, AssessmentIn, access_right_out, apply_assessment
 from epicurrents.assessment import assessment_visible, ensure_can_assess
 from epicurrents.auth import enforce_session_csrf
+from epicurrents.granting import held_grant_ids
 from epicurrents.models import AccessRight
 from epicurrents.offload import offload_file_response
 from epicurrents.permissions import (
@@ -3125,6 +3126,10 @@ def list_recording_access(request, hash: str):
         .select_related("access_target", "access_target_group")
         .order_by("id")
     )
+    # A grant a workflow holds is its own to show and revoke: a review claim names the reviewer, and the
+    # recording's author is the one reader that name is withheld from.
+    held = held_grant_ids(rights)
+    rights = [right for right in rights if right.pk not in held]
     log_activity(
         verb="recordings.access.list",
         target=recording,
@@ -3150,7 +3155,7 @@ def assess_recording_access(request, hash: str, right_id: int, payload: Assessme
         .select_related("access_target", "access_target_group")
         .first()
     )
-    if right is None:
+    if right is None or held_grant_ids([right]):
         raise HttpError(404, "Access right not found")
     ensure_can_assess(request, user, recording, right, object_label="recording")
 
@@ -3185,7 +3190,7 @@ def revoke_recording_access(request, hash: str, right_id: int):
         content_type=recording_ct,
         object_id=str(recording.pk),
     ).first()
-    if right is None:
+    if right is None or held_grant_ids([right]):
         raise HttpError(404, "Access right not found")
 
     if right.access_target_id is not None and right.access_target_id == recording.author_id:

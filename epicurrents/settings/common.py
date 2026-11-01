@@ -304,6 +304,13 @@ RECORDINGS_ORIGINALS_PATH = config("RECORDINGS_ORIGINALS_PATH", default="") or N
 TWO_FACTOR_REQUIRED_FOR_STAFF = env_bool("TWO_FACTOR_REQUIRED_FOR_STAFF", default=False)
 TWO_FACTOR_REQUIRED_FOR_ALL = env_bool("TWO_FACTOR_REQUIRED_FOR_ALL", default=False)
 
+# Who may look accounts up by name. The search exists for sharing flows, and it
+# is also the one surface that turns a user id, which every annotation and
+# grant response carries, into a name. A deployment whose users share nothing
+# with each other, or whose workflows keep the parties to a case unnamed, turns
+# it off for everyone but staff.
+USER_SEARCH_REQUIRES_STAFF = env_bool("USER_SEARCH_REQUIRES_STAFF", default=False)
+
 # ── Ingest privacy overrides ─────────────────────────────────────────────────
 # Both default off, because they discard information the author may legitimately
 # want, and both exist for projects whose data-protection position is that no

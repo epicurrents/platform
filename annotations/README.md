@@ -54,6 +54,8 @@ List endpoints accept `target_content_type_id` + `target_object_id` (required) a
 
 `GET /content-types` returns the available `(app_label, model, id)` triples for use as `target_content_type_id`. Filterable by `app_label` / `model`.
 
+A response names the row's target as `target_type` (`app_label.model`) and `target_hash`: a recording's hash, a model's `object_hash` where it has one, `null` otherwise. No response carries the target's primary key, or a parent's on a code, since a recording's key is its ingest order and the recording responses serve none; the listing across targets prefetches the target for it. `author_id` stays, as the platform rule on annotation responses says.
+
 An event, interruption or label write takes its codes inline as `codes`, an object keyed by standard whose entries are `{value, meta}`. Each is validated against its vocabulary before anything is written, and the first refusal answers 422 naming the standard. On a create the codes are written with the row; on a patch a `codes` object replaces the row's set, `{}` clears it, an absent key leaves it and an explicit `null` is refused. This is how a client attaches codes: the `/codes/` endpoints name their parent by its primary key, which no response carries. A write the model's own validation refuses, such as a label without a name, answers 422 with the model's message per field.
 
 `GET /vocabularies` lists the registered coding standards as `{standard, label, version, closed, confined}`, so a client renders an editor only for a standard the deployment validates. Any authenticated caller may read it; it writes an `annotations.vocabulary.list` row with the count.

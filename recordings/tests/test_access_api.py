@@ -17,6 +17,8 @@ The properties that matter:
   unable to read a recording they can still rename and delete.
 """
 
+import json
+
 import pytest
 from django.contrib.auth.models import Group
 from django.contrib.contenttypes.models import ContentType
@@ -282,3 +284,39 @@ class TestRevoke:
         response = delete_json(owner_client, f"/recordings/api/v1/{HASH}/access/{right.pk}")
         assert response.status_code == 404
         assert AccessRight.objects.filter(pk=right.pk).exists()
+
+
+@pytest.mark.django_db
+class TestHeldGrants:
+    """A grant a workflow registers as held is left off the listing and answers 404 to assessment and revocation."""
+
+    @pytest.fixture
+    def held_source(self):
+        from epicurrents import granting
+
+        held: set[int] = set()
+        source = lambda rights: {right.pk for right in rights if right.pk in held}  # noqa: E731
+        granting.register_held_grants(source)
+        try:
+            yield held
+        finally:
+            granting._HELD_GRANT_SOURCES.remove(source)
+
+    def test_a_held_grant_is_neither_listed_nor_touched(self, auth_client, make_user, held_source):
+        c, author = auth_client
+        recording = _make_recording(author)
+        _grant(recording, author, access_target=author, can_read=True, can_write=True, can_share=True)
+        reviewer = make_user(username="the_reviewer")
+        claim = _grant(recording, author, access_target=reviewer, can_read=True)
+        held_source.add(claim.pk)
+
+        rows = c.get(_url()).json()
+        assert [row["access_target_id"] for row in rows] == [author.pk]
+        assert "the_reviewer" not in str(rows)
+        assert c.delete(_url(right_id=claim.pk)).status_code == 404
+        assert c.patch(
+            _url(right_id=claim.pk),
+            json.dumps({"assessment_reference": "x", "assessment_date": "2026-01-01"}),
+            content_type="application/json",
+        ).status_code == 404
+        assert AccessRight.objects.filter(pk=claim.pk).exists()

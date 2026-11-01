@@ -78,7 +78,7 @@ Mounted at `/api/v1/user/`. Full request/response detail in [api/v1/ninja.py](ap
 | `POST` | `/me/change-password` | Change the current password. Keeps the session alive via `update_session_auth_hash`. |
 | `POST` | `/reset-password` | Request a password reset link by email. Rate-limited per email address. |
 | `POST` | `/reset-password/confirm` | Validate a reset token and set a new password. |
-| `GET` | `/search?q=...` | Search active users by username / first name / last name. Used by sharing flows. Returns up to 20 matches; `q` must be at least 2 chars. |
+| `GET` | `/search?q=...` | Search active users by username / first name / last name. Used by sharing flows. Returns up to 20 matches; `q` must be at least 2 chars. Staff and superusers only when `USER_SEARCH_REQUIRES_STAFF` is on. |
 | `GET` | `/groups` | List the Django groups an `AccessRight` may target, leaving out [dedicated groups](#dedicated-groups). |
 | `GET` | `/preferences?scope=viewer` | The caller's stored client settings for that scope, as `{ scope, settings }`. An unknown scope is not an error — it yields an empty map, which is what a client that has never saved anything should see. |
 | `PUT` | `/preferences?scope=viewer` | Replace the caller's stored settings for that scope. The whole map is replaced rather than merged: the client owns the settings and sends a complete snapshot, so merging would resurrect settings the user has since cleared. Rejects keys that do not look like `<module>.<field>` setting paths, values that are not primitives or short flat lists of them, and blobs over 16 KiB serialized. The total-size cap is the bound that matters: the per-field limits multiply out to tens of megabytes, and every accepted blob is written to `ObjectChangeLog` twice (before and after state) and kept forever. |
@@ -98,7 +98,7 @@ Mounted at `/api/v1/user/`. Full request/response detail in [api/v1/ninja.py](ap
 | `agreement_required` | True while the account has not accepted the binding version of the [user agreement](#user-agreement). |
 | `external_provider` | Display name of the identity provider this account signs in through, or `null`. Set only for an account that also has no local password; see [Externally authenticated accounts](#externally-authenticated-accounts). The profile page reads it to decide whether to render a change-password form at all. |
 
-`UserSearchOut` is a smaller shape returned by `/search`: `id`, `username`, `first_name`, `last_name`. No `email` is exposed (it's PII that doesn't need to leak through search auto-complete).
+`UserSearchOut` is a smaller shape returned by `/search`: `id`, `username`, `first_name`, `last_name`. No `email` is exposed (it's PII that doesn't need to leak through search auto-complete). The search is also the one surface that turns a user id, which annotation and grant responses carry, into a name: `USER_SEARCH_REQUIRES_STAFF` (default off) answers 403 to every other account and logs the refusal as `permission.denied`, for a deployment whose workflows keep the parties to a case unnamed and whose users share nothing through the platform's dialogs.
 
 ## Account administration
 

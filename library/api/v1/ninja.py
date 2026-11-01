@@ -62,7 +62,7 @@ from activity.audit import log_activity
 from epicurrents.api.schemas import AccessRightOut, AssessmentIn, access_right_out, apply_assessment, assessment_values
 from epicurrents.assessment import assessment_visible, ensure_can_assess
 from epicurrents.auth import enforce_session_csrf
-from epicurrents.granting import ensure_can_confer, ensure_can_manage_access, ensure_can_revoke
+from epicurrents.granting import ensure_can_confer, ensure_can_manage_access, ensure_can_revoke, share_refusal
 from epicurrents.models import AccessRight
 from epicurrents.permissions import can_modify_object
 from epicurrents.security_log import log_security_event
@@ -1145,7 +1145,8 @@ def export_collection_to_dataset(request, collection_id: int, payload: Collectio
                 or getattr(obj, "author_id", None) == user.pk
                 or can_read_object(user=user, obj=obj)
             )
-            if not readable:
+            if not readable or share_refusal(obj):
+                # An object a workflow holds is left behind as an unreadable one is: the dataset would share it.
                 skipped += 1
                 continue
             DatasetItem.objects.create(
@@ -1330,6 +1331,9 @@ def create_dataset(request, payload: DatasetIn):
         for hash_ in payload.recording_hashes:
             object_id = _resolve_recording_object_id(hash_)
             _check_item_readable(user=user, ct=recording_ct, object_id=object_id)
+            refusal = share_refusal(Recording.objects.get(pk=object_id))
+            if refusal:
+                raise HttpError(409, refusal)
             DatasetItem.objects.get_or_create(
                 dataset=dataset,
                 content_type=recording_ct,
@@ -2091,10 +2095,14 @@ def add_dataset_item(request, dataset_id: str, payload: CollectionItemIn):
         object_id = _resolve_media_object_id(object_id)
 
     _check_item_readable(user=user, ct=ct, object_id=object_id)
+    member = ct.model_class()._default_manager.filter(pk=object_id).first()
+    # A dataset conveys read access to its members, so adding an object a workflow holds shares it onward.
+    refusal = share_refusal(member) if member is not None else None
+    if refusal:
+        raise HttpError(409, refusal)
     if dataset.release_gated:
         from library.release import membership_refusal
 
-        member = ct.model_class()._default_manager.filter(pk=object_id).first()
         refusal = membership_refusal(dataset, member)
         if refusal:
             raise HttpError(409, refusal)
@@ -2677,6 +2685,10 @@ def grant_dataset_access(request, dataset_id: str, payload: GrantAccessIn):
         token = (payload.public_share_token or "").strip()
         if not token:
             raise HttpError(400, "public_share_token must not be empty")
+        if dataset.release_gated:
+            # The gate refuses every member to a share-token request, so the row would convey nothing and would
+            # still be a forwardable link to a pool. Refused rather than written inert.
+            raise HttpError(409, "A release-gated dataset cannot be shared by link")
         kwargs["public_share_token"] = token
 
     try:

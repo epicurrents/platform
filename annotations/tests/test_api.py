@@ -995,3 +995,49 @@ class TestAnnotationsAuditTrail:
         assert resp.status_code == 200
         activity = Activity.objects.filter(verb="annotations.code.delete").latest("created_at")
         assert activity.target_object_id == str(code_pk)
+
+
+@pytest.mark.django_db
+class TestTargetsAreNamedByHash:
+    """A response names the row's target by type and hash; no primary key of the target or the parent is served."""
+
+    def _recording(self, user):
+        from recordings.models import Recording
+
+        return Recording.objects.create(
+            author=user,
+            original_name="t.edf",
+            stored_name="ABCDEF1234567890ABCDEF1234567890.edf",
+            file_extension=".edf",
+            file_size=1,
+            file_path="/tmp/t.edf",
+            file_hash="a" * 64,
+            content_hash="b" * 64,
+            status=Recording.Status.READY,
+        )
+
+    def test_an_event_listing_carries_the_recording_hash(self, auth_client):
+        c, user = auth_client
+        recording = self._recording(user)
+        _grant_read(user, recording, user)
+        resp = post_json(
+            c,
+            EVENTS_URL,
+            _base_payload(recording, name="Spike", timestamp=1.0, duration=0.5, codes={"hed": {"value": "Spike"}}),
+        )
+        assert resp.status_code in (200, 201), resp.content
+        for row in (resp.json(), *c.get(_list_url(EVENTS_URL, recording)).json()):
+            assert row["target_type"] == "recordings.recording"
+            assert row["target_hash"] == "ABCDEF1234567890ABCDEF1234567890"
+            assert "target_object_id" not in row and "target_content_type_id" not in row
+            for code in row["codes"]:
+                assert "object_id" not in code and "content_type_id" not in code
+
+    def test_the_mine_listing_names_each_target(self, auth_client):
+        c, user = auth_client
+        recording = self._recording(user)
+        _grant_read(user, recording, user)
+        assert post_json(c, LABELS_URL, _base_payload(recording, name="Routine", value="yes")).status_code in (200, 201)
+        rows = c.get(f"{LABELS_URL}mine").json()
+        assert rows and rows[0]["target_hash"] == "ABCDEF1234567890ABCDEF1234567890"
+        assert "target_object_id" not in rows[0]
