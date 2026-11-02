@@ -900,9 +900,11 @@ onBeforeUnmount(() => {
                 <wa-icon name="folder-open" slot="start"></wa-icon>
                 {{ t('Select files', SCOPE) }}
             </wa-button>
+            <!-- File pickers match only the last extension, so ".tar.gz" greys the archive out; classifyPackageFiles
+                sorts the parts by their full names. -->
             <input
                 ref="packageInputRef"
-                accept=".tar.gz,.tgz,.json,.sig"
+                accept=".gz,.tgz,.json,.sig"
                 class="hidden-input"
                 multiple
                 type="file"
