@@ -98,6 +98,8 @@ export interface ArgSchemaProperty {
     minimum?: number
     maximum?: number
     pattern?: string
+    /** Shown in an empty input; a `json_schema_extra` key of the field, not a JSON Schema keyword. */
+    placeholder?: string
     title?: string
 }
 

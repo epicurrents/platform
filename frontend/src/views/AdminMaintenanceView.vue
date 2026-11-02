@@ -848,6 +848,7 @@ onBeforeUnmount(() => {
                     :label="argLabel(name, selected.args_schema.properties![name]!)"
                     :max="argConstraint(selected.args_schema.properties![name]!, 'maximum')"
                     :min="argConstraint(selected.args_schema.properties![name]!, 'minimum')"
+                    :placeholder="selected.args_schema.properties![name]!.placeholder"
                     type="number"
                     v-wa="[argValues, name]"
                 ></wa-input>
@@ -855,6 +856,7 @@ onBeforeUnmount(() => {
                     :help-text="selected.args_schema.properties![name]!.description"
                     :label="argLabel(name, selected.args_schema.properties![name]!)"
                     :pattern="argConstraint(selected.args_schema.properties![name]!, 'pattern')"
+                    :placeholder="selected.args_schema.properties![name]!.placeholder"
                     :required="selected.args_schema.required?.includes(name)"
                     v-wa="[argValues, name]"
                 ></wa-input>

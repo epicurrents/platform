@@ -142,6 +142,11 @@ class TestCoreOperations:
             op.args_schema(package_sha256="a" * 64, verify_window_minutes=2)
         assert op.args_schema(package_sha256="a" * 64, verify_window_minutes=30).verify_window_minutes == 30
 
+    def test_the_update_window_names_its_unit_and_what_happens_unverified(self):
+        window = get_operation("platform.update").args_schema.model_json_schema()["properties"]["verify_window_minutes"]
+        assert window["title"] == "Verification window (in minutes)"
+        assert window["placeholder"] == "Automatic rollback if not verified"
+
     def test_the_read_only_operations_skip_step_up_and_the_writing_one_does_not(self):
         assert not get_operation("activity.verify_audit_integrity").requires_step_up
         assert not get_operation("recordings.validate_originals").requires_step_up

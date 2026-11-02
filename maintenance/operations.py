@@ -262,7 +262,9 @@ class PlatformUpdateArgs(Schema):
         None,
         ge=5,
         le=1440,
+        title="Verification window (in minutes)",
         description="Minutes to wait for a superuser's confirmation before rolling back. Default: the deployment setting.",
+        json_schema_extra={"placeholder": "Automatic rollback if not verified"},
     )
 
 
