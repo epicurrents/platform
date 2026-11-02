@@ -19,7 +19,8 @@
  * release from this bundle; a superuser testing the new API through stale
  * code would verify the wrong thing. A lifted `verifying` lock, and the step
  * from `verifying` to `rolling_back`, change nothing yet and only announce.
- * `window.location.reload()` is wrapped so tests can stub it.
+ * `window.location.reload()` is wrapped so tests can stub it, and carries the
+ * view area's scroll position across (`lib/viewScroll`).
  *
  * @package    epicurrents-platform
  */
@@ -36,6 +37,7 @@ import {
 import { t } from '#i18n'
 import { clearMaintenanceNotice, maintenanceLock, type MaintenanceNotice } from '#lib/maintenanceLock'
 import { dismissToast, showToast } from '#lib/toast'
+import { rememberViewScroll } from '#lib/viewScroll'
 
 const SCOPE = 'MaintenanceStore'
 
@@ -56,6 +58,8 @@ export function reloadPage(): void {
     // reload is not the accident that guard exists for, and a prompt here would leave the SPA
     // running code the server has already replaced.
     window.__EPICURRENTS__?.APP?.allowUnload?.()
+    // The page scrolls inside the view area, whose position the browser does not restore.
+    rememberViewScroll()
     window.location.reload()
 }
 

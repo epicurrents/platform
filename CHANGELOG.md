@@ -8,6 +8,16 @@ Entries are written for the person deciding whether to upgrade, so the ones that
 
 ## [Unreleased]
 
+### Fixed
+
+- **A host agent that replaces itself mid-job no longer runs the job again.** Agent 2 and earlier left every request unclaimed with its status beside it in the spool, so the agent that replaced one took them all as new: the update that shipped it was run again and refused as not newer, recorded as failed although it had applied, and the earlier agent's maintenance flag stayed up, refusing every write from an account that is not a superuser until it was removed by hand; an old rollback request would have restored an old snapshot. Agent 5 claims such a request without running it, leaves one the earlier agent finished as it reported it, closes one it was still working on as `failed` with reason `handover`, and lifts that agent's flag. A deployment on agent 2 that applied an update since has its flag lifted by `rm update/maintenance.json` once the platform is checked. [scripts/updater/README.md → Self-update](scripts/updater/README.md#self-update).
+- **A long page keeps its bottom padding.** [index.html](frontend/index.html) holds every `<main>` to its parent's height, so a `.page-view` taller than the window spilled past it and the last element sat against the bottom edge; a page now grows with its content inside the area under the nav, which scrolls it, so the nav, the maintenance banner and the toast stack stay where they are.
+- **The job page draws the agent log as a terminal does.** The colour codes [update.sh](scripts/update.sh) and the agent print are drawn as bold and coloured text instead of escape sequences, and the log fills a box of fixed height and follows new lines unless the reader has scrolled up through it. While a host job runs, every detail it will report is listed from the start, so the log does not move down the page as they arrive, and neither the maintenance banner appearing above the page nor the reload the page makes when an update reaches its confirmation window moves the reader's place.
+
+### Changed
+
+- **The verification window says what it is.** The update form labels it "Verification window (in minutes)" and shows "Automatic rollback if not verified" while it is empty; an operation argument's schema can carry a `placeholder`.
+
 ## [0.1.3] — 2026-11-02
 
 ### Added

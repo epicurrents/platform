@@ -1003,6 +1003,22 @@ export function resetState(): void {
 // Initialize on module load so the first request is always ready.
 resetState()
 
+/** How long after a host job ends a page load still keeps the state; the store reloads as the lock lifts. */
+const RELOAD_GRACE_MS = 60_000
+
+/**
+ * Whether a page load keeps the state instead of resetting it: while a host job is in flight, and briefly after one
+ * ends. The maintenance store reloads the page when an update or rollback moves past its code change, and against a
+ * real deployment the session and the job survive that reload; a reset here would sign the reader out mid-update.
+ */
+export function keepsStateOnReload(): boolean {
+    const now = Date.now()
+    return _state.jobs.some(job => job.executor === 'host' && (
+        IN_FLIGHT_STATES.has(job.state) ||
+        (job.finished_at !== null && now - Date.parse(job.finished_at) < RELOAD_GRACE_MS)
+    ))
+}
+
 // ─── HTTP helpers ─────────────────────────────────────────────────────────────
 
 function readBody(req: IncomingMessage): Promise<Record<string, unknown>> {
@@ -1383,6 +1399,44 @@ function jobOut(job: MockJob) {
 }
 
 /** Run `fn` later unless the state has been reset in between. */
+/**
+ * The agent log of a host job, as update.sh writes it into the spool: its coloured progress lines and the `::`
+ * markers the agent reads, growing with the steps the job has reached and, through the build, with the time spent
+ * in it, so the job page can be seen following a log that outgrows its box.
+ */
+function mockAgentLog(job: MockJob): string {
+    const head = '\u001b[1;34m==> '
+    const tick = '    \u001b[32m✓\u001b[0m  '
+    const end = '\u001b[0m'
+    const lines = [
+        `[updater] checking the package (${job.package_sha256 ?? ''})`,
+        `${head}Checking archive: package.tar.gz${end}`,
+        `${tick}Signature verified against /etc/epicurrents-updater/release.pub`,
+        `${tick}Package version ${job.target_version || '?'} is newer than the installed ${job.installed_version_before || '?'}`,
+        '::step=snapshot',
+        `${head}Taking a pre-update snapshot${end}`,
+        `${tick}Snapshot ${job.snapshot}`,
+        `::snapshot=${job.snapshot}`,
+    ]
+    if (job.step === 'snapshot') {
+        return lines.join('\n') + '\n'
+    }
+    lines.push('::step=build', `${head}Building images${end}`)
+    const elapsed = job.started_at ? (Date.now() - Date.parse(job.started_at)) / 1000 : 0
+    const built = job.step === 'build' ? Math.min(80, Math.floor(elapsed * 12)) : 80
+    for (let n = 1; n <= built; n++) {
+        lines.push(`#${n} [web ${Math.min(n, 18)}/18] RUN pip install --no-cache-dir -r requirements.lock  ${(n * 0.7).toFixed(1)}s`)
+    }
+    if (job.step === 'build') {
+        return lines.join('\n') + '\n'
+    }
+    lines.push(`${tick}Images built`, '::step=health', `${head}Waiting for the platform${end}`, `${tick}Ready`)
+    if (job.state === 'failed' || job.state === 'rolled_back') {
+        lines.push(`\u001b[1;31mERROR:${end} The platform did not confirm in time.`)
+    }
+    return lines.join('\n') + '\n'
+}
+
 function later(ms: number, fn: () => void): void {
     const timer = setTimeout(() => {
         _jobTimers.delete(timer)
@@ -1458,7 +1512,8 @@ function driveJob(job: MockJob): void {
         later(2000, () => {
             if (job.state !== 'running') return
             job.step = 'build'
-            later(2500, () => {
+            // Long enough to watch the log outgrow its box and the view follow it.
+            later(6000, () => {
                 if (job.state !== 'running') return
                 job.state = 'awaiting_verification'
                 job.step = 'health'
@@ -1498,6 +1553,10 @@ export async function handleMock(
     }
 
     // ── User API ──────────────────────────────────────────────────────────────
+
+    if (path === '/api/v1/user/auth-config' && method === 'GET') {
+        return send(res, 200, { oidc_providers: [] })
+    }
 
     if (path === '/api/v1/user/login' && method === 'POST') {
         res.setHeader('Set-Cookie', `${SESSION_COOKIE}=1; Path=/; HttpOnly; SameSite=Strict`)
@@ -2006,9 +2065,7 @@ export async function handleMock(
 
             if (suffix === '/log' && method === 'GET') {
                 if (!_state.user.is_superuser) return send(res, 403, { detail: 'Superuser access required.' })
-                const text = job.executor === 'host' && job.started_at
-                    ? `::step=check\n::step=snapshot\n::snapshot=${job.snapshot}\n::step=build\n[+] Building 42.1s (18/18) FINISHED\n::step=${job.step}\n`
-                    : job.output
+                const text = job.executor === 'host' && job.started_at ? mockAgentLog(job) : job.output
                 return send(res, 200, { job_id: job.job_id, log: text, truncated: false, bytes: text.length })
             }
 

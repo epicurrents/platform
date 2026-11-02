@@ -102,11 +102,17 @@ wa-icon.inline {
 
 /* ── Page layout ─────────────────────────────────────────────────────── */
 
+/* Grows with its content inside .route-view-wrapper, which scrolls it, so the nav and the bottom-edge chrome stay
+   where they are. index.html holds every <main> to its parent's height, which the views that scroll internally need;
+   a page held that way spills past it, and its bottom padding lands inside the first screen instead of below the
+   content. */
 .page-view {
   max-width: 960px;
   margin: 0 auto;
-  padding: var(--wa-space-xl) var(--wa-space-m);
-  flex: 1;
+  padding: var(--wa-space-xl) var(--wa-space-m) var(--wa-space-m);
+  flex: 1 0 auto;
+  height: auto;
+  width: 100%;
 }
   .page-view wa-callout {
     margin-bottom: var(--wa-space-m);
