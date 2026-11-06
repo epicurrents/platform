@@ -20,6 +20,10 @@ A linked recording (``import_recordings --link``) is a fourth kind: its file is 
 and never written, so no pass applies and nothing can be behind. Its row says ``linked`` and repeats the
 operator's assertion of the source's de-identification that the import required.
 
+A recording whose sealed record names a different set of project-registered channel names from the
+running deployment's is flagged as well. Those names are stored, and every later read of the file classifies
+it under the names registered then, so a name dropped since ingest is renamed on the way out.
+
 Each row also repeats ``Recording.public_source``, the DOI or URL of the published dataset the
 author says the data was taken from, so the reader can tell a recording acquired here from one
 whose original is already public (paragraph 26); the platform asserts nothing about the locator.
@@ -49,6 +53,7 @@ from recordings.deidentification_record import (
     stored_deidentification_records,
 )
 from recordings.models import Recording, RecordingMeta
+from recordings.processors.channel_labels import registered_channel_names
 
 _TEXT_STATES = {None: "unknown", True: "preserved", False: "stripped"}
 
@@ -64,9 +69,7 @@ def _overrides_abbrev(overrides: dict | None) -> str:
     return " ".join(f"{name}={'T' if overrides.get(name) else 'F'}" for name in INGEST_OVERRIDE_SETTINGS)
 
 
-def report_row(
-    recording: Recording, meta: RecordingMeta | None, audit_record: dict | None, current: dict[str, int]
-) -> dict:
+def report_row(recording: Recording, meta: RecordingMeta | None, audit_record: dict | None, current: dict) -> dict:
     """Assemble one recording's entry of the report."""
     row: dict = {
         "hash": _hash_of(recording),
@@ -77,6 +80,7 @@ def report_row(
         "annotation_text_preserved": None,
         "audit_record": audit_record,
         "behind": False,
+        "registered_names_differ": False,
     }
     if meta is None:
         return row
@@ -85,6 +89,9 @@ def report_row(
         row["annotation_text_preserved"] = True
         row["source_deidentification"] = LINKED_SOURCE_DEIDENTIFICATION
         return row
+    sealed_names = (audit_record or {}).get("project_channel_names")
+    # Records sealed before the registry existed name none; their files can carry no registered name.
+    row["registered_names_differ"] = sealed_names is not None and sealed_names != current["project_channel_names"]
     stamped = meta.deidentification_version
     row["deidentification_version"] = stamped
     row["channel_order_version"] = meta.channel_order_version
@@ -128,7 +135,7 @@ class Command(BaseCommand):
             if not recordings.exists():
                 raise CommandError(f"No READY recording with hash {wanted}.")
 
-        current = current_pass_versions()
+        current = {**current_pass_versions(), "project_channel_names": registered_channel_names()}
         overrides_now = current_ingest_overrides()
         recording_ct = ContentType.objects.get_for_model(Recording, for_concrete_model=False)
         # Two batch reads rather than two queries per recording: every meta row
@@ -153,6 +160,7 @@ class Command(BaseCommand):
             "current": {**current, "ingest_overrides": overrides_now},
             "recordings": rows,
             "behind_count": sum(1 for r in rows if r["behind"]),
+            "registered_names_differ_count": sum(1 for r in rows if r["registered_names_differ"]),
             "public_source_count": sum(1 for r in rows if r["public_source"]),
         }
         if options["format"] == "json":
@@ -168,6 +176,9 @@ class Command(BaseCommand):
             f"channel order v{current['channel_order_version']}"
         )
         self.stdout.write(f"Ingest overrides now: {_overrides_abbrev(current['ingest_overrides'])}")
+        names = current["project_channel_names"]
+        listed = " ".join(f"{name}={kind}" for name, kind in sorted(names.items())) or "none"
+        self.stdout.write(f"Registered channel names now: {listed}")
         self.stdout.write("")
         self.stdout.write(
             f"{'HASH':32}  {'PASS':>4}  {'ORDER':>5}  {'ANNOTATION TEXT':15}  {'RECORDED OVERRIDES':60}  PUBLIC SOURCE"
@@ -191,7 +202,7 @@ class Command(BaseCommand):
             if row["deidentification_version"] == 0:
                 unstamped += 1
             record = row["audit_record"] or {}
-            flag = "behind " if row["behind"] else ""
+            flag = ("behind " if row["behind"] else "") + ("names-differ " if row["registered_names_differ"] else "")
             mapped = record.get("channel_map")
             overrides = f"{flag}{_overrides_abbrev(record.get('ingest_overrides'))}"
             if mapped:
@@ -205,9 +216,10 @@ class Command(BaseCommand):
             f"{len(report['recordings'])} recording(s); {report['behind_count']} behind the current pass; "
             f"{unstamped} processed before the record existed; {unprocessed} stored without a pass; "
             f"{linked} linked in place; "
+            f"{report['registered_names_differ_count']} sealed under other registered channel names; "
             f"{report['public_source_count']} from a published source."
         )
-        if report["behind_count"]:
+        if report["behind_count"] or report["registered_names_differ_count"]:
             self.stdout.write(self.style.WARNING(summary))
         else:
             self.stdout.write(self.style.SUCCESS(summary))

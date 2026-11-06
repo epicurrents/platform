@@ -67,6 +67,7 @@ PINNED_SOURCE_DIGESTS = {
     4: "f18975887e354c24381acc827e4b372671f8114a5cdfe2d927e69690171252bf",
     5: "44cbef20cf3291cff77b5bce85b989194560f319a81fcde2274a82a050b098b9",
     6: "82be1a0df70445928e220b83f249ed31b1416113930ebd932f9458da66fa43f4",
+    7: "d218e236128506e561934399abff3664bccb8353b86e43eaec4cab8f545f23a2",
 }
 _TWO_FUNCTION_VERSIONS = frozenset({1, 2})
 
@@ -358,6 +359,7 @@ class TestAuditRecord:
             "annotation_text_preserved": False,
             "channel_order_version": CHANNEL_ORDER_VERSION,
             "site_channel_rules": "",
+            "project_channel_names": {},
             "channel_map": None,
             "ingest_overrides": {
                 "RECORDINGS_DISCARD_ORIGINAL_NAME": True,

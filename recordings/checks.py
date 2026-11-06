@@ -1,4 +1,4 @@
-"""Django system checks for the data tables ingest reads: event translation and channel rules.
+"""Django system checks for the data tables ingest reads: event translation, channel rules and registered names.
 
 A translation table is data a deployment points at from settings, and every way of getting it wrong is quiet at
 runtime: a file that is missing or malformed is skipped with a log line, and a rule whose code no vocabulary has
@@ -79,6 +79,33 @@ def check_channel_maps(app_configs, **kwargs):
                     f"RECORDING_CHANNEL_MAPS names a map that cannot be used: {error}",
                     hint="The format is documented on recordings.processors.channel_labels.parse_channel_map.",
                     id="recordings.E004",
+                )
+            )
+    return errors
+
+
+@register(Tags.compatibility)
+def check_registered_channel_names(app_configs, **kwargs):
+    """No site table spells a channel as a registered name it does not map to: the registered name wins first."""
+    from recordings.processors.channel_labels import _compact, registered_channel_names
+
+    try:
+        rules = load_site_rules(site_rule_paths())
+    except ChannelRuleError:
+        return []  # recordings.E003 reports the table.
+    registered = {_compact(name): name for name in registered_channel_names()}
+    errors = []
+    for rule in rules:
+        shadowed = sorted(
+            registered[key] for key in rule.labels & registered.keys() if registered[key] != rule.canonical
+        )
+        if shadowed:
+            errors.append(
+                Error(
+                    f"A RECORDING_CHANNEL_RULES rule for {rule.canonical!r} lists the registered channel names "
+                    f"{shadowed}, which resolve before any site rule is read, so the rule never names them.",
+                    hint="Drop the spelling from the rule, or stop registering the name.",
+                    id="recordings.E005",
                 )
             )
     return errors

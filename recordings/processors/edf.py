@@ -310,7 +310,10 @@ def wall_clock_to_data_position(onset: float, gaps: GapMap) -> float:
 # signals of a study needed, names a trace in a unit of resistance ``Impedance`` whatever its label,
 # names a channel an ``EMG`` transducer describes ``EMG``, applies a channel map chosen for the
 # file, and reads a UTF-8 header field as UTF-8.
-DEIDENTIFICATION_VERSION = 6
+# Version 7 lets a project register stored channel names
+# (``channel_labels.register_channel_names``); without a registration it writes what 6 wrote,
+# and with one the recording's record seals the registered names.
+DEIDENTIFICATION_VERSION = 7
 
 # Label the de-identification pass writes for a channel that resolved to no
 # canonical name, numbered ``MISC_1``, ``MISC_2``… in stored order.
