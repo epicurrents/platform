@@ -848,6 +848,7 @@ onBeforeUnmount(() => {
                     :label="argLabel(name, selected.args_schema.properties![name]!)"
                     :max="argConstraint(selected.args_schema.properties![name]!, 'maximum')"
                     :min="argConstraint(selected.args_schema.properties![name]!, 'minimum')"
+                    :placeholder="selected.args_schema.properties![name]!.placeholder"
                     type="number"
                     v-wa="[argValues, name]"
                 ></wa-input>
@@ -855,6 +856,7 @@ onBeforeUnmount(() => {
                     :help-text="selected.args_schema.properties![name]!.description"
                     :label="argLabel(name, selected.args_schema.properties![name]!)"
                     :pattern="argConstraint(selected.args_schema.properties![name]!, 'pattern')"
+                    :placeholder="selected.args_schema.properties![name]!.placeholder"
                     :required="selected.args_schema.required?.includes(name)"
                     v-wa="[argValues, name]"
                 ></wa-input>
@@ -900,9 +902,11 @@ onBeforeUnmount(() => {
                 <wa-icon name="folder-open" slot="start"></wa-icon>
                 {{ t('Select files', SCOPE) }}
             </wa-button>
+            <!-- File pickers match only the last extension, so ".tar.gz" greys the archive out; classifyPackageFiles
+                sorts the parts by their full names. -->
             <input
                 ref="packageInputRef"
-                accept=".tar.gz,.tgz,.json,.sig"
+                accept=".gz,.tgz,.json,.sig"
                 class="hidden-input"
                 multiple
                 type="file"

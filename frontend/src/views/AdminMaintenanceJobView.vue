@@ -13,7 +13,7 @@
  *
  * @package    epicurrents-platform
  */
-import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import ErasureAcknowledgement from '#components/ErasureAcknowledgement.vue'
 import JobStateBadge from '#components/JobStateBadge.vue'
@@ -32,6 +32,7 @@ import {
 import { useDialog } from '#composables/useDialog'
 import { usePolling } from '#composables/usePolling'
 import { t } from '#i18n'
+import { type AnsiSegment, ansiSegments } from '#lib/ansi'
 import { formatDateTime } from '#lib/datetime'
 import { errorDetail } from '#lib/http'
 import { jobReasonLabel } from '#lib/maintenanceLabels'
@@ -53,6 +54,7 @@ const jobId = computed(() => String(route.params.id))
 
 const job = ref<MaintenanceJob | null>(null)
 const log = ref<JobLog | null>(null)
+const outputRef = ref<HTMLElement | null>(null)
 const loading = ref(true)
 const loadError = ref('')
 
@@ -149,11 +151,28 @@ const countdown = computed(() => {
     return `${minutes}:${String(rest).padStart(2, '0')}`
 })
 
+/** What an update did to the database, once the agent has reported it. */
+function databaseEffect (migrationsApplied: boolean | null) {
+    if (migrationsApplied === null) {
+        return null
+    }
+    return migrationsApplied
+        ? t('Migrated by this update; a rollback restores it', SCOPE)
+        : t('Unchanged by this update; a rollback keeps it', SCOPE)
+}
+
+/** Shown for a detail a running host job has not reported yet. */
+const NOT_YET = '—'
+
 const facts = computed(() => {
     const current = job.value
     if (!current) {
         return []
     }
+    const isUpdate = current.operation === UPDATE_OPERATION
+    // A running host job reports its details one by one. Listing them all from the start keeps the log below them
+    // from moving down the page while the reader watches it.
+    const reserve = current.in_flight && current.executor === 'host'
     const rows: { label: string, value: string }[] = [
         { label: t('Operation', SCOPE), value: current.operation },
         {
@@ -163,43 +182,28 @@ const facts = computed(() => {
         { label: t('Requested by', SCOPE), value: current.requested_by ?? t('Unknown', SCOPE) },
         { label: t('Requested', SCOPE), value: formatDateTime(current.created_at) },
     ]
-    if (current.started_at) {
-        rows.push({ label: t('Started', SCOPE), value: formatDateTime(current.started_at) })
+    const add = (label: string, value: string | null | undefined, reserved = reserve) => {
+        if (value) {
+            rows.push({ label, value })
+        } else if (reserved) {
+            rows.push({ label, value: NOT_YET })
+        }
     }
-    if (current.finished_at) {
-        rows.push({ label: t('Finished', SCOPE), value: formatDateTime(current.finished_at) })
-    }
-    if (current.step) {
-        rows.push({ label: t('Step', SCOPE), value: current.step })
-    }
-    if (current.reason) {
-        rows.push({ label: t('Reason', SCOPE), value: jobReasonLabel(current.reason) })
-    }
-    if (current.target_version) {
-        rows.push({ label: t('Target version', SCOPE), value: current.target_version })
-    }
-    if (current.installed_version_before) {
-        rows.push({ label: t('Version before', SCOPE), value: current.installed_version_before })
-    }
-    if (current.running_version) {
-        rows.push({ label: t('Running version', SCOPE), value: current.running_version })
-    }
-    if (current.snapshot) {
-        rows.push({ label: t('Snapshot', SCOPE), value: current.snapshot })
-    }
-    if (current.post_snapshot) {
-        rows.push({
-            label: current.operation === UPDATE_OPERATION ? t('Post-update snapshot', SCOPE) : t('Safety snapshot', SCOPE),
-            value: current.post_snapshot,
-        })
-    }
-    if (current.operation === UPDATE_OPERATION && current.migrations_applied !== null) {
-        rows.push({
-            label: t('Database', SCOPE),
-            value: current.migrations_applied
-                ? t('Migrated by this update; a rollback restores it', SCOPE)
-                : t('Unchanged by this update; a rollback keeps it', SCOPE),
-        })
+    add(t('Started', SCOPE), current.started_at ? formatDateTime(current.started_at) : null)
+    add(t('Finished', SCOPE), current.finished_at ? formatDateTime(current.finished_at) : null, false)
+    add(t('Step', SCOPE), current.step)
+    add(t('Reason', SCOPE), current.reason ? jobReasonLabel(current.reason) : null, false)
+    add(t('Target version', SCOPE), current.target_version)
+    add(t('Version before', SCOPE), current.installed_version_before)
+    add(t('Running version', SCOPE), current.running_version, reserve && isUpdate)
+    add(t('Snapshot', SCOPE), current.snapshot)
+    add(
+        isUpdate ? t('Post-update snapshot', SCOPE) : t('Safety snapshot', SCOPE),
+        current.post_snapshot,
+        false,
+    )
+    if (isUpdate) {
+        add(t('Database', SCOPE), databaseEffect(current.migrations_applied))
     }
     if (Object.keys(current.args).length) {
         rows.push({ label: t('Arguments', SCOPE), value: JSON.stringify(current.args) })
@@ -213,6 +217,45 @@ const outputText = computed(() => {
     }
     return job.value?.output ?? ''
 })
+
+/** The output as styled runs: update.sh and the agent colour their lines for a terminal. */
+const outputSegments = computed(() => ansiSegments(outputText.value))
+
+/** Within this many pixels of the end, the reader is following the output rather than reading back through it. */
+const FOLLOW_SLACK = 24
+
+/**
+ * Whether the reader is following the end of the output, as a terminal does, rather than reading back through it.
+ * Kept as a flag set by the reader's own scrolling, not measured when text arrives: after a reload the text can arrive
+ * before its box is drawn, and the box then first appears scrolled to the top.
+ */
+const followingOutput = ref(true)
+
+function onOutputScroll () {
+    const box = outputRef.value
+    if (box) {
+        followingOutput.value = box.scrollHeight - box.scrollTop - box.clientHeight <= FOLLOW_SLACK
+    }
+}
+
+/** Keep the end of the output in view as it grows, and when its box first appears, while the reader follows it. */
+watch([outputText, outputRef], () => {
+    if (!followingOutput.value) {
+        return
+    }
+    nextTick(() => {
+        if (outputRef.value) {
+            outputRef.value.scrollTop = outputRef.value.scrollHeight
+        }
+    })
+})
+
+function segmentClass (segment: AnsiSegment) {
+    return {
+        'job-output-bold': segment.bold,
+        [`job-output-${segment.tone}`]: segment.tone !== null,
+    }
+}
 
 function fingerprint (current: MaintenanceJob | null) {
     if (!current) {
@@ -482,6 +525,10 @@ onBeforeUnmount(() => {
                 {{ t('The agent left no record of this job. It was marked failed; nothing was changed.', SCOPE) }}
             </wa-callout>
 
+            <wa-callout v-else-if="job.state === 'failed' && job.reason === 'handover'" variant="warning">
+                {{ t('The host agent that ran this job replaced itself with a newer one before the job finished, and the newer agent does not run it again. The update may have been applied: check the version the platform reports, and roll back to the snapshot it took if it is not serving what it should.', SCOPE) }}
+            </wa-callout>
+
             <dl class="job-facts">
                 <template v-for="fact in facts" :key="fact.label">
                     <dt>{{ fact.label }}</dt>
@@ -500,7 +547,8 @@ onBeforeUnmount(() => {
                     <p v-if="log?.truncated" class="job-hint">
                         {{ t('Showing the end of the log.', SCOPE) }}
                     </p>
-                    <pre class="job-output">{{ outputText }}</pre>
+                    <!-- One line: whitespace between the spans would print inside the pre. -->
+                    <pre ref="outputRef" class="job-output" @scroll="onOutputScroll"><span v-for="(segment, index) in outputSegments" :key="index" :class="segmentClass(segment)">{{ segment.text }}</span></pre>
                 </template>
             </section>
         </template>
@@ -660,6 +708,10 @@ onBeforeUnmount(() => {
     margin-bottom: var(--wa-space-xl);
 }
 
+.job-section:last-child {
+    margin-bottom: 0;
+}
+
 .job-form {
     display: flex;
     flex-direction: column;
@@ -690,17 +742,38 @@ onBeforeUnmount(() => {
     overflow-wrap: anywhere;
 }
 
-/* A log is read top to bottom and may be wide; it scrolls inside its box rather than the page. */
+/* A log is read top to bottom and may be wide; it scrolls inside its box rather than the page. The box takes its
+   full height from the start, so the page below it does not move as the log fills. */
 .job-output {
     background: var(--wa-color-surface-lowered);
     border: 1px solid var(--wa-color-surface-border);
     border-radius: var(--wa-border-radius-m);
     font-size: var(--wa-font-size-xs);
     margin: 0;
-    max-height: 60vh;
+    height: 60vh;
     overflow: auto;
     padding: var(--wa-space-s);
     white-space: pre-wrap;
+}
+
+.job-output-bold {
+    font-weight: var(--wa-font-weight-bold);
+}
+
+.job-output-brand {
+    color: var(--wa-color-brand-on-quiet);
+}
+
+.job-output-danger {
+    color: var(--wa-color-danger-on-quiet);
+}
+
+.job-output-success {
+    color: var(--wa-color-success-on-quiet);
+}
+
+.job-output-warning {
+    color: var(--wa-color-warning-on-quiet);
 }
 
 .dialog-text {

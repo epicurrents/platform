@@ -47,7 +47,7 @@ set -euo pipefail
 # the files it publishes into the spool set their own mode.
 umask 077
 
-AGENT_VERSION=4
+AGENT_VERSION=5
 PROTOCOL=1
 OPERATION_UPDATE="platform.update"
 OPERATION_BACKUP="platform.backup"
@@ -181,6 +181,9 @@ locate_spool() {
 #   requests             unclaimed request ids, oldest first
 #   claim ID DEST        rename jobs/ID.json to jobs/ID.claimed.json, then copy
 #                        it to DEST; 4 when there was nothing to claim
+#   read-earlier REL DEST   copy jobs/<id>.status.json, jobs/<id>.log or
+#                        maintenance.json, as an agent before this one left it,
+#                        to DEST; 4 when absent
 #   package-size SHA     the size of packages/SHA/package.tar.gz; 4 when absent
 #   fetch-package SHA DIR SIZE   copy the package's three files into DIR
 # Exit status: 0 done, 1 no, 3 a spool directory is unusable, 4 absent,
@@ -193,6 +196,8 @@ UUID = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
 PUBLISHED = re.compile(rf"(agent\.json|maintenance\.json|jobs/{UUID}\.(status\.json|log))")
 REMOVABLE = re.compile(rf"(maintenance\.json|jobs/{UUID}\.(verify|rollback))")
 MARKER = re.compile(rf"jobs/{UUID}\.(verify|rollback)")
+EARLIER = re.compile(rf"(maintenance\.json|jobs/{UUID}\.(status\.json|log))")
+EARLIER_LOG_CAP = int(os.environ.get("EPICURRENTS_UPDATER_LOG_CAP", 8 * 1024 * 1024))
 SHA256 = re.compile(r"[0-9a-f]{64}")
 TEMP = re.compile(r"\.agent-[0-9a-f]{16}\.tmp")
 CLOEXEC = getattr(os, "O_CLOEXEC", 0)
@@ -416,6 +421,16 @@ def cmd_claim(job_id, dest):
         os.close(parent)
 
 
+def cmd_read_earlier(rel, dest):
+    if not EARLIER.fullmatch(rel):
+        raise Refused(5, f"{rel} is not a file an earlier agent kept in the spool")
+    parent, name = parent_of(rel)
+    try:
+        write_private(dest, safe_read(parent, name, EARLIER_LOG_CAP if rel.endswith(".log") else REQUEST_CAP))
+    finally:
+        os.close(parent)
+
+
 def open_package(sha):
     if not SHA256.fullmatch(sha):
         raise Refused(5, f"{sha} is not a package hash")
@@ -495,6 +510,7 @@ COMMANDS = {
     "present": cmd_present,
     "requests": cmd_requests,
     "claim": cmd_claim,
+    "read-earlier": cmd_read_earlier,
     "package-size": cmd_package_size,
     "fetch-package": cmd_fetch_package,
 }
@@ -1910,6 +1926,62 @@ handle_stale_lock() {
     return 0
 }
 
+# ── Jobs an earlier agent started ─────────────────────────────────────────────
+# Agent 2 and earlier read a request where it lay and kept the job's status
+# beside it in the spool, so every job they ran is still there as an unclaimed
+# request when a deployment's agent updates past them, often in the middle of
+# the job that carried the new agent. Taken as new, that update is run again
+# and refused as not newer, and an old rollback request restores an old
+# snapshot. The spool is the web tier's to write, so what it says about such a
+# job decides only that the request is not run.
+
+close_earlier_job() {
+    # $1 = job id. 0 when the spool holds a status beside the request, which
+    # only an agent before this one writes ahead of a claim: the request is
+    # claimed and never run. 1 when there is none, and when what is there is
+    # not a plain file, which no agent wrote.
+    local copy="$STATE_DIR/work/.earlier.$1" flag="$STATE_DIR/work/.earlier-flag.$1" state
+    rm -f "$copy" "$flag"
+    if ! spoolfs read-earlier "jobs/$1.status.json" "$copy" 2>/dev/null; then
+        rm -f "$copy"
+        return 1
+    fi
+    state="$(clean "$(json_get "$copy" state)")"
+    reset_job "$1"
+    if ! spoolfs claim "$JOB_ID" "$(job_request)" 2>/dev/null; then
+        rm -f "$copy"
+        return 0
+    fi
+    JOB_OPERATION="$(clean "$(json_get "$(job_request)" operation)")"
+    JOB_OPERATION="${JOB_OPERATION:-unknown}"
+    case "$state" in
+        succeeded|failed|cancelled|rolled_back|rollback_failed)
+            # Over before this agent arrived: the earlier agent's status stays
+            # the account of it.
+            log "job $JOB_ID was finished by an earlier agent ($state); its request is retired"
+            rm -f "$copy" "$(job_request)"
+            return 0
+            ;;
+    esac
+    # The earlier agent's log is the account of what ran; publishing this
+    # agent's notes alone would replace it.
+    rm -f "$(job_log)"
+    spoolfs read-earlier "jobs/$JOB_ID.log" "$(job_log)" 2>/dev/null || rm -f "$(job_log)"
+    job_note "this job was taken by an earlier agent (version $(clean "$(json_get "$copy" agent_version)")), which was replaced while the job was ${state:-in an unknown state}; it is not run again"
+    [ -z "$(json_get "$copy" snapshot)" ] \
+        || job_note "the earlier agent reported the snapshot $(clean "$(json_get "$copy" snapshot)"); check the deployment, and roll back to it from the Maintenance tab if it is not serving what it should"
+    # The earlier agent's maintenance flag is in the spool alone, so nothing
+    # else lifts it; it goes when it names this job.
+    if [ ! -f "$STATE_FLAG" ] && spoolfs read-earlier maintenance.json "$flag" 2>/dev/null \
+        && [ "$(json_get "$flag" job_id)" = "$JOB_ID" ]; then
+        job_note "removing the maintenance flag the earlier agent left"
+        remove_flag
+    fi
+    rm -f "$copy" "$flag"
+    finish failed handover
+    return 0
+}
+
 # ── The tick ──────────────────────────────────────────────────────────────────
 
 in_flight_elsewhere() {
@@ -1939,6 +2011,10 @@ tick() {
         # A request for a job the agent already knows is the platform's
         # business, not a new job; it is never taken twice.
         [ ! -f "$STATE_JOBS/$id.status.json" ] || continue
+        # Retired without running, and without using up this tick's request.
+        if close_earlier_job "$id"; then
+            continue
+        fi
         if in_flight_elsewhere "$id"; then
             break
         fi

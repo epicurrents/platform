@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted } from 'vue'
+import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { RouterLink, RouterView, useRoute, useRouter } from 'vue-router'
 import ToastStack from '#components/ToastStack.vue'
 import AppLogo from '#components/AppLogo.vue'
@@ -7,6 +7,7 @@ import StepUpDialog from '#components/StepUpDialog.vue'
 import { t } from '#i18n'
 import { setAgreementRefusalHandler } from '#lib/agreementGate'
 import { showToast } from '#lib/toast'
+import { registerViewScroller, restoreViewScroll } from '#lib/viewScroll'
 import { getViewerSetup, setViewerSetup } from '#lib/viewerGlobal'
 import type { EpicurrentsGlobal } from '@epicurrents/core/dist/types'
 import { plugin } from '#projects/active'
@@ -60,8 +61,13 @@ async function onAgreementRefused () {
 // Lives under `window.__EPICURRENTS__.announce` so the host-callback contract
 // shares the existing viewer namespace; future host hooks (e.g. `confirm`,
 // `progress`) belong on the same object.
+/** The view area, which scrolls the page; its position is carried across a reload the maintenance store makes. */
+const viewArea = ref<HTMLElement | null>(null)
+
 onMounted(() => {
     setAgreementRefusalHandler(onAgreementRefused)
+    registerViewScroller(viewArea.value)
+    restoreViewScroll()
     deploymentStore.init()
     // Ask the public lock probe once, so a page opened during maintenance says so before a request is refused.
     maintenanceStore.init()
@@ -96,6 +102,7 @@ onMounted(() => {
 
 onUnmounted(() => {
     setAgreementRefusalHandler(null)
+    registerViewScroller(null)
     // Clear the slot on hot-reload / teardown so a stale closure can't leak
     // a reference to a destroyed component instance.
     if (window.__EPICURRENTS__) {
@@ -322,7 +329,11 @@ function handleUserMenu (event: Event) {
         </div>
     </nav>
 
-    <div class="route-view-wrapper">
+    <div
+        ref="viewArea"
+        class="route-view-wrapper"
+        :class="{ 'route-view-wrapper--above-banner': deploymentStore.isDevelopmentMode }"
+    >
         <RouterView />
     </div>
 
@@ -390,12 +401,21 @@ function handleUserMenu (event: Event) {
 
 /* Fills the remaining viewport height so full-bleed layout views
    (e.g. CourseLayout with wa-page) get a real height to work with.
-   Standard .page-view children already use flex: 1 so they are unaffected. */
+   A .page-view child grows with its content instead (flex: 1 0 auto) and this
+   box scrolls it: the scrollbar rides the viewport edge, and the nav and the
+   bottom-edge chrome never move. Views that scroll internally fit exactly and
+   leave it idle. */
 .route-view-wrapper {
     display: flex;
     flex: 1;
     flex-direction: column;
     min-height: 0;
+    overflow-y: auto;
+}
+
+/* Ends the scrolling area above the fixed dev-mode banner rather than behind it. */
+.route-view-wrapper--above-banner {
+    margin-bottom: 1.5rem;
 }
 
 /* Containing block for the toast stack, which positions itself against its

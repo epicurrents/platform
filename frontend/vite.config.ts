@@ -227,12 +227,15 @@ export default defineConfig(({ mode }) => {
                         ? rawPath.slice(apiBase.length)
                         : rawPath
 
-                    // Reset seed state on every full browser navigation.
+                    // Reset seed state on every full browser navigation, except the reload a mock update triggers.
                     if (
                         req.headers['sec-fetch-mode'] === 'navigate' &&
                         req.headers['sec-fetch-dest'] === 'document'
                     ) {
-                        const { resetState, SESSION_COOKIE_CLEAR } = await import('./mocks')
+                        const { keepsStateOnReload, resetState, SESSION_COOKIE_CLEAR } = await import('./mocks')
+                        if (keepsStateOnReload()) {
+                            return next()
+                        }
                         res.setHeader('Set-Cookie', SESSION_COOKIE_CLEAR)
                         resetState()
                         return next()

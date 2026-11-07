@@ -47,6 +47,8 @@ export function jobReasonLabel (reason: string): string {
             return t('The agent left no record of the job', SCOPE)
         case 'stale':
             return t('The executor stopped reporting', SCOPE)
+        case 'handover':
+            return t('An earlier host agent was replaced while running the job; check the deployment', SCOPE)
         case 'abandoned':
             return t('Marked as failed by a superuser', SCOPE)
         case 'interrupted':

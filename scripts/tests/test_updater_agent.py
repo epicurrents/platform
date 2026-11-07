@@ -422,7 +422,7 @@ class TestHeartbeatAndConfig:
         result = _run(staged)
         assert result.returncode == 0, result.stderr
         beat = staged.heartbeat()
-        assert beat["protocol"] == 1 and beat["enabled"] is False and beat["version"] == "4"
+        assert beat["protocol"] == 1 and beat["enabled"] is False and beat["version"] == "5"
         assert beat["runtime"] == "docker" and beat["last_run"].endswith("Z")
         assert beat["capabilities"] == ["platform.update", "platform.backup", "platform.rollback"]
         assert beat["self_update"] is False and beat["snapshots"] == []
@@ -480,7 +480,7 @@ class TestAcceptance:
         assert status["running_version"] == "0.2.0"
         assert status["snapshot"] == "pre-update-20260920-100000"
         assert status["started_at"].endswith("Z") and status["finished_at"] is None
-        assert status["verify_deadline"].endswith("Z") and status["agent_version"] == "4"
+        assert status["verify_deadline"].endswith("Z") and status["agent_version"] == "5"
         assert status["operation"] == "platform.update" and status["migrations_applied"] is True
 
         calls = staged.update_sh_calls()
@@ -864,6 +864,66 @@ class TestFailedUpdates:
         assert "log truncated at 4000 bytes" in log
         assert len(log.encode()) < 6000
         assert staged.status(job_id)["state"] == "awaiting_verification", "the cap must not stop the :: parsing"
+
+
+class TestJobsAnEarlierAgentStarted:
+    """Agent 2 and earlier left every request unclaimed, its status beside it in the spool."""
+
+    def _earlier(self, staged: Staged, state: str, *, operation="platform.update", snapshot="") -> str:
+        job_id = _request(staged, _package(staged, f"package for {state}".encode()), operation=operation)
+        earlier = {"job_id": job_id, "operation": operation, "state": state, "agent_version": "2", "snapshot": snapshot}
+        (staged.jobs / f"{job_id}.status.json").write_text(json.dumps(earlier))
+        return job_id
+
+    def _earlier_flag(self, staged: Staged, job_id: str) -> None:
+        flag = {"protocol": 1, "phase": "verifying", "job_id": job_id, "since": "2026-11-02T05:49:15Z"}
+        (staged.spool / "maintenance.json").write_text(json.dumps(flag))
+
+    def test_a_job_in_its_window_is_closed_without_running_and_its_flag_lifted(self, fakebin, tmp_path):
+        staged = _stage(tmp_path, fakebin, installed="0.2.0")
+        job_id = self._earlier(staged, "awaiting_verification", snapshot="pre-update-20261102-054919")
+        (staged.jobs / f"{job_id}.log").write_text("::step=recreate\n::health=ok\n")
+        self._earlier_flag(staged, job_id)
+        result = _run(staged)
+        assert result.returncode == 0, result.stderr
+        assert staged.update_sh_calls() == []
+        assert not (staged.jobs / f"{job_id}.json").exists()
+        assert (staged.jobs / f"{job_id}.claimed.json").exists()
+        status = staged.state_status(job_id)
+        assert status["state"] == "failed" and status["reason"] == "handover"
+        assert staged.status(job_id)["reason"] == "handover"
+        assert "version 2" in staged.log(job_id) and "pre-update-20261102-054919" in staged.log(job_id)
+        assert staged.log(job_id).startswith("::step=recreate\n::health=ok\n")
+        assert staged.flag() is None
+
+    def test_a_finished_job_is_retired_and_its_status_left_as_the_earlier_agent_wrote_it(self, fakebin, tmp_path):
+        staged = _stage(tmp_path, fakebin)
+        old_rollback = self._earlier(staged, "succeeded", operation="platform.rollback")
+        old_update = self._earlier(staged, "rolled_back")
+        result = _run(staged)
+        assert result.returncode == 0, result.stderr
+        assert staged.update_sh_calls() == []
+        for job_id, state in ((old_rollback, "succeeded"), (old_update, "rolled_back")):
+            assert not (staged.jobs / f"{job_id}.json").exists()
+            assert staged.status(job_id)["state"] == state and staged.status(job_id)["agent_version"] == "2"
+            assert not (staged.state_jobs / f"{job_id}.status.json").exists()
+
+    def test_a_new_request_behind_retired_ones_runs_in_the_same_tick(self, fakebin, tmp_path):
+        staged = _stage(tmp_path, fakebin)
+        self._earlier(staged, "succeeded")
+        newer = _request(staged, _package(staged, b"the new package"))
+        result = _run(staged)
+        assert result.returncode == 0, result.stderr
+        assert staged.status(newer)["state"] == "awaiting_verification", staged.log(newer)
+
+    def test_a_flag_naming_another_job_is_left(self, fakebin, tmp_path):
+        staged = _stage(tmp_path, fakebin)
+        job_id = self._earlier(staged, "running")
+        self._earlier_flag(staged, str(uuid.uuid4()))
+        result = _run(staged)
+        assert result.returncode == 0, result.stderr
+        assert staged.state_status(job_id)["reason"] == "handover"
+        assert staged.flag() is not None
 
 
 class TestStaleLock:
@@ -1386,11 +1446,11 @@ class TestSelfUpdate:
     def test_an_older_or_equal_agent_is_kept(self, fakebin, tmp_path):
         staged = _stage(tmp_path, fakebin, SELF_UPDATE=1)
         before = (staged.lib_dir / "epicurrents-updater.sh").read_text()
-        sha = _package(staged, _tarball(tmp_path, {"updater/epicurrents-updater.sh": self._agent("4")}))
+        sha = _package(staged, _tarball(tmp_path, {"updater/epicurrents-updater.sh": self._agent("5")}))
         job_id = _request(staged, sha)
         _run(staged)
         assert (staged.lib_dir / "epicurrents-updater.sh").read_text() == before
-        assert "this is 4; this one stays" in staged.log(job_id)
+        assert "this is 5; this one stays" in staged.log(job_id)
 
     def test_an_agent_that_does_not_parse_is_kept(self, fakebin, tmp_path):
         staged = _stage(tmp_path, fakebin, SELF_UPDATE=1)
@@ -1752,7 +1812,7 @@ def test_the_agent_and_installer_parse_and_carry_a_version():
     for script in (AGENT, INSTALLER):
         subprocess.run(["bash", "-n", str(script)], check=True)
     body = AGENT.read_text()
-    assert "AGENT_VERSION=4" in body
+    assert "AGENT_VERSION=5" in body
     assert 'OPERATION_UPDATE="platform.update"' in body
     assert 'OPERATION_BACKUP="platform.backup"' in body and 'OPERATION_ROLLBACK="platform.rollback"' in body
 
