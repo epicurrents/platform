@@ -295,7 +295,7 @@ class TestHeldGrants:
         from epicurrents import granting
 
         held: set[int] = set()
-        source = lambda rights: {right.pk for right in rights if right.pk in held}  # noqa: E731
+        source = lambda rights: {right.pk for right in rights if right.pk in held}
         granting.register_held_grants(source)
         try:
             yield held
@@ -314,9 +314,12 @@ class TestHeldGrants:
         assert [row["access_target_id"] for row in rows] == [author.pk]
         assert "the_reviewer" not in str(rows)
         assert c.delete(_url(right_id=claim.pk)).status_code == 404
-        assert c.patch(
-            _url(right_id=claim.pk),
-            json.dumps({"assessment_reference": "x", "assessment_date": "2026-01-01"}),
-            content_type="application/json",
-        ).status_code == 404
+        assert (
+            c.patch(
+                _url(right_id=claim.pk),
+                json.dumps({"assessment_reference": "x", "assessment_date": "2026-01-01"}),
+                content_type="application/json",
+            ).status_code
+            == 404
+        )
         assert AccessRight.objects.filter(pk=claim.pk).exists()

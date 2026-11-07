@@ -2699,16 +2699,23 @@ class TestShareGuardsAndGatedLinks:
         from recordings.models import Recording
 
         return Recording.objects.create(
-            author=user, original_name=f"{name}.edf", stored_name=f"{secrets.token_hex(16).upper()}.edf",
-            file_extension=".edf", file_size=1, file_path="/tmp/x.edf", file_hash="a" * 64,
-            content_hash="b" * 64, status=Recording.Status.READY, display_name=name,
+            author=user,
+            original_name=f"{name}.edf",
+            stored_name=f"{secrets.token_hex(16).upper()}.edf",
+            file_extension=".edf",
+            file_size=1,
+            file_path="/tmp/x.edf",
+            file_hash="a" * 64,
+            content_hash="b" * 64,
+            status=Recording.Status.READY,
+            display_name=name,
         )
 
     @pytest.fixture
     def guard(self):
         from epicurrents import granting
 
-        guard = lambda obj: "Held by a workflow" if obj.display_name == "held" else None  # noqa: E731
+        guard = lambda obj: "Held by a workflow" if obj.display_name == "held" else None
         granting.register_share_guard("recordings.recording", guard)
         try:
             yield guard
@@ -2723,12 +2730,21 @@ class TestShareGuardsAndGatedLinks:
         dataset = baker.make(Dataset, author=user)
         AccessRight.objects.create(
             content_type=ContentType.objects.get_for_model(dataset, for_concrete_model=False),
-            object_id=str(dataset.pk), access_giver=user, access_target=user,
-            can_read=True, can_write=True, can_share=True,
+            object_id=str(dataset.pk),
+            access_giver=user,
+            access_target=user,
+            can_read=True,
+            can_write=True,
+            can_share=True,
         )
         refused = post_json(c, f"{DS_BASE}{dataset.pk}/items/", {"content_type_id": ct.pk, "object_id": str(held.pk)})
         assert refused.status_code == 409 and "Held" in refused.json()["detail"]
-        assert post_json(c, f"{DS_BASE}{dataset.pk}/items/", {"content_type_id": ct.pk, "object_id": str(free.pk)}).status_code == 201
+        assert (
+            post_json(
+                c, f"{DS_BASE}{dataset.pk}/items/", {"content_type_id": ct.pk, "object_id": str(free.pk)}
+            ).status_code
+            == 201
+        )
 
         created = post_json(c, DS_BASE, {"name": "Around", "recording_hashes": [held.stored_name.split(".")[0]]})
         assert created.status_code == 409
@@ -2745,8 +2761,12 @@ class TestShareGuardsAndGatedLinks:
         dataset = baker.make(Dataset, author=user, release_gated=True)
         AccessRight.objects.create(
             content_type=ContentType.objects.get_for_model(dataset, for_concrete_model=False),
-            object_id=str(dataset.pk), access_giver=user, access_target=user,
-            can_read=True, can_write=True, can_share=True,
+            object_id=str(dataset.pk),
+            access_giver=user,
+            access_target=user,
+            can_read=True,
+            can_write=True,
+            can_share=True,
         )
         resp = post_json(c, f"{DS_BASE}{dataset.pk}/access/", {"public_share_token": "tok-" * 8, "can_read": True})
         assert resp.status_code == 409
