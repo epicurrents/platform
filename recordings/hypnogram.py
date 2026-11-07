@@ -14,9 +14,9 @@ The header, the labels and the bytes go no further, and nothing here puts any of
 route Django's memory threshold applies to the whole request, so beside any real study this file too is spooled to a
 temporary file, which is removed when the request ends and left behind if the worker dies during it.
 
-The stages wait on ``Recording.pending_scoring`` and become rows in the transition to READY
-(``recordings.tasks._write_final_recording_transition``), so they follow the study: a reader holding a grant from the
-upload finds no stage until the study itself can be read, and a study refused by the worker never has any. They must
+The stages wait on ``Recording.pending_scoring`` and become rows when the study first becomes openable
+(``recordings.lifecycle.write_pending_scoring``, at the end of ingest or when post-ingest stages settle), so they follow
+the study: a reader holding a grant from the upload finds no stage until the study itself can be read, and a study refused by the worker never has any. They must
 not travel in a task argument: a stage is a reading about the subject, and no erasure path reaches the broker's
 append-only file.
 

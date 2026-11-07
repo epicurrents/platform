@@ -102,8 +102,17 @@ class Recording(models.Model):
     linked_at = models.DateTimeField(null=True, blank=True, default=None)
 
     class Status(models.TextChoices):
+        """Where a recording stands in its lifecycle (``recording-lifecycle-design.md``).
+
+        ``PROCESSING`` covers ingest and then any reconstruction stage still to settle; ``AVAILABLE`` means the
+        default version is final and openable while derive jobs run; ``READY`` means everything has settled.
+        ``FAILED`` is reserved for an ingest that left no usable file: a failed stage or job is reported on the
+        recording's jobs, never here. ``recordings.lifecycle`` derives every value after ingest.
+        """
+
         PENDING = "pending", "Pending"
         PROCESSING = "processing", "Processing"
+        AVAILABLE = "available", "Available"
         READY = "ready", "Ready"
         FAILED = "failed", "Failed"  # file preserved but format processing failed
 
@@ -113,6 +122,10 @@ class Recording(models.Model):
         default=Status.PENDING,
         db_index=True,
     )
+    # When ingest finished and the stored file became final, or null while ingest is still running. ``PROCESSING``
+    # alone cannot tell an ingest that never finished from a recording whose reconstruction stages are still
+    # running, and the orphan reaper must reap only the first.
+    ingested_at = models.DateTimeField(null=True, blank=True, default=None)
     # Populated when status transitions to FAILED so the author has enough
     # information to act (re-upload, fix the source, etc.).  May contain
     # filesystem paths and library stack-trace fragments — surfaced only to
@@ -136,9 +149,9 @@ class Recording(models.Model):
     # rather than a person. Lives here for the same reason as ``power_line_frequency``:
     # a reprocess rebuilds ``RecordingMeta`` and would drop it.
     public_source = models.CharField(max_length=512, blank=True, default="")
-    # The scoring read from a hypnogram file, ``{onset, duration, code}`` per event, until ingest settles. Written as
-    # coded events by the READY transition and cleared by every end of processing, so a reader of the recording never
-    # holds a stage of a study they cannot yet read, and a refused study has none. Here rather than in the task
+    # The scoring read from a hypnogram file, ``{onset, duration, code}`` per event, until the study is first openable.
+    # Written as coded events and cleared by the transition to AVAILABLE or READY, and cleared by a failed ingest, so a
+    # reader of the recording never holds a stage of a study they cannot yet read, and a refused study has none. Here rather than in the task
     # message, because no erasure path reaches the broker; withheld from the audit trail in ``RecordingsConfig``.
     pending_scoring = models.JSONField(null=True, blank=True, default=None)
 

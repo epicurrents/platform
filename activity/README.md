@@ -443,6 +443,8 @@ To check the table against the tree, walk the AST for `log_activity` / `with_sys
 | Verb | Emitted by |
 |---|---|
 | `compute.analysis.run` | `_record_launch` † |
+| `compute.derive.run` | `run_derive_job` † |
+| `compute.reconstruction.run` | `run_reconstruction` † |
 
 ### `epicurrents`
 
@@ -581,9 +583,12 @@ To check the table against the tree, walk the AST for `log_activity` / `with_sys
 | `recordings.annotations.list` | `list_recording_annotations` |
 | `recordings.channel_map.list` | `list_channel_maps` |
 | `recordings.deidentification_report` | `handle` † |
-| `recordings.download` | `download_recording` |
+| `recordings.download` | `download_recording`, `_serve_version_file` |
+| `recordings.download.signal` | `read_version_signal` |
 | `recordings.download.slice` | `slice_recording` |
 | `recordings.import` | `_run_job` † |
+| `recordings.job.list` | `list_recording_jobs` |
+| `recordings.job.update` | `update_recording_jobs` |
 | `recordings.list` | `list_recordings` |
 | `recordings.metadata.refresh` | `handle` † |
 | `recordings.process` | `process_recording` † |
@@ -603,6 +608,7 @@ To check the table against the tree, walk the AST for `log_activity` / `with_sys
 | `recordings.trash` | `delete_recording` |
 | `recordings.update` | `update_recording` |
 | `recordings.upload` | `upload_recording` |
+| `recordings.version.list` | `list_recording_versions` |
 
 ### `user`
 

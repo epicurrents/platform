@@ -60,12 +60,14 @@ supplied) require session authentication or a ``FederatedBearer`` JWT.
 """
 
 import hashlib
+import json
 import logging
 import math
 import re
 import secrets
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Literal
 
 from django.conf import settings
 from django.contrib.auth import get_user_model
@@ -100,6 +102,7 @@ from epicurrents.text_hygiene import NameWarningOut, name_warnings
 from federation.audit import log_federation_access
 from federation.auth import try_federation_auth
 from federation.limits import QuotaExceeded, check_peer_download_limits
+from recordings import lifecycle
 from recordings.hypnogram import (
     MAX_HYPNOGRAM_BYTES,
     HypnogramError,
@@ -110,6 +113,7 @@ from recordings.hypnogram import (
 from recordings.linked import linked_file_change
 from recordings.modalities import PSG, ModalityError, ensure_continuous_file, normalise_modality
 from recordings.models import Recording, stored_original_name
+from recordings.pipeline import SOURCE_VERSION_ID
 from recordings.pipelines import get_converter
 from recordings.processors.channel_labels import channel_map_paths
 from recordings.public_source import normalise_public_source
@@ -538,6 +542,12 @@ def _annotation_text_preserved(recording) -> bool:
     ).exists()
 
 
+# The statuses whose stored file a byte-serving endpoint hands out. AVAILABLE is openable by design
+# (``recording-lifecycle-design.md``): its derive jobs only read. PROCESSING is not, even after ingest, because the
+# version a reader should open is still being built. FAILED keeps its file for the author to download.
+_SERVABLE_STATUSES = frozenset({Recording.Status.AVAILABLE, Recording.Status.READY, Recording.Status.FAILED})
+
+
 def _hidden_for_caller(recording, user, fed, share_token: str | None = None) -> bool:
     """Return True when *recording* must answer 404 to this caller: FAILED-hidden, or a gated member it may not see.
 
@@ -934,8 +944,15 @@ def _build_serve_pipeline(recording):
     ).for_scope("api")
 
 
-def _serve_recording_with_middleware(request, file_path: Path, filename: str, recording) -> object:
+def _serve_recording_with_middleware(
+    request, file_path: Path, filename: str, recording, *, header_size: int | None = None
+) -> object:
     """Serve an EDF/BDF recording with the API-scope middleware pipeline applied.
+
+    *header_size* is given when *file_path* is one of the recording's reconstructed versions rather than its stored
+    file: a version can carry channels the stored metadata does not describe (a stage that keeps the uncorrected
+    signal beside the corrected one), so its header is cut by its own size. The platform built that file from the
+    de-identified source, and the same pipeline still runs over it. The metadata row is required either way.
 
     Three serving strategies, tried in order:
 
@@ -962,7 +979,7 @@ def _serve_recording_with_middleware(request, file_path: Path, filename: str, re
     would leak the unrewritten EDF/BDF header to a grantee whose grant
     specifically requires middleware to apply.  Fires for ``status=FAILED``
     recordings (processing didn't write meta) and the rare partial-ingest
-    race; never fires for ``status=READY`` because successful processing
+    race; never fires for an AVAILABLE or READY recording, because successful ingest
     always writes meta.
     """
     pipeline = _build_serve_pipeline(recording)
@@ -990,7 +1007,8 @@ def _serve_recording_with_middleware(request, file_path: Path, filename: str, re
             status=403,
         )
 
-    header_size = 256 * (1 + meta.signal_count)
+    if header_size is None:
+        header_size = 256 * (1 + meta.signal_count)
     file_size = file_path.stat().st_size
     if header_size > file_size:
         return _serve_recording_file(request, file_path, filename)
@@ -1029,6 +1047,55 @@ def _serve_recording_with_middleware(request, file_path: Path, filename: str, re
         },
         status=403,
     )
+
+
+_VERSION_ID_RE = re.compile(r"[0-9a-f]{64}")
+
+
+def _requested_version(recording, version: str | None) -> str:
+    """The version id a request names: ``source`` when it names none, the recording's default for ``default``.
+
+    Answers 400 for something that is not a version id. ``default`` falls back to the source when no provider lists
+    versions for the recording, so the stored file is served.
+    """
+    if version is None or version == SOURCE_VERSION_ID:
+        return SOURCE_VERSION_ID
+    if version == "default":
+        listing = lifecycle.versions(recording)
+        if listing is None:
+            return SOURCE_VERSION_ID
+        return listing["default_version"]
+    if not _VERSION_ID_RE.fullmatch(version):
+        raise HttpError(400, "A version is 'source', 'default' or a 64-character hex id.")
+    return version
+
+
+def _serve_version_file(request, recording, version_id: str, *, apply_middleware: bool):
+    """Serve a reconstructed version of *recording* as a whole EDF, on the caller's access terms.
+
+    The proxy offload is never asked: a version lives in the artifact cache, outside the root the proxy reads from,
+    so the bytes stream from here. A caller reading under middleware gets them through ``_build_serve_pipeline`` like
+    any stored file.
+    """
+    from recordings.processors.edf_window import read_header
+
+    path = lifecycle.version_file(recording, version_id)
+    if path is None or not path.is_file():
+        raise HttpError(409, "That version is not materialised.")
+    header_size = read_header(path)[0].header_record_bytes
+    if header_size > path.stat().st_size:
+        # The middleware path streams a file shorter than its header as it is, unsanitised; a version is the
+        # platform's own file, so one that short is damaged, and refusing costs nothing.
+        raise HttpError(409, "That version's file is damaged.")
+    log_activity(
+        verb="recordings.download",
+        target=recording,
+        metadata={"apply_middleware": apply_middleware, "version_id": version_id},
+    )
+    filename = _download_filename(recording)
+    if apply_middleware:
+        return _serve_recording_with_middleware(request, path, filename, recording, header_size=header_size)
+    return _serve_recording_file(request, path, filename)
 
 
 def _serve_isometric_pipeline(
@@ -1472,7 +1539,7 @@ def upload_recording(
     """Save uploaded file to staging and enqueue background processing.
 
     Returns 202 Accepted immediately. Poll GET /status/{hash} until
-    status transitions from pending → processing → ready before downloading.
+    status reaches available or ready (or failed) before downloading.
 
     The optional ``display_name`` parameter sets the grantee-visible label
     for the recording.  When omitted, the field is left null and responses
@@ -1727,7 +1794,9 @@ def upload_recording(
 def recording_status(request, hash: str):
     """Return the processing status of a recording. Lightweight — suitable for polling.
 
-    Available immediately after upload. Transitions: pending → processing → ready.
+    Available immediately after upload. Transitions: pending → processing → available → ready; processing and
+    available are skipped when the deployment has no post-ingest work for the recording, and failed ends ingest that
+    left no usable file. The file can be opened from available onwards.
     A recording that disappeared (row deleted due to processing error) returns 404.
     """
 
@@ -1811,7 +1880,7 @@ def list_recordings(
     limit: int = Query(50, ge=1, le=200),
     offset: int = Query(0, ge=0),
     trash: bool = Query(False, description="List soft-deleted recordings instead of active ones"),
-    status: str | None = Query(None, description="Filter by status: pending, processing, ready"),
+    status: str | None = Query(None, description="Filter by status: pending, processing, available, ready, failed"),
     uncollected: bool = Query(
         False,
         description="List only recordings not in any collection (the library root)",
@@ -1821,7 +1890,7 @@ def list_recordings(
 
     Pass trash=true to browse the recycle bin. Only the recording's author and
     superusers can see deleted recordings; shared access does not extend to trash.
-    Pass status=ready to show only fully processed recordings. Pass
+    Pass status=ready to show only recordings whose processing has fully settled. Pass
     uncollected=true to list only recordings that sit in no collection.
     """
 
@@ -2546,6 +2615,10 @@ def download_recording(
         None,
         description="Content pin: answer 412 unless the recording's stored_hash equals this SHA-256 digest.",
     ),
+    version: str | None = Query(
+        None,
+        description="A version id from GET /{hash}/versions, or 'default'. Omitted, the stored file is served.",
+    ),
 ):
     """Download file content by stored recording hash, with Range request support.
 
@@ -2555,6 +2628,11 @@ def download_recording(
     without an initial probe request.  Unauthenticated access is allowed when a
     valid *share_token* is supplied. ``expect_stored_hash`` pins the content:
     a recording whose ``stored_hash`` differs answers **412** and serves nothing.
+
+    ``version`` serves one of the recording's reconstructed versions instead of the stored file, as a whole EDF in
+    the same access terms and through the same sanitising pipeline; ``default`` names the one the recording opens
+    in. A version that is not materialised answers **409**. The content pin covers the stored file only, so it is
+    refused beside a version.
     """
 
     user = getattr(request, "user", None)
@@ -2656,11 +2734,17 @@ def download_recording(
     if _hidden_for_caller(recording, user, fed, share_token=share_token):
         raise HttpError(404, "Recording not found")
 
-    if recording.status not in (Recording.Status.READY, Recording.Status.FAILED):
+    if recording.status not in _SERVABLE_STATUSES:
         raise HttpError(
             409,
             f"Recording is not yet available for download (status: {recording.status})",
         )
+
+    version_id = _requested_version(recording, version)
+    if version_id != SOURCE_VERSION_ID:
+        if expect_stored_hash is not None:
+            raise HttpError(400, "The content pin covers the stored file and cannot be combined with a version.")
+        return _serve_version_file(request, recording, version_id, apply_middleware=apply_middleware)
 
     _ensure_pinned_content(
         recording,
@@ -2828,7 +2912,7 @@ def slice_recording(
     if _hidden_for_caller(recording, user, fed):
         raise HttpError(404, "Recording not found")
 
-    if recording.status not in (Recording.Status.READY, Recording.Status.FAILED):
+    if recording.status not in _SERVABLE_STATUSES:
         raise HttpError(409, f"Recording is not yet available (status: {recording.status})")
 
     ext = (recording.file_extension or "").lower()
@@ -2909,6 +2993,317 @@ def slice_recording(
         apply_middleware=apply_middleware,
         recording=recording,
     )
+
+
+# ── Post-ingest jobs and versions ─────────────────────────────────────────────
+#
+# The lifecycle's read and control surface (``recordings.lifecycle``): the stages and jobs a recording runs after
+# ingest, and the versions its stages build (``version-fetch-contract.md``). The data comes from the app that runs the
+# work; the routes are here so they answer on the recording's own access terms.
+
+
+class RecordingJobOut(Schema):
+    """One reconstruction stage or derive job of a recording, in run order."""
+
+    name: str
+    phase: Literal["reconstruct", "derive"]
+    order: int | None
+    enabled: bool
+    requires: list[str]
+    state: str
+    version_id: str
+    started_at: datetime | None
+    finished_at: datetime | None
+    # Author and superusers only: a stage's error can quote a path or a library's message about the file.
+    error: str | None
+
+
+class RecordingJobsOut(Schema):
+    """A recording's post-ingest jobs, with the counts a progress badge shows."""
+
+    status: str
+    done: int
+    failed: int
+    skipped: int
+    total: int
+    jobs: list[RecordingJobOut]
+
+
+class RecordingJobChangeIn(Schema):
+    """One stage's per-recording enable override."""
+
+    name: str
+    enabled: bool
+
+
+class RecordingJobsPatchIn(Schema):
+    """Per-recording stage overrides. ``order`` lists every reconstruction stage once, in the order to run them."""
+
+    stages: list[RecordingJobChangeIn] = []
+    order: list[str] | None = None
+
+
+#: The most samples one signal request decodes: 32 M floats, 128 MB on the wire.
+_MAX_SIGNAL_SAMPLES = 32 * 1024 * 1024
+
+
+def _require_reader(request, hash: str, share_token: str | None):
+    """Resolve the recording a version or job read names, on the caller's read terms.
+
+    Returns ``(recording, user, apply_middleware, author_view)``. Session callers and share-token holders only;
+    a federated peer reads files through ``/file``. The session CSRF check runs too, a no-op on the reads that use
+    this today, so a write that adopts the helper cannot skip it.
+    """
+    user = getattr(request, "user", None)
+    authenticated = bool(user and getattr(user, "is_authenticated", False))
+    if not authenticated and not (share_token or "").strip():
+        raise HttpError(401, "Authentication credentials were not provided")
+    if authenticated:
+        enforce_session_csrf(request)
+    recording = _resolve_recording_by_hash(hash)
+    if _hidden_for_caller(recording, user, None, share_token=share_token):
+        raise HttpError(404, "Recording not found")
+    author_view = authenticated and (getattr(user, "is_superuser", False) or recording.author_id == user.pk)
+    apply_middleware = False
+    if not author_view:
+        result = get_read_access_result(user=user, obj=recording, share_token=share_token)
+        if not result.granted:
+            raise HttpError(403, "You do not have permission to view this recording")
+        apply_middleware = result.apply_middleware
+    return recording, user, apply_middleware, author_view
+
+
+def _version_digest_withheld(recording, *, user, author_view: bool, apply_middleware: bool) -> bool:
+    """Whether *recording*'s ``stored_hash`` is withheld from this caller, by the rules every recording response
+    applies (``_stored_digest_withheld``, ``_text_digest_withheld``).
+
+    A version id is the hash of a manifest that names the stored digest, so it is the digest in another form: with a
+    version id and its manifest in hand, a guessed digest can be confirmed offline. Where the digest is withheld, so
+    is every version id.
+    """
+    if author_view:
+        return False
+    if _stored_digest_withheld(recording, can_see_author_fields=False, user=user):
+        return True
+    from recordings.models import RecordingMeta
+
+    meta = RecordingMeta.objects.filter(
+        content_type=ContentType.objects.get_for_model(recording, for_concrete_model=False),
+        object_id=str(recording.pk),
+    ).first()
+    return _text_digest_withheld(meta, can_see_author_fields=False, under_middleware=lambda: apply_middleware)
+
+
+def _refuse_version_surfaces(recording, *, user, author_view: bool, apply_middleware: bool) -> None:
+    """403 from the version listing and the signal route for a caller they cannot be served to.
+
+    Two cases. A linked recording read under middleware: a stored file carries de-identified channel names, which
+    these routes name, but a linked file keeps the operator's, which only ``/file``'s serve pipeline rewrites. And a
+    caller from whom the stored digest is withheld: every version id these routes carry would hand it back
+    (:func:`_version_digest_withheld`). Either can still open the default version through ``/file?version=default``,
+    which names no id.
+    """
+    if apply_middleware and recording.storage == Recording.Storage.LINKED:
+        raise HttpError(403, "This recording's channels can be read de-identified only as a file download.")
+    if _version_digest_withheld(recording, user=user, author_view=author_view, apply_middleware=apply_middleware):
+        raise HttpError(403, "This recording's versions can be opened only as a file download.")
+
+
+@api.get("/{hash}/jobs", response=RecordingJobsOut)
+def list_recording_jobs(request, hash: str, share_token: str | None = None):
+    """The stages and jobs a recording runs after ingest, with the counts its progress badge shows."""
+    recording, user, apply_middleware, author_view = _require_reader(request, hash, share_token)
+    log_activity(verb="recordings.job.list", target=recording)
+    withheld = _version_digest_withheld(
+        recording, user=user, author_view=author_view, apply_middleware=apply_middleware
+    )
+    return _jobs_body(recording, author_view=author_view, version_ids_withheld=withheld)
+
+
+def _jobs_body(recording, *, author_view: bool, version_ids_withheld: bool = False) -> dict:
+    """The jobs response for *recording*.
+
+    The author and superusers see everything. Everyone else sees the states and counts the progress badge needs,
+    without a stage's error (it can quote a path), without times (a stage starts within minutes of the upload, which
+    ``created_at`` is truncated to the month to hide), and without version ids where the stored digest is withheld.
+    """
+    jobs = lifecycle.jobs(recording)
+    if not author_view:
+        jobs = [
+            dict(
+                job,
+                error=None,
+                started_at=None,
+                finished_at=None,
+                version_id="" if version_ids_withheld else job["version_id"],
+            )
+            for job in jobs
+        ]
+    states = [job["state"] for job in jobs]
+    return {
+        "status": recording.status,
+        "done": states.count("done"),
+        "failed": states.count("failed"),
+        "skipped": states.count("skipped"),
+        "total": len(jobs),
+        "jobs": jobs,
+    }
+
+
+@api.patch("/{hash}/jobs", response=RecordingJobsOut)
+def update_recording_jobs(request, hash: str, payload: RecordingJobsPatchIn):
+    """Enable, disable or reorder a recording's reconstruction stages, and rerun them when that changed anything.
+
+    Requires write access. A stage may only move after the stages it requires (409 otherwise), and nothing may change
+    while a stage is running (409). When a stage is to run, the recording goes back to ``processing`` until the new
+    default version is built; with every stage disabled it settles straight to ``available`` or ``ready``.
+    """
+    user = _require_auth(request)
+    recording = _resolve_recording_by_hash(hash)
+    if _hidden_for_caller(recording, user, None):
+        raise HttpError(404, "Recording not found")
+    ensure_can_write_object(user=user, obj=recording)
+    if recording.ingested_at is None or recording.status == Recording.Status.FAILED:
+        raise HttpError(409, "The recording has no stages to change before its ingest has finished.")
+    enabled = {change.name: change.enabled for change in payload.stages}
+    try:
+        with transaction.atomic():
+            changed = lifecycle.update_jobs(recording, enabled=enabled, order=payload.order)
+    except LookupError as exc:
+        raise HttpError(404, str(exc)) from None
+    except (ValueError, RuntimeError) as exc:
+        raise HttpError(409, str(exc)) from None
+    log_activity(
+        verb="recordings.job.update",
+        target=recording,
+        metadata={"changed": changed, "enabled": enabled, "order": payload.order},
+    )
+    if changed:
+        lifecycle.settle(recording.pk)
+        pk = recording.pk
+        transaction.on_commit(lambda: lifecycle.start(pk), robust=True)
+        recording.refresh_from_db()
+    # A writer who is not the author gets the reader's view; version ids withheld, as the digest may be.
+    author_view = user.is_superuser or recording.author_id == user.pk
+    return _jobs_body(recording, author_view=author_view, version_ids_withheld=not author_view)
+
+
+@api.get("/{hash}/versions")
+def list_recording_versions(request, hash: str, share_token: str | None = None):
+    """The recording's versions (``version-fetch-contract.md`` §2.1): the source, every built version, and the
+    default one it opens in. An EDF/BDF recording with no stages lists its source alone; one the pipeline does not
+    apply to answers 404. A caller from whom the stored digest is withheld gets 403 (``_refuse_version_surfaces``)."""
+    recording, user, apply_middleware, author_view = _require_reader(request, hash, share_token)
+    _refuse_version_surfaces(recording, user=user, author_view=author_view, apply_middleware=apply_middleware)
+    if recording.ingested_at is None or recording.status == Recording.Status.FAILED:
+        raise HttpError(409, f"Recording has no versions yet (status: {recording.status})")
+    log_activity(verb="recordings.version.list", target=recording)
+    listing = lifecycle.versions(recording)
+    if listing is None:
+        raise HttpError(404, "This recording has no versions to list.")
+    return {"recording": recording.stored_name.split(".", 1)[0], **listing}
+
+
+@api.get("/{hash}/versions/{version_id}/signal")
+def read_version_signal(
+    request,
+    hash: str,
+    version_id: str,
+    channels: str = Query(..., description="Comma-separated stored channel names, returned in this order."),
+    start_sec: float = Query(0.0, description="Window start; an integer multiple of record_duration_sec."),
+    duration_sec: float | None = Query(None, description="Window length; a multiple too. Default: to the end."),
+    share_token: str | None = None,
+):
+    """Per-channel float32 samples of one version over a record-aligned window (``version-fetch-contract.md`` §2.2).
+
+    Answers 202 while the version is being built, 409 when its build failed. The body is a little-endian ``uint32``
+    header length, the header as UTF-8 JSON, then each channel's samples at its own rate in the order asked for.
+    Only signal channels are decoded — never annotation text — so a de-identifying grant reads the same samples.
+    Unlike the contract's draft, the response is not marked cacheable: the platform keeps every PHI-bearing response
+    out of shared caches (``SecurityHeadersMiddleware``).
+    """
+    from recordings.processors.edf_window import WindowError, read_header, read_window
+
+    recording, user, apply_middleware, author_view = _require_reader(request, hash, share_token)
+    # Annotated before any refusal or early answer, so a 202 poll or a 409 lands on the verb and target too.
+    log_activity(
+        verb="recordings.download.signal",
+        target=recording,
+        metadata={"version_id": version_id, "apply_middleware": apply_middleware},
+    )
+    _refuse_version_surfaces(recording, user=user, author_view=author_view, apply_middleware=apply_middleware)
+    if recording.ingested_at is None or recording.status == Recording.Status.FAILED:
+        raise HttpError(409, f"Recording has no versions yet (status: {recording.status})")
+    if version_id != SOURCE_VERSION_ID and not _VERSION_ID_RE.fullmatch(version_id):
+        raise HttpError(404, "Unknown version")
+    listing = lifecycle.versions(recording)
+    entry = None
+    if listing is not None:
+        entry = next((v for v in listing["versions"] if v["version_id"] == version_id), None)
+    if entry is None and version_id != SOURCE_VERSION_ID:
+        raise HttpError(404, "Unknown version")
+    state = entry["state"] if entry is not None else "ready"
+    if state == "building":
+        return JsonResponse(
+            {"state": "building", "version_id": version_id, "poll_after_ms": 1000, "progress": None}, status=202
+        )
+    if state != "ready":
+        return JsonResponse({"state": state, "version_id": version_id}, status=409)
+    path = (
+        _servable_file(recording) if version_id == SOURCE_VERSION_ID else lifecycle.version_file(recording, version_id)
+    )
+    if path is None:
+        raise HttpError(409, "That version is not materialised.")
+
+    header, _infos = read_header(path)
+    record = header.data_record_duration
+    total = header.data_record_count
+    if record <= 0:
+        raise HttpError(422, "The recording has no record grid to address a window on.")
+    start_record = start_sec / record
+    n_records = (duration_sec / record) if duration_sec is not None else total - start_record
+    if not (float(start_record).is_integer() and float(n_records).is_integer()):
+        return JsonResponse(
+            {
+                "detail": "start_sec and duration_sec must be multiples of the record duration.",
+                "record_duration_sec": record,
+            },
+            status=400,
+        )
+    names = [name.strip() for name in channels.split(",") if name.strip()]
+    if not names:
+        raise HttpError(400, "Name at least one channel.")
+    try:
+        windows = read_window(path, names, int(start_record), int(n_records))
+    except WindowError as exc:
+        return JsonResponse({"detail": str(exc), "duration_seconds": total * record}, status=400)
+    if sum(window.samples.size for window in windows) > _MAX_SIGNAL_SAMPLES:
+        raise HttpError(400, "The window is too large; ask for fewer channels or a shorter window.")
+
+    log_activity(
+        verb="recordings.download.signal",
+        target=recording,
+        metadata={"version_id": version_id, "channels": len(names), "apply_middleware": apply_middleware},
+    )
+    frame_header = json.dumps(
+        {
+            "version_id": version_id,
+            "source_hash": f"sha256:{recording.stored_hash}",
+            "start_sec": start_sec,
+            "duration_sec": n_records * record,
+            "dtype": "float32",
+            "endian": "little",
+            "channels": [
+                {"name": w.name, "fs": w.fs, "start": w.start, "count": int(w.samples.size), "units": w.units}
+                for w in windows
+            ],
+        }
+    ).encode("utf-8")
+    body = len(frame_header).to_bytes(4, "little") + frame_header
+    body += b"".join(window.samples.astype("<f4").tobytes() for window in windows)
+    response = HttpResponse(body, content_type="application/octet-stream")
+    response["ETag"] = f'"{version_id}:{",".join(names)}:{int(start_record)}:{int(n_records)}"'
+    return response
 
 
 @api.delete("/{hash}")

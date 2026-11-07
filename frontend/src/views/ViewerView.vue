@@ -529,9 +529,13 @@ onMounted(async () => {
                             // document.baseURI, so a relative path throws "Failed to parse URL" inside the
                             // EDF reader worker. Main-thread fetches would resolve it; resolve here so both
                             // paths see the same string.
-                            const relativePath = bundle.shareToken
-                                ? `/recordings/api/v1/${rec.hash}/file?share_token=${encodeURIComponent(bundle.shareToken)}`
-                                : `/recordings/api/v1/${rec.hash}/file`
+                            // The default version is the one the recording's reconstruction stages built, and the
+                            // stored file when it has none; until the viewer compares versions itself, it opens that.
+                            const query = new URLSearchParams({ version: 'default' })
+                            if (bundle.shareToken) {
+                                query.set('share_token', bundle.shareToken)
+                            }
+                            const relativePath = `/recordings/api/v1/${rec.hash}/file?${query.toString()}`
                             downloadUrl = new URL(relativePath, import.meta.url).toString()
                             displayName = recordingName(rec).replace(/\.[^.]+$/, '')
                             // Lower-case the extension before lookup — loader names are registered as

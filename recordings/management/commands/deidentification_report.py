@@ -2,12 +2,13 @@
 
 The artefact an operator hands to a supervisory authority or attaches to a data-sharing agreement:
 EDPB Guidelines 02/2026 paragraph 41 ask the controller to document the anonymisation process
-per recording, and this is that documentation as the platform holds it. For every READY
-recording the report gives the pass versions stamped on its ``RecordingMeta``, whether the stored
-file keeps its annotation text, and the ingest privacy overrides sealed into its READY audit row,
-beside the versions and overrides the running deployment has now. A recording whose stamped
-version is behind the current pass is flagged: the platform never reprocesses on its own, so an
-operator who wants the current pass on such a file re-ingests it deliberately.
+per recording, and this is that documentation as the platform holds it. For every recording whose
+ingest finished without failing, the report gives the pass versions stamped on its ``RecordingMeta``,
+whether the stored file keeps its annotation text, and the ingest privacy overrides sealed into the
+audit row that ended its ingest, beside the versions and overrides the running deployment has
+now. A recording whose stamped version is behind the current pass is flagged: the platform never
+reprocesses on its own, so an operator who wants the current pass on such a file re-ingests it
+deliberately.
 
 Three kinds of row need reading with care. A recording processed before the record existed
 carries version ``0`` and no audit record, and its annotation-text flag was never stamped, so the
@@ -29,7 +30,7 @@ produced, which is part of what paragraph 41 asks to be kept.
 
 Usage::
 
-    python manage.py deidentification_report                     # every READY recording
+    python manage.py deidentification_report                     # every ingested recording
     python manage.py deidentification_report --recording <hash>  # one, by its URL hash
     python manage.py deidentification_report --format json       # machine-readable
 """
@@ -39,6 +40,7 @@ from __future__ import annotations
 import json
 
 from django.core.management.base import BaseCommand, CommandError
+from django.db.models import Q
 from django.utils import timezone
 
 from recordings.deidentification_record import (
@@ -119,14 +121,20 @@ class Command(BaseCommand):
         from activity.models import Activity
         from activity.system_activity import with_system_activity
 
-        recordings = Recording.objects.filter(status=Recording.Status.READY, deleted_at__isnull=True).order_by("pk")
+        # Every recording whose stored file is final, which is every finished ingest that did not fail: the pass
+        # wrote the file then, whatever stages or jobs are still to run.
+        recordings = Recording.objects.filter(
+            Q(status__in=[Recording.Status.AVAILABLE, Recording.Status.READY])
+            | Q(status=Recording.Status.PROCESSING, ingested_at__isnull=False),
+            deleted_at__isnull=True,
+        ).order_by("pk")
         wanted = (options["recording"] or "").strip().upper()
         if wanted:
             if len(wanted) != 32 or not wanted.isalnum():
                 raise CommandError("--recording takes the 32-character hash from the recording's URL.")
             recordings = recordings.filter(stored_name__startswith=f"{wanted}.")
             if not recordings.exists():
-                raise CommandError(f"No READY recording with hash {wanted}.")
+                raise CommandError(f"No ingested recording with hash {wanted}.")
 
         current = current_pass_versions()
         overrides_now = current_ingest_overrides()

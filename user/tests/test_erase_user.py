@@ -90,6 +90,28 @@ class TestEraseUserCommand:
         assert ObjectChangeLog.objects.filter(action=ObjectChangeLog.ACTION_ERASE, object_id=str(user_pk)).exists()
         assert Activity.objects.filter(verb="user.account.erase").exists()
 
+    def test_versions_built_from_the_subjects_recordings_are_unlinked(self, make_user, tmp_path, client):
+        """A reconstructed version in the artifact cache is the recording's signal under another name. No backup
+        holds it, so erasure is the one path that reaches it, through ``unlink_recording_file``."""
+        from compute.models import ArtifactCacheEntry
+        from recordings.models import Recording
+
+        user, _recording_file, _media = _make_subject(make_user, tmp_path, client)
+        version = tmp_path / "cache" / "version.edf"
+        version.parent.mkdir()
+        version.write_bytes(b"\x00" * 16)
+        ArtifactCacheEntry.objects.create(
+            recording=Recording.objects.get(author=user),
+            version_id="a" * 64,
+            storage_path=str(version),
+            size_bytes=16,
+        )
+
+        call_command("erase_user", USERNAME, "--yes", stdout=StringIO())
+
+        assert not version.exists()
+        assert not ArtifactCacheEntry.objects.exists()
+
     def test_dry_run_changes_nothing(self, make_user, tmp_path, client):
         user, recording_file, _ = _make_subject(make_user, tmp_path, client)
         out = StringIO()

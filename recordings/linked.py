@@ -154,9 +154,20 @@ def unlink_recording_file(recording, *, missing_ok: bool = False) -> bool:
     The one sanctioned way to delete a recording's file. A managed file is unlinked as the caller asks, with
     ``OSError`` propagating so a caller that keeps the row on failure still can; a linked file belongs to the
     operator and is never touched, so its recording's removal is a removal of rows.
+
+    The files a lifecycle provider keeps on the recording's behalf — its reconstructed versions
+    (``recordings.lifecycle.derived_files``) — go first, for a linked recording too: they are the platform's copies of
+    the recording's signal, wherever the source lives. Removing them before the recording's own file means a failure
+    leaves the row and the source in place for the caller's retry, rather than a deleted source beside versions no
+    row remembers.
     """
+    from recordings import lifecycle
     from recordings.models import Recording
 
+    for derived in lifecycle.derived_files(recording):
+        if missing_ok and not derived.exists():
+            continue
+        derived.unlink()
     if recording.storage == Recording.Storage.LINKED:
         return False
     path = Path(recording.file_path)

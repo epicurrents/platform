@@ -8,13 +8,13 @@ the samples covering the segment's halo-padded context window
 :class:`~compute.contract.SignalWindow` with canonical channel labels, per-channel
 types and per-channel units.
 
-Scope of this slice
--------------------
-Only the **source** version (``input_version_id == SOURCE_VERSION_ID``) is handled:
-samples are read straight from ``recording.file_path`` (the preserved EDF/BDF). A
-*derived* version (a ``RecordingJob`` output) must have its processed signal
-materialised first — a later slice — so a derived ``input_version_id`` raises
-``NotImplementedError`` rather than silently scoring the source.
+Which file
+----------
+The **source** version (``input_version_id == SOURCE_VERSION_ID``) is read straight from
+``recording.file_path`` (the preserved EDF/BDF). A *derived* version (a ``RecordingJob``
+output) is read from its materialisation in the artifact cache
+(:func:`compute.lifecycle.version_file`); one that is not materialised raises
+``FileNotFoundError`` rather than silently scoring the source.
 
 Discontinuity is refused, not accommodated
 ------------------------------------------
@@ -275,8 +275,8 @@ def load_signal_window(run: AnalysisRun, segment: SegmentPlan) -> SignalWindow:
     because every one of them would otherwise produce a plausible-looking window that
     means something other than it claims:
 
-    * a derived ``input_version_id`` → ``NotImplementedError`` (materialisation is a
-      later slice);
+    * a derived ``input_version_id`` that is not materialised in the artifact cache →
+      ``FileNotFoundError``, never a silent read of the source;
     * **mixed per-channel sampling rates** → ``NotImplementedError``, naming the
       resampled derived version that would satisfy the read. MNE would upsample the
       slow channels to the fastest rate and the contract's single ``fs`` cannot record
@@ -292,17 +292,21 @@ def load_signal_window(run: AnalysisRun, segment: SegmentPlan) -> SignalWindow:
       ``ValueError`` (see :func:`_window_bounds`).
     """
     if run.input_version_id != SOURCE_VERSION_ID:
-        raise NotImplementedError(
-            f"Signal loader handles only the source version for now; run {run.pk} "
-            f"scores derived version {run.input_version_id!r}. Materialising a "
-            "derived version's signal is a pending slice."
-        )
+        # A derived version is read from its materialisation in the artifact cache. One that is not there — never
+        # built, evicted — is refused by name rather than replaced by the source, which would score other bytes.
+        from compute.lifecycle import version_file
 
-    path = Path(run.recording.file_path)
-    if not path.is_file():
-        raise FileNotFoundError(f"Source signal for recording {run.recording_id} not found at {path}.")
-    # A linked file read after it changed would be scored against rows describing other bytes.
-    ensure_linked_file_unchanged(run.recording)
+        path = version_file(run.recording, run.input_version_id)
+        if path is None:
+            raise FileNotFoundError(
+                f"Version {run.input_version_id!r} of recording {run.recording_id} is not materialised."
+            )
+    else:
+        path = Path(run.recording.file_path)
+        if not path.is_file():
+            raise FileNotFoundError(f"Source signal for recording {run.recording_id} not found at {path}.")
+        # A linked file read after it changed would be scored against rows describing other bytes.
+        ensure_linked_file_unchanged(run.recording)
 
     header, all_infos = read_header(path)
     infos = [info for info in all_infos if not info.is_annotation_channel]

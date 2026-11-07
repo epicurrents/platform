@@ -4,8 +4,7 @@ The bridge artifact of `signal-pipeline-plan.md`. Both the backend endpoint and 
 viewer are built against this; the Pyodide client consumes the same shapes. Pin it before
 either side is built.
 
-Status: **draft.** Open sub-decisions are marked ⟨OPEN⟩ inline and collected in §8 for you
-to amend. Nothing here is implemented yet.
+Status: **implemented 2026-11-07** ([recordings/README.md → Jobs and versions](README.md#jobs-and-versions)), with four departures from the text below. The routes are under `/recordings/api/v1/{hash}/…`, where the recording's access rules already live. The signal response is not `public, immutable`: the platform keeps PHI-bearing responses out of shared caches, so §4 holds for the `ETag` only. `progress` in the 202 body is `null`, since a stage reports none. And rebuild-on-miss is not built: a version that is not materialised is a 409 from `/file` and a 404 from the signal route, not a 202. A reader from whom the recording's `stored_hash` is withheld is refused the listing and the signal route, since a version id is a digest over it.
 
 Settled going in: manifests live in the audit chain (`ObjectChangeLog`), not git; storage is
 source + manifest + evictable cache; versions are content-addressed.

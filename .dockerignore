@@ -82,6 +82,7 @@ mediafiles/
 # production image, which only dev's .:/code bind mount would mask.
 media_uploads/
 media_staging/
+artifact_cache/
 
 # Local test data (real recordings for the smoke tests). Host-only: the test
 # service reaches it through the ``.:/code`` bind mount, so it never needs to be

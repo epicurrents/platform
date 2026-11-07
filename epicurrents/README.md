@@ -162,6 +162,7 @@ Covered — a breaking change to any of these bumps the major:
 - The AppConfig contract a project or plugin implements: `requires_platform`, `plugin_url_namespace`, `requires`.
 - The URL mount points (`/project/api/v1/`, `/project/<name>/`, `/plugin/<name>/`).
 - Core model names and their identity fields, which project foreign keys point at.
+- The `Recording.status` values and what each means, which projects filter on, and the post-ingest lifecycle's extension points: `register_reconstruction_stage` and its stage contract, `register_derive_job`, and `register_lifecycle_provider` ([recordings/README.md → Post-ingest lifecycle](../recordings/README.md#post-ingest-lifecycle)).
 
 Not covered: everything else, including any name not documented as an extension point. The surface is expected to widen as more of it is written down; it is not expected to shrink.
 

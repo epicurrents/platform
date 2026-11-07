@@ -9,6 +9,7 @@ import { showToast } from '#lib/toast'
 import { useRecordingSelection } from '#composables/useRecordingSelection'
 import EditRecordingDialog from '#components/EditRecordingDialog.vue'
 import NeedsAttentionRow from '#components/NeedsAttentionRow.vue'
+import RecordingJobsBadge from '#components/RecordingJobsBadge.vue'
 import RecordingListRow from '#components/RecordingListRow.vue'
 import RecordingMediaDialog from '#components/RecordingMediaDialog.vue'
 
@@ -26,14 +27,20 @@ onMounted(() => {
 })
 onUnmounted(() => store.stopPolling())
 
+/** A recording's background work settled while shown: move it to its new list now rather than at the next poll. */
+function onJobsSettled() {
+    store.load()
+}
+
 // ── Derived lists ─────────────────────────────────────────────────────────
 
 const processingRecs = computed(() =>
     store.recordings.filter(r => r.status === 'pending' || r.status === 'processing'),
 )
 
+// An available recording opens while its background jobs finish, so it belongs with the openable ones.
 const recentRecs = computed(() =>
-    store.recordings.filter(r => r.status === 'ready').slice(0, RECENT_LIMIT),
+    store.recordings.filter(r => r.status === 'available' || r.status === 'ready').slice(0, RECENT_LIMIT),
 )
 
 // Recordings that failed processing. Derived from the loaded set (like the other
@@ -236,6 +243,12 @@ async function confirmDelete () {
                                 {{ rec.status }} ·
                                 <wa-relative-time :date="rec.created_at"></wa-relative-time>
                             </span>
+                            <RecordingJobsBadge
+                                :hash="rec.hash"
+                                :name="recordingName(rec)"
+                                :status="rec.status"
+                                @settled="onJobsSettled"
+                            ></RecordingJobsBadge>
                         </div>
                     </div>
                 </div>
@@ -275,6 +288,13 @@ async function confirmDelete () {
                                 </template>
                                 <wa-relative-time :date="rec.created_at"></wa-relative-time>
                             </span>
+                            <RecordingJobsBadge
+                                v-if="rec.status === 'available'"
+                                :hash="rec.hash"
+                                :name="recordingName(rec)"
+                                :status="rec.status"
+                                @settled="onJobsSettled"
+                            ></RecordingJobsBadge>
                         </template>
                         <template #actions>
                             <wa-dropdown-item value="details">

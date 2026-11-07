@@ -186,6 +186,58 @@ Always run inside the Docker stack so the command writes to PostgreSQL, not the 
 
 For typical clinical EEG montages (19–64 channels, 200–2 000 source points) each row is well under 1 MB. High-density caps (256 channels, ~5 000 source points, free orientation) can reach ~10 MB — still within `bytea` limits. If a future module needs more, migrate the binary fields from `BinaryField` to `FileField` backed by a configurable storage backend.
 
+## Recording lifecycle
+
+What happens to a recording after ingest, implemented here as the [`recordings.lifecycle`](../recordings/lifecycle.py) provider in [lifecycle.py](lifecycle.py). The design is [recording-lifecycle-design.md](../recordings/recording-lifecycle-design.md) and [signal-pipeline-plan.md](../recordings/signal-pipeline-plan.md); the models are those of [pipeline-persistence-models.md](../recordings/pipeline-persistence-models.md) plus `DeriveJob`.
+
+Two kinds of post-ingest work, in fixed phase order:
+
+| Phase | Registered with | Ledger | Runs |
+|---|---|---|---|
+| `RECONSTRUCT` — rewrites signal | `recordings.pipeline.register_reconstruction_stage` | `RecordingJob`, one row per stage | One after another, in one Celery task (`compute.run_reconstruction`), each stage on the previous one's output |
+| `DERIVE` — reads signal, writes rows | `compute.derive.register_derive_job` | `DeriveJob`, one row per job and input version | In parallel, one task each (`compute.run_derive_job`), after reconstruction |
+
+A project registers both from its `AppConfig.ready()`; the platform registers neither. Annotation-producing detectors are not derive jobs — they are `AnalysisRun`s ([Integrating an ML model-analysis workflow](#integrating-an-ml-model-analysis-workflow)).
+
+**The flow.** Ingest's final transition calls `recordings.lifecycle.begin`, inside its transaction: `plan` writes a `RecordingJob` per registered stage — `QUEUED` if enabled, `SKIPPED` if not — and a `DeriveJob` per job whose `applies_to` accepts the recording, against the version the enabled stages will produce. That version's id is the hash of its manifest, so it is known before anything runs. On commit, `run_reconstruction` reads the stored file, runs each enabled stage's `transform` over the EDF bytes, and writes the result into the artifact cache as the recording's **default version**. It then dispatches the derive jobs, which read that version. After every settled step `recordings.lifecycle.settle` re-derives the recording's status: `processing` while a stage is outstanding, `available` while only jobs are, `ready` once everything has settled. A recording with no applicable stages or jobs is `ready` at the end of ingest. A linked recording gets no stages, only derive jobs against its source: its file was never de-identified by the platform, and a version built from it would be a new platform-held copy.
+
+**The stored file is never rewritten.** A version is a new file in the artifact cache, keyed `(recording, version_id)` in `ArtifactCacheEntry`. Its first materialisation is recorded as the CREATE of that row in `ObjectChangeLog`, carrying the manifest (`version_manifest`) and each channel's `modified_by` — the stages that added or changed it, taken by comparing per-channel digests before and after each stage. That row is the durable recipe; the bytes can be rebuilt from it and the source.
+
+**Failure.** A stage that raises is `FAILED`, with the exception text; the stages after it and every derive job are `SKIPPED`, because a number derived from a half-reconstructed signal would be attributed to a version that was never built. A derive job that raises is `FAILED` alone. Either way the recording still settles to `ready` — `FAILED` status stays reserved for an ingest that left no usable file — and the failure shows on its jobs. A provider whose planning raises is logged and contributes nothing, rather than reach the ingest's failure handler, which would unlink a good upload.
+
+**Ledger state is not audited row by row.** Stage and job rows change through queryset updates, which write no audit row: they are operational state, rebuildable from the registries and the manifest, as the persistence note decides. What a derive job writes is audited in the `compute.derive.run` scope; reconstruction runs in `compute.reconstruction.run`.
+
+**Reruns.** `PATCH /recordings/api/v1/{hash}/jobs` (write access) enables, disables or reorders a recording's stages. An order must respect each stage's `requires`; nothing may change while a stage runs. A change replans — overrides survive a replan — and reruns from the source, moving the recording back to `processing` when a stage is to run. A job already `DONE` against the same version by the same `code_version` is not rerun: the version is content-addressed. An unchanged request reruns a recording with a failed stage, which is how an author retries one. A stage left `running` longer than `COMPUTE_STAGE_STALE_HOURS` (default 6) — its worker killed mid-run — is failed by the next run or request, so the recording settles and can be retried rather than staying `processing` for good.
+
+**The artifact cache.** `COMPUTE_ARTIFACT_CACHE_PATH`, one directory per recording by its hash prefix. In the stack it is the `artifact-data` volume, which the borg services do not mount: every byte in it can be rebuilt, so it is left out of backups by construction. It is still the recording's personal data, removed with the recording by `recordings.linked.unlink_recording_file` on every deletion path, and served only on the recording's own access terms. Deletion finds a version through its cache row, so a file without one is out of reach: `materialise_version` re-checks the recording under its row lock and removes its file when the recording went while the stages ran, and `sweep_artifact_cache` (every 3 hours) removes any file no row names once it is older than `COMPUTE_ARTIFACT_CACHE_SWEEP_GRACE_HOURS` (default 24) — a `.tmp` a killed worker left, or a version whose row went in a cascade that had already listed the recording's files. Eviction and rebuild-on-miss are not built yet: a materialised version stays until its recording goes.
+
+**Serving.** The routes live in `recordings` so they answer on the recording's access rules ([recordings/README.md → Jobs and versions](../recordings/README.md#jobs-and-versions)). This provider supplies the data through the lifecycle's optional calls — `jobs`, `update_jobs`, `versions`, `version_file`. `signal_loader` reads a derived version from its materialisation, and refuses one that is not materialised rather than read the source in its place.
+
+### `RecordingJob` and `DeriveJob`
+
+| Model | One row per | Key fields |
+|---|---|---|
+| `RecordingJob` | `(recording, stage_name)` | `order` (run position, per-recording override), `enabled`, `state` (`queued`/`running`/`done`/`failed`/`skipped`), `input_digest` (SHA-256 of the bytes the stage read), `output_version_id`, `error` |
+| `DeriveJob` | `(recording, job_name, input_version_id)` | `code_version`, `state`, `error`. A rerun that produces a new default version plans a new row rather than overwriting the record of what the old one read |
+
+### Writing a derive job
+
+```python
+from compute.derive import register_derive_job
+
+
+class ImpedanceJob:
+    name = "myproject_impedance"
+    code_version = "1"
+
+    def applies_to(self, recording) -> bool:
+        return recording.modality == "eeg"
+
+    def run(self, recording, signal_path, version_id) -> None: ...  # read signal_path, write your own rows
+```
+
+Register it from `AppConfig.ready()`. `run` must only read `signal_path` — the stored file or a cached version, neither of which may change — and runs inside a transaction and an audited scope. An exception's message is shown to the recording's author, so it must not quote personal data.
+
 ## Integrating an ML model-analysis workflow
 
 The platform's stance on ML detectors: **it ships the mechanism and the

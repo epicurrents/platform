@@ -21,7 +21,7 @@ class ExampleConfig(AppConfig):
     default_auto_field = "django.db.models.BigAutoField"
     name = "projects.example"
     label = "example"
-    requires_platform = ">=0.1,<0.2"
+    requires_platform = ">=0.2,<0.3"
 
     def ready(self):
         # ── EDF middleware registration ────────────────────────────────────────

@@ -41,6 +41,9 @@ def _patch_ahead(steps: int) -> str:
 # Relative to the installed version rather than written out: a release bump that
 # reaches a literal turns "newer" into "the same" and every upload into a refusal.
 NEWER, LATER, LATEST = (_patch_ahead(n) for n in (1, 2, 3))
+# The pins a package of NEWER satisfies and does not, for the same reason.
+SATISFIED_PIN = f">={VERSION_INFO[0]}.{VERSION_INFO[1]},<{VERSION_INFO[0]}.{VERSION_INFO[1] + 1}"
+UNSATISFIED_PIN = f">={VERSION_INFO[0]}.{VERSION_INFO[1] + 1},<{VERSION_INFO[0]}.{VERSION_INFO[1] + 2}"
 SECURITY = "epicurrents.security"
 
 
@@ -104,7 +107,7 @@ def manifest_for(data: bytes, *, version: str = NEWER, project: str = "", plugin
         "manifest_version": packaging.MANIFEST_VERSION,
         "min_updater_version": 2,
         "package": "epicurrents-platform.tar.gz",
-        "platform_compatible": ">=0.1,<0.2",
+        "platform_compatible": SATISFIED_PIN,
         "plugins": list(plugins),
         "project": project,
         "sha256": hashlib.sha256(data).hexdigest(),
@@ -281,14 +284,14 @@ class TestUpload:
         assert MaintenancePackage.objects.count() == 1 and incoming_dirs() == []
 
     def test_a_pin_the_package_version_does_not_satisfy_is_refused(self, ready, monkeypatch):
-        pinned = SimpleNamespace(name="projects.somecourse", label="somecourse", requires_platform=">=0.2,<0.3")
+        pinned = SimpleNamespace(name="projects.somecourse", label="somecourse", requires_platform=UNSATISFIED_PIN)
         monkeypatch.setattr(packaging, "_pinned_apps", lambda: [pinned])
         response = upload(ready)
         assert response.status_code == 400 and response.json()["reason"] == "incompatible"
-        assert "somecourse" in response.json()["detail"] and ">=0.2,<0.3" in response.json()["detail"]
+        assert "somecourse" in response.json()["detail"] and UNSATISFIED_PIN in response.json()["detail"]
 
     def test_a_pin_the_package_satisfies_passes(self, ready, monkeypatch):
-        pinned = SimpleNamespace(name="plugins.something", label="something", requires_platform=">=0.1,<0.2")
+        pinned = SimpleNamespace(name="plugins.something", label="something", requires_platform=SATISFIED_PIN)
         monkeypatch.setattr(packaging, "_pinned_apps", lambda: [pinned])
         assert upload(ready).status_code == 201
 

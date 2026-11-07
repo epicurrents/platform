@@ -186,6 +186,12 @@ CELERY_BEAT_SCHEDULE = {
         # every deployment without a registered ingest profile.
         "schedule": 60 * 60,
     },
+    "sweep-artifact-cache": {
+        "task": "compute.sweep_artifact_cache",
+        # Every 3 hours, alongside the trash purges: removes artifact-cache files no
+        # cache entry names, which no deletion path could otherwise reach.
+        "schedule": 3 * 60 * 60,
+    },
     "purge-deleted-media": {
         "task": "media.tasks.purge_deleted_media",
         # Runs every 3 hours, alongside the recordings purge.
@@ -257,6 +263,16 @@ WEBPUSH_VAPID_PRIVATE_KEY = config("WEBPUSH_VAPID_PRIVATE_KEY", default="")
 WEBPUSH_VAPID_SUBJECT = config("WEBPUSH_VAPID_SUBJECT", default="mailto:admin@epicurrents.local")
 RECORDINGS_UPLOAD_PATH = config("RECORDINGS_UPLOAD_PATH", default=str(BASE_DIR / "recordings_uploads"))
 RECORDINGS_STAGING_PATH = config("RECORDINGS_STAGING_PATH", default=str(BASE_DIR / "recordings_staging"))
+# Where reconstructed recording versions are materialised (compute.lifecycle). Every byte here can be rebuilt from a
+# recording's stored file and the manifest in its audit trail, so the directory is deliberately left out of backups:
+# its own compose volume, which the borg service does not mount. It is still personal data, held to the recording's
+# access rules and removed with it by every deletion path (recordings.linked.unlink_recording_file).
+COMPUTE_ARTIFACT_CACHE_PATH = config("COMPUTE_ARTIFACT_CACHE_PATH", default=str(BASE_DIR / "artifact_cache"))
+# Age past which an artifact-cache file no cache entry names is removed (compute.lifecycle.sweep_artifact_cache).
+COMPUTE_ARTIFACT_CACHE_SWEEP_GRACE_HOURS = config("COMPUTE_ARTIFACT_CACHE_SWEEP_GRACE_HOURS", default=24, cast=int)
+# A reconstruction stage left running longer than this is taken as abandoned by a killed worker and failed, so its
+# recording can settle and be rerun (compute.lifecycle.release_stale_stages).
+COMPUTE_STAGE_STALE_HOURS = config("COMPUTE_STAGE_STALE_HOURS", default=6, cast=int)
 # Mount point for the bulk-import source directory (used by the import_recordings
 # management command).  Map a host directory or Docker volume to this path so
 # the command can be invoked as:

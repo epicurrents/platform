@@ -124,6 +124,7 @@ services:
       - RECORDINGS_STAGING_PATH=/data/staging
       - MEDIA_UPLOAD_PATH=/data/media/uploads
       - MEDIA_STAGING_PATH=/data/media/staging
+      - COMPUTE_ARTIFACT_CACHE_PATH=/data/artifacts
       - MAINTENANCE_SPOOL_PATH=/data/update
       - REDIS_CACHE_URL=redis://:${REDIS_PASSWORD:-}@redis:6379/2
     # Restore public port binding — the base file pins to 127.0.0.1 for
@@ -144,6 +145,7 @@ services:
       - recordings-data:/data/recordings
       - staging-data:/data/staging
       - media-data:/data/media
+      - artifact-data:/data/artifacts
       # The maintenance spool (maintenance/README.md): the lock flag update.sh
       # writes, and the job requests and statuses the web tier and the host
       # agent exchange. A bind rather than a volume because the agent and
@@ -185,6 +187,7 @@ services:
       - RECORDINGS_STAGING_PATH=/data/staging
       - MEDIA_UPLOAD_PATH=/data/media/uploads
       - MEDIA_STAGING_PATH=/data/media/staging
+      - COMPUTE_ARTIFACT_CACHE_PATH=/data/artifacts
       - MAINTENANCE_SPOOL_PATH=/data/update
       - REDIS_CACHE_URL=redis://:${REDIS_PASSWORD:-}@redis:6379/2
     volumes: !override
@@ -192,6 +195,7 @@ services:
       - recordings-data:/data/recordings
       - staging-data:/data/staging
       - media-data:/data/media
+      - artifact-data:/data/artifacts
       - celery-data:/data/celery
       # The spool sync reads it every minute and the daily prune removes the
       # files of long-finished jobs, so read-write here too.

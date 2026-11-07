@@ -107,7 +107,7 @@ interface MockRecording {
     file_size: number
     stored_hash: string
     content_hash: string
-    status: 'pending' | 'processing' | 'ready' | 'failed'
+    status: 'pending' | 'processing' | 'available' | 'ready' | 'failed'
     modality: string
     created_at: string
     deleted_at: string | null

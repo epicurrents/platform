@@ -39,7 +39,8 @@ export interface Recording {
      */
     stored_hash: string | null
     content_hash: string
-    status: 'pending' | 'processing' | 'ready' | 'failed'
+    /** `available`: openable while background jobs still run; `ready`: everything has settled. */
+    status: 'pending' | 'processing' | 'available' | 'ready' | 'failed'
     modality: string
     /** DOI or URL of the published dataset the data was taken from; empty for data acquired here. */
     public_source: string
@@ -101,6 +102,61 @@ export async function getRecordingDetail(hash: string, shareToken?: string): Pro
 
 export async function getRecordingStatus(hash: string): Promise<RecordingStatus> {
     const response = await http.get<RecordingStatus>(`/recordings/api/v1/status/${hash}`)
+    return response.data
+}
+
+/** One reconstruction stage or derive job a recording runs after ingest. */
+export interface RecordingJob {
+    name: string
+    phase: 'reconstruct' | 'derive'
+    /** Run position among the reconstruction stages; `null` for derive jobs, which run in parallel. */
+    order: number | null
+    enabled: boolean
+    /** Stages that must run before this one. */
+    requires: string[]
+    state: 'queued' | 'running' | 'done' | 'failed' | 'skipped'
+    /** The version a stage produced, or the version a derive job reads. */
+    version_id: string
+    started_at: string | null
+    finished_at: string | null
+    /** Shown to the author and superusers only; `null` for everyone else. */
+    error: string | null
+}
+
+/** A recording's post-ingest jobs with the counts its progress badge shows; see `getRecordingJobs`. */
+export interface RecordingJobs {
+    status: Recording['status']
+    done: number
+    failed: number
+    skipped: number
+    total: number
+    jobs: RecordingJob[]
+}
+
+/**
+ * A recording's post-ingest stages and jobs. Readers other than the author and superusers get states and counts only.
+ * @param hash - The recording's 32-character hash.
+ */
+export async function getRecordingJobs(hash: string): Promise<RecordingJobs> {
+    const response = await http.get<RecordingJobs>(`/recordings/api/v1/${hash}/jobs`)
+    return response.data
+}
+
+/**
+ * Enable, disable or reorder a recording's reconstruction stages. A change reruns them.
+ * @param hash - The recording's 32-character hash.
+ * @param stages - Per-stage enable overrides.
+ * @param order - Every reconstruction stage once, in run order; omit to keep the current order.
+ */
+export async function updateRecordingJobs(
+    hash: string,
+    stages: { name: string, enabled: boolean }[],
+    order?: string[],
+): Promise<RecordingJobs> {
+    const response = await http.patch<RecordingJobs>(`/recordings/api/v1/${hash}/jobs`, {
+        stages,
+        ...(order ? { order } : {}),
+    })
     return response.data
 }
 

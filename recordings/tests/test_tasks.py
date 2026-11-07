@@ -659,6 +659,103 @@ class TestPurgeDeletedRecordingsContract:
         assert not Recording.objects.filter(pk=rec.pk).exists()
         assert not Path(rec.file_path).exists()
 
+    # ── Post-ingest lifecycle states ────────────────────────────────────────
+
+    def test_ingested_processing_recording_is_not_orphan_reaped(self, user, tmp_path):
+        """PROCESSING with ``ingested_at`` set is a finished ingest whose
+        reconstruction stages are running or stuck: live data. Dropping the
+        reaper's ``ingested_at__isnull=True`` clause would delete it with
+        its file once it is older than the window."""
+        rec = _make_recording(user, tmp_path, status=Recording.Status.PROCESSING)
+        Recording.objects.filter(pk=rec.pk).update(
+            created_at=timezone.now() - timezone.timedelta(days=365),
+            ingested_at=timezone.now() - timezone.timedelta(days=365),
+        )
+        with override_settings(RECORDINGS_TRASH_RETENTION_DAYS=30):
+            purge_deleted_recordings()
+        assert Recording.objects.filter(pk=rec.pk).exists()
+        assert Path(rec.file_path).exists()
+
+    def test_available_recording_is_not_purged_or_reaped(self, user, tmp_path):
+        rec = _make_recording(user, tmp_path, status=Recording.Status.AVAILABLE)
+        Recording.objects.filter(pk=rec.pk).update(
+            created_at=timezone.now() - timezone.timedelta(days=365),
+            ingested_at=timezone.now() - timezone.timedelta(days=365),
+        )
+        with override_settings(RECORDINGS_TRASH_RETENTION_DAYS=30):
+            purge_deleted_recordings()
+        assert Recording.objects.filter(pk=rec.pk).exists()
+
+    @pytest.mark.parametrize("status", [Recording.Status.AVAILABLE, Recording.Status.PROCESSING])
+    def test_trashed_recording_with_post_ingest_work_is_purged(self, user, tmp_path, status):
+        """A recording trashed while its stages or jobs ran has a final file
+        and must leave with the trash. Neither state existed when the trash
+        branch read READY and FAILED, so leaving them out would keep such a
+        recording past the window for good: the reaper takes only ingests
+        that never finished."""
+        rec = _make_recording(
+            user,
+            tmp_path,
+            status=status,
+            deleted_at=timezone.now() - timezone.timedelta(days=45),
+        )
+        Recording.objects.filter(pk=rec.pk).update(ingested_at=timezone.now() - timezone.timedelta(days=60))
+        with override_settings(RECORDINGS_TRASH_RETENTION_DAYS=30):
+            purge_deleted_recordings()
+        assert not Recording.objects.filter(pk=rec.pk).exists()
+        assert not Path(rec.file_path).exists()
+
+    def test_trashed_unfinished_ingest_is_left_to_the_reaper(self, user, tmp_path):
+        """A trashed PROCESSING row whose ingest never finished is not the
+        trash branch's: its worker may still be writing. The reaper takes it
+        by ``created_at`` instead."""
+        rec = _make_recording(
+            user,
+            tmp_path,
+            status=Recording.Status.PROCESSING,
+            deleted_at=timezone.now() - timezone.timedelta(days=45),
+        )
+        with override_settings(RECORDINGS_TRASH_RETENTION_DAYS=30):
+            result = purge_deleted_recordings()
+        assert result["purged"] == 0
+        assert Recording.objects.filter(pk=rec.pk).exists()
+
+    def test_purge_removes_derived_files_with_the_recording(self, user, tmp_path):
+        """Versions built from a recording are its data. The purge reaches
+        them through ``unlink_recording_file``, which removes every file a
+        lifecycle provider holds for the recording before its own."""
+        from recordings import lifecycle
+
+        derived = tmp_path / "derived.edf"
+        derived.write_bytes(b"version")
+
+        class _Holder:
+            def plan(self, recording):
+                pass
+
+            def outstanding(self, recording):
+                return set()
+
+            def start(self, recording_pk):
+                pass
+
+            def derived_files(self, recording):
+                return [derived]
+
+        rec = _make_recording(
+            user,
+            tmp_path,
+            status=Recording.Status.READY,
+            deleted_at=timezone.now() - timezone.timedelta(days=45),
+        )
+        with (
+            patch.object(lifecycle, "_PROVIDERS", [_Holder()]),
+            override_settings(RECORDINGS_TRASH_RETENTION_DAYS=30),
+        ):
+            purge_deleted_recordings()
+        assert not Recording.objects.filter(pk=rec.pk).exists()
+        assert not derived.exists()
+
     # ── Cutoff boundary (sign + unit) ───────────────────────────────────────
 
     def test_cutoff_boundary_just_inside_window(self, user, tmp_path):

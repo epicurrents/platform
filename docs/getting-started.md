@@ -517,7 +517,7 @@ Paths are relative to your `frontend/` directory and name files rather than glob
 See [First login](#6-first-login) below — and do the two hardening steps there, because nothing does them for you.
 
 **Where are recordings stored on disk?**
-In the `recordings-data` named volume, mounted at the path in `RECORDINGS_UPLOAD_PATH` (`/data/recordings` in the stack). Files in flight during upload live briefly in `RECORDINGS_STAGING_PATH` (the `staging-data` volume at `/data/staging`). The stack uses a separate named volume per data domain — `recordings-data`, `staging-data`, `media-data`, `postgres-data`, `celery-data`, `borg-data` — defined at the bottom of [docker-compose.yml](../docker-compose.yml).
+In the `recordings-data` named volume, mounted at the path in `RECORDINGS_UPLOAD_PATH` (`/data/recordings` in the stack). Files in flight during upload live briefly in `RECORDINGS_STAGING_PATH` (the `staging-data` volume at `/data/staging`). The stack uses a separate named volume per data domain — `recordings-data`, `staging-data`, `media-data`, `artifact-data`, `postgres-data`, `celery-data`, `borg-data` — defined at the bottom of [docker-compose.yml](../docker-compose.yml). `artifact-data` holds the versions a project's reconstruction stages build from each recording; it can be rebuilt, so no backup includes it.
 
 **Do I need PostgreSQL installed on my host?**
 No. The Docker stack runs its own PostgreSQL. The host only needs Docker.

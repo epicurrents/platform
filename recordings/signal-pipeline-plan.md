@@ -6,6 +6,8 @@ signal-modifying stages** is registered, sequenced, tracked, and eventually cont
 the UI. It is written against the code as it stands (EOG correction shipped, WQN repair
 WIP), and for the expectation that several more modifiers will follow.
 
+**Status (2026-11-07):** phase 1 steps 2–7 of §10 are built — registry, artifact cache volume, manifest CREATE in the audit chain, ledgers, chained dispatch, `GET` / `PATCH /jobs` and the version endpoints ([compute/README.md → Recording lifecycle](../compute/README.md#recording-lifecycle)). Not yet: cache eviction and rebuild-on-miss (a materialised version stays until its recording goes), the `PipelineRunAudit` writer, the reorder UI, and phases 2 and 3. The project's existing `_orig` output is kept as the default version's content until the core viewer compares versions itself (§8), so §3.1's interchange format is what today's viewer reads.
+
 The plan is deliberately staged so that each part is useful on its own and nothing
 downstream is blocked on the UI. The hard problem is not the UI — it is §3, canonical
 input, which the current single-stage design quietly avoids and a second stage breaks.

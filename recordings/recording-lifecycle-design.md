@@ -1,8 +1,8 @@
 # Recording lifecycle — post-processing states and job progress
 
-Agreed design for making a recording's post-processing visible and safe. Nothing here is
-implemented except the atomic write (§6), which shipped separately because it fixes a
-live data-integrity bug.
+Agreed design for making a recording's post-processing visible and safe.
+
+**Status (2026-11-07): implemented**, in the shape [signal-pipeline-plan.md](signal-pipeline-plan.md) §3 settled rather than by rewriting the stored file: states and `ingested_at` in `recordings`, the ledgers and dispatch in `compute` ([compute/README.md → Recording lifecycle](../compute/README.md#recording-lifecycle)). Reconstruction writes a new version into the artifact cache, so the torn-read hazard of §1 and §6 no longer arises on the platform's own path; §6 remains the rule for a project that still writes a file. Answers to §8: the job registry is an app-config hook (`register_reconstruction_stage`, `register_derive_job`); `AVAILABLE` recordings open, and the viewer degrades per feature; retry is a rerun through `PATCH /jobs`. The sections below are the design as agreed.
 
 ## 1. The problem
 

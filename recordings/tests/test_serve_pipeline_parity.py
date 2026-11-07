@@ -102,15 +102,25 @@ def _request_body(client, recording, shape, file_size):
         resp = client.get(base, HTTP_RANGE=f"bytes=0-{file_size - 1}")
     elif shape == "slice":
         resp = client.get(f"{base}/slice")
+    elif shape == "download_version":
+        # A reconstructed version, served from the artifact cache rather than the stored file. The stand-in version
+        # holds the stored file's bytes, so every assertion about the stored file holds for it too.
+        stored = Path(recording.file_path)
+        built = stored.with_name("version-" + stored.name)
+        built.write_bytes(stored.read_bytes())
+        with patch("recordings.lifecycle.version_file", return_value=built):
+            resp = client.get(base, {"version": _VERSION_ID})
     else:
         raise AssertionError(f"unknown request shape {shape!r}")
     return resp.status_code, b"".join(resp.streaming_content)
 
 
+_VERSION_ID = "c" * 64
+
 # Every byte-serving request shape the recordings API exposes. A new
 # byte-serving endpoint must be added here (the phi-exposure reviewer's
 # C8 check points at this list).
-_SERVING_SHAPES = ["download", "download_range", "slice"]
+_SERVING_SHAPES = ["download", "download_range", "slice", "download_version"]
 
 
 @pytest.mark.django_db
@@ -243,3 +253,39 @@ class TestSinglePipelineSource:
             f"_build_serve_pipeline: {offenders}. Route the serving path "
             "through _build_serve_pipeline instead."
         )
+
+
+@pytest.mark.django_db
+class TestVersionWithItsOwnLayout:
+    """A version can carry channels the stored metadata does not describe (a stage keeping the uncorrected signal
+    beside the corrected one). Served under middleware it is cut by its own header, so the annotation channel is found
+    where the version has it and its text is stripped, and the header is de-identified like the stored file's."""
+
+    def test_middleware_caller_gets_a_sanitised_version_with_an_extra_channel(self, user, make_user, tmp_path):
+        recording, *_ = _make_recording_with_meta(user, tmp_path)
+        signals = [
+            {"label": "EEG Fp1", "sample_count": 8},
+            {"label": "Fp1_orig", "sample_count": 8},
+            {"label": "EDF Annotations", "sample_count": _ANNO_SAMPLE_COUNT},
+        ]
+        header = _make_edf_header(reserved="EDF+C", signals=signals, n_records=1)
+        eeg = b"\x01\x02" * 8 + b"\x03\x04" * 8
+        anno = _make_anno_record(onset=0.0, tals=[_make_tal(0.5, "spike")], total_bytes=_ANNO_SAMPLE_COUNT * 2)
+        built = tmp_path / "version.edf"
+        built.write_bytes(header + eeg + anno)
+        reader = make_user()
+        _grant_with_middleware(user, reader, recording)
+        client = Client()
+        client.force_login(reader)
+
+        hash_part = recording.stored_name.split(".")[0]
+        with patch("recordings.lifecycle.version_file", return_value=built):
+            resp = client.get(f"/recordings/api/v1/{hash_part}/file", {"version": _VERSION_ID})
+        body = b"".join(resp.streaming_content)
+
+        assert resp.status_code == 200
+        assert len(body) == len(header + eeg + anno)
+        assert parse_edf_header(body).patient_id == "X X X X"
+        assert body[len(header) : len(header) + len(eeg)] == eeg
+        _onset, annotations = _parse_tal_record(body[len(header) + len(eeg) :])
+        assert annotations == []

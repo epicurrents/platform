@@ -439,6 +439,23 @@ export const useRecordingsStore = defineStore('recordings', () => {
         await _pollStatusBatch(hash, legacyState, fileState, batch)
     }
 
+    /**
+     * The upload phase a recording status ends polling in, or `null` while it should go on.
+     *
+     * An `available` recording can be opened while its background jobs run, so for the uploader it is done: waiting
+     * for `ready` would hold the upload open for as long as the slowest job, and time out on a long one.
+     * @param status - The recording status the status endpoint returned.
+     */
+    function _settledUploadPhase(status: string): 'ready' | 'failed' | null {
+        if (status === 'available' || status === 'ready') {
+            return 'ready'
+        }
+        if (status === 'failed') {
+            return 'failed'
+        }
+        return null
+    }
+
     async function _pollStatusBatch(
         hash: string,
         legacyState: UploadState,
@@ -449,8 +466,8 @@ export const useRecordingsStore = defineStore('recordings', () => {
             await _sleep(POLL_INTERVAL_MS)
             try {
                 const status = await getRecordingStatus(hash)
-                if (status.status === 'ready' || status.status === 'failed') {
-                    const phase = status.status as 'ready' | 'failed'
+                const phase = _settledUploadPhase(status.status)
+                if (phase) {
                     fileState.phase = phase
                     fileState.recordingHash = hash
                     legacyState.phase = phase
@@ -542,9 +559,10 @@ export const useRecordingsStore = defineStore('recordings', () => {
             await _sleep(POLL_INTERVAL_MS)
             try {
                 const status = await getRecordingStatus(hash)
-                if (status.status === 'ready' || status.status === 'failed') {
-                    state.phase = status.status
-                    onDone?.(status.status as 'ready' | 'failed')
+                const phase = _settledUploadPhase(status.status)
+                if (phase) {
+                    state.phase = phase
+                    onDone?.(phase)
                     // Refresh the list so the new recording appears.
                     await load()
                     _removeUpload(hash)

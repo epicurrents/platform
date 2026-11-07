@@ -49,3 +49,11 @@ class ComputeConfig(AppConfig):
         from .redaction import machine_produced_event_ids
 
         register_exempt_rows(machine_produced_event_ids)
+
+        # The post-ingest pipeline: reconstruction stages and derive jobs, tracked in this app's ledgers. Registered
+        # rather than imported by ``recordings``, which owns the status they drive and must not depend on compute.
+        from recordings.lifecycle import register_lifecycle_provider
+
+        from .lifecycle import PROVIDER
+
+        register_lifecycle_provider(PROVIDER)

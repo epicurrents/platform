@@ -35,6 +35,8 @@ ENV/
 # MEDIA_UPLOAD_PATH / MEDIA_STAGING_PATH should be ignored.
 /media_uploads/
 /media_staging/
+# The artifact cache (COMPUTE_ARTIFACT_CACHE_PATH): reconstructed recording versions.
+/artifact_cache/
 
 # Project plugins. A deployment's real project is its own git repository nested
 # here (`projects/local/.git` and so on), so the platform must not track it: a

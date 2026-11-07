@@ -26,7 +26,7 @@
 # Volume layout note
 #
 # The platform's runtime state lives in six separate named volumes
-# (postgres-data / recordings-data / staging-data / media-data /
+# (postgres-data / recordings-data / staging-data / media-data / artifact-data /
 # celery-data / borg-data). Earlier revisions of this file used a single `data` volume
 # with `volume.subpath:` for each domain, which is more ergonomic for
 # operators (one volume to back up, one volume to provision through a
@@ -65,11 +65,12 @@ x-build-args: &build-args
 services:
   init-volumes:
     image: busybox:1.38.0
-    command: ["sh", "-c", "mkdir -p /media/uploads /media/staging && chown -R ${EPICURRENTS_UID:-1000}:${EPICURRENTS_GID:-1000} /recordings /staging /media /celery /static"]
+    command: ["sh", "-c", "mkdir -p /media/uploads /media/staging && chown -R ${EPICURRENTS_UID:-1000}:${EPICURRENTS_GID:-1000} /recordings /staging /media /artifacts /celery /static"]
     volumes:
       - recordings-data:/recordings
       - staging-data:/staging
       - media-data:/media
+      - artifact-data:/artifacts
       - celery-data:/celery
       - static:/static
 
@@ -259,6 +260,7 @@ services:
       # the volume layout note above for why subpath is off-limits.
       - MEDIA_UPLOAD_PATH=/data/media/uploads
       - MEDIA_STAGING_PATH=/data/media/staging
+      - COMPUTE_ARTIFACT_CACHE_PATH=/data/artifacts
     ports:
       # Loopback-only binding so the dev box stays unreachable from the
       # LAN.  docker-compose.prod.yml overlays a public binding for
@@ -286,6 +288,7 @@ services:
       - recordings-data:/data/recordings
       - staging-data:/data/staging
       - media-data:/data/media
+      - artifact-data:/data/artifacts
       # Recordings registered in place by `import_recordings --link`, read-only:
       # the platform never writes a linked file. RECORDINGS_LINKED_HOST_PATH names
       # the host tree, and RECORDINGS_LINKED_ROOTS=/data/linked in .env enables
@@ -324,6 +327,7 @@ services:
       - RECORDINGS_STAGING_PATH=/data/staging
       - MEDIA_UPLOAD_PATH=/data/media/uploads
       - MEDIA_STAGING_PATH=/data/media/staging
+      - COMPUTE_ARTIFACT_CACHE_PATH=/data/artifacts
       - CELERY_BROKER_URL=redis://:${REDIS_PASSWORD:-}@redis:6379/0
       - CELERY_RESULT_BACKEND=redis://:${REDIS_PASSWORD:-}@redis:6379/1
     volumes:
@@ -331,6 +335,7 @@ services:
       - recordings-data:/data/recordings
       - staging-data:/data/staging
       - media-data:/data/media
+      - artifact-data:/data/artifacts
       - celery-data:/data/celery
       # Recordings registered in place by `import_recordings --link`, read-only:
       # the platform never writes a linked file. RECORDINGS_LINKED_HOST_PATH names
@@ -724,6 +729,9 @@ volumes:
   recordings-data:
   staging-data:
   media-data:
+  # Reconstructed recording versions (compute.lifecycle). Rebuildable from the stored file and the manifest in the
+  # audit trail, so the borg services deliberately do not mount it: it is out of every backup by construction.
+  artifact-data:
   celery-data:
   borg-data:
   frontend-node-modules:

@@ -241,7 +241,9 @@ def test_channel_scale_never_defaults_to_microvolts():
 # ── load_signal_window: preconditions ─────────────────────────────────────
 
 
-def test_derived_version_not_implemented(tmp_path):
+def test_an_unmaterialised_derived_version_is_refused_not_read_from_the_source(tmp_path, monkeypatch):
+    import compute.lifecycle
+
     f = tmp_path / "r.edf"
     f.write_bytes(b"x")
     run = SimpleNamespace(
@@ -250,8 +252,25 @@ def test_derived_version_not_implemented(tmp_path):
         recording_id=7,
         recording=SimpleNamespace(file_path=str(f)),
     )
-    with pytest.raises(NotImplementedError):
+    monkeypatch.setattr(compute.lifecycle, "version_file", lambda recording, version_id: None)
+    with pytest.raises(FileNotFoundError, match="not materialised"):
         signal_loader.load_signal_window(run, _seg(0.0, 1.0))
+
+
+def test_a_derived_version_is_read_from_its_materialisation(tmp_path, monkeypatch):
+    import compute.lifecycle
+
+    infos = [_info("EEG Fp1-Ref")]
+    run = _wire(monkeypatch, tmp_path, infos, np.zeros((1, 10)))
+    run.input_version_id = "deadbeef"
+    built = tmp_path / "built.edf"
+    built.write_bytes(b"x")
+    read = []
+    monkeypatch.setattr(compute.lifecycle, "version_file", lambda recording, version_id: built)
+    header = _header(infos)
+    monkeypatch.setattr(signal_loader, "read_header", lambda p: (read.append(Path(p)), (header, infos))[1])
+    signal_loader.load_signal_window(run, _seg(0.0, 0.02))
+    assert read == [built]
 
 
 def test_missing_source_file(tmp_path):

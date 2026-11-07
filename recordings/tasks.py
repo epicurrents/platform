@@ -22,6 +22,7 @@ from celery import shared_task
 from django.conf import settings
 from django.contrib.contenttypes.models import ContentType
 from django.db import transaction
+from django.db.models import Q
 from django.utils import timezone
 
 logger = logging.getLogger(__name__)
@@ -38,8 +39,8 @@ _EDF_EXTENSIONS = {".edf", ".bdf"}
 _annotation_hash = annotation_hash
 
 
-def _write_final_recording_transition(*, recording, update_fields: dict, channel_map=None) -> None:
-    """Apply ``update_fields`` to ``recording`` and emit the final audit row.
+def _write_final_recording_transition(*, recording, update_fields: dict, channel_map=None):
+    """Apply ``update_fields`` to ``recording``, emit the final audit row, and return the status it ended in.
 
     Shared by ``process_recording`` (Celery) and ``import_recordings``
     (management command). Both compute new field values from in-memory
@@ -50,10 +51,18 @@ def _write_final_recording_transition(*, recording, update_fields: dict, channel
     one ``record_modify_change`` row carrying the ``SignalInfo`` digest
     in ``extra_payload``.
 
-    Also where a hypnogram's scoring settles: ``pending_scoring`` is cleared on
-    every transition and becomes coded events on one to READY, in one transaction
-    with the status and the audit row, so that the stages and the study arrive
-    together or not at all.
+    Callers pass ``status`` as ``READY`` for an ingest that succeeded and ``FAILED`` for one that did not. A
+    successful ingest is not necessarily ``READY``: ``recordings.lifecycle.begin`` plans the post-ingest work in the
+    same transaction, and the recording starts in the status that work implies — ``PROCESSING`` while reconstruction
+    stages are to run, ``AVAILABLE`` while only derive jobs are, ``READY`` when there is nothing. Either outcome stamps
+    ``ingested_at``, which is what tells a finished ingest from one still running.
+
+    Also where a hypnogram's scoring settles when the study is openable at once:
+    ``pending_scoring`` becomes coded events in one transaction with the status and
+    the audit row, so the stages and the study arrive together or not at all. A study
+    that starts in ``PROCESSING`` keeps its scoring until ``recordings.lifecycle.settle``
+    first makes it openable, so a reader holding a grant finds no stage before the
+    study itself can be read. A failed ingest clears it.
 
     Reads the pre-update state from a fresh ``Recording.objects.get``
     rather than ``serialize_instance(recording)`` — by the time this
@@ -64,6 +73,7 @@ def _write_final_recording_transition(*, recording, update_fields: dict, channel
     is the price of correctness. *channel_map* is the map that named the channels, for the record.
     """
     from activity.audit import record_modify_change, serialize_instance
+    from recordings import lifecycle
     from recordings.audit_digests import (
         SIGNAL_INFO_DIGEST_KEY,
         compute_signal_info_digest,
@@ -72,16 +82,26 @@ def _write_final_recording_transition(*, recording, update_fields: dict, channel
         DEIDENTIFICATION_RECORD_KEY,
         build_deidentification_record,
     )
-    from recordings.hypnogram import write_hypnogram
     from recordings.models import Recording
 
+    succeeded = update_fields.get("status") != Recording.Status.FAILED
     with transaction.atomic():
         stored = Recording.objects.get(pk=recording.pk)
         before_state = serialize_instance(stored)
-        Recording.objects.filter(pk=recording.pk).update(**update_fields, pending_scoring=None)
+        fields = {**update_fields, "ingested_at": timezone.now()}
+        if succeeded:
+            # Held in PROCESSING until the lifecycle has planned its work below; one audit row covers both writes.
+            fields["status"] = Recording.Status.PROCESSING
+        else:
+            fields["pending_scoring"] = None
+        Recording.objects.filter(pk=recording.pk).update(**fields)
         recording.refresh_from_db()
-        if stored.pending_scoring and recording.status == Recording.Status.READY:
-            write_hypnogram(recording, stored.pending_scoring)
+        if succeeded:
+            status = lifecycle.begin(recording)
+            if status != recording.status:
+                Recording.objects.filter(pk=recording.pk).update(status=status)
+                recording.refresh_from_db()
+            lifecycle.write_pending_scoring(recording)
         extra_payload = {SIGNAL_INFO_DIGEST_KEY: compute_signal_info_digest(recording)}
         # The process record rides on the same row as the digest: the versions
         # stamped on the meta row and the ingest overrides in force at this moment,
@@ -96,6 +116,7 @@ def _write_final_recording_transition(*, recording, update_fields: dict, channel
             before_state=before_state,
             extra_payload=extra_payload,
         )
+    return recording.status
 
 
 def _determine_modality(signal_infos) -> str:
@@ -679,7 +700,7 @@ def _process_recording_body(*, recording, recording_id, staging_path, preserve_a
         # capture from DB (not in-memory, which has already been mutated for
         # the content_hash computation above) + record_modify_change with
         # the SignalInfo digest in extra_payload. See activity/derived_state.py.
-        _write_final_recording_transition(
+        final_status = _write_final_recording_transition(
             recording=recording,
             update_fields={
                 "file_path": str(permanent_path),
@@ -716,7 +737,8 @@ def _process_recording_body(*, recording, recording_id, staging_path, preserve_a
                     ),
                     data={"type": "recording_failed", "recording_id": recording_id},
                 )
-            else:
+            elif final_status == Recording.Status.READY:
+                # A recording with stages or jobs still to run is announced by ``lifecycle.settle`` once they settle.
                 send_push_to_user.delay(
                     user_id=recording.author_id,
                     title="Recording ready",
@@ -792,10 +814,14 @@ def purge_deleted_recordings():
     a user (or operator) trashes a recording → ``deleted_at`` is set →
     after ``RECORDINGS_TRASH_RETENTION_DAYS`` the row + file are
     permanently removed. Silent narrowing of either filter
-    (``deleted_at__isnull=False, deleted_at__lt=cutoff,
-    status__in=[READY, FAILED]`` or the orphan reaper's
-    ``status__in=[PENDING, PROCESSING], created_at__lt=cutoff``) leaves
-    PHI past the retention window with no externally visible signal.
+    (``deleted_at__isnull=False, deleted_at__lt=cutoff`` with an ingest that
+    finished — status READY, AVAILABLE or FAILED, or PROCESSING with
+    ``ingested_at`` set — or the orphan reaper's
+    ``status__in=[PENDING, PROCESSING], ingested_at__isnull=True,
+    created_at__lt=cutoff``) leaves PHI past the retention window with no
+    externally visible signal. The reaper's ``ingested_at`` condition is
+    what keeps it off a live recording whose reconstruction stages are
+    still running, which is also PROCESSING.
     Equally damaging is the inverse: a regression that widens either
     filter takes still-live data with it. See AGENTS.md →
     *Load-bearing files* and the contract-test class
@@ -809,8 +835,8 @@ def purge_deleted_recordings():
     scope, so each deletion is attributed to the same parent ``Activity`` row
     (``verb="recordings.purge"``, ``interface=celery``).
 
-    Recordings stuck in PENDING or PROCESSING status past the retention window are
-    also purged — these represent orphaned rows from failed processing runs where
+    Recordings stuck in PENDING or PROCESSING status past the retention window, with an
+    ingest that never finished, are also purged — these represent orphaned rows from failed processing runs where
     the file was already cleaned up (or never moved to permanent storage).
 
     The host-controlled originals volume
@@ -836,7 +862,7 @@ def purge_deleted_recordings():
 def _purge_deleted_recordings_body(*, cutoff, retention_days):
     """Walk both purge querysets inside an open audited scope.
 
-    Iterates the soft-deleted READY queryset first, then the orphaned
+    Iterates the soft-deleted queryset first, then the orphaned
     PENDING / PROCESSING reaper. Per-row ``recording.delete()`` fires
     ``pre_delete`` so each removal lands in ``ObjectChangeLog`` under
     the surrounding ``recordings.purge`` ``Activity`` row.
@@ -844,15 +870,20 @@ def _purge_deleted_recordings_body(*, cutoff, retention_days):
     from recordings.linked import unlink_recording_file
     from recordings.models import Recording
 
-    # Normal trash: soft-deleted READY and FAILED recordings past the
-    # retention window. FAILED belongs here because delete_recording trashes
+    # Normal trash: soft-deleted recordings past the retention window whose
+    # ingest finished. FAILED belongs here because delete_recording trashes
     # recordings of any status and a FAILED recording keeps its file on disk
     # — excluding it left trashed FAILED uploads (file + PHI-bearing
-    # original_name) outside every purge branch indefinitely.
+    # original_name) outside every purge branch indefinitely. AVAILABLE, and
+    # PROCESSING after ingest, are recordings whose post-ingest stages or jobs
+    # were still running when they were trashed: their file is final, and
+    # leaving them out would keep them forever, since the reaper below takes
+    # only ingests that never finished.
     queryset = Recording.objects.filter(
+        Q(status__in=[Recording.Status.READY, Recording.Status.AVAILABLE, Recording.Status.FAILED])
+        | Q(status=Recording.Status.PROCESSING, ingested_at__isnull=False),
         deleted_at__isnull=False,
         deleted_at__lt=cutoff,
-        status__in=[Recording.Status.READY, Recording.Status.FAILED],
     )
 
     purged = 0
@@ -876,10 +907,14 @@ def _purge_deleted_recordings_body(*, cutoff, retention_days):
         purged += 1
 
     # Orphaned rows: PENDING or PROCESSING recordings created before the cutoff
-    # that were never advanced to READY. The worker that handled them either
-    # crashed or already deleted the staged file; the DB row is the only remnant.
+    # whose ingest never finished. The worker that handled them either crashed
+    # or already deleted the staged file; the DB row is the only remnant. A
+    # PROCESSING recording with ``ingested_at`` set is not one: its file is
+    # final and its reconstruction stages are running or stuck, which is live
+    # data, not a remnant.
     orphaned_qs = Recording.objects.filter(
         status__in=[Recording.Status.PENDING, Recording.Status.PROCESSING],
+        ingested_at__isnull=True,
         created_at__lt=cutoff,
     )
     orphaned_purged = 0

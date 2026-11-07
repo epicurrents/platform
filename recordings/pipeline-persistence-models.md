@@ -1,7 +1,6 @@
 # Pipeline persistence — model sketches
 
-**Status: models implemented — `compute` migration `0003`, `annotations` migration `0006`.
-Dispatch, GC/retention, and the service/API layers are still unbuilt.** The durable/operational
+**Status: models implemented (`compute` and `annotations` initial migrations); dispatch and the jobs / versions API built 2026-11-07, with one addition — `DeriveJob`, the ledger for DERIVE jobs that write model rows rather than annotations, which `AnalysisRun` is shaped for. GC/retention and the `PipelineRunAudit` writer are still unbuilt.** The durable/operational
 models that the three pipeline plans left deferred:
 [`signal-pipeline-plan.md`](signal-pipeline-plan.md) (reconstruction, §5–6 ledger),
 [`retention-and-lifecycle-plan.md`](retention-and-lifecycle-plan.md) (analysis DAG, retention),

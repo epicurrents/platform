@@ -261,6 +261,60 @@ class RecordingJob(models.Model):
         return f"RecordingJob({self.recording_id}/{self.stage_name} [{self.state}])"
 
 
+class DeriveJob(models.Model):
+    """DERIVE-phase operational ledger for jobs that write model rows rather than annotations.
+
+    The DERIVE phase reads a version and never writes signal. ``AnalysisRun`` covers the annotation-producing kind —
+    detectors, with image digests, segment grids and conformance. A job that computes model rows from the signal (an
+    impedance mask, a table of indices) has none of those, so it gets this smaller ledger rather than placeholders in
+    every detector column. Like :class:`RecordingJob`, live state, rebuildable from the registry
+    (``compute.derive``) and the version it read, and outside every integrity chain: its rows change state through
+    queryset updates, which write no audit row, and the rows the job itself writes are audited where they land.
+
+    ``input_version_id`` names the version the job read, by the same ``(recording, version_id)`` string the run
+    tables join on, so a rerun of the reconstruction that produces a new default version plans a new row rather than
+    overwriting the record of what the old one read.
+    """
+
+    recording = models.ForeignKey(
+        "recordings.Recording",
+        on_delete=models.CASCADE,
+        related_name="derive_jobs",
+    )
+    job_name = models.CharField(max_length=64, help_text="Derive job identifier; matches the derive-job registry.")
+    code_version = models.CharField(max_length=32, blank=True, default="")
+    input_version_id = models.CharField(
+        max_length=64,
+        help_text="The version the job reads: a manifest hash, or 'source'.",
+    )
+
+    class State(models.TextChoices):
+        QUEUED = "queued", "Queued"
+        RUNNING = "running", "Running"
+        DONE = "done", "Done"
+        FAILED = "failed", "Failed"
+        SKIPPED = "skipped", "Skipped"
+
+    state = models.CharField(max_length=8, choices=State.choices, default=State.QUEUED, db_index=True)
+    started_at = models.DateTimeField(null=True, blank=True)
+    finished_at = models.DateTimeField(null=True, blank=True)
+    error = models.TextField(blank=True, default="")
+
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["recording", "job_name", "input_version_id"],
+                name="compute_derivejob_unique_job_per_version",
+            ),
+        ]
+
+    def __str__(self) -> str:
+        return f"DeriveJob({self.recording_id}/{self.job_name}@{self.input_version_id[:12]} [{self.state}])"
+
+
 class ArtifactCacheEntry(models.Model):
     """Materialised version bytes in the cache tier (signal-pipeline-plan §3.5).
 

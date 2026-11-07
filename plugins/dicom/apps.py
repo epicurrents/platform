@@ -19,7 +19,7 @@ class DicomConfig(PluginConfig):
     default_auto_field = "django.db.models.BigAutoField"
     name = "plugins.dicom"
     label = "dicom"
-    requires_platform = ">=0.1,<0.2"
+    requires_platform = ">=0.2,<0.3"
 
     # DICOM composes with any active project; it depends only on core apps that
     # are always loaded (recordings' access model, activity's audit trail), so

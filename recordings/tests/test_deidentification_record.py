@@ -540,7 +540,7 @@ class TestReportCommand:
 
     def test_an_unknown_hash_is_refused(self, user, tmp_path):
         _ingest(user, tmp_path)
-        with pytest.raises(CommandError, match="No READY recording"):
+        with pytest.raises(CommandError, match="No ingested recording"):
             _run_report("--recording", "F" * 32)
         with pytest.raises(CommandError, match="32-character"):
             _run_report("--recording", "short")

@@ -10,7 +10,7 @@ class HedscoreConfig(PluginConfig):
     name = "plugins.hedscore"
     label = "hedscore"
     verbose_name = "HED-SCORE"
-    requires_platform = ">=0.1,<0.2"
+    requires_platform = ">=0.2,<0.3"
     requires: list[str] = ["annotations"]
 
     def ready(self):
