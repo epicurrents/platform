@@ -696,9 +696,9 @@ class TestTheFilenameRuleCoversEveryRoute:
         root = Path(__file__).resolve().parents[2]
         offenders = []
         for path in list(root.glob("recordings/**/*.py")) + list(root.glob("projects/**/*.py")):
-            if "/tests/" in str(path):
+            if "tests" in path.parts:
                 continue
-            text = path.read_text()
+            text = path.read_text(encoding="utf8")
             for match in creation.finditer(text):
                 block = _call_body(text, match.end() - 1)
                 # Both spellings: a keyword argument, and the dict-literal form a
