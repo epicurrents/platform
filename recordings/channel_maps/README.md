@@ -74,7 +74,7 @@ Any other key is refused.
 
 ## Stored names
 
-A map chooses among the names the platform stores and cannot add one, which keeps a source's own naming out of every stored file.
+A map chooses among the names the platform stores and cannot add one, which keeps a source's own spellings out of every stored file. A project adds stored names by registering them ([recordings/README.md → Registered channel names](../README.md#registered-channel-names)); a registered name is then one a map may choose.
 
 | Kind | Names |
 |---|---|
@@ -83,8 +83,9 @@ A map chooses among the names the platform stores and cannot add one, which keep
 | EMG | `EMG`, or `EMG/<site>` for `Chin`, `ChinRef`, `Leg`, `LegL`, `LegR`, `ArmL`, `ArmR`, `Diaph` |
 | ECG | `ECG`, `ECGL`, `ECGR`, and the lead names `I` to `III`, `aVR`, `aVL`, `aVF`, `V1` to `V6` |
 | Everything else | Every `canonical` in [channel_rules.json](../processors/channel_rules.json) |
+| Registered | Whatever the deployment's project or plugins registered with `register_channel_names` |
 
-A name outside these fails `manage.py check` with `is not a name the platform ships`. A genuinely new kind of signal needs a new name in the shipped table, which is a change to the de-identification pass.
+A name outside these fails `manage.py check` with `is not a name the platform ships or a project registered`. A genuinely new kind of signal needs a new name: in the shipped table, which is a change to the de-identification pass, or registered by the deployment's project for a device only it uses.
 
 ## EEG recordings
 

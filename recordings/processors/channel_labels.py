@@ -674,8 +674,9 @@ def _parse_rule(
         signal_type = types[canonical]
     else:
         # What keeps a site's rule from writing the site's own naming into every stored
-        # file, which is the fingerprint the channel-block pass exists to remove.
-        raise ChannelRuleError(f"{source}: {canonical!r} is not a name the platform ships.")
+        # file, which is the fingerprint the channel-block pass exists to remove. A registered
+        # name is the one exception, and the deployment accepted it by registering.
+        raise ChannelRuleError(f"{source}: {canonical!r} is not a name the platform ships or a project registered.")
     transducers = raw.get("transducer", [])
     if not isinstance(transducers, list) or not all(isinstance(item, str) and item for item in transducers):
         raise ChannelRuleError(f"{source}: transducer must be a list of words.")
@@ -699,8 +700,8 @@ def parse_channel_rules(raw: object, source: str, *, site: bool = False) -> tupl
     units, see ``processors.units``) and ``transducer`` (words the transducer field must contain,
     in either case). A channel missing the field a condition reads fails that condition and falls
     through to the next rule. The shipped table also gives each rule its ``type``. A *site* table
-    gives none, and its ``canonical`` must be a name the shipped table has: a site teaches the
-    platform new spellings, never new names.
+    gives none, and its ``canonical`` must be a stored name, shipped or registered
+    (:func:`register_channel_names`): a site table teaches the platform new spellings, never new names.
     """
     if not isinstance(raw, dict) or not isinstance(raw.get("rules"), list):
         raise ChannelRuleError(f"{source}: a table must be an object with a rules list.")
@@ -738,6 +739,104 @@ _STORED_MISC = re.compile(r"MISC_\d+")
 # Numbered analogue inputs (``DC1``…``DC12``, ``AUX3``), kept individually because the
 # number is the only thing identifying what was plugged in.
 _NUMBERED_AUX = re.compile(r"^(DC|AUX)(\d{1,2})$")
+
+
+# --- Project-registered names ------------------------------------------------
+# Names a deployment's project or plugin adds to the ones the platform ships, for channels
+# a device records that no shipped name fits: an electrode outside 10-10, say. A channel
+# map cannot reach these, because a map chooses among stored names, and every later look
+# at a stored file (serving, metadata refresh) classifies it without the map. A registered
+# name is stored, so it reads back as itself the way a shipped one does.
+#
+# The vocabulary tables are extended in place, from ``AppConfig.ready()``, and only there: once
+# the app registry is ready, workers are classifying channels, and a name added then would
+# make one process store a file another process renames on the way out.
+
+_REGISTERED_NAMES: dict[str, str] = {}
+
+# What a registered name may look like: one token the label parser keeps whole, short
+# enough to be stored with the derived-copy suffix appended.
+_REGISTRABLE_NAME = re.compile(r"[A-Za-z][A-Za-z0-9_]*")
+_REGISTRABLE_TYPES = frozenset({"eeg"}) | AUXILIARY_TYPES
+
+
+def _registered_name_problem(name: object, signal_type: object) -> str | None:
+    """Why *name* cannot be registered as *signal_type*, or ``None`` when it can."""
+    if not isinstance(name, str) or not _REGISTRABLE_NAME.fullmatch(name):
+        return "a name is one token of ASCII letters, digits and '_', starting with a letter"
+    if signal_type not in _REGISTRABLE_TYPES:
+        return f"the type must be one of {sorted(_REGISTRABLE_TYPES)}"
+    if len(name) + len(DERIVED_COPY_SUFFIX) > _EDF_LABEL_WIDTH:
+        return f"a stored name has to fit {_EDF_LABEL_WIDTH} bytes with {DERIVED_COPY_SUFFIX!r} appended"
+    if name.lower().endswith(DERIVED_COPY_SUFFIX) or _STORED_MISC.fullmatch(name.upper()):
+        return "the name has the form of a name the platform generates"
+    key = _compact(name)
+    if key.startswith("EEG"):
+        return "a leading 'EEG' is read as the modality prefix"
+    if _REGISTERED_NAMES.get(name) == signal_type:
+        return None
+    if key in _SELF_RESOLVING or name.upper() in _CANONICAL_BY_UPPER:
+        return "the name is one the platform ships or one already registered"
+    reserved = (
+        _REFERENCE_SUFFIXES,
+        _OLD_TO_NEW,
+        _EOG_LEFT_KEYS | _EOG_RIGHT_KEYS,
+        _EMG_SITE_BY_KEY,
+        _ECG_LEAD_CANON,
+        _EOG_SIDE_WORDS,
+    )
+    if any(key in words for words in reserved) or any(key in rule.labels for rule in _SHIPPED_RULES):
+        return "the platform already reads the name as something else"
+    # Deferred: ``edf`` imports this module at load.
+    from recordings.processors.edf import extract_signal_type
+
+    # Each later read of a stored file types the label from its text before resolving it, so a
+    # name the inference or a generic prefix reads as something else would not read back.
+    if extract_signal_type(name) or _GENERIC_PREFIX.match(name) or _NUMBERED_AUX.match(key):
+        return "the platform reads part of the name as a modality or an input"
+    return None
+
+
+def register_channel_names(names: dict[str, str]) -> None:
+    """Add stored channel names to the vocabulary, each with its signal type.
+
+    Call from an ``AppConfig.ready()``. A registered ``eeg`` name resolves wherever a 10-10
+    electrode does: on its own, behind the ``EEG`` prefix, with a reference stripped
+    (``EEG Xy1-Ref`` → ``Xy1``) and inside a derivation (``F7-Xy1``). A channel whose primary
+    electrode is a registered name is stored after the ranked electrodes, because the canonical
+    order has no place for it. An auxiliary-typed name resolves as a shipped auxiliary name does.
+    *names* maps each name to ``"eeg"`` or one of ``AUXILIARY_TYPES``. Site tables and channel maps
+    may name a registered name as their ``canonical``. Registering a name again under the same
+    type does nothing.
+
+    Every stored, served and federated file carries the name, so registering one is the
+    deployment accepting that whatever the name says about the device travels with the data.
+    Each recording's de-identification record seals :func:`registered_channel_names`.
+
+    Raises :class:`ChannelRuleError` for a name the platform could not read back as itself,
+    and ``RuntimeError`` once the app registry is ready.
+    """
+    from django.apps import apps
+
+    if apps.ready:
+        raise RuntimeError("Channel names are registered from AppConfig.ready(), before the app registry is ready.")
+    for name, signal_type in names.items():
+        problem = _registered_name_problem(name, signal_type)
+        if problem:
+            raise ChannelRuleError(f"Cannot register channel name {name!r} as {signal_type!r}: {problem}.")
+        _REGISTERED_NAMES[name] = signal_type
+        _SHIPPED_TYPES[name] = signal_type
+        _SELF_RESOLVING[_compact(name)] = (signal_type, name)
+        if signal_type == "eeg":
+            _CANONICAL_BY_UPPER[name.upper()] = name
+    # A site table or map read before this registration was checked against the narrower vocabulary.
+    _cached_site_tables.cache_clear()
+    _read_channel_map.cache_clear()
+
+
+def registered_channel_names() -> dict[str, str]:
+    """The names registered in this process, with their types."""
+    return dict(_REGISTERED_NAMES)
 
 
 def site_rule_paths() -> list[Path]:

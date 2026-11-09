@@ -10,8 +10,9 @@ and keep that documentation. The platform's record has three parts, and this mod
   text it arrived with. Stamped together with the version, so it means nothing on a ``0`` row.
 - ``deidentification_record`` in the READY transition's audit ``extra_payload`` — the two values
   above, the channel-order version, the ingest privacy overrides in force at the time, and the
-  site tables and any channel map that named the channels. The audit row is tamper-evident, so
-  the record cannot be edited after the fact, and the overrides and the map are kept nowhere else.
+  site tables, the channel names the project and plugins registered and any channel map that named the channels.
+  The audit row is tamper-evident, so the record cannot be edited after the fact, and the overrides
+  and the map are kept nowhere else.
 
 A linked recording (``recordings.linked``) is the exception to all three: no pass wrote its file,
 which is the operator's and was de-identified by whoever produced it. Its versions are ``0``, its
@@ -30,7 +31,11 @@ from django.conf import settings
 from django.contrib.contenttypes.models import ContentType
 from django.utils import timezone
 
-from recordings.processors.channel_labels import CHANNEL_ORDER_VERSION, site_rules_digest
+from recordings.processors.channel_labels import (
+    CHANNEL_ORDER_VERSION,
+    registered_channel_names,
+    site_rules_digest,
+)
 from recordings.processors.edf import DEIDENTIFICATION_VERSION
 
 DEIDENTIFICATION_RECORD_KEY = "deidentification_record"
@@ -87,6 +92,7 @@ def build_deidentification_record(recording, channel_map=None) -> dict | None:
         "ingest_overrides": current_ingest_overrides(),
         # The stored labels depend on these tables as well as on the pass version.
         "site_channel_rules": site_rules_digest(),
+        "project_channel_names": registered_channel_names(),
         "channel_map": {"key": channel_map.key, "digest": channel_map.digest} if channel_map else None,
     }
     if recording.storage == recording.Storage.LINKED:
