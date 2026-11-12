@@ -328,7 +328,7 @@ The label must not collide with any existing Django app label (`admin`, `auth`, 
 `requires_platform` is the range of platform versions your project supports — it is what keeps a project from silently drifting out of step with the platform it is checked out beside, now that the two are separate repositories. Rather than working the range out, ask the platform for it:
 
 ```bash
-docker compose run --rm --no-deps web python -c \
+docker compose run --rm --no-deps --entrypoint python web -c \
     "from epicurrents.version import __version__, compatible_range; print(compatible_range(__version__))"
 ```
 
@@ -404,8 +404,10 @@ Skip this step if the platform already has everything you import.
 ### 9. Generate the initial migration
 
 ```bash
-EPICURRENTS_PROJECT=<yourname> docker compose run --rm --no-deps web python manage.py makemigrations <yourname>
+EPICURRENTS_PROJECT=<yourname> docker compose run --rm --no-deps --entrypoint python web manage.py makemigrations <yourname>
 ```
+
+Neither this nor the version check above needs the database, so both replace the image's entrypoint, which waits for one (see [troubleshooting](troubleshooting.md#a-docker-compose-run-command-prints-waiting-for-postgres-to-become-available-and-never-returns)).
 
 This produces `projects/<yourname>/migrations/0001_initial.py`. Commit it.
 
@@ -414,9 +416,12 @@ This produces `projects/<yourname>/migrations/0001_initial.py`. Commit it.
 Edit `.env` and set `EPICURRENTS_PROJECT=<yourname>`. Then:
 
 ```bash
+docker compose up -d db
 docker compose run --rm --no-deps web python manage.py activate_project <yourname>
 docker compose up -d
 ```
+
+`activate_project` needs the database, so it is started on its own first; `--no-deps` keeps the run from starting the `migrate` service first, which would migrate the new project before `activate_project` could restore any tables it archived earlier.
 
 If the stack is already running, restart the application containers so they pick up the new project:
 

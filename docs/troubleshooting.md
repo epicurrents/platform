@@ -109,6 +109,23 @@ docker compose restart celery celery-beat
 
 If both are running and Celery still exits, check that `REDIS_PASSWORD` is set in `.env` — the compose stack starts Redis with `--requirepass` and injects credentialed broker URLs into the app containers, overriding the `CELERY_BROKER_URL` value in `.env`.
 
+### A `docker compose run` command prints "Waiting for postgres to become available..." and never returns
+
+The image's entrypoint ([entrypoint.sh](../entrypoint.sh)) waits for PostgreSQL before running anything, with no timeout. `--no-deps` stops compose starting the database, so a run with it on a stack that is not up waits forever. Stop it with Ctrl-C, then start the database first for a command that needs it (`activate_project`, `migrate`, `shell`):
+
+```bash
+docker compose up -d db
+docker compose run --rm --no-deps web python manage.py <command>
+```
+
+or skip the entrypoint for one that does not (`init_env`, `makemigrations`, a `python -c` one-liner):
+
+```bash
+docker compose run --rm --no-deps --entrypoint python web manage.py <command>
+```
+
+The setup scripts already do one or the other.
+
 ### The stack never finishes starting — `migrate` sits at `Waiting` (Podman)
 
 Symptom: `compose up` prints `Container <stack>-migrate-1 Waiting` and stays there for as long as you let it. `podman ps` shows migrate `Up` with empty logs, `db` and `redis` both `healthy`, and every service behind migrate `Created`.
