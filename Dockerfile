@@ -27,7 +27,7 @@
 # invalidates only this stage's cheap COPY, not the scientific stack's install
 # in base — which is what a project-source COPY placed there directly would do
 # on every `update.sh`.
-FROM python:3.14-slim AS project-reqs
+FROM python:3.15-slim AS project-reqs
 ARG EPICURRENTS_PROJECT=""
 WORKDIR /src
 COPY projects/ ./projects/
@@ -42,7 +42,7 @@ RUN mkdir -p /out \
         fi; \
     fi
 
-FROM python:3.14-slim AS base
+FROM python:3.15-slim AS base
 
 # Redeclared because ARG is per-stage. Used only to name the project in the
 # digest-mismatch message below, so the remedy it prints can be pasted as-is.
