@@ -91,8 +91,8 @@ class TestInstall:
 
     def test_honours_a_target_subdirectory(self, tmp_path, out_dir):
         archive = _archive(tmp_path, {LIB: "lib"})
-        _run(_pin(tmp_path, archive, target="edu"), out_dir)
-        assert (out_dir / "edu" / LIB).is_file()
+        _run(_pin(tmp_path, archive, target="example"), out_dir)
+        assert (out_dir / "example" / LIB).is_file()
 
     def test_writes_a_stamp_recording_what_was_installed(self, tmp_path, out_dir):
         archive = _archive(tmp_path, {LIB: "lib"})
@@ -143,11 +143,11 @@ class TestReinstall:
     def test_reinstalling_leaves_files_this_command_does_not_own(self, tmp_path, out_dir):
         # The per-project viewer builds and the public-setup shim share this directory and
         # are written by the frontend build, so an edition swap must not take them with it.
-        (out_dir / "edu").mkdir()
-        (out_dir / "edu" / "epicurrents-lib.umd.cjs").write_text("project lib")
+        (out_dir / "example").mkdir()
+        (out_dir / "example" / "epicurrents-lib.umd.cjs").write_text("project lib")
         _run(_pin(tmp_path, _archive(tmp_path, {LIB: "old"}, name="a.tar.gz"), tag="full-v1.0.0"), out_dir)
         _run(_pin(tmp_path, _archive(tmp_path, {LIB: "new"}, name="b.tar.gz"), tag="full-v1.1.0"), out_dir)
-        assert (out_dir / "edu" / "epicurrents-lib.umd.cjs").read_text() == "project lib"
+        assert (out_dir / "example" / "epicurrents-lib.umd.cjs").read_text() == "project lib"
 
 
 class TestCheck:

@@ -135,7 +135,7 @@ class TestBackupHorizon:
         assert horizon.remote == horizon.archives + timedelta(days=30)
         assert horizon.total == horizon.remote
 
-    def test_an_edu_configuration_comes_to_about_four_months(self):
+    def test_three_weekly_and_two_monthly_archives_come_to_about_four_months(self):
         values = {"BACKUP_KEEP_WEEKLY": "3", "BACKUP_KEEP_MONTHLY": "2", "BACKUP_REMOTE_CONFIGURED": True}
         with _settings(**values, BACKUP_REMOTE_COMPACTION_DAYS="30"):
             horizon = backup_horizon()

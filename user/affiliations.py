@@ -3,7 +3,7 @@
 An affiliation is a fact about an account, not a permission. Keeping it a group reuses what groups already have:
 membership is managed and audited on the account surface, exported to the subject and erased with the account, and
 a project can give an affiliation a meaning through a role provider scoped to affiliations
-(``RoleProvider.group_kind``), the way edu marks the one that counts as an account's institution.
+(``RoleProvider.group_kind``), the way a project marks the one that counts as an account's institution.
 
 An affiliation is a dedicated group of kind ``affiliation``, so an access grant targeting it is refused, a role not
 scoped to affiliations is refused on it, and it is left out of the grant-target listings. Unlike other dedicated

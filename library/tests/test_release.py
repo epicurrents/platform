@@ -650,14 +650,14 @@ class TestReleaseCommand:
         def selector(ds, eligible, *, as_of):
             seen["eligible"] = [item.pk for item in eligible]
             seen["as_of"] = as_of
-            return ReleaseDecision(items=[eligible[1]], profile_version="edu-7", k=5, class_k={"b": 10}, m=2)
+            return ReleaseDecision(items=[eligible[1]], profile_version="profile-7", k=5, class_k={"b": 10}, m=2)
 
         register_release_selector(selector)
         out = self._run(dataset.object_hash, "--as-of", "2026-10-01")
         assert seen == {"eligible": [items[0].pk, items[1].pk], "as_of": date(2026, 10, 1)}
         assert "Released 1 of 2 eligible" in out and "withheld" in out
         release = DatasetRelease.objects.get(dataset=dataset)
-        assert (release.profile_version, release.k, release.class_k, release.m) == ("edu-7", 5, {"b": 10}, 2)
+        assert (release.profile_version, release.k, release.class_k, release.m) == ("profile-7", 5, {"b": 10}, 2)
         items[1].refresh_from_db()
         assert items[1].release == release
 

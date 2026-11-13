@@ -202,7 +202,7 @@ bundle_plugins() {
 }
 
 # Whether $1 appears in the remaining arguments. A loop rather than a pattern
-# match on a joined string, which would let "edu" match "education".
+# match on a joined string, which would let "demo" match "demonstration".
 contains() {
     local needle="$1"
     shift

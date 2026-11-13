@@ -205,7 +205,7 @@ A provider applies to ordinary groups unless it sets `group_kind` to a kind of [
 
 ## User agreement
 
-A deployment can require every account to accept its user agreement before using anything else. Nothing happens until it publishes one, and the text is the deployment's own, never part of the repository: a project ships a template (the edu project's is [projects/edu/docs/user-agreement-template.md](../projects/edu/docs/user-agreement-template.md)), and the operator fills in a copy outside the history and publishes it from the host.
+A deployment can require every account to accept its user agreement before using anything else. Nothing happens until it publishes one, and the text is the deployment's own, never part of the repository: a project ships a template, and the operator fills in a copy outside the history and publishes it from the host.
 
 ```sh
 docker compose exec -T web python manage.py publish_agreement --label 2026-11 < local/user-agreement.md

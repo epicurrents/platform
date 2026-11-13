@@ -1406,14 +1406,14 @@ class TestArchiveVerification:
         assert "signature=unverifiable" in _progress(result)
 
     def test_a_package_for_another_project_is_refused(self, fakebin, tmp_path):
-        self._signed(fakebin, tmp_path, EPICURRENTS_PROJECT="edu", project="research")
+        self._signed(fakebin, tmp_path, EPICURRENTS_PROJECT="example", project="research")
         result = run_script("update.sh", fakebin, cwd=tmp_path)
         assert result.returncode != 0
-        assert "built for project 'research'" in result.stderr and "runs 'edu'" in result.stderr
+        assert "built for project 'research'" in result.stderr and "runs 'example'" in result.stderr
         _nothing_touched(fakebin, tmp_path)
 
     def test_a_base_package_over_a_project_deployment_is_refused(self, fakebin, tmp_path):
-        self._signed(fakebin, tmp_path, EPICURRENTS_PROJECT="edu", project="")
+        self._signed(fakebin, tmp_path, EPICURRENTS_PROJECT="example", project="")
         result = run_script("update.sh", fakebin, cwd=tmp_path)
         assert result.returncode != 0
         assert "built for project '<none>'" in result.stderr

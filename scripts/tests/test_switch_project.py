@@ -17,7 +17,7 @@ def _make_repo(tmp_path, *, env, frontend_env=None):
         (tmp_path / "frontend" / ".env").write_text(frontend_env)
 
 
-def _run(fakebin, tmp_path, project="edu"):
+def _run(fakebin, tmp_path, project="research"):
     fakebin.stub("docker")
     fakebin.stub("npm")
     return run_script(SWITCH, fakebin, cwd=tmp_path, args=[project])
@@ -29,18 +29,18 @@ class TestSwitchProject:
         result = _run(fakebin, tmp_path)
         assert result.returncode == 0, result.stderr
         assert not fakebin.has_call("deactivate_project")
-        assert fakebin.has_call("activate_project edu")
+        assert fakebin.has_call("activate_project research")
         assert fakebin.has_call("npm run build")
-        assert (tmp_path / ".env").read_text() == "EPICURRENTS_PROJECT=edu\nOTHER=1\n"
-        assert (tmp_path / "frontend" / ".env").read_text() == "VITE_PROJECT=edu\n"
+        assert (tmp_path / ".env").read_text() == "EPICURRENTS_PROJECT=research\nOTHER=1\n"
+        assert (tmp_path / "frontend" / ".env").read_text() == "VITE_PROJECT=research\n"
 
     def test_an_absent_key_and_frontend_env_are_added(self, fakebin, tmp_path):
         _make_repo(tmp_path, env="OTHER=1\n")
         result = _run(fakebin, tmp_path)
         assert result.returncode == 0, result.stderr
         assert not fakebin.has_call("deactivate_project")
-        assert (tmp_path / ".env").read_text() == "OTHER=1\nEPICURRENTS_PROJECT=edu\n"
-        assert (tmp_path / "frontend" / ".env").read_text() == "VITE_PROJECT=edu\n"
+        assert (tmp_path / ".env").read_text() == "OTHER=1\nEPICURRENTS_PROJECT=research\n"
+        assert (tmp_path / "frontend" / ".env").read_text() == "VITE_PROJECT=research\n"
 
     def test_a_named_project_is_deactivated_first(self, fakebin, tmp_path):
         _make_repo(tmp_path, env="EPICURRENTS_PROJECT=example\n", frontend_env="VITE_PROJECT=example\n")
@@ -48,12 +48,12 @@ class TestSwitchProject:
         assert result.returncode == 0, result.stderr
         calls = fakebin.calls()
         deactivate = next(i for i, c in enumerate(calls) if "deactivate_project" in c)
-        activate = next(i for i, c in enumerate(calls) if "activate_project edu" in c)
+        activate = next(i for i, c in enumerate(calls) if "activate_project research" in c)
         assert deactivate < activate
-        assert "EPICURRENTS_PROJECT=edu" in (tmp_path / ".env").read_text()
+        assert "EPICURRENTS_PROJECT=research" in (tmp_path / ".env").read_text()
 
     def test_the_active_project_is_a_no_op(self, fakebin, tmp_path):
-        _make_repo(tmp_path, env="EPICURRENTS_PROJECT=edu\n")
+        _make_repo(tmp_path, env="EPICURRENTS_PROJECT=research\n")
         result = _run(fakebin, tmp_path)
         assert result.returncode == 0, result.stderr
         assert "nothing to do" in result.stdout
