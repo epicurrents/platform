@@ -610,7 +610,7 @@ onMounted(async () => {
 
         <wa-spinner v-if="loading" class="spinner"></wa-spinner>
 
-        <wa-callout v-else-if="error" variant="danger">{{ error }}</wa-callout>
+        <wa-callout v-else-if="error" class="error" variant="danger">{{ error }}</wa-callout>
 
         <template v-else-if="totalItems || emptyMode">
             <!-- Epicurrents viewer mount point. -->
@@ -666,6 +666,11 @@ onMounted(async () => {
     display: block;
     margin: 3rem auto;
     font-size: 2rem;
+}
+
+.error {
+    align-self: center;
+    margin: 3rem 1rem;
 }
 
 .viewer-container {
