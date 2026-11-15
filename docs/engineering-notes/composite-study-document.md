@@ -1,6 +1,6 @@
 # Composite studies — the study document
 
-**Status:** draft v0.2, 2026-11-14. Nothing built. Decided so far: the modality is `composite`; the importer accepts canonical English names only and the submitter maps everything else during upload; device-recorded distances and markers travel as seeds the reader can move; the viewer builds the study as a composite resource whose tables are derived children bound to the parts' measurements ([section 10](#10-viewer-side)). The specification is being settled point by point in [composite-module-plan.md](composite-module-plan.md). Open questions are collected in [section 9](#9-open-questions).
+**Status:** draft v0.3, 2026-11-15. Nothing built. Decided so far: the modality is `composite`; the importer accepts canonical English names only and the submitter maps everything else in the viewer before upload; device-recorded distances and markers travel as seeds the reader can move; the viewer builds the study as a composite resource whose tables are derived children bound to the parts' measurements ([section 10](#10-viewer-side)). The specification is being settled point by point in [composite-module-plan.md](composite-module-plan.md). Open questions are collected in [section 9](#9-open-questions).
 
 ## TL;DR
 
@@ -91,12 +91,13 @@ Rules:
 - **A position is a term or a term with an offset.** `stimulation` and `recording` take a site term, or `{ "site": "elbow", "offset": { "direction": "distal", "mm": 50 } }` for a point measured from one, as an inching study's steps are; the direction is an anatomical relation term.
 - **`intensity` is in amperes** and optional: absent when the export does not carry it or the device reports none (magnetic stimulation).
 - **`triggerOffset`** is the sample index of the stimulus, 0 when the sweep starts at the stimulus.
-- **A sensory sweep carries `split: "odd" | "even"`** and the two halves of a pair share `stimulation`, `recording` and `intensity`. The viewer shows their mean and can overlay the halves.
+- **A sensory sweep carries `split: "odd" | "even"`** and the two halves of a pair share `stimulation`, `recording` and `intensity`. The viewer shows their mean and can overlay the halves; measurements are taken on the mean only, and a seed for the pair sits on its odd half.
 - **An F-wave or H-reflex part is a series**: its sweeps share sites, may differ in intensity, and keep their order.
 - **An EMG part has no sites.** Its `nerve` field is replaced by `muscle`; each sweep is one save, or in an `mup` part one motor unit potential template.
+- **`requires` is optional** and lists the features a reader must understand to read the file correctly; a reader refuses a file naming one it does not know, where it ignores an optional field it does not know.
 - **`kind` is optional** and selects the derived children the viewer builds over the parts ([section 10](#10-viewer-side)); grouping and serving use only `modality`.
 - **`defaultChild` is optional** and names the child a composite resource activates when it is itself activated: a part `id`, or a derived child the vocabulary declares for the `kind` (`summary` for `edx`). Anything else is refused like an unknown term.
-- **A sweep or part may carry `seed`**, the measurements the source recorded: marker latencies in seconds under marker terms of the vocabulary, and segment distances in millimetres between two of the part's sites. Seeds are numbers only and become the viewer's initial markers and distances, which the reader can move ([section 8](#8-measurements)); the document never carries a value computed from them.
+- **A sweep or part may carry `seed`**, the measurements the source recorded: marker positions as sample indices under marker terms of the vocabulary, distances in millimetres between a part's steps, and the limb's temperature. Seeds are numbers only and become the viewer's initial markers and distances, which the reader can move ([section 8](#8-measurements)); the document never carries a value computed from them.
 - **A part may record from several sites at once.** Sweeps sharing step and trial with different `recording` are simultaneous responses to one stimulus, as in an anastomosis study or a somatosensory evoked potential, and `nerve` is always the stimulated nerve.
 - **Several parts may share test, nerve and side.** A short-segment sensory study of the median nerve is a second sensory part beside the routine one, not merged into it.
 
@@ -143,13 +144,15 @@ The initial set below covers every English-named site, nerve and muscle in the i
 
 ## 5. Mapping names during upload
 
-The converter is name-agnostic. It reads the vendor's folder tree and writes the document with each name as found, in a `sourceNames` table the parts refer to by index, plus the test type it read. The platform does the rest:
+A reader or converter is name-agnostic. It reads the vendor's export and hands over the document with each name as found, in a `sourceNames` table the parts refer to by index, plus the test type it read. The names are resolved in the viewer, before anything is sent:
 
-1. Ingest resolves every source name it can match ([section 4](#4-the-canonical-vocabulary)).
-2. If any name is left, the upload stops in a mapping state and the submitter is shown the unresolved names, with the test, nerve and side they occur in, and picks a term for each — or marks a sweep or part to be dropped.
-3. Ingest rewrites the manifest with terms only and removes `sourceNames`. The stored file carries no name the submitter did not confirm.
+1. The upload step resolves every source name it can, through the name map the submitter chose and then by matching ([section 4](#4-the-canonical-vocabulary)).
+2. The submitter is shown whatever is left, with the test, nerve and side each name occurs in, and picks a term for each or marks a sweep or part to be dropped. The upload does not continue until none is left.
+3. The viewer writes the canonical file, terms only and no `sourceNames`. No source name leaves the browser, and ingest refuses a file still carrying one.
 
-Source names live only in the author-private staging state while the upload waits, under the same rule as `Recording.original_name`. A batch following one naming can name a **name map** at upload, an exact table from a source's labels to terms that is consulted before matching, as a channel map is for EDF labels; a submitter's saved mapping is a map of their own. The platform ships no maps, per-language or other: the composite module's repository holds a template for writing one, and a deployment's maps are its own configuration.
+A batch following one naming uses a **name map**, an exact table from a source's labels to terms that is consulted before matching, as a channel map is for EDF labels. The platform ships no maps, per-language or other: the composite module's repository holds a template for writing one, and a deployment's maps are its own configuration, served to the users who may upload.
+
+Converter output that reaches the platform some other way, a batch upload or `import_recordings`, is mapped there by the same three steps, the upload waiting in an author-private mapping state in which source names are held under the rule for `Recording.original_name`. That route exists only where a deployment allows direct upload ([composite-module-plan.md](composite-module-plan.md), 8c).
 
 The test type comes from the converter, but the submitter can correct it in the same step, which is how the demo's motor evoked potentials (stored by the device as motor conduction) get their real test once `mep` exists.
 
@@ -165,12 +168,12 @@ A vendor format reaches the viewer through a reader of its own and the platform 
 
 A converter for a database export must:
 
-- read an allowlist of tables and columns, and nothing else — never the patient, study or journal tables, operator or workstation columns, free-text notes, the snapshot file or the reports;
-- drop every date and time, including those inside the serialised sweep blocks;
+- read an allowlist of tables and columns, and nothing else — never the patient, study or journal tables, operator or workstation columns, free-text notes, the snapshot file or the reports. The one exception is the viewer's upload step, for which a reader reads the subject's sex, height and birth date and the examination date, hands over sex, height and the age computed from the two dates, and keeps neither date; a converter the platform runs reads none of them;
+- drop every other date and time, including those inside the serialised sweep blocks;
 - resolve nerve, muscle and test type from its own table of the device's factory identifiers, and refuse a reference it does not know rather than guess;
 - put each site's factory key or typed label into `sourceNames`, never into a part directly;
 - convert samples to microvolts float32, applying each sweep's own scale;
-- write the device's marker latencies and recorded distances as seeds, leaving out a marker the device left unset.
+- write the device's markers, as sample indices, and its recorded distances as seeds, leaving out a marker the device left unset.
 
 Neither converter may compute measurements, guess distances, rename sites or invert polarity.
 
@@ -188,7 +191,7 @@ Storing a format that is not EDF touches every place that assumes EDF. Each need
 
 Markers, distances and the values computed from them (latency, amplitude, area, duration, conduction velocity, F-wave persistence and latencies) are the reader's work. The viewer computes them from markers, as `NcsChannelMarker` already does for a single trace, and binds the tab-module's table rows to them, so moving a marker updates the table.
 
-What persists is the reader's markers and inputs, never the values computed from them: one `Label` per item on the recording, carrying a code of the confined vocabulary `epicurrents.edx.work`, whose every part is a term, an id or a bounded number, so a reader's work crosses the annotation-text boundary as codes. Confined is the right class because the writer is the viewer, a known writer, not a file. The grammar and limits are in [composite-module-plan.md](composite-module-plan.md) (point 7).
+What persists is the reader's markers and inputs, never the values computed from them: one `Label` per item on the recording, carrying a code of a confined vocabulary whose every part is a term, an id or a bounded integer. Markers, distances and selections are codes of `epicurrents.edx.work` and cross the annotation-text boundary; an EMG part's gradings are codes of `epicurrents.edx.finding`, which a de-identifying recipient does not receive, being conclusions about the subject. A device's stored gradings are saved the same way, as the uploader's findings, and never written into the file. Confined is the right class because the writer is the viewer, a known writer, not a file. The grammar and limits are in [composite-module-plan.md](composite-module-plan.md) (point 7).
 
 ## 9. Open questions
 
@@ -196,8 +199,7 @@ What persists is the reader's markers and inputs, never the values computed from
 - **Split-average count.** Whether a sensory sweep's averaging count is per half or for the pair; it decides how the mean is weighted.
 - **Polarity.** The sign convention of the samples, to be verified against a device printout before the viewer draws anything.
 - **Placeholder sites.** Whether the vocabulary should offer numbered neutral sites (`additional_site_1` …) for a submitter who cannot name an anatomical location, or whether such sweeps are dropped.
-- **Marker terms.** The set of marker names a seed and a measurement may use per test (onset, negative peak, end, the M and H responses, the F-wave minimum), and whether a device's markers map onto it one to one.
-- **Reference limits.** The lab's limits are configuration, not part of the examination, and a regression limit needs the subject's age. Whether the platform offers reference tables of its own, and whether a converter may write an age band, are both open; the age band is a de-identification decision for the assessment, not the converter.
+- **Reference tables of the platform's own.** Reference sets are generated from annotated datasets and held as configuration, never in the examination ([composite-module-plan.md](composite-module-plan.md), 6i and point 9). Whether the platform also ships published tables is open.
 
 ## 10. Viewer side
 
