@@ -188,7 +188,7 @@ Storing a format that is not EDF touches every place that assumes EDF. Each need
 
 Markers, distances and the values computed from them (latency, amplitude, area, duration, conduction velocity, F-wave persistence and latencies) are the reader's work. The viewer computes them from markers, as `NcsChannelMarker` already does for a single trace, and binds the tab-module's table rows to them, so moving a marker updates the table.
 
-Persisting them is the one structural decision left. A `Label` carries them today but its value is text, withheld from every de-identifying recipient. A confined vocabulary `epicurrents.edx.measure`, whose every part is a term, a sweep id or a number, would let them cross that boundary as codes; confined is the right class because the writer is the viewer, a known writer, not a file. This note recommends the confined vocabulary and leaves the decision open.
+What persists is the reader's markers and inputs, never the values computed from them: one `Label` per item on the recording, carrying a code of the confined vocabulary `epicurrents.edx.work`, whose every part is a term, an id or a bounded number, so a reader's work crosses the annotation-text boundary as codes. Confined is the right class because the writer is the viewer, a known writer, not a file. The grammar and limits are in [composite-module-plan.md](composite-module-plan.md) (point 7).
 
 ## 9. Open questions
 
@@ -196,7 +196,6 @@ Persisting them is the one structural decision left. A `Label` carries them toda
 - **Split-average count.** Whether a sensory sweep's averaging count is per half or for the pair; it decides how the mean is weighted.
 - **Polarity.** The sign convention of the samples, to be verified against a device printout before the viewer draws anything.
 - **Placeholder sites.** Whether the vocabulary should offer numbered neutral sites (`additional_site_1` …) for a submitter who cannot name an anatomical location, or whether such sweeps are dropped.
-- **Measurement persistence** ([section 8](#8-measurements)).
 - **Marker terms.** The set of marker names a seed and a measurement may use per test (onset, negative peak, end, the M and H responses, the F-wave minimum), and whether a device's markers map onto it one to one.
 - **Reference limits.** The lab's limits are configuration, not part of the examination, and a regression limit needs the subject's age. Whether the platform offers reference tables of its own, and whether a converter may write an age band, are both open; the age band is a de-identification decision for the assessment, not the converter.
 

@@ -1,6 +1,6 @@
 # Composite module — specification plan
 
-**Status:** started 2026-11-14. Resume at the first point whose status is not *decided*.
+**Status:** started 2026-11-14; every point decided 2026-11-15. The next step is the composite module's specification, into which these decisions move.
 
 The [composite study document](composite-study-document.md) fixes the architecture: the modality, the parts, the default child, derived children bound to the parts' measurements. It is not yet enough to build a module from. This plan takes the missing pieces one at a time. Each point records the decisions as they are made; once a point is decided, its result is written into the module's own specification, which lives in the composite module's repository and is linked from the design note.
 
@@ -18,12 +18,13 @@ Facts already established that every point can rely on:
 | 2 | Reader and module split, sweep loading | 3, 4 | decided |
 | 3 | Part to NCS and EMG resource mapping | 4 | decided |
 | 4 | Interfaces: composite resource, child builders, measures, cell bindings | first slice | decided |
-| 5 | The vocabulary files | first slice | decided; marker and measure terms come with point 6 |
-| 6 | Measurement definitions in the NCS module | measures and bindings | open |
-| 7 | Marker and distance persistence | saving a reader's work | open |
-| 8 | Platform side: modality, validating pass, serving, assessment | storing a composite study | open |
+| 5 | The vocabulary files | first slice | decided; marker and measure terms defined in point 6 |
+| 6 | Measurement definitions | measures and bindings | decided |
+| 7 | Marker and distance persistence | saving a reader's work | decided |
+| 8 | Platform side: modality, validating pass, serving, assessment | storing a composite study | decided |
+| 9 | Reference value generation | reference sets from annotated datasets | decided |
 
-Points 1 to 5 are what the first slice needs: a reader, the composite resource, the parts as plain resources without measurements, the child-builder registry and the default child. Points 6 and 7 add measurements and bindings; point 8 can run in parallel with any of them.
+Point 9 follows 7 and 8, since it reads saved work across a dataset on the platform. Points 1 to 5 are what the first slice needs: a reader, the composite resource, the parts as plain resources without measurements, the child-builder registry and the default child. Points 6 and 7 add measurements and bindings; point 8 can run in parallel with any of them.
 
 ### 1. Manifest schema and fixtures
 
@@ -63,7 +64,19 @@ Decide, in order:
 
 ### 6. Measurement definitions
 
-The marker set per test type; amplitude (baseline-to-peak or peak-to-peak), area and duration bounds; conduction velocity; F-wave persistence and its threshold; H-reflex measures.
+Decide, in order:
+
+- **6a. Common conventions.** Units, the baseline, how a marker position becomes a sample, signs and polarity, what makes a measure unavailable.
+- **6b. Placement.** Whether the module places markers itself where no seed or reader has, and if so by what rule; what a reader's edit does to measures depending on it.
+- **6c. Motor conduction.** Markers, the response measures (latencies, amplitudes, durations, areas) and the segment measures (conduction velocity, amplitude and area change, dispersion).
+- **6d. Sensory conduction.** Markers, including whether an initial positive peak is one; onset and peak velocities; the pair mean.
+- **6e. F-wave.** Markers per sweep and for the M response; persistence and what counts as a present F wave; minimum, mean and maximum latency, chronodispersion, amplitudes, the F/M ratio.
+- **6f. H-reflex.** M and H markers; the recruitment series; maximum amplitudes and the H/M ratio.
+- **6g. Distances and links.** A response's stimulation-to-recording distance and a segment's; distances derived from offsets on one landmark; which refs the composite links automatically and which only the reader does (4d).
+- **6h. EMG saves and MUP templates.** Which measures a save has, if any (interference pattern analysis), and a template's (amplitude, duration, phases, turns, area, size index); the firing-rate question left open in 1e.
+- **6i. Reference limits.** Whether deviation from reference values belongs to this point or later, given that a regression limit needs the subject's age.
+
+Repetitive stimulation, single-fibre EMG and the evoked potentials are specified when those tests are built.
 
 ### 7. Persistence
 
@@ -71,7 +84,43 @@ Whether markers and distances persist as codes of a confined `epicurrents.edx.me
 
 ### 8. Platform side
 
-The `composite` modality, the validating de-identification pass and its version, the serve-pipeline entry, the given-data rows in the anonymisation assessment, and the mapping step during upload (design note sections 5 and 7).
+- **8a. Modality.** `composite` in `RECORDING_MODALITIES`, declared by the converter's output and never inferred by the channel vote.
+- **8b. The validating pass.** Parsing, strict validation against the pinned schema and vocabularies, source-name resolution (1g), the canonical rewrite, and the pass's own version.
+- **8c. The mapping state.** The author-private waiting state, the upload page's mapping step, and name maps configured like channel maps.
+- **8d. Serving.** A pass-through entry in the serve pipeline, range requests, and the offload interlock kept on `apply_middleware`.
+- **8e. Vocabularies on the platform.** `epicurrents.edx.work` registered as confined, the pinned copies, and the optional composite write gate (point 7).
+- **8f. The assessment.** Given-data rows, the construction claim with its basis, and the residual covert channel.
+- **8g. Linked imports and the lifecycle.** `--link` against the canonical rewrite, no lifecycle stages at first, purge and erasure.
+- **8h. Subject covariates.** Age, sex, height and later weight, stored beside the recording for reference values.
+
+### 9. Reference value generation
+
+Generating reference sets from the markers readers place in the viewer and the exact covariates of 8h:
+
+- **9a. Computation.** Which code computes the measures and the statistics, where, and when.
+- **9b. The reference population.** Where the studies a set is computed from come from.
+- **9c. Annotation protocol and blinding.** What a reader sees while marking work a reference set will be computed from.
+- **9d. Annotator layers.** One annotator, each separately, or a combination.
+- **9e. Statistics.** Per cell (test, nerve, sites, technique, measure): mean and standard deviations, log transforms for skewed measures, percentiles, regression on age and height, stratification by sex, outliers, no extrapolation beyond the covariates' range.
+- **9f. Release and distribution.** Aggregates only, a minimum number of examinations per cell, the release gate of a pooled dataset, provenance (6i), and reference sets as keyed, versioned platform objects with sharing rules that the viewer loads.
+
+## Build obligations
+
+Found by the privacy reviews of the finished plan (2026-11-15) and binding on the build; none changes a decision, each is a place the implementation must not miss.
+
+- **Part index.** Parts are addressed by recording hash and part id, never a sequential key; the listing applies the release gate's rules to every key it serves (no sequential id to a non-manager, the release month for a released pooled member), and its keys join the grantee-visible shape test.
+- **Extraction.** The part file endpoint calls `_hidden_for_caller` with the share token, serves through `_build_serve_pipeline`, and joins the parity test's request shapes. An extract marks itself a subset and names no source recording, its hash included, since a file travels beyond the access it was served under.
+- **Every byte path dispatches on modality**, the FUSE mount included, so no composite file passes through an EDF middleware by its failing open.
+- **Work labels** derive `object_hash` from the recording's `stored_name`, never a primary key.
+- **The annotation-text rule** in AGENTS.md and the assessment row say that `edx.work` codes carry readings — marker positions and distances — to de-identifying recipients, a confined vocabulary admitting readings by design.
+- **Audit verbs** for every new write: covariates and the reference-use flag (field names only, never values), reference-set share, delete and export, the mapping endpoints (counts only). A refused work code puts no value in the security log or an activity row.
+- **Registrations.** `SubjectCovariates` and `CompositeMapping` take exemption entries as `original_name` does: patient data, a cascade from the recording, no user key. A `ReferenceSet` key to a user has a decided `on_delete`, `register_subject_pii` and `register_export_relation`, never `SET_NULL` by default; a run's provenance names annotators by opaque id only. Personal name maps, if ever saved on the platform, take erasure and export registration and cascade with their user.
+- **Rollback** never restores a withheld field of `SubjectCovariates` or `CompositeMapping`; a guard is registered if the generic path would.
+- **Hidden with their recording.** Covariate, mapping and part rows follow the FAILED-hiding and trash rules of their recording on every surface.
+- **The part index's digest-only audit** is documented inline on the writing site, with how the audit signals skip those rows.
+- **Reference sets.** A set's key and labels are grantee-visible free text and return `name_warnings`; an exported set names its dataset by `object_hash`, never by name. Calling an aggregate set fit for release is a disclosure-control threshold, not an anonymity finding, which only a deployment's contextual assessment may make. A set outlives the recordings and accounts behind it because, past the cell minimum and the rounded ranges, it holds aggregates rather than any one person's data; the exemption entry states that rationale, and a set computed from an erased or purged member is marked stale (9f).
+- **Inventories.** [docs/gdpr-compliance.md](../gdpr-compliance.md) gains rows for `SubjectCovariates` (health data), `CompositeMapping`, `CompositePart`, `ReferenceSet` and the work labels, and states that exact covariates reach no federated peer and that an exported set is a manual transfer.
+- **E-norms** (9b's later direction) takes its own assessment before it is built.
 
 ## Decisions
 
@@ -136,7 +185,7 @@ Every sweep:
 |---|---|---|
 | `id` | yes | `s<n>` (1c). |
 | `samplingRate` | yes | Hz. |
-| `data` | yes | `{ offset, samples }`. Samples are float32 microvolts for every sweep, a property of the format rather than a field. |
+| `data` | yes | `{ offset, samples }`, and optionally `encoding` and `scale`. Samples are float32 microvolts by default; `encoding: "int16"` with `scale` in microvolts per count halves a block's size, which matters for long EMG saves (about 0.18 µV a count at a ±6 mV range). It is a minor format version, so a reader knowing only float32 refuses such a file cleanly. |
 | `filters` | no | `{ highpass, lowpass }` in Hz, `notch` a boolean. |
 | `seed` | no | Marker latencies (1f). |
 
@@ -150,6 +199,7 @@ Stimulated sweeps (every test but `emg` and `mup`):
 | `pulseWidth` | no | Seconds. |
 | `averages` | yes | Integer, at least 1. |
 | `triggerOffset` | yes | Sample index of the stimulus. |
+| `technique` | no | `orthodromic` or `antidromic`, on a sensory sweep, where the source says so; absent is unknown. Reference values differ by technique, and inferring it from the positions would need the anatomical ordering point 5 leaves out. |
 
 A position (`stimulation`, `recording`) is a term, or an object placing a point relative to one (2026-11-15):
 
@@ -218,7 +268,7 @@ A converter's output carries the names it could not resolve in `sourceNames`, an
              "sweeps": [ { "id": "s1", "stimulation": { "source": 1 }, "recording": { "source": 2 } } ] } ]
 ```
 
-- Five fields may hold a reference in place of a term: `side`, `nerve`, `muscle`, `stimulation`, `recording`. `test` may not; the converter reads it from the export's type field and the submitter can correct it.
+- Five fields may hold a reference in place of a term: `side`, `nerve`, `muscle`, `stimulation`, `recording`; so may an EMG finding's grade (6h), a device's stored grading being a source value like a name. `test` may not; the converter reads it from the export's type field and the submitter can correct it.
 - A converter writes a term itself only where it resolves one deterministically, from a device's factory identifier; it never guesses from a typed label.
 - A name is mapped per kind of field, so one string used as a nerve and as a site is two questions.
 - Resolution runs in order: the name map the upload names, if any; exact matching on the vocabulary (design note section 4); the submitter, for whatever is left, mapping each name or marking a part or sweep to be dropped.
@@ -393,4 +443,313 @@ Section and table templates replace `subcontext` with `source?: SourceRef`.
 - **Validation is membership only.** A field's value is a term of a category the field accepts, and a marker is in its test's list. Nothing checks anatomical plausibility, which is the reader's judgement and would refuse legitimate unusual protocols.
 - **Versioning.** A term is never removed or renamed once shipped; additions are a minor version. A reader meeting a term newer than its copy shows the code rather than refusing the document; ingest validates against its pinned version.
 - **Contents.** Point 5 fills the anatomy from the design note's lists and the `edx` tests and derived-child terms; marker and measure terms arrive with point 6, the conduction markers `onset`, `negative_peak`, `positive_peak` and `end` already decided (1f).
+
+**6a. Common conventions** (2026-11-15).
+
+- **Units** are SI: seconds for latencies and durations, volts for amplitudes, volt-seconds for areas, metres per second for velocities, millimetres for distances as in seeds, and fractions, not percentages, for changes. Display units and decimals belong to the table's columns.
+- **A latency is measured from the stimulus**: the marker's position (1f) less `triggerOffset / samplingRate`.
+- **A marker reads the nearest sample**, as `NcsChannelMarker` does; at 24 to 48 kHz a sample is 0.02 to 0.04 ms, below any reading's resolution.
+- **Two baselines.** From the onset marker, the signal's value there, as devices measure baseline-to-peak amplitude; or tilted, the straight line between the onset marker and the positive peak, which corrects baseline drift and is common in sensory measurement. A measure taken against the tilted line is a measure of its own (`amplitude_negative_tilt` beside `amplitude_negative`, the area likewise), so both are always available, a table binds the one it shows, and no setting changes a number under a binding.
+- **Signs.** Measures are computed on the samples as stored (1e), never the displayed trace, so display polarity changes no number. The negative peak is the phase in which the active electrode is negative; amplitudes are positive magnitudes, the phase in the measure's name.
+- **No response is not no value.** `null` is a value that cannot be computed, a marker or a distance missing. An absent response is a finding the reader records as an input on the response: its amplitudes and areas are then `0`, its latencies `null`, and every velocity depending on it `null`.
+- **Saturation.** A measure using a sample on a run of identical values at the sweep's extreme carries a `<measure>.clipped` flag on the same ref, since the input range is not exported and the flat run is the only evidence; the measure is still given.
+
+**6b. Placement** (2026-11-15).
+
+- A marker's origin is the reader, a seed or automatic placement, in that precedence, and each marker records its own. A reader's marker hides the one beneath it; removing it brings that one back.
+- Automatic placement fills only sweeps whose seed carries no markers, so a marker a device left unset stays unset.
+- **Placement is anchored on the reader's markers.** A reader typically places only the onset of a motor response, and the rest follow from the waveform after it; the detector therefore also runs anchored, placing every marker the reader has not placed relative to those they have — the peaks and the end after a reader's onset, an F wave's end after its onset — and re-placing them when the reader moves an anchor. A marker the reader placed is never moved by the detector.
+- The detector is deterministic and versioned with the module, so a value computed from automatic markers can name the rules that placed them; the rules per test are in 6c to 6f.
+- The detector never records an absent response; finding nothing leaves the markers unset and the measures `null`.
+- Automatic markers are recomputed on every load and never saved; the reader's markers and inputs are saved (point 7), and seeds are already in the stored file.
+- Placing, moving or removing a marker, or changing an input, emits a change for every measure depending on it (4c).
+
+**6c. Motor conduction** (2026-11-15). Markers `onset`, `negative_peak`, `positive_peak`, `end`.
+
+| Response measure | Definition |
+|---|---|
+| `latency_onset` | Onset latency; at the most distal site, the distal motor latency. |
+| `latency_negative_peak` | Negative-peak latency. |
+| `amplitude_negative` | Onset baseline to negative peak. |
+| `amplitude_negative_tilt` | Tilted baseline to negative peak. |
+| `amplitude_peak_to_peak` | Negative peak to positive peak. |
+| `duration_negative` | Onset to the negative phase's end, where the signal recrosses the baseline after the negative peak, found in the samples rather than marked. |
+| `duration_total` | Onset to end. |
+| `area_negative` | Integral below the baseline over the negative phase. |
+| `area_negative_tilt` | The same against the tilted baseline. |
+| `area_total` | Integral of the absolute deviation from the baseline, onset to end. |
+
+A segment is two stimulation sites seen from one recording site. The default segments join consecutive steps; a reader may add one between any two stimulation sites of a recording site, skipping those between, as a quick test for conduction block does, and a seed's distance between two non-consecutive sweeps defines one too. A reader's segment is an input, saved with their work (point 7).
+
+| Segment measure | Definition |
+|---|---|
+| `latency_difference` | Proximal less distal onset latency. |
+| `conduction_velocity` | Segment distance over `latency_difference`, in metres per second; `null` when either is missing or the difference is not positive. |
+| `amplitude_change` | (proximal − distal) / distal on `amplitude_negative`; negative is a drop. |
+| `amplitude_change_peak_to_peak` | The same on `amplitude_peak_to_peak`, an option beside the default. |
+| `area_change` | The same on `area_negative`. |
+| `duration_change` | The same on `duration_negative`, for temporal dispersion. |
+
+The most distal response has a distance but no velocity, its latency including neuromuscular transmission; a residual latency can join later as a term of its own.
+
+Detector: blank the first millisecond after the stimulus; onset is the first sample after it leaving the pre-response noise band by more than the larger of three standard deviations and a fixed floor, and staying out; the negative peak is the most negative sample before the next return to baseline; the positive peak the most positive after it, before the signal settles; the end the first sample after that back inside the band. The constants are the implementation's, versioned with the detector and pinned by tests against the synthetic fixtures' known latencies and amplitudes (1h).
+
+**6d. Sensory conduction** (2026-11-15). Markers `onset`, `negative_peak`, `positive_peak`, `end`, and an optional `first_deflection`.
+
+- `onset` is where the negative deflection starts, in sensory as in motor, so an onset latency means one thing in every test. With an initial positive phase, that is its peak, where the signal turns negative; without one, where the signal leaves the baseline going negative.
+- The default sensory amplitude is `amplitude_negative_tilt`, the tilted line from `onset` to `positive_peak` (6a). With an initial positive phase it is the positive-to-positive tilt, without one the onset-to-positive tilt, one definition covering both as clinical practice measures them.
+- `first_deflection`, where an initial positive deflection leaves the baseline, gives a `latency_first_deflection` for research; no clinical measure depends on it.
+- Response measures are motor's (6c) — latencies, the amplitudes, durations and areas — and `conduction_velocity_onset` and `conduction_velocity_peak`, the stimulation-to-recording distance over `latency_onset` and `latency_negative_peak`. Segments are motor's, an inching step or a short segment, the velocity over the onset-latency difference.
+- Measures are taken on the pair's mean channel (3c); each half is measurable as its own sweep, and a reproducibility measure for the pair can join later as its own term.
+- The `edx` builder's sensory columns are `amplitude_negative_tilt`, `latency_onset`, `latency_negative_peak` and `conduction_velocity_onset`, the builder's choice rather than a rule of the measures.
+- Detector: motor's with a 0.5 ms blanking. A positive deflection above the noise band before the negative phase puts `onset` at its maximum and `first_deflection` where it left the band; without one, `onset` is where the signal leaves the band going negative and `first_deflection` stays unset.
+- A converter maps a vendor marker placed at the negative deflection's start in the absence of a positive phase to `onset`; which vendors do so the export samples will show.
+
+**6e. F-wave** (2026-11-15). A series of sweeps, one per step, each holding the M response and then the F wave.
+
+- Markers per sweep: `m_onset` and `m_end`, the M response's bounds as the motor detector places them; `f_onset`, set only where an F wave is present; `f_end`, bounding the window the F amplitude is measured in.
+- Sweep measures: `latency_m_onset`; `amplitude_m_peak_to_peak` over the M window; `latency_f_onset`; `amplitude_f_peak_to_peak`, the largest less the smallest sample between `f_onset` and `f_end`, F waves being polyphasic; `f_m_interval`, `latency_f_onset` less the M onset latency, the sweep's own where marked and the series' otherwise.
+- Presence: a sweep has an F wave when `amplitude_f_peak_to_peak` reaches the presence threshold, an input on the part defaulting to a constant of the implementation, conventions varying around 20 µV. A reader may mark a sweep's F wave absent (6a) or present whatever the threshold says, a small wave clearly seen counting.
+
+| Series measure | Definition |
+|---|---|
+| `f_m_interval_min`, `f_m_interval_mean`, `f_m_interval_max` | Over the sweeps with an F wave. The minimum is the measure clinical practice relies on most, since subtracting the M latency removes conduction disturbances distal to the stimulation site. |
+| `f_latency_min`, `f_latency_mean`, `f_latency_max` | Over the sweeps with an F wave. |
+| `f_persistence` | Sweeps with an F wave over all sweeps, as a fraction. |
+| `f_chronodispersion` | `f_latency_max` less `f_latency_min`. |
+| `f_amplitude_mean`, `f_amplitude_max` | Over the sweeps with an F wave. |
+| `f_m_ratio_max`, `f_m_ratio_mean` | `f_amplitude_max` and `f_amplitude_mean` over the series' M amplitude; for research, neither being a clinical routine. |
+| `latency_m_onset` | The series' M onset, from the first sweep carrying `m_onset`. |
+
+The `edx` builder's F-wave columns are `f_m_interval_min`, `f_latency_min` and `f_persistence`. F-wave conduction velocity waits, since it needs the distance from the stimulation site to the cord, a distance of another kind than a segment's (6g).
+
+Detector: the M response by the motor detector; the F window from a fixed margin after `m_end` to the sweep's end, `f_onset` its first sample leaving the noise band and `f_end` its last outside it. A window with no excursion reaching the threshold leaves `f_onset` unset, which persistence counts as no F wave — the one case where the detector's silence counts, persistence being defined over the sweeps without one.
+
+**6f. H-reflex** (2026-11-15). A recruitment series, one sweep per step, usually at rising intensity, each with an M and an H response.
+
+- Markers per sweep: `m_onset`, `m_end`, `h_onset`, `h_end`, bounding the two windows as the F-wave markers do.
+- Sweep measures: `latency_m_onset`, `amplitude_m_peak_to_peak`, `latency_h_onset`, `amplitude_h_peak_to_peak` over the H window. Each response's presence is a threshold input on the part with the reader's present and absent override, as for the F wave.
+
+| Series measure | Definition |
+|---|---|
+| `h_amplitude_max` | The largest H peak-to-peak over the series. |
+| `m_amplitude_max` | The largest M peak-to-peak, Mmax where the series reaches supramaximal intensity. |
+| `h_m_ratio` | `h_amplitude_max` over `m_amplitude_max`. |
+| `latency_h_onset_min` | The shortest H onset latency over the sweeps with an H response. |
+| `latency_h_onset_at_max` | The H onset latency of the sweep with the largest H. |
+| `h_threshold_intensity` | The lowest intensity with an H response present; `null` where the source carries no intensities. |
+
+A recruitment-curve fit is research for later.
+
+Detector: at low intensity the H response appears with no M before it, so M and H are told apart by latency. The boundary is an input on the part, defaulting to the end of the M response of the highest-intensity sweep, where M is largest and certain; a response starting before it is M, after it H, and each window is measured as the F wave's is.
+
+Side-to-side differences, of an H latency here and of any measure elsewhere, are a value of the composite resource rather than a part's, since no part holds both sides; they are defined once in 6g.
+
+**6g. Distances, links and side differences** (2026-11-15).
+
+- **Distances are inputs** of two kinds: a response's, from its stimulation site to its recording site (scope `{ part, step }`), and a segment's, between two stimulation sites (scope `{ part, segment }`). Each records its origin, in the precedence reader, seed, derived.
+- **Derived distances** the composite resource fills until a reader or a seed gives one: two stimulation positions offset from one landmark along one axis (distal and proximal its two senses) give the difference of their offsets, so an inching study needs no typing; a reader's segment skipping sites (6c) gives the sum of the consecutive segments along its path when all are known. Nothing else is guessed; a stimulation-to-recording distance is never estimated from anatomy.
+- **Links** (4d) are made automatically only between parts sharing nerve, side, stimulation position and recording where both tests use the distance — a repeated part, a motor and an F-wave part from one stimulation and recording. A reader may link any two distance refs and remove an automatic link; the composite resource holds the links, and a reader's links and unlinks are saved with their work (point 7).
+- **Side differences.** Mirror parts — one test on one nerve or muscle with the same stimulation and recording on opposite sides — are paired automatically, and a reader may pair or unpair any two. For a measure of a pair the composite resource gives `<measure>.side_difference`, the absolute difference, and for an amplitude `<measure>.side_ratio`, the smaller over the larger, as composite-level values of scope `{ pair: [partA, partB] }`.
+
+**6h. EMG saves and MUP templates** (2026-11-15).
+
+An EMG part's findings are the examiner's gradings, categorical inputs on the part whose values are ordered terms of the `edx` vocabulary, never text, so a table or a report binds them like any value (4c) and they cross the annotation-text boundary when saved (point 7). The grid is a compromise between the grading styles in use:
+
+| Category | Finding | Scale |
+|---|---|---|
+| Spontaneous activity | Insertional activity | `normal`, `increased`, `reduced` |
+| | Fibrillation potentials | `0` to `5+` |
+| | Positive sharp waves | `0` to `5+` |
+| | Fasciculations | `0` to `3+` |
+| | Complex repetitive discharges | `0` to `3+` |
+| | Myotonic discharges | `0` to `3+` |
+| MUP morphology | Amplitude | `3-` to `3+` |
+| | Duration | `3-` to `3+` |
+| | Polyphasia | `0` to `3+` |
+| | Instability (jitter) | `normal`, `increased`; optional |
+| Voluntary activity | Recruitment | `normal`, `reduced`, `early` |
+| | Interference pattern | `normal`, `1-`, `2-`, `3-`, `none` |
+
+- **Grading styles translate through the name-map mechanism (1g).** A converter writes a device's stored grade into `sourceNames` and refers to it from the finding; resolution runs through the upload's name map, which is where a lab's grading style becomes one map, then exact matching on the scale's terms, then the submitter. A style that does not fit, a four-step scale against a six-step one, is placed by the map or the submitter and never interpolated, and a grade that cannot be placed is dropped. Showing a device's grading as stored, as the vendor API reader does, remains possible in a local file through the converter-output form (point 2), never in a stored one.
+- **Device gradings are seeds**, in the precedence the markers follow (6b).
+- **A save has no computed measures in version 1**; interference pattern analysis (turns and amplitude, the envelope) is later.
+
+A MUP template has markers `onset` and `end` bounding the potential and an optional `satellite` for a late component.
+
+| Template measure | Definition |
+|---|---|
+| `amplitude_peak_to_peak` | The largest less the smallest sample between onset and end. |
+| `duration` | `end` less `onset`. |
+| `phases` | Baseline crossings between onset and end, plus one. |
+| `turns` | Direction changes exceeding the turn threshold, an input on the part defaulting near the usual 20 to 25 µV. |
+| `area` | Integral of the absolute value between onset and end. |
+| `thickness` | `area` over `amplitude_peak_to_peak`. |
+| `size_index` | Twice the base-ten logarithm of the amplitude in millivolts, plus the thickness in milliseconds. |
+
+The part's measures over its templates are `mup_count`, the means of amplitude, duration, phases and turns, and `polyphasic_fraction`, the share with more than four phases. A template's firing rate (1e) is a seed when the device reports one and `null` otherwise; discharge times are not carried in version 1, and could be re-detected from the source save when a template names one. The detector places onset and end where the signal leaves and regains the baseline band by a slope criterion, versioned with the others. Multi-MUP statistics beyond these and the turns-amplitude cloud are later.
+
+**6i. Reference sets** (2026-11-15). Building waits; these constraints hold now. Generating reference values from the markers readers place is one of the module's purposes, and benchmarking against several sets is part of it.
+
+- **A reference set is configuration, never part of a document**: limits per measure for a test, nerve and site, as mean and standard deviations from a regression or as fixed bounds. It carries a key, a version and its provenance — the dataset it was generated from, n, the method, the measure-definition and detector versions it was computed under.
+- **Any number of sets may be active**, an ordered list the reader changes. Per set, `<measure>.deviation` (in standard deviations; `null` for a fixed-bound limit) and `<measure>.abnormal` (true, false or `null`) carry a `reference: '<key>@<version>'` in their scope, so a table shows sets side by side; a ref naming no set uses the first active one.
+- **Consensus** over the active sets is a value of the composite resource: `<measure>.consensus` is `normal` when every set covering the measure calls it normal, `abnormal` when every one calls it abnormal, `discordant` when they disagree, and `null` when no active set covers it or none can be evaluated; `<measure>.consensus_count` gives the abnormal and covering counts. It is computed in the module, so an export or a report carries it, and changing the active sets emits like any input.
+- **A measure has a `layer` dimension**: the same measure computed from reader A's markers, reader B's, the seed or the detector, for inter-rater agreement and detector benchmarking. A ref naming no layer follows the precedence of 6b.
+- **Measures must be reproducible from saved work** (a constraint on point 7): marker positions and inputs are saved, never computed measures; saved work records the measure-definition and detector versions; two readers' markers on one sweep are kept apart, as the annotations layer keeps each author's rows.
+- **Covariates.** A regression limit needs the subject's age, sex and height, later weight. They are stored beside the recording, never in the document, and served exactly only where 8h allows; the composite resource reads them as inputs when present, and without them only fixed-bound limits apply and a regression limit reads `null`.
+- **Generation** is point 9.
+- The first build has no reference sets; its tables show measures only.
+
+**7. Persistence** (2026-11-15).
+
+- **One label per item.** Each item of a reader's work is a `Label` on the recording carrying one code of the confined vocabulary `epicurrents.edx.work`. A label suits work positioned within a sweep, a composite file having no common timeline; its `name` is the term's display name, as ingest names a label from a footer code, and its `value` is empty. A code value under a confined vocabulary crosses the annotation-text boundary, so a reader's work reaches de-identifying grantees, federated peers and reference generation over a pool, where a label value or a code's `meta` would be withheld from all of them.
+- **The grammar** is `<verb>:<subject>[=<value>]`, each separator with one role: `:` ends the verb, `>` joins the two ends of a segment (from, to), `/` qualifies a subject with a term or a number, `=` introduces the value, `~` joins the two sides of a link or a pair. None occurs within an id, a term, a grade (`2+`, `3-`) or a number, and no number has a sign.
+
+| Item | Value |
+|---|---|
+| Marker | `marker:s12/negative_peak=0.014500` |
+| Response distance | `distance:s3=72` |
+| Segment distance | `distance:s3>s5=230` |
+| Absent or present | `absent:s4`, `present:s4` |
+| Trial selection | `selected:p2/2=1` (part, step, trial) |
+| Reader segment | `segment:s3>s7` |
+| Link | `link:s3>s5~s9>s11`, distance links being the only kind in version 1; `unlink:` likewise |
+| Pairing | `pair:p1~p2`, `unpair:p1~p2` |
+| Finding | `finding:p5/fibrillation=2+` |
+| Part input | `threshold:p4/f_presence=0.000020`, `boundary:p6=0.018000` |
+| Versions | `versions:measures=1.0/detector=1.0` |
+
+| Domain | Range | Form |
+|---|---|---|
+| Ids | `p` or `s` and 1 to 5 digits | as 1c |
+| Step, trial | 1 to 999 | integer |
+| Distance | 1 to 999 mm | integer |
+| Marker position, boundary | 0 to 2 s | six decimals |
+| Threshold | 0 to 0.01 V | seven decimals |
+| Version | `major.minor`, each 0 to 99 | |
+| Whole value | at most 64 characters | |
+
+- **Validation.** The validator matches each verb's anchored pattern and checks every part against its domain: id patterns, `edx` terms, the ranges and precisions above. `canonicalise` writes numbers in their one canonical form, so equal values are spelled alike. The limits leave no room for a name, a date or an identity code in a value; they cannot remove every covert channel, marker positions being legitimately free numbers that a determined writer could spread digits across, which is why a confined vocabulary is for an authenticated writer and not for files, and what the assessment row (point 8) states. A composite-specific write gate checking that a sweep exists and a position lies within it is an option for point 8.
+- **Versions.** Each author's work on a recording carries one `versions` label naming the measure-definition and detector versions their work was placed under, updated on every save.
+- **Identity.** A label's `object_hash` derives from its author, the recording and the item's key — a marker's sweep and term, a distance's sweeps — so saving an item again updates its row. Moving a marker rewrites the value; removing it deletes the label, restoring the seed or automatic marker beneath (6b). Undoing a link or pairing deletes its label; `unlink` and `unpair` exist only to cancel an automatic one.
+- **Authors are layers.** Each author's labels are their own, the `layer` dimension (6i) selects one, and nothing is merged. Which layers a reader sees follows the existing permissions; their own is the default.
+- **Not saved as work:** automatic markers, recomputed; seeds, already in the stored file; computed measures, recomputed (6i). Covariates are not reader work and have their own record (8h).
+- **Writer.** The viewer writes through the annotations API. Ingest never writes `edx.work` codes, accepting closed vocabularies only; device work arrives as seeds in the file.
+
+Fully marked work is a few hundred labels per examination, the corpus averaging about 85 sweeps.
+
+**8a. Modality** (2026-11-15). `composite` joins `RECORDING_MODALITIES`. A file declares it through its magic and the manifest's `modality`; the channel vote never infers it.
+
+**8b. The validating pass** (2026-11-15). Ingest parses the file, validates the manifest strictly against the pinned schema and vocabularies (1a, 5) and refuses anything else, resolves source names (1g), and rewrites the manifest canonically. The pass carries a version of its own beside `DEIDENTIFICATION_VERSION`, stamped on every composite recording it writes and pinned the same way: a digest over the validator, the canonical rewrite and the pinned schema and vocabulary files fails the suite when any of them changes without a bump. A vocabulary's minor version therefore bumps the pass too, so a stored file names exactly the term lists that admitted it.
+
+**8c. Mapping before upload, and the fallback** (2026-11-15).
+
+- **The viewer maps before anything is sent**, as the submission upload prepares its file against what the platform accepts. The upload step lists every unresolved source name and does not continue until each has a term or is dropped; dropping removes parts and sweeps and renumbers ids and offsets by ingest's rules (1g). No source name or reference leaves the browser, and for a file the viewer prepared ingest's canonical rewrite changes nothing.
+- **The upload is the resource's serialisation.** A composite resource's serialised form is the composite document of point 2, so a reader's document, the resource built from it and the resource serialised close a loop. Each part's resource serialises its part, which makes the NCS, EMG and MUP resources' serialisation real work and their `fromSerialized` its round-trip check; the composite resource assembles the manifest and samples, volts back to microvolts, canonical fields only, seeds unchanged. A file format is an encoding of that form: the composite file is one, a thin writer of magic, length, manifest and blocks pinned by the fixtures (1h) so the viewer's writer and the platform's validator agree, and a DICOM exporter would be another, the module unchanged. The reader's work is not in it, being annotations (point 7), and serialising a resource that still carries an unresolved reference fails, so the mapping rule is enforced by the serialiser and not only by the interface.
+- **`serialize()` becomes `toSerialized()`** in core, pairing with `fromSerialized()`. The base declaration in core's application and biosignal types and its implementations (`GenericAsset`, `GenericAnnotation`, `ResourceLabel`, `GenericBiosignalEvent`) gain `toSerialized()`, and `serialize()` stays one release as a deprecated alias forwarding to it, so the sibling packages and the interface move at their own pace; the alias goes at core's next major. It is a core prerequisite of the composite module, beside the value-binding types (4c).
+- **Name maps in the viewer.** The deployment's name maps are served in full to signed-in users who may upload, the audience that already sees the channel-map keys, since a map holds a lab's labels, a fingerprint of a site and not of a patient. A submitter's own saved choices stay in the browser for now; saved on the platform they would link to the user and need registering for erasure and subject export.
+- **The fallback** is platform-side mapping for files that did not come through the viewer: converter output from a batch upload in the platform interface, or `import_recordings`. Such an upload waits as `PROCESSING` with `ingested_at` unset, which leaves the purge filter as it is and lets the orphan reaper retire one left unmapped past the retention window. A `CompositeMapping` row tied to the recording holds the source names, their unresolved occurrences and the chosen name map; it is author-private through `_can_see_original_name`, its source-name fields are registered with `register_masked_fields(..., withhold=True)` so no name reaches the permanent trail, and it goes with its recording or when ingest completes. The author's `GET` and `POST /recordings/{hash}/mapping` read and submit the mapping, auditing as `recordings.composite.mapping.read` and `.submit` with counts only. A name map chosen at upload (`name_map` beside `channel_map`, configured in `RECORDING_NAME_MAPS`) has its key and digest sealed in the READY audit row, as a channel map's are.
+- **The fallback exists only where direct upload does.** `RECORDINGS_DIRECT_UPLOAD`, a deployment-level setting in core and not a composite one, closes the direct route for every format: off, the upload endpoint accepts only files the viewer prepared, which leaves no platform-side mapping. It is a platform item of its own in the ROADMAP.
+
+**8d. Serving, the part index and extraction** (2026-11-15).
+
+- **Dispatch on modality in `_build_serve_pipeline`.** A `composite` recording gets an empty pipeline, the file holding no identification by construction once the validating pass (8b) has admitted it. The dispatch is explicit: no EDF pass ever runs on composite bytes, the EDF header middleware's fail-open on bytes it cannot parse never being the reason a file passes through, and a recording whose modality has no entry is refused rather than passed through, so a new format is not served until its pipeline is decided.
+- **Range requests** work on the stored bytes as they do now, and the composite reader relies on them; a peer's download size is the file's, an empty pipeline changing no length. The offload stays keyed on `apply_middleware`: a de-identifying grant streams the file, any other caller may be offloaded.
+- **EDF-only endpoints refuse** a composite recording with a code saying the format has no time slices, the time-range slice among them, rather than failing inside the EDF parser.
+- **Contract tests.** `test_serve_pipeline_parity` gains the composite request shapes — full and ranged, with and without middleware, the same bytes — and the refusal of an unknown modality; the load-bearing reviewer runs on the change.
+- **One file per recording.** The stored file stays the single unit, EMG saves included: purge, erasure, linking, preservation, lifecycle versions and the de-identification record all rest on one file per recording, and separate files would reopen each of them and bring back the wrapper's consistency problem. On-demand loading needs no split: the data section holds every sweep block before any EMG save, so opening a study is two range requests — header and manifest, then the sweeps in one contiguous read — and a save is one more when its part is first activated.
+- **The part index.** The validating pass writes a `CompositePart` row per part from the manifest it has validated: the recording, the part id, modality, test, nerve or muscle, side, technique where declared, sweep count, sampling rates, the stimulation and recording site sets, and whether it carries seeds. A part listing filters them across what the caller can read, with the recording listing's visibility (FAILED and trashed hidden, the release gate, federated terms). The rows add nothing a reader of the file does not already have, so they need no erasure registration and go with their recording by cascade; as high-fanout derived rows they are audited by a digest in the recording's READY audit row rather than one row each.
+- **Extraction.** `GET /recordings/{hash}/parts/{part_id}/file` serves a composite file holding that part alone, with the full file's access check, grant terms and serving rules. An extract keeps the original part and sweep ids, so a reader's work codes stay valid against it, and its envelope names its source in `subsetOf`; the consecutive-id rule (1c) holds for complete documents only. Bulk extraction is a job over a part query, writing one subset file per part. A reader's work follows its part through the sweep ids it names, which is how the annotation export and reference generation (point 9) work per part.
+- **Derived exports.** A later lifecycle derive job writes EDF per part or per EMG save for tools that read only EDF, the stored file staying the one source. WAV is neither a stored nor an export form, carrying no units, calibration or per-channel metadata.
+
+**8e. Vocabularies on the platform** (2026-11-15).
+
+- **Pinned copies**, each by version and digest with a test failing on drift, as [annotations/core_vocabularies.py](../../annotations/core_vocabularies.py) pins the event vocabularies: the anatomy file, shipped by viewer core and serving more than composite studies, in a vocabulary directory of the `epicurrents` app; the `edx` file and the schema, from the composite module's repository, with the composite code in `recordings/composite/`, where the validating pass reads them.
+- **`epicurrents.edx.work` registers as confined** from the recordings app's `ready()`, the app owning the format. Its validator is point 7's grammar, its `canonicalise` the canonical number forms. Ingest never writes it, accepting closed vocabularies only, so the API is its one writer.
+- **The write gate is built with it.** A work code is accepted only when every sweep it names exists in the recording, and in the part a `selected` or `finding` names; a marker position lies within its sweep's duration; and a marker, measure or finding term is valid for the part's test. The part index stores what the gate reads and no more: each part's sweep id range, the ids being consecutive (1c), and its longest sweep's duration. The gate runs on the annotation write path for this standard only, in the write's transaction, and a refusal is a 422 naming the rule, the value never logged.
+- **Strict mode is unchanged.** `ANNOTATION_CODE_STRICT_VOCABULARY` stays a project's decision; `edx.work` is validated whatever it says, being registered.
+
+**8f. The assessment** (2026-11-15). Written into [docs/anonymisation-compliance.md](../anonymisation-compliance.md) with a log row when point 8 is built.
+
+| Surface | Removed or replaced | Survives |
+|---|---|---|
+| Composite file, admitted by the validating pass and served unchanged | Everything outside the schema and vocabularies is refused at ingest: patient and study identification, dates and times, operator and workstation, free text, source names; ids are pattern-bound | Acquisition order; per-sweep parameters (site terms, intensity, pulse width, averages, filters, sampling rate, technique); seeds (device markers, distances, trial selection, device gradings); samples at full resolution; EMG save lengths |
+| Part index and listing | Nothing beyond the file | The file's terms and counts |
+| Reader work, `edx.work` codes | Typed text: terms and bounded numbers only, by the grammar and the write gate | Every reader's markers, distances, selections, findings and links, to every grantee |
+| Subject covariates (8h) | Withheld from every grantee, share-token holder and federated peer, under any grant; never in the audit trail | Exact values to the recording's author and superusers |
+
+Design gaps to record:
+
+- **Acquisition order fingerprints a lab**, the order of parts being a protocol template, the kind of site signature the EDF pass removes by its canonical channel order. Version 1 keeps it for the reader; a pooled dataset's ingest profile could require a canonical part order, as the submission gate refuses a non-canonical record split.
+- **Device parameters fingerprint a vendor** — sampling rates, filter settings, pulse-width defaults — as sampling rate does for EDF; recorded, and constrained by a pool's profile.
+- **Distances are anthropometric.** Segment lengths track height, and `distance:` work codes reach every grantee (point 7). Alone a segment length says little about a person; the strong quasi-identifier is its combination with the exact covariates, which reach no grantee (8h) and leave a reference generation run only as aggregates (point 9). Recorded as a gap rather than withheld, since withholding one verb's codes would make the redaction rule per-verb.
+- **The covert channel in work codes** is bounded by the numeric ranges and the write gate and rests on an authenticated writer (point 7).
+- **The construction claim** is stated with its basis: the file holds no identification because the validator refuses everything else, not as a property of the samples or the parameters.
+
+**8g. Linked imports, the lifecycle, the rest** (2026-11-15).
+
+- `import_recordings --link` validates a composite file without rewriting it, a linked file never being written, and refuses one the canonical rewrite would change — source names, references, drops, a non-canonical spelling. Only a canonical file is linked.
+- No reconstruction stages or derive jobs at first: a composite recording is `ready` once ingested. Derived EDF exports join later as a derive job (8d).
+- Purge, erasure and preservation are unchanged, a composite recording being one file. The originals volume keeps what was uploaded, as for every format: the canonical file on the viewer route, the vendor input on the fallback route.
+
+**8h. Subject covariates** (2026-11-15). Many reference values are unusable without the subject's age, sex and height, and later weight, so they are stored, exactly.
+
+- **Not in the file**, which is served unchanged to every reader (8d). A `SubjectCovariates` row tied to the recording holds `age` in decimal years at the examination, `sex` from a closed list, `height` in centimetres, later `weight` in kilograms.
+- **Exact to the recording's author and superusers only**, through `_can_see_original_name`, the single author-private gate; every grantee, share-token holder and federated peer receives nothing, under any grant. No collaborator needs an individual's covariates, reference generation running on the platform; a raw grant's widening would be a deliberate later change with a contract test of its own.
+- **Reference use is the author's decision.** A per-recording flag, set by the recording's author and off by default, allows its covariates into reference generation; a run reads covariates only where it is set (9b).
+- **Pooled submissions carry no covariates** in version 1, the submission gate already refusing subject keys: exact covariates on a pooled recording would be a quasi-identifier the pool's k does not see. A pooled dataset gives fixed-bound cells only.
+- **Never in the audit trail**: the fields are registered with `register_masked_fields(..., withhold=True)`. They are a patient's data rather than a user's, so `erase_subject` would never reach a value written there; the row goes with its recording.
+- **Entry.** The viewer's upload step pre-fills them from the vendor export where it holds them — the database export has height, birth date and sex — computes the age from the birth date and the examination date, neither of which leaves the browser, and sends the confirmed values as structured fields beside the file. On the fallback route the submitter enters them in the mapping step. Viewing a local file reads them, so regression limits work there too.
+- **Use.** Reference generation runs where the exact values are and releases only aggregates over a minimum number of examinations per cell (9f).
+
+**9a. Computation** (2026-11-15).
+
+- **The statistics run in the compute app**, in Python, as a scheduled Celery task, which a dataset's manager may also start, after a large annotation batch for instance. It opens its audited scope with `with_system_activity`. The interface consumes the reference sets it produces and never computes one.
+- **The measures are computed twice**: in the viewer, where a reader sees them, and in the compute app, where reference values are made from them. The 1h fixtures carry a file of expected measures per sweep that both test suites reproduce exactly, so a definition changed on one side fails the other. The Python implementation declares the measure-definition version it implements, and the job refuses saved work stamped with another (7b), so a reference set never mixes two definitions.
+
+**9b. The reference population** (2026-11-15). A dataset's members are the population a set is computed from, and its manager decides what belongs: whether an examination counts as normal is decided by its membership, not by a rule of the job. A later method may lift that requirement: extrapolated reference values (e-norms) estimate the limits from the distribution of all of a lab's data, abnormal studies included, so a run could take a whole clinical dataset rather than one curated as normal. It is recorded here as the direction, not designed. Datasets bring membership, access, a pooled dataset's release gate and the dataset reports with them. The job runs as the system and reads exact covariates only of members whose author has allowed reference use (8h), so a manager running over other authors' recordings uses their covariates only with their consent; nothing individual leaves the job (9f).
+
+**9c. Annotation protocol and blinding** (2026-11-15). A reader who sees a number while placing a marker anchors on it, and reference limits made from such markers partly reproduce the expectations that shaped them.
+
+- **Blinding is a mode of the composite resource**, not a display setting: in blind mode every derived measure, deviation and consensus ref answers `null`, seeds and other annotators' layers are not exposed, and covariates read as absent, while inputs — markers, distances, absent flags, findings — work as ever. Every consumer is blinded without cooperating, and the module stays ignorant of the interface. A distance is still entered; the velocity it produces stays hidden.
+- **The dataset declares the protocol**: blind or open, and whether marking starts from the detector's estimate or from no markers. The viewer applies it to every recording opened from that dataset, so every annotator works under the same rules and none can lift them.
+- **The usual protocol is blind, starting from the detector's estimate**, a reader placing the anchors (a motor response's onset) and the detector following (6b). Starting from no markers is the option for work that must not lean on the detector's rules.
+- **Provenance records the protocol** (6i), so a set from blinded annotation is told apart from one generated from routine clinical marking.
+- **Routine clinical work stays open**: the protocol applies only to a dataset declaring it.
+
+**9d. Annotator layers** (2026-11-15). A reference limit is applied by one reader measuring once, so it must carry one reader's variability; averaging annotators before computing narrows the limits below what any single reader achieves.
+
+- **One observation per examination by default**, from one annotator's layer: the dataset's designated primary annotator where it has one, otherwise one drawn at random with the seed stored in the run's provenance so the draw repeats.
+- **Per-rater sets** are an option, one set per annotator from their layer alone, to see whether annotators' sets differ systematically.
+- **An agreement report is a by-product**, not a set: where examinations carry several layers the run reports per measure the intraclass correlation and the Bland–Altman bias and limits of agreement, reader against reader and reader against detector.
+- **A detector-only set** is an option for comparison, never the default, since the blind protocol exists for the reader's judgement.
+- **Absent responses** contribute no latency or amplitude to a distribution but are counted, so a cell reports how often a response was absent; a part with no work in the chosen layer contributes nothing.
+
+**9e. Statistics** (2026-11-15). A pipeline of registered steps, with a default method set as its first steps.
+
+| Stage | Default |
+|---|---|
+| Cells | Test, nerve or muscle, stimulation, recording, technique and measure, a segment measure adding its segment; sides pooled, side difference having cells of its own |
+| Selection | One observation per examination (9d) |
+| Transform | Log for amplitudes and areas, being right-skewed; latencies, durations and velocities untransformed unless a normality test on the residuals rejects them |
+| Outliers | Tukey fences on the transformed residuals, excluded observations counted and reported |
+| Model | Linear regression on age, and on height for measures depending on limb length (distal and F latencies, F-M intervals), each kept when significant; sex a covariate when significant and strata only where each meets the minimum count; non-parametric percentiles instead where a cell has at least 120 observations and no covariate is significant |
+| Limits | One-sided at the 2.5th or 97.5th percentile or the prediction plus or minus 1.96 residual standard deviations, by the abnormal direction each measure term declares in `edx` (amplitudes and velocities low, latencies and durations high, side differences large); two-sided only where a term says so. Side-difference cells give an upper limit on `side_difference` and a lower limit on an amplitude's `side_ratio` |
+| Acceptance | The minimum count (9f) and the covariate ranges, outside which a regression limit reads `null` |
+
+- **Steps register; runs choose.** A step is a Python callable registered for a stage under a key and a version, `register_reference_step(stage, key, version, fn)`, from an `AppConfig.ready()`. The defaults register that way, and a lab's experimental methods register beside them from a project or plugin. A run names one `key@version` per stage, recorded in its provenance, so a set says which method made it and sets from one dataset by different methods compare side by side as active sets (6i).
+- **Code comes from the deployment, never a request.** A dataset's manager chooses among registered steps; no request supplies code or names a module, as an operation in the maintenance registry is chosen and never described. Experimental methods are deployed as project code is, reviewed and versioned.
+- **The platform enforces the release rule, not the steps.** Steps see individual observations and exact covariates, as a model must. What leaves the job is checked after the last step by platform code no step replaces: the cell-record schema with no per-subject field, and the minimum count per cell. A step returning anything else fails the run.
+- **A cell records** n, the excluded and absent-response counts, the method, the transform, the coefficients, the residual standard deviation, the covariate ranges and the direction.
+- **Any method's result is usable in the viewer.** A cell's limits travel as a known model family the viewer evaluates exactly — linear, log-linear, fixed bounds, percentiles — where the method yields one, and always also tabulated: the limit and the standard-deviation scale on a grid over the covariate range, which the viewer interpolates, so a new method needs no viewer change. The grid's spacing is a property of the set.
+
+**9f. Release and distribution** (2026-11-15).
+
+- **Two minimums per cell.** A statistical one, below which a limit means nothing (20 observations for a parametric model by default, 120 for percentiles), and a privacy one, below which aggregates describe individuals: `REFERENCE_CELL_MIN_EXAMINATIONS`, a deployment setting defaulting to 10, distinct from a pool's k, which is a class size. A cell is published only when it meets both; otherwise it appears uncomputed with its count. The minimum counts examinations, not subjects: the platform holds no subject identity across examinations, by design, so a patient examined twice counts twice, and within a pool a cell's spread over contributors is unknowable, ledgers and recordings being unjoinable. Both are recorded limitations.
+- **What a cell must not reveal.** A cell's exact covariate minimum and maximum are two individuals' values, so the recorded range is rounded outward to 5 years and 5 centimetres and the tabulated grid spans the rounded range; the 120-observation threshold keeps an extreme percentile an interpolation between several observations; coefficients and the residual standard deviation are aggregates. The release check (9e) applies these after the last step, whatever method made the cell.
+- **Reference sets are platform objects.** A `ReferenceSet` row carries its key, version, provenance — the dataset, each stage's `key@version`, the annotation protocol, the layer rule and its seed, the measure-definition version — and its cells. A new run is a new version, and earlier versions stay, since deviations name `key@version`. Sets are shared as datasets are, through `AccessRight` rows, so the model declares the reverse generic relations the GenericFK rule asks for; a set exports as a JSON file for another deployment or a local viewer, no more sensitive than the set, being aggregates. A reader loads the sets they can read by key and activates them (6i).
+- **Pooled datasets.** A run reads released members only, under the release gate; pooled members carry no covariates (8h), so a pooled dataset yields fixed-bound cells only.
+- **Who runs it.** A dataset's managers and superusers, over the covariates of members whose authors allowed reference use (8h); the dataset reports list the runs made over a dataset for its other managers to see.
+- **Versions and staleness.** A set's versions are immutable, and a new version is published only when the membership it reads has changed by at least the cell minimum since the last, so two versions cannot be differenced down to one member. A run's provenance keeps its member set, visible to the set's managers only, and a member withdrawn, vetoed, erased or purged marks every set computed from it stale, shown in the viewer and the set listing; the next run excludes it.
+- **Audit.** A run audits as `compute.reference.generate`, its target the set, with ids and counts only.
 
