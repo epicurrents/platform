@@ -83,15 +83,16 @@ set -euo pipefail
 # 4 made a present release key require a signature, refused downgrades, took
 # the database dump before the tree changes, and exits non-zero on a failed
 # health check; 5 added --prune-snapshots and the age limit
-# BACKUP_SNAPSHOT_MAX_AGE_DAYS sets on every snapshot.
-UPDATER_SCRIPT_VERSION=5
+# BACKUP_SNAPSHOT_MAX_AGE_DAYS sets on every snapshot; 6 appends to .env the
+# settings a package declares in env-additions.
+UPDATER_SCRIPT_VERSION=6
 
 info() { printf '\n\033[1;34m==> %s\033[0m\n' "$*"; }
 ok()   { printf '    \033[32m✓\033[0m  %s\n'  "$*"; }
 warn() { printf '    \033[33m!\033[0m  %s\n'  "$*"; }
 # Machine-readable progress, one fact per line, for a caller that tees this
 # script's output. Kept to a small vocabulary: step, snapshot, pruned, health,
-# done, failed, and the facts --check-archive reports.
+# env_added, done, failed, and the facts --check-archive reports.
 emit() { printf '::%s\n' "$*"; }
 die()  {
     local msg="$*"
@@ -985,6 +986,90 @@ report_orphan_candidates() {
     done <<< "$candidates"
 }
 
+# ── Settings a release introduces ─────────────────────────────────────────────
+# A package declares the .env settings its release introduces in env-additions
+# at its root, since|KEY|value|comment per line (scripts/env-additions in the
+# repository describes them). An entry introduced after the release being
+# replaced, whose key .env lacks, is appended with the package's value after the
+# snapshot that holds the previous .env, so a rollback takes it back out. An
+# entry introduced at or before that release is left alone: its absence is the
+# operator's doing. Nothing in this file ever replaces a value .env holds, and the
+# keys ENV_NEVER_ADD names are never written whatever a package declares; the
+# packager refuses them too, from the same pattern in scripts/lib/release_sign.py.
+
+ENV_ADDITIONS_FILE="env-additions"
+ENV_NEVER_ADD='^(SECRET_KEY|DB_[A-Z0-9_]*|REDIS_PASSWORD|BORG_PASSPHRASE|ADMIN_[A-Z0-9_]*|VAPID_[A-Z0-9_]*|FEDERATION_[A-Z0-9_]*KEY[A-Z0-9_]*|[A-Z0-9_]*_PRIVATE_KEY|DJANGO_MODE|DEBUG|EPICURRENTS_PROJECT|EPICURRENTS_PLUGINS|EPICURRENTS_NETWORK_NAME|EPICURRENTS_UID|EPICURRENTS_GID|HOST_PORT|PROXY_DOMAIN|TS_[A-Z0-9_]*|REMOTE_MAINTENANCE_ENABLED|REMOTE_UPDATE_ENABLED)$'
+
+env_has_key() {
+    # $1 = key. A commented-out line does not count: that is how .env.example
+    # documents a key it leaves unset.
+    grep -qE "^[[:space:]]*(export[[:space:]]+)?$1=" .env 2>/dev/null
+}
+
+env_additions_due() {
+    # stdin = an env-additions file; $1 = the version being replaced. Prints
+    # KEY<TAB>value<TAB>since<TAB>comment for each entry due. Warnings go to
+    # stderr, because callers capture the output.
+    local installed="$1" since key value comment
+    if [ -z "$installed" ]; then
+        warn "The installed version is unknown, so no setting is added to .env." >&2
+        return 0
+    fi
+    while IFS='|' read -r since key value comment || [ -n "$since" ]; do
+        case "$since" in ""|\#*) continue ;; esac
+        if ! is_version "$since" || ! [[ "$key" =~ ^[A-Z][A-Z0-9_]{0,63}$ ]] \
+            || ! [[ "$value" =~ ^[A-Za-z0-9_.,:/@+-]{0,200}$ ]]; then
+            warn "Ignoring an env-additions entry that cannot be read (${key:0:64})." >&2
+            continue
+        fi
+        if [[ "$key" =~ $ENV_NEVER_ADD ]]; then
+            warn "Ignoring $key in env-additions: an update never writes that key." >&2
+            continue
+        fi
+        version_gt "$since" "$installed" || continue
+        env_has_key "$key" && continue
+        comment="$(printf '%s' "$comment" | tr -d '\000-\037\177' | cut -c1-200)"
+        printf '%s\t%s\t%s\t%s\n' "$key" "$value" "$since" "$comment"
+    done
+}
+
+report_env_additions() {
+    # For --check-archive: the settings applying the package would add.
+    local due key value since comment keys=()
+    due="$(archive_member "$ENV_ADDITIONS_FILE" | env_additions_due "$INSTALLED_VERSION")"
+    [ -n "$due" ] || return 0
+    while IFS=$'\t' read -r key value since comment; do
+        ok "The update adds $key=$value to .env (introduced in $since)"
+        keys+=("$key")
+    done <<< "$due"
+    emit "env_adds=$(IFS=,; printf '%s' "${keys[*]}")"
+}
+
+apply_env_additions() {
+    # $1 = the extracted package's env-additions file. Appends in place, so the
+    # file keeps its owner and mode.
+    local due key value since comment added=()
+    [ -f "$1" ] || return 0
+    due="$(env_additions_due "$INSTALLED_VERSION" < "$1")"
+    if [ -z "$due" ]; then
+        ok "No new settings for .env"
+        return 0
+    fi
+    if [ -s .env ] && [ -n "$(tail -c1 .env)" ]; then
+        printf '\n' >> .env
+    fi
+    printf '\n# Added by the update to %s on %s.\n' "${PKG_VERSION:-a new release}" "$(date -u +%Y-%m-%d)" >> .env
+    while IFS=$'\t' read -r key value since comment; do
+        # Checked again: a package declaring a key twice must not write it twice.
+        env_has_key "$key" && continue
+        [ -z "$comment" ] || printf '# %s\n' "$comment" >> .env
+        printf '%s=%s\n' "$key" "$value" >> .env
+        added+=("$key")
+        ok "Added $key=$value to .env (introduced in $since)"
+    done <<< "$due"
+    emit "env_added=$(IFS=,; printf '%s' "${added[*]}")"
+}
+
 # ── --check-archive ───────────────────────────────────────────────────────────
 
 if [ -n "$CHECK_ARCHIVE" ]; then
@@ -992,6 +1077,7 @@ if [ -n "$CHECK_ARCHIVE" ]; then
     [ -f "$ARCHIVE" ] || die "Archive not found: $ARCHIVE"
     check_archive
     report_orphan_candidates
+    report_env_additions
     echo
     ok "Archive check passed. Nothing was changed."
     emit "check=ok"
@@ -1936,6 +2022,7 @@ if [ "$MODE" = archive ]; then
         "$src"/ "$ROOT"/
     ok "Files updated"
     prune_orphans "$src/FILELIST"
+    apply_env_additions "$src/$ENV_ADDITIONS_FILE"
 else
     git rev-parse --is-inside-work-tree >/dev/null 2>&1 \
         || die "repo mode needs a git checkout. In a distribution deployment use archive mode (the default)."

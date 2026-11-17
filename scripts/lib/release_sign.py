@@ -15,18 +15,20 @@ in one place: keys sorted, one key per line, lists on one line. ``update.sh``
 reads it with ``sed``, and that only works while the shape holds.
 
 Subcommands that touch a key need ``cryptography``; ``manifest`` (without
-``--successor-key``), ``version``, ``compatible`` and ``vercmp`` run on any
-Python 3.
+``--successor-key``), ``version``, ``compatible``, ``vercmp``, ``pin-check`` and
+``env-additions`` run on any Python 3.
 """
 
 from __future__ import annotations
 
 import argparse
+import ast
 import base64
 import datetime as _dt
 import hashlib
 import json
 import os
+import re
 import runpy
 import sys
 from pathlib import Path
@@ -208,6 +210,121 @@ def cmd_vercmp(args: argparse.Namespace) -> None:
     print((a > b) - (a < b))
 
 
+def _declared_pin(apps_py: Path) -> str | None:
+    """The ``requires_platform`` string a class in *apps_py* assigns, read with ``ast`` so Django is never imported."""
+    tree = ast.parse(apps_py.read_text(encoding="utf-8"), filename=str(apps_py))
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.ClassDef):
+            continue
+        for statement in node.body:
+            if isinstance(statement, ast.Assign):
+                targets = statement.targets
+            elif isinstance(statement, ast.AnnAssign):
+                targets = [statement.target]
+            else:
+                continue
+            if (
+                any(isinstance(t, ast.Name) and t.id == "requires_platform" for t in targets)
+                and isinstance(statement.value, ast.Constant)
+                and isinstance(statement.value.value, str)
+            ):
+                return statement.value.value
+    return None
+
+
+def cmd_pin_check(args: argparse.Namespace) -> None:
+    """Exit non-zero when a bundled project's or plugin's ``requires_platform`` excludes the platform version.
+
+    A deployment's upload check leaves the pins of what a package carries to this one, so a package whose own
+    project would fail ``manage.py check`` after the snapshot is refused here, before it is built. An absent pin
+    only warns, as it does at boot.
+    """
+    module = _version_module()
+    version = module["__version__"]
+    failed = False
+    for path in args.apps:
+        pin = _declared_pin(Path(path))
+        if pin is None:
+            print(f"warning: {path} declares no requires_platform", file=sys.stderr)
+            continue
+        try:
+            ok = module["satisfies"](version, pin)
+        except ValueError as exc:
+            print(f"{path}: requires_platform {pin!r} cannot be read: {exc}", file=sys.stderr)
+            failed = True
+            continue
+        if not ok:
+            print(f"{path}: requires_platform {pin} excludes platform {version}", file=sys.stderr)
+            failed = True
+    if failed:
+        sys.exit(1)
+
+
+#: Keys an update never writes into ``.env``, whatever a package declares: credentials the deployment generated or
+#: initialised another container with, the keys that shape the stack before any container exists, and the gates of
+#: remote maintenance itself. ``update.sh`` carries the same pattern as ``ENV_NEVER_ADD``; a test keeps them equal.
+ENV_NEVER_ADD = (
+    r"^(SECRET_KEY|DB_[A-Z0-9_]*|REDIS_PASSWORD|BORG_PASSPHRASE|ADMIN_[A-Z0-9_]*|VAPID_[A-Z0-9_]*"
+    r"|FEDERATION_[A-Z0-9_]*KEY[A-Z0-9_]*|[A-Z0-9_]*_PRIVATE_KEY|DJANGO_MODE|DEBUG|EPICURRENTS_PROJECT"
+    r"|EPICURRENTS_PLUGINS|EPICURRENTS_NETWORK_NAME|EPICURRENTS_UID|EPICURRENTS_GID|HOST_PORT|PROXY_DOMAIN"
+    r"|TS_[A-Z0-9_]*|REMOTE_MAINTENANCE_ENABLED|REMOTE_UPDATE_ENABLED)$"
+)
+_ENV_KEY = re.compile(r"^[A-Z][A-Z0-9_]{0,63}$")
+_ENV_VALUE = re.compile(r"^[A-Za-z0-9_.,:/@+-]{0,200}$")
+_ENV_COMMENT = re.compile(r"^[^\x00-\x1f\x7f|]{0,200}$")
+
+
+def cmd_env_additions(args: argparse.Namespace) -> None:
+    """Validate and merge ``env-additions`` files into one, and print ``KEY=value`` for each entry.
+
+    A line is ``since|KEY|value|comment``: the platform version that introduced the setting, the key, the value an
+    update appends when ``.env`` lacks it, and one line of explanation written above it. ``#`` lines and blank
+    lines are skipped. Refused: a malformed line, a version above the one being packaged, a key declared twice, and
+    a key an update must never write. The value's alphabet leaves out whitespace, quotes, ``$`` and ``#``, which
+    compose interpolates or a reader misreads.
+    """
+    module = _version_module()
+    version = module["parse_version"](module["__version__"])
+    never = re.compile(ENV_NEVER_ADD)
+    seen: dict[str, str] = {}
+    entries: list[str] = []
+    errors: list[str] = []
+    for source in args.sources:
+        for number, raw in enumerate(Path(source).read_text(encoding="utf-8").splitlines(), start=1):
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            where = f"{source}:{number}"
+            parts = line.split("|", 3)
+            if len(parts) != 4:
+                errors.append(f"{where}: expected since|KEY|value|comment")
+                continue
+            since, key, value, comment = (part.strip() for part in parts)
+            try:
+                introduced = module["parse_version"](since)
+            except ValueError:
+                errors.append(f"{where}: {since!r} is not a MAJOR.MINOR.PATCH version")
+                continue
+            if introduced > version:
+                errors.append(f"{where}: {key} is introduced in {since}, after the version being packaged")
+            if not _ENV_KEY.match(key) or never.match(key):
+                errors.append(f"{where}: {key!r} is not a key an update may write")
+            if not _ENV_VALUE.match(value):
+                errors.append(f"{where}: the value of {key} uses characters an update does not write")
+            if not _ENV_COMMENT.match(comment):
+                errors.append(f"{where}: the comment of {key} is longer than 200 characters or has control characters")
+            if key in seen:
+                errors.append(f"{where}: {key} is already declared in {seen[key]}")
+            seen[key] = where
+            entries.append(f"{since}|{key}|{value}|{comment}")
+            print(f"{key}={value}")
+    if errors:
+        sys.exit("\n".join(errors))
+    if args.out:
+        header = "# Settings this release introduces; update.sh appends the ones .env lacks. since|KEY|value|comment\n"
+        Path(args.out).write_text(header + "".join(f"{entry}\n" for entry in entries), encoding="utf-8")
+
+
 def main(argv: list[str] | None = None) -> None:
     """Command-line entry point."""
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n", maxsplit=1)[0])
@@ -263,6 +380,15 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("a")
     p.add_argument("b")
     p.set_defaults(func=cmd_vercmp)
+
+    p = sub.add_parser("pin-check", help="check bundled apps.py pins against the platform version")
+    p.add_argument("apps", nargs="+")
+    p.set_defaults(func=cmd_pin_check)
+
+    p = sub.add_parser("env-additions", help="validate and merge env-additions files, printing KEY=value")
+    p.add_argument("sources", nargs="+")
+    p.add_argument("--out")
+    p.set_defaults(func=cmd_env_additions)
 
     args = parser.parse_args(argv)
     args.func(args)

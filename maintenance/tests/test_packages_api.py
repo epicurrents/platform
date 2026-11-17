@@ -290,6 +290,19 @@ class TestUpload:
         assert response.status_code == 400 and response.json()["reason"] == "incompatible"
         assert "somecourse" in response.json()["detail"] and UNSATISFIED_PIN in response.json()["detail"]
 
+    def test_the_pin_of_a_project_the_package_carries_is_not_consulted(self, ready, monkeypatch):
+        # The installed copy pins the release being replaced; a breaking bump would otherwise never upload.
+        monkeypatch.setenv("EPICURRENTS_PROJECT", "somecourse")
+        pinned = SimpleNamespace(name="projects.somecourse", label="somecourse", requires_platform=UNSATISFIED_PIN)
+        monkeypatch.setattr(packaging, "_pinned_apps", lambda: [pinned])
+        assert upload(ready, project="somecourse").status_code == 201
+
+    def test_the_pin_of_a_plugin_the_package_carries_is_not_consulted(self, ready, monkeypatch):
+        monkeypatch.setenv("EPICURRENTS_PLUGINS", "something")
+        pinned = SimpleNamespace(name="plugins.something", label="something", requires_platform=UNSATISFIED_PIN)
+        monkeypatch.setattr(packaging, "_pinned_apps", lambda: [pinned])
+        assert upload(ready, plugins=["something"]).status_code == 201
+
     def test_a_pin_the_package_satisfies_passes(self, ready, monkeypatch):
         pinned = SimpleNamespace(name="plugins.something", label="something", requires_platform=SATISFIED_PIN)
         monkeypatch.setattr(packaging, "_pinned_apps", lambda: [pinned])

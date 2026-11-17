@@ -1,0 +1,10 @@
+# Settings a platform release introduces that a deployment's .env must gain when it updates.
+#
+# One line per setting: since|KEY|value|comment. `since` is the platform version that introduced the setting,
+# `value` is what update.sh appends when .env lacks the key and the deployment is on an older release, and the
+# comment is written above it. A project or plugin declares its own in an env-additions file at its root, which
+# the packager merges with this one. Declare a setting here only when its absence would stop the release from
+# booting or leave it wrong in a way a later edit cannot repair, and only with a value every deployment can take;
+# a value that needs a judgement belongs in the release notes. An entry stays here once released: a deployment that
+# skips releases needs every entry introduced after its own version. scripts/lib/release_sign.py validates the file
+# and names the keys an update never writes.

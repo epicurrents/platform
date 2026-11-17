@@ -13,8 +13,10 @@ The checks here are for the superuser's benefit, not the security boundary:
 the host agent verifies its own copy of the package against a root-owned key
 before anything runs. Refusing a bad package at upload gives an immediate,
 specific answer instead of a ``failed`` job a minute later, and lets Django
-make the one check the agent cannot — that the version satisfies every
-installed project's and plugin's platform pin.
+make the one check the agent cannot — that the version satisfies the platform
+pin of every installed project and plugin the package does not carry. The
+ones it carries are replaced by the package's own copies, whose pins the
+packager checks against the version it builds.
 """
 
 from __future__ import annotations
@@ -327,7 +329,13 @@ def check_manifest(manifest: Manifest) -> None:
             f"The package carries plugins '{','.join(manifest.plugins) or '<none>'}' and this deployment runs "
             f"'{','.join(plugins) or '<none>'}'.",
         )
+    # The package carries its own copy of the active project and of every plugin, and that copy's pin is the one
+    # the new release boots against; the packager refuses a package whose bundled pins exclude its version. The
+    # installed copy's pin speaks for the release being replaced, so testing it would refuse every breaking bump.
+    carried = {f"projects.{manifest.project}"} | {f"plugins.{name}" for name in manifest.plugins}
     for config in _pinned_apps():
+        if config.name in carried:
+            continue
         specifier = getattr(config, "requires_platform", None)
         if not specifier:
             continue

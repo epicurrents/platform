@@ -450,6 +450,24 @@ if [ "$DEMO" = true ] || [ "$DIST" = true ]; then
         || die "frontend/dist is not built. Run 'npm run build' in frontend/ (or scripts/rebuild-frontend.sh) first."
     check_bundle_provenance
 fi
+
+# A deployment's upload check leaves the pins of the projects and plugins a package
+# carries to this one: the package replaces the installed copies, so their pins speak
+# for the release being replaced. A bundled pin that excludes this version would boot
+# into a failing manage.py check after the deployment's snapshot, so it stops here.
+if [ "$TARBALL" = true ]; then
+    _pin_apps=()
+    for p in ${PROJECTS[@]+"${PROJECTS[@]}"}; do
+        [ ! -f "$REPO_ROOT/projects/$p/apps.py" ] || _pin_apps+=("$REPO_ROOT/projects/$p/apps.py")
+    done
+    for p in ${PLUGINS[@]+"${PLUGINS[@]}"}; do
+        [ ! -f "$REPO_ROOT/plugins/$p/apps.py" ] || _pin_apps+=("$REPO_ROOT/plugins/$p/apps.py")
+    done
+    if [ ${#_pin_apps[@]} -gt 0 ]; then
+        "$PYTHON" "$RELEASE_SIGN" pin-check "${_pin_apps[@]}" \
+            || die "A bundled project or plugin pins a platform range that excludes $("$PYTHON" "$RELEASE_SIGN" version); move its requires_platform after testing it against this version."
+    fi
+fi
 if [ "$DEMO" = true ]; then
     [ ${#PROJECTS[@]} -eq 0 ] \
         || die "--demo builds the base platform with no project; use --dist --with-project NAME for a project distributable."
@@ -650,6 +668,36 @@ if [ "$FEDERATION" = true ]; then
     [ -n "$PROXY_DOMAIN_ARG" ] || die "--federation needs --proxy-domain; the instance URL is built from it."
     set_env_key FEDERATION_INSTANCE_URL "https://$PROXY_DOMAIN_ARG"
     ok "Federation instance URL: https://$PROXY_DOMAIN_ARG"
+fi
+
+# ── Settings the release introduces ──────────────────────────────────────────
+# The platform's scripts/env-additions and each bundled project's and plugin's
+# env-additions, merged into one file at the package root. update.sh appends the
+# entries a deployment's .env lacks when it applies the package; a fresh install
+# takes the same values from .env.example, written in here.
+ENV_ADDITION_SOURCES=()
+[ ! -f "$REPO_ROOT/scripts/env-additions" ] || ENV_ADDITION_SOURCES+=("$REPO_ROOT/scripts/env-additions")
+for p in ${PROJECTS[@]+"${PROJECTS[@]}"}; do
+    [ ! -f "$REPO_ROOT/projects/$p/env-additions" ] || ENV_ADDITION_SOURCES+=("$REPO_ROOT/projects/$p/env-additions")
+done
+for p in ${PLUGINS[@]+"${PLUGINS[@]}"}; do
+    [ ! -f "$REPO_ROOT/plugins/$p/env-additions" ] || ENV_ADDITION_SOURCES+=("$REPO_ROOT/plugins/$p/env-additions")
+done
+if [ ${#ENV_ADDITION_SOURCES[@]} -gt 0 ]; then
+    info "Writing the settings this release introduces"
+    [ -n "$PYTHON" ] || die "python3 is required to validate env-additions."
+    ENV_ADDITIONS_KV="$("$PYTHON" "$SCRIPT_DIR/lib/release_sign.py" env-additions \
+        --out "$DEST/env-additions" "${ENV_ADDITION_SOURCES[@]}")" \
+        || die "An env-additions file is invalid; see the messages above."
+    while IFS= read -r _kv; do
+        [ -n "$_kv" ] || continue
+        if grep -qE "^#* *${_kv%%=*}=" "$DEST/.env.example"; then
+            set_env_key "${_kv%%=*}" "${_kv#*=}"
+        else
+            printf '\n%s\n' "$_kv" >> "$DEST/.env.example"
+        fi
+        ok "$_kv"
+    done <<< "$ENV_ADDITIONS_KV"
 fi
 
 info "Copying backend app trees"
@@ -1691,6 +1739,7 @@ PREPARE
             install-updater.sh
             epicurrents-updater.service
             epicurrents-updater.timer
+            epicurrents-updater.cil
             README.md
         )
         mkdir -p "$DEST/updater"
@@ -1987,6 +2036,8 @@ sudo restorecon -R /home/epicurrents/DIRECTORY
 ```
 
 `semanage` comes with `policycoreutils-python-utils`. The rule is recorded, so a later relabel of the file system keeps it, and files the stack creates inherit the label.
+
+The host agent that applies updates from the Maintenance tab needs a policy module as well, which `updater/install-updater.sh` installs on its own when SELinux is enabled; without it every update from the tab fails and its automatic rollback with it. See `updater/README.md`.
 
 ## 5. Start
 

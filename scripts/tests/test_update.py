@@ -15,6 +15,8 @@ import gzip as gzlib
 import hashlib
 import json
 import os
+import re
+import runpy
 import shutil
 import subprocess
 import sys
@@ -1610,6 +1612,93 @@ class TestCheckArchive:
         assert result.returncode != 0
         assert "same as the installed release" in result.stderr
         assert "check=ok" not in _progress(result)
+
+
+class TestEnvAdditions:
+    """A package's env-additions name the settings its release introduces. Applying it appends to .env each
+    one introduced after the release being replaced that .env lacks, after the snapshot that keeps the old
+    file, and never touches a value .env holds or a key an update must not write.
+    """
+
+    @staticmethod
+    def _apply(fakebin, tmp_path, additions, *, args=()):
+        archive = _build_package(tmp_path, files={"env-additions": additions})
+        fakebin.stub("rsync")
+        return archive, run_script("update.sh", fakebin, cwd=tmp_path, args=list(args))
+
+    def test_a_setting_introduced_after_the_installed_release_is_appended_with_its_comment(self, fakebin, tmp_path):
+        _deploy(fakebin, tmp_path)
+        _, result = self._apply(fakebin, tmp_path, "# header\n0.2.0|NEW_LIMIT_DAYS|30|Why the release needs it.\n")
+        assert result.returncode == 0, result.stderr
+        env = (tmp_path / ".env").read_text()
+        assert "# Why the release needs it.\nNEW_LIMIT_DAYS=30\n" in env
+        assert "# Added by the update to 0.2.0" in env
+        assert "env_added=NEW_LIMIT_DAYS" in _progress(result)
+        snapshot = next((tmp_path / "backups").glob("pre-update-*"))
+        assert "NEW_LIMIT_DAYS" not in (snapshot / ".env").read_text(), "the snapshot must hold the .env before it"
+
+    def test_a_value_env_already_holds_is_left_alone(self, fakebin, tmp_path):
+        _deploy(fakebin, tmp_path, NEW_LIMIT_DAYS="7")
+        _, result = self._apply(fakebin, tmp_path, "0.2.0|NEW_LIMIT_DAYS|30|c\n")
+        assert result.returncode == 0, result.stderr
+        env = (tmp_path / ".env").read_text()
+        assert "NEW_LIMIT_DAYS=7" in env and "NEW_LIMIT_DAYS=30" not in env
+
+    def test_a_commented_out_key_counts_as_absent(self, fakebin, tmp_path):
+        _deploy(fakebin, tmp_path)
+        with (tmp_path / ".env").open("a") as env:
+            env.write("# NEW_LIMIT_DAYS=\n")
+        _, result = self._apply(fakebin, tmp_path, "0.2.0|NEW_LIMIT_DAYS|30|c\n")
+        assert result.returncode == 0, result.stderr
+        assert "\nNEW_LIMIT_DAYS=30\n" in (tmp_path / ".env").read_text()
+
+    def test_a_setting_introduced_by_the_installed_release_or_earlier_is_not_added(self, fakebin, tmp_path):
+        # Its absence is the operator's doing: the installed release already shipped it.
+        _deploy(fakebin, tmp_path, installed_version="0.2.0")
+        archive = _build_package(tmp_path, version="0.3.0", files={"env-additions": "0.2.0|OLD_SETTING|1|c\n"})
+        fakebin.stub("rsync")
+        result = run_script("update.sh", fakebin, cwd=tmp_path)
+        assert result.returncode == 0, result.stderr
+        assert archive.exists() and "OLD_SETTING" not in (tmp_path / ".env").read_text()
+
+    def test_keys_an_update_never_writes_and_unreadable_entries_are_skipped(self, fakebin, tmp_path):
+        _deploy(fakebin, tmp_path)
+        additions = "0.2.0|SECRET_KEY|x|c\n0.2.0|PROXY_DOMAIN|evil.example|c\n0.2.0|SPACED|a b|c\n0.2.0|GOOD|1|c\n"
+        _, result = self._apply(fakebin, tmp_path, additions)
+        assert result.returncode == 0, result.stderr
+        env = (tmp_path / ".env").read_text()
+        assert "GOOD=1" in env
+        assert "SECRET_KEY=x" not in env and "evil.example" not in env and "SPACED" not in env
+        assert "an update never writes that key" in result.stdout + result.stderr
+
+    def test_a_key_declared_twice_is_written_once(self, fakebin, tmp_path):
+        _deploy(fakebin, tmp_path)
+        _, result = self._apply(fakebin, tmp_path, "0.2.0|TWICE|1|c\n0.2.0|TWICE|2|c\n")
+        assert result.returncode == 0, result.stderr
+        assert (tmp_path / ".env").read_text().count("TWICE=") == 1
+
+    def test_an_env_without_a_final_newline_keeps_its_last_line(self, fakebin, tmp_path):
+        _deploy(fakebin, tmp_path)
+        env_file = tmp_path / ".env"
+        env_file.write_text(env_file.read_text().rstrip("\n") + "\nLAST_LINE=kept")
+        _, result = self._apply(fakebin, tmp_path, "0.2.0|NEW_LIMIT_DAYS|30|c\n")
+        assert result.returncode == 0, result.stderr
+        assert "LAST_LINE=kept\n" in env_file.read_text()
+
+    def test_the_archive_check_reports_the_additions_and_writes_nothing(self, fakebin, tmp_path):
+        _deploy(fakebin, tmp_path)
+        before = (tmp_path / ".env").read_text()
+        archive = _build_package(tmp_path, files={"env-additions": "0.2.0|NEW_LIMIT_DAYS|30|c\n"})
+        result = run_script("update.sh", fakebin, cwd=tmp_path, args=["--check-archive", str(archive)])
+        assert result.returncode == 0, result.stderr
+        assert "env_adds=NEW_LIMIT_DAYS" in _progress(result)
+        assert (tmp_path / ".env").read_text() == before
+
+    def test_the_never_written_pattern_is_the_packagers(self):
+        script = (SCRIPTS_DIR / "update.sh").read_text()
+        declared = re.search(r"^ENV_NEVER_ADD='([^']*)'$", script, re.MULTILINE).group(1)
+        namespace = runpy.run_path(str(RELEASE_SIGN))
+        assert declared == namespace["ENV_NEVER_ADD"]
 
 
 class TestOrphanPruning:

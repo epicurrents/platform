@@ -567,6 +567,7 @@ class TestDistTailnet:
             "install-updater.sh",
             "epicurrents-updater.service",
             "epicurrents-updater.timer",
+            "epicurrents-updater.cil",
             "README.md",
         ):
             shipped = dest / "updater" / name

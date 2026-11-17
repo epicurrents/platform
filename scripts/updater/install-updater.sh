@@ -10,6 +10,7 @@
 #   /var/lib/epicurrents-updater/          the agent's state of record (job statuses, logs,
 #                                          the active-run lock), verified package copies
 #   /etc/systemd/system/                   epicurrents-updater.service + .timer (one-minute timer)
+#   SELinux policy module                  epicurrents-updater, when SELinux is enabled
 #   <root>/update/{packages,jobs}          the spool, owned by the deployment account
 #
 # The agent stays disabled until ENABLED=1 is set in the config, or --enable is
@@ -178,6 +179,25 @@ echo "==> Spool under $DEPLOY_ROOT/update"
 # never write a request.
 install -d -o "${OWNER%%:*}" -g "${OWNER##*:}" "$DEPLOY_ROOT/update" "$DEPLOY_ROOT/update/packages" "$DEPLOY_ROOT/update/jobs"
 echo "    packages/ and jobs/ owned by $OWNER"
+
+echo "==> SELinux"
+# rsync started from the agent's service runs confined as rsync_t, which cannot
+# write the container-labelled deployment tree: on an enforcing host every update
+# and every rollback the agent runs would fail at its first rsync, the rollback
+# leaving the stack stopped. The module grants rsync_t that tree and nothing else;
+# its header says why each permission is there.
+if command -v selinuxenabled >/dev/null 2>&1 && selinuxenabled; then
+    command -v semodule >/dev/null 2>&1 \
+        || die "SELinux is enabled but semodule is missing (policycoreutils); the agent's rsync could not write the deployment."
+    [ -f "$HERE/epicurrents-updater.cil" ] || die "SELinux is enabled and this updater/ carries no epicurrents-updater.cil."
+    semodule -i "$HERE/epicurrents-updater.cil"
+    echo "    policy module epicurrents-updater installed"
+    if [ "$(stat -c %C "$DEPLOY_ROOT" 2>/dev/null | cut -d: -f3)" != container_file_t ]; then
+        echo "    note: $DEPLOY_ROOT is not labelled container_file_t; label it as INSTALL-RHEL.md says, or the containers and the agent cannot use it." >&2
+    fi
+else
+    echo "    not enabled; nothing to install"
+fi
 
 echo "==> systemd timer"
 install -m 0644 -o 0 -g 0 "$HERE/epicurrents-updater.service" "$UNIT_DIR/epicurrents-updater.service"

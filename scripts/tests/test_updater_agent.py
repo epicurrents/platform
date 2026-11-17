@@ -1494,7 +1494,7 @@ class TestHeartbeatSnapshots:
 
 
 class TestInstaller:
-    def _install(self, fakebin, tmp_path, *args, key=True, as_root=True):
+    def _install(self, fakebin, tmp_path, *args, key=True, as_root=True, selinux=False):
         root = tmp_path / "deploy"
         (root / "updater").mkdir(parents=True, exist_ok=True)
         (root / "docker-compose.yml").write_text("services: {}\n")
@@ -1509,9 +1509,14 @@ class TestInstaller:
             "install-updater.sh",
             "epicurrents-updater.service",
             "epicurrents-updater.timer",
+            "epicurrents-updater.cil",
             "README.md",
         ):
             shutil.copy(SCRIPTS_DIR / "updater" / name, root / "updater" / name)
+        # Decided by the test, never by the host running the suite.
+        fakebin.stub("selinuxenabled", exit_code=0 if selinux else 1)
+        if "semodule" not in fakebin.removed:
+            fakebin.stub("semodule")
         if as_root:
             fakebin.stub("id", body='case "${1:-}" in -u) echo 0 ;; *) echo "uid=0(root)" ;; esac')
         else:
@@ -1573,6 +1578,33 @@ exec /usr/bin/install "$@"
         for sub in ("update", "update/packages", "update/jobs"):
             assert (root / sub).is_dir()
         assert "ENABLED=1 is" in result.stdout
+
+    def test_selinux_enabled_installs_the_policy_module(self, fakebin, tmp_path):
+        result, root, _, _, _ = self._install(fakebin, tmp_path, selinux=True)
+        assert result.returncode == 0, result.stderr
+        assert fakebin.has_call(f"semodule -i {root}/updater/epicurrents-updater.cil")
+        assert "policy module epicurrents-updater installed" in result.stdout
+
+    def test_selinux_disabled_installs_no_module(self, fakebin, tmp_path):
+        result, _, _, _, _ = self._install(fakebin, tmp_path)
+        assert result.returncode == 0, result.stderr
+        assert not fakebin.has_call("semodule")
+
+    def test_selinux_enabled_without_semodule_stops_before_the_timer(self, fakebin, tmp_path):
+        fakebin.remove("semodule")
+        result, _, _, _, _ = self._install(fakebin, tmp_path, selinux=True)
+        assert result.returncode != 0 and "semodule is missing" in result.stderr
+        assert not fakebin.has_call("systemctl enable")
+
+    def test_the_policy_module_grants_rsync_the_deployment_tree_only(self):
+        # The module widens one confined domain, and only towards the label the deployment carries.
+        rules = [
+            line
+            for line in (SCRIPTS_DIR / "updater" / "epicurrents-updater.cil").read_text().splitlines()
+            if line.startswith("(")
+        ]
+        assert rules and all(rule.split()[1] == "rsync_t" for rule in rules)
+        assert {rule.split()[2] for rule in rules if rule.startswith("(allow")} == {"container_file_t", "self"}
 
     def test_enable_and_allow_checkout_flags_edit_the_config(self, fakebin, tmp_path):
         result, _, etc, _, _ = self._install(fakebin, tmp_path, "--enable", "--allow-checkout")

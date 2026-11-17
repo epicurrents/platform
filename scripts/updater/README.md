@@ -12,6 +12,8 @@ sudo ./updater/install-updater.sh
 
 It installs the agent and its own copy of `update.sh` under `/usr/local/lib/epicurrents-updater/`, the configuration and the release public key under `/etc/epicurrents-updater/` (root-only), creates the spool directories owned by the deployment account, and enables `epicurrents-updater.timer`. The key is `RELEASE_KEY.pub` from the package root unless `--key PATH` names another; the installer prints its id, which is the same one `release_sign.py key-id` prints for the publisher, so the two can be compared out of band. The agent starts disabled: it writes a heartbeat the Maintenance tab shows and refuses every request until `ENABLED=1` is set in the config (or `--enable` was passed). Running the installer again refreshes the agent and leaves the config alone; `--self-update` sets `SELF_UPDATE=1`, described below.
 
+On a host where SELinux is enabled the installer also installs a policy module; see [SELinux](#selinux).
+
 Two settings in the platform's `.env` are the other half: `REMOTE_MAINTENANCE_ENABLED=true` mounts the Maintenance tab, `REMOTE_UPDATE_ENABLED=true` lets a superuser request an update from it.
 
 ## What a tick does
@@ -37,6 +39,16 @@ Every state is written to the agent's own status file, published into the spool,
 ## Release keys and their rotation
 
 The agent verifies packages against `/etc/epicurrents-updater/release.pub`, its own root-owned copy of the publisher's key. A release may announce the key that signs the next one: the packager's `--successor-key` puts that public key inside the signed manifest, and when a package with one verifies, the agent installs it as `release.pub.next`. From then on a package may be signed with either key; the first time one verifies with the successor, the successor becomes `release.pub` and the old key is gone. The heartbeat carries both ids, so the Maintenance tab shows which keys the agent trusts. A deployment that skipped the announcing release does not know the new key and refuses the next one with `refused_signature`; re-running the installer with `--key` is the way in.
+
+## SELinux
+
+rsync started from the agent's service enters the confined `rsync_t` domain, which may neither write the deployment tree, labelled `container_file_t` so the containers can mount it, nor override the deployment account's permissions as root. Without help every update fails at its first rsync, and the automatic rollback fails the same way and leaves the stack stopped as `rollback_failed`. [epicurrents-updater.cil](epicurrents-updater.cil) grants `rsync_t` the management of directories, files and links of that label and `dac_override`, and keeps the agent's inherited lock descriptor out of the audit log; the installer loads it with `semodule -i` when `selinuxenabled` answers yes, and stops if `semodule` is missing. It was derived from the denials of a full update and rollback on AlmaLinux 9 with `rsync_t` permissive, and verified with enforcement on. The module widens a domain, so it is worth knowing what else runs in it: an rsync daemon on the same host could write container-labelled files. `semodule -r epicurrents-updater` removes it.
+
+Interactive root runs [update.sh](../update.sh) unconfined, which is why an update from a shell works on a host where the agent's did not, and why `rollback_failed` there is recovered by running `update.sh --rollback` by hand.
+
+## Settings a release introduces
+
+A package carries `env-additions` at its root, `since|KEY|value|comment` per line, merged by the packager from [scripts/env-additions](../env-additions) and the bundled project's and plugins' own. When [update.sh](../update.sh) 6 or later applies the package it appends to `.env`, after the snapshot that keeps the old file, each entry introduced after the release being replaced whose key `.env` lacks, under a dated comment; `--check-archive` lists them first, so the job log names them before anything changes. A value `.env` holds is never replaced, an entry from an earlier release is not re-added after an operator removed it, and the keys `ENV_NEVER_ADD` names — credentials, the keys that shape the stack, the gates of this feature — are never written. A rollback restores the snapshot's `.env`, which takes the additions back out. The agent applies a package with its own copy of the script, which is the previous release's, so a release can rely on additions only from the one after the release that shipped update.sh 6.
 
 ## Self-update
 

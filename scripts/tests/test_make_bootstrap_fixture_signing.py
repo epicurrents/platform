@@ -172,6 +172,74 @@ class TestReleaseSignHelper:
         assert _helper("vercmp", "0.1.9", "0.1.9").stdout.strip() == "0"
         assert _helper("vercmp", "0.1.0", "1.0.0").stdout.strip() == "-1"
 
+    @staticmethod
+    def _apps(tmp_path, name, body):
+        path = tmp_path / f"{name}.py"
+        path.write_text(body)
+        return str(path)
+
+    def test_pin_check_passes_a_bundled_pin_admitting_the_version(self, tmp_path):
+        compatible = _helper("compatible").stdout.strip()
+        apps = self._apps(tmp_path, "good", f'class Config:\n    requires_platform = "{compatible}"\n')
+        assert _helper("pin-check", apps, check=False).returncode == 0
+
+    def test_pin_check_refuses_a_bundled_pin_excluding_the_version(self, tmp_path):
+        version = _helper("version").stdout.strip()
+        major = int(version.split(".")[0])
+        apps = self._apps(tmp_path, "stale", f'class Config:\n    requires_platform = ">={major + 1}.0"\n')
+        result = _helper("pin-check", apps, check=False)
+        assert result.returncode == 1 and "excludes platform" in result.stderr
+
+    def test_pin_check_reads_an_annotated_pin(self, tmp_path):
+        version = _helper("version").stdout.strip()
+        major = int(version.split(".")[0])
+        apps = self._apps(tmp_path, "annotated", f'class Config:\n    requires_platform: str = ">={major + 1}.0"\n')
+        assert _helper("pin-check", apps, check=False).returncode == 1
+
+    def test_pin_check_warns_on_an_absent_pin_without_refusing(self, tmp_path):
+        apps = self._apps(tmp_path, "unpinned", "class Config:\n    name = 'x'\n")
+        result = _helper("pin-check", apps, check=False)
+        assert result.returncode == 0 and "declares no requires_platform" in result.stderr
+
+    def test_env_additions_merge_and_print_each_setting(self, tmp_path):
+        version = _helper("version").stdout.strip()
+        platform = self._apps(tmp_path, "platform", f"# comment\n\n{version}|PLATFORM_KEY|1|why\n")
+        project = self._apps(tmp_path, "project", "0.0.1|PROJECT_KEY|a,b|why too\n")
+        out = tmp_path / "env-additions"
+        result = _helper("env-additions", platform, project, "--out", str(out), check=False)
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.splitlines() == ["PLATFORM_KEY=1", "PROJECT_KEY=a,b"]
+        lines = [line for line in out.read_text().splitlines() if not line.startswith("#")]
+        assert lines == [f"{version}|PLATFORM_KEY|1|why", "0.0.1|PROJECT_KEY|a,b|why too"]
+
+    @pytest.mark.parametrize(
+        "line, reason",
+        [
+            ("99.0.0|LATER|1|c", "after the version being packaged"),
+            ("0.0.1|SECRET_KEY|1|c", "not a key an update may write"),
+            ("0.0.1|DB_PASSWORD|1|c", "not a key an update may write"),
+            ("0.0.1|lower|1|c", "not a key an update may write"),
+            ("0.0.1|SPACED|a b|c", "characters an update does not write"),
+            ("0.0.1|DOLLAR|$HOME|c", "characters an update does not write"),
+            ("0.0.1|NO_COMMENT|1", "expected since|KEY|value|comment"),
+            ("x.y|BAD_SINCE|1|c", "not a MAJOR.MINOR.PATCH version"),
+        ],
+    )
+    def test_env_additions_refuse_what_an_update_must_not_write(self, tmp_path, line, reason):
+        result = _helper("env-additions", self._apps(tmp_path, "bad", line + "\n"), check=False)
+        assert result.returncode != 0 and reason in result.stderr
+
+    def test_env_additions_refuse_a_key_declared_twice(self, tmp_path):
+        first = self._apps(tmp_path, "first", "0.0.1|TWICE|1|c\n")
+        second = self._apps(tmp_path, "second", "0.0.1|TWICE|2|c\n")
+        result = _helper("env-additions", first, second, check=False)
+        assert result.returncode != 0 and "already declared" in result.stderr
+
+    def test_pin_check_reads_without_importing_the_module(self, tmp_path):
+        compatible = _helper("compatible").stdout.strip()
+        body = f'import module_that_does_not_exist\nclass Config:\n    requires_platform = "{compatible}"\n'
+        assert _helper("pin-check", self._apps(tmp_path, "imports", body), check=False).returncode == 0
+
 
 @requires_built_frontend
 class TestSignedPackage:

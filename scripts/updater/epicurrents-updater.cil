@@ -1,0 +1,17 @@
+; epicurrents-updater: what the host agent's rsync needs on an SELinux-enforcing host.
+;
+; The agent runs as a systemd service (unconfined_service_t), and rsync started from a service enters the confined
+; rsync_t domain, which may neither write the deployment tree nor override the tree owner's permissions as root.
+; Without this module every update and every rollback the agent runs fails at its first rsync, the rollback
+; included, which leaves the stack stopped. The deployment tree is labelled container_file_t so the containers can
+; bind-mount it (the distribution's INSTALL-RHEL.md), and that label is the one rsync_t is given here: managing
+; directories, files and links in it, and dac_override, since the agent runs rsync as root over a tree owned by the
+; deployment account. The agent's flock on its lock files is inherited by rsync and never used; dontaudit keeps that
+; closing out of the audit log. The dir and file permissions and the capability are exactly the denials of a full
+; update and rollback on AlmaLinux 9 with rsync_t permissive, plus getattr; lnk_file is there for a package that
+; carries a link. install-updater.sh installs it with semodule when SELinux is enabled.
+(allow rsync_t container_file_t (dir (add_name create getattr open read remove_name rmdir search setattr write)))
+(allow rsync_t container_file_t (file (create getattr open read rename setattr unlink write)))
+(allow rsync_t container_file_t (lnk_file (create getattr read rename setattr unlink)))
+(allow rsync_t self (capability (dac_override)))
+(dontaudit rsync_t var_lock_t (file (lock read write)))
