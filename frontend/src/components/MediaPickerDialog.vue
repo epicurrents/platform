@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, reactive, ref, watch } from 'vue'
 import { t } from '#i18n'
-import { listMediaFiles, uploadMedia, type MediaFileSummary } from '#api/media'
+import { listMediaFiles, mediaTypeForFilename, uploadMedia, type MediaFileSummary } from '#api/media'
 import { showToast } from '#lib/toast'
 
 const SCOPE = 'MediaPickerDialog'
@@ -91,6 +91,9 @@ async function confirmUpload () {
     try {
         const created = await uploadMedia(file, {
             displayName: labelForm.label.trim() || undefined,
+            // The server takes an untyped upload for a document, which it serves as a download rather than
+            // inline, so a video would not play.
+            mediaType: mediaTypeForFilename(file.name),
             onProgress: (f) => { uploadProgress.value = f },
         })
         // Newly uploaded row jumps to the top and is auto-checked so the
@@ -198,7 +201,7 @@ function onCloseClick () {
                     </div>
                 </div>
                 <input
-                    accept=".md,.pdf,.htm,.html"
+                    accept="audio/*,image/*,video/*,.md,.pdf,.htm,.html"
                     class="file-picker-input"
                     hidden
                     ref="fileInput"

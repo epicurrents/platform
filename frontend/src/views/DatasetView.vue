@@ -1049,6 +1049,7 @@ const assessFn = (right: AccessRight, payload: AssessmentPayload) =>
                                 :is-focused="false"
                                 :is-selected="false"
                                 :is-supported="item.is_supported ?? false"
+                                :media-type="item.media_type"
                                 :name="itemName(item)"
                                 @dropdown-action="onMediaAction($event, item)"
                                 @open="openMedia(item.object_hash)"

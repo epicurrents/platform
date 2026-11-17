@@ -1236,7 +1236,7 @@ Also worth folding in: `_serve_media_file` returns `(response, range_start)` so 
 
 ### Why yellow
 
-Media files are documents today — small, and nothing like the multi-hundred-megabyte recordings that motivated the offload. It becomes worth doing when a project enables video.
+Most media files are documents, small next to the multi-hundred-megabyte recordings that motivated the offload. Video changes that, and any deployment can enable it from .env, so this moves up once one serves video to more than a handful of viewers at a time: every playing video holds a gunicorn thread for as long as it streams.
 
 ---
 

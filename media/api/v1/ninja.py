@@ -212,9 +212,13 @@ def _try_federated_auth(request):
 
 
 def _allowed_extensions() -> set[str]:
-    """Return the current allowlist as a set of lowercase, dot-prefixed exts."""
+    """Return the current allowlist as a set of lowercase, dot-prefixed exts.
+
+    Entries are normalised here rather than trusted, since the list may come from .env, where ``MP4`` and ``mp4``
+    are as likely as ``.mp4``.
+    """
     raw = getattr(settings, "MEDIA_ALLOWED_UPLOAD_EXTENSIONS", []) or []
-    return {e.lower().strip() for e in raw if e}
+    return {"." + e.strip().lower().lstrip(".") for e in raw if e and e.strip().lstrip(".")}
 
 
 def _resolve_media_root(configured: str) -> Path:
@@ -354,17 +358,31 @@ def _serialise(media: MediaFile, user, detail: bool = False) -> dict:
     return base
 
 
+# Media types the browser renders itself, each with the MIME major type its file must have to be served inline.
+_INLINE_MAJOR_TYPES = {
+    MediaFile.MediaType.AUDIO: "audio",
+    MediaFile.MediaType.IMAGE: "image",
+    MediaFile.MediaType.VIDEO: "video",
+}
+
+# Types inside an inline major type that can carry script, and so are always downloaded.
+_NEVER_INLINE = {"image/svg+xml"}
+
+
 def _serve_disposition(media: MediaFile) -> tuple[str, bool]:
     """Return ``(content_type, inline)`` for serving this media file.
 
-    Video is served inline with its real MIME type so the browser's
-    ``<video>`` element plays it (and can seek via Range requests); every
-    other media type keeps the download-as-attachment behaviour with a
-    generic type.
+    Audio, images and video are served inline with their real MIME type, so the browser's own element renders them
+    and can seek through Range requests. The type is guessed from the file's extension and must belong to the major
+    type its ``media_type`` declares: ``media_type`` is the uploader's word, and a file labelled video that is in fact
+    HTML would otherwise run as a page on the platform's origin. Everything else, SVG included, downloads as an
+    attachment with a generic type.
     """
-    if media.media_type == MediaFile.MediaType.VIDEO:
+    major = _INLINE_MAJOR_TYPES.get(media.media_type)
+    if major is not None:
         guessed, _ = mimetypes.guess_type(media.stored_name)
-        return guessed or "application/octet-stream", True
+        if guessed and guessed.split("/", 1)[0] == major and guessed not in _NEVER_INLINE:
+            return guessed, True
     return "application/octet-stream", False
 
 
@@ -379,8 +397,8 @@ def _serve_media_file(request, media: MediaFile, file_path: Path):
     session starts by fetching from byte 0, while seeks request a later offset.
 
     ``Accept-Ranges: bytes`` is always advertised so a client can issue ranges
-    without a prior 416 probe. Video is served inline; other types download as
-    an attachment (see :func:`_serve_disposition`).
+    without a prior 416 probe. Audio, images and video are served inline;
+    other types download as an attachment (see :func:`_serve_disposition`).
     """
     content_type, inline = _serve_disposition(media)
     filename = f"{_resolve_display_name(media)}{media.file_extension}"

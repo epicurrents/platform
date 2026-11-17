@@ -105,6 +105,27 @@ def test_upload_accepts_extension_in_allowlist(auth_client, tmp_path):
 
 
 @pytest.mark.django_db
+def test_allowlist_entries_are_normalised(auth_client, tmp_path):
+    """An allowlist written in .env without dots, in capitals or with spaces reads as the canonical extensions."""
+    c, _ = auth_client
+    with override_settings(
+        MEDIA_ALLOWED_UPLOAD_EXTENSIONS=["MP4", " pdf ", "", "."],
+        MEDIA_STAGING_PATH=str(tmp_path / "staging"),
+        MEDIA_UPLOAD_PATH=str(tmp_path / "uploads"),
+    ):
+        pdf = c.post(UPLOAD_URL, {"file": _make_pdf("a.pdf")}, format="multipart")
+        video = c.post(f"{UPLOAD_URL}?media_type=video", {"file": _make_mp4()}, format="multipart")
+        f = io.BytesIO(b"# heading")
+        f.name = "notes.md"
+        refused = c.post(UPLOAD_URL, {"file": f}, format="multipart")
+    assert pdf.status_code == 200, pdf.content
+    assert video.status_code == 200, video.content
+    assert video.json()["is_supported"] is True
+    assert refused.status_code == 400
+    assert "['.mp4', '.pdf']" in refused.json()["detail"]
+
+
+@pytest.mark.django_db
 def test_upload_stores_file_under_upload_root_not_staging(auth_client, tmp_path):
     """The stored file lands in MEDIA_UPLOAD_PATH and leaves staging empty.
 
@@ -618,6 +639,59 @@ def test_document_download_stays_attachment(auth_client, tmp_path):
         dl = c.get(_download_url(hash_))
     assert dl["Content-Disposition"].startswith("attachment")
     assert dl["Accept-Ranges"] == "bytes"
+
+
+def _serve_as(client, tmp_path, name: str, media_type: str):
+    """Upload a file under the given media type and return the download response."""
+    ext = "." + name.rsplit(".", 1)[1]
+    with override_settings(
+        MEDIA_ALLOWED_UPLOAD_EXTENSIONS=[ext],
+        MEDIA_STAGING_PATH=str(tmp_path / "staging"),
+        MEDIA_UPLOAD_PATH=str(tmp_path / "uploads"),
+    ):
+        f = io.BytesIO(b"\x00\x01payload")
+        f.name = name
+        upload = client.post(f"{UPLOAD_URL}?media_type={media_type}", {"file": f}, format="multipart")
+        assert upload.status_code == 200, upload.content
+        return client.get(_download_url(upload.json()["content_hash"]))
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize(
+    ("name", "media_type", "content_type"),
+    [
+        ("photo.png", "image", "image/png"),
+        ("photo.jpg", "image", "image/jpeg"),
+        ("sound.mp3", "audio", "audio/mpeg"),
+        ("clip.webm", "video", "video/webm"),
+    ],
+)
+def test_native_media_is_served_inline_with_its_type(auth_client, tmp_path, name, media_type, content_type):
+    c, _ = auth_client
+    dl = _serve_as(c, tmp_path, name, media_type)
+    assert dl["Content-Type"] == content_type
+    assert dl["Content-Disposition"].startswith("inline")
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize(
+    ("name", "media_type"),
+    [
+        # A page labelled as media would run as script on the platform's origin.
+        ("page.html", "video"),
+        ("page.html", "image"),
+        # SVG is an image that can carry script.
+        ("drawing.svg", "image"),
+        # A type that belongs to another media element.
+        ("sound.mp3", "video"),
+        ("photo.png", "audio"),
+    ],
+)
+def test_a_file_whose_type_contradicts_its_media_type_downloads(auth_client, tmp_path, name, media_type):
+    c, _ = auth_client
+    dl = _serve_as(c, tmp_path, name, media_type)
+    assert dl["Content-Type"] == "application/octet-stream"
+    assert dl["Content-Disposition"].startswith("attachment")
 
 
 @pytest.mark.django_db

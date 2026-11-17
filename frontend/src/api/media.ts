@@ -143,19 +143,31 @@ export async function uploadMedia(
     return res.data
 }
 
-/** Lower-case, dot-prefixed extensions the platform serves as inline video. */
-const VIDEO_EXTENSIONS = new Set(['.mp4', '.webm', '.mov', '.m4v', '.ogv', '.mkv'])
+/**
+ * Lower-case, dot-prefixed extensions per media type the browser renders itself. The server serves a file inline only
+ * when its type matches its media type, so a file typed by this table plays; SVG stays a document, which downloads.
+ */
+const NATIVE_EXTENSIONS: Record<string, Set<string>> = {
+    audio: new Set(['.aac', '.flac', '.m4a', '.mp3', '.ogg', '.opus', '.wav']),
+    image: new Set(['.avif', '.bmp', '.gif', '.jpeg', '.jpg', '.png', '.webp']),
+    video: new Set(['.m4v', '.mkv', '.mov', '.mp4', '.ogv', '.webm']),
+}
 
 /**
- * Map a filename to the ``media_type`` the upload endpoint expects. Only the
- * media types the backend currently accepts are produced — video for known
- * video containers, document for everything else. Image / audio extensions
- * fall through to document until those MediaType seats are enabled server-side.
+ * Map a filename to the ``media_type`` the upload endpoint expects: audio, image or video for a format the browser
+ * renders itself, document for everything else.
+ *
+ * @param name - The file name, extension included.
  */
 export function mediaTypeForFilename(name: string): string {
     const dot = name.lastIndexOf('.')
     const ext = dot >= 0 ? name.slice(dot).toLowerCase() : ''
-    return VIDEO_EXTENSIONS.has(ext) ? 'video' : 'document'
+    for (const [type, extensions] of Object.entries(NATIVE_EXTENSIONS)) {
+        if (extensions.has(ext)) {
+            return type
+        }
+    }
+    return 'document'
 }
 
 export interface MediaPatch {

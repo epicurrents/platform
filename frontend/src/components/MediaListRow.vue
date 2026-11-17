@@ -13,6 +13,8 @@ const props = defineProps<{
     fileExtension: string | null
     /** False when the file's extension is no longer in the project's allowlist. */
     isSupported: boolean
+    /** The file's MediaFile.MediaType, which picks the icon for a type the extension does not settle. */
+    mediaType?: string | null
     /** When true, all rows in the list show their checkbox (selection mode is active). */
     selectionActive?: boolean
     /** When true, show the file extension in the listing. Defaults to false. */
@@ -30,6 +32,9 @@ const displayName = computed(() =>
  * .docx / .epub never renders blank.
  */
 const fileIcon = computed(() => {
+    if (props.mediaType === 'video') return 'film'
+    if (props.mediaType === 'image') return 'image'
+    if (props.mediaType === 'audio') return 'music'
     const ext = (props.fileExtension ?? '').toLowerCase()
     if (ext === '.pdf') return 'file-pdf'
     if (ext === '.md') return 'file-lines'

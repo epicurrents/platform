@@ -46,34 +46,27 @@ type BundleItem =
     | { kind: 'recording'; recording: Recording }
     | { kind: 'media'; media: MediaFileDetail }
 
+/** Media types the viewer renders with the browser's own element, each through its `media/<type>-url` importer. */
+const NATIVE_MEDIA_TYPES = new Set(['audio', 'image', 'video'])
+
 /**
- * Map a media file's extension to one of the viewer's pre-registered
- * document importers (default setup, viewer/interface/src/setups/default.ts).
- * The platform always loads media by URL (the file bytes live behind
- * /media/api/v1/<hash>/file) so we dispatch to the ``-url`` importer
- * variant rather than the ``-file`` one — the latter expects a File
- * object from a picker and silently misinterprets URL strings as
- * asset-relative filenames, which manifests as ``/assets/undefined``
- * requests against the SPA host. Returns null when the format is not
- * yet wired into the viewer — the caller skips the item rather than
- * failing the whole dataset load.
+ * Map a media file to the viewer importer that opens it: a native media type by its type, which hands the URL to
+ * the browser's own element, and a document by its extension. The platform always loads media by URL (the bytes live
+ * behind /media/api/v1/<hash>/file), so this dispatches to the ``-url`` importer rather than the ``-file`` one,
+ * which expects a File object from a picker and misreads a URL string as an asset-relative filename
+ * (``/assets/undefined`` requests against the SPA host). Returns null for a format the viewer cannot open; the caller
+ * skips the item rather than failing the whole dataset load.
  */
 function importerForMedia(media: MediaFileDetail): string | null {
+    if (NATIVE_MEDIA_TYPES.has(media.media_type)) {
+        return `media/${media.media_type}-url`
+    }
     const ext = (media.file_extension || '').toLowerCase()
     if (ext === '.pdf') return 'doc/pdf-url'
     if (ext === '.md') return 'doc/htm-url'
     return null
 }
 
-/**
- * Fetch the videos attached to a recording and expose them on the viewer
- * resource so the ACC module's video window can play them. Session auth only:
- * the ``<video>`` element fetches ``/media/api/v1/<hash>/file`` directly with
- * cookies — federated and share-token video playback are not supported (a
- * browser video element cannot carry the FederatedBearer header; see
- * media/README.md). Unsupported rows (extension outside the live allowlist) and
- * fetch failures are skipped so a missing video never blocks the recording.
- */
 /**
  * Seed the viewer resource with the platform's complete interruption table from the recording
  * metadata. The platform parses the whole file at ingest, so its gap table is authoritative;
@@ -100,6 +93,15 @@ function seedTrustedInterruptions(resource: DataResource, recording: Recording):
     )
 }
 
+/**
+ * Fetch the videos attached to a recording and expose them on the viewer
+ * resource so the ACC module's video window can play them. Session auth only:
+ * the ``<video>`` element fetches ``/media/api/v1/<hash>/file`` directly with
+ * cookies — federated and share-token video playback are not supported (a
+ * browser video element cannot carry the FederatedBearer header; see
+ * media/README.md). Unsupported rows (extension outside the live allowlist) and
+ * fetch failures are skipped so a missing video never blocks the recording.
+ */
 async function attachRecordingVideos(resource: DataResource, hash: string): Promise<void> {
     let mediaVideos: MediaFileSummary[]
     try {

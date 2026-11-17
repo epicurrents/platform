@@ -881,6 +881,7 @@ async function submitExport () {
                         :is-focused="false"
                         :is-selected="false"
                         :is-supported="item.is_supported ?? false"
+                        :media-type="item.media_type"
                         :name="item.object_name ?? t('Item #{id}', SCOPE, { id: item.id })"
                         @dropdown-action="removeItem(item)"
                         @open="openMedia(item.object_hash)"

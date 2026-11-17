@@ -8,8 +8,14 @@ Entries are written for the person deciding whether to upgrade, so the ones that
 
 ## [Unreleased]
 
+### Added
+
+- **A deployment can accept media from `.env`.** `MEDIA_ALLOWED_UPLOAD_EXTENSIONS` is read from the environment, comma-separated, so a deployment running without a project can take documents and video. A project that sets the list in its settings.py still replaces it, as before. Entries are normalised, so `mp4` and `.MP4` both read as `.mp4`. [media/README.md](media/README.md#allowed-extensions-setting).
+- **Video, audio and images open in the viewer.** `MediaFile` gains the `audio` and `image` types beside `video`, and a member of any of the three opens in the viewer's main area, from its row or with the rest of its dataset, through the viewer edition's new native media module. It needs an edition built with that module; an older edition shows such a member as one that failed to load. The "Add media" picker accepts audio, images and video and declares each as its type; before, it uploaded every file as a document, which the server sends as a download. [media/README.md](media/README.md#viewer-integration).
+
 ### Fixed
 
+- **A media file is served inline only when its type matches its media type.** The file endpoint served anything uploaded as `video` inline with the MIME type its extension implies, so on a deployment whose allowlist admits HTML, an HTML file uploaded as video ran as a page on the platform's origin. Video, audio and images are now inline only when the extension's type belongs to the declared media type, SVG never, and anything else downloads. [media/README.md](media/README.md#serving-and-range-requests).
 - **A maintenance job names its operation and arguments in words.** The job page and the job history showed the registry key, such as `platform.update`, where the Maintenance tab shows "Update the platform", and printed the arguments as one JSON string. Jobs now carry `operation_label` and `arg_labels`, and the job page lists each argument on its own row under the title the request form gives it. [maintenance/README.md](maintenance/README.md).
 
 ## [0.2.0] — 2026-11-17

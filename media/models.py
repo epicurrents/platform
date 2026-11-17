@@ -1,8 +1,8 @@
-"""Media models — non-signal files (documents and video, later images / audio).
+"""Media models — non-signal files: documents, video, audio and images.
 
 ``MediaFile``
     Core model: file identity (hash, path, size), media-type taxonomy
-    (``document`` and ``video``, room for ``image`` / ``audio`` later), an
+    (``document``, ``video``, ``audio`` and ``image``), an
     optional timeline position for time-aligned media, soft-delete timestamp.
     Reverse GenericRelations match Recording so the same library / access /
     annotation plumbing applies.
@@ -20,23 +20,22 @@ class MediaFile(models.Model):
     Storage and de-identification rules mirror :class:`recordings.Recording`:
     ``original_name`` is author-private, ``display_name`` is the grantee-
     visible label, ``content_hash`` is the de-identified identifier used in
-    URLs. The viewer dispatches by ``media_type`` + ``file_extension`` to the
-    appropriate reader (htm, pdf, …).
+    URLs. The viewer opens video, audio and images by ``media_type`` in the
+    browser's own elements, and a document by ``file_extension`` (htm, pdf, …).
     """
 
     class MediaType(models.TextChoices):
         # Documents — markdown, html, pdf today; rendered by the viewer's
         # doc-module (HtmImporter / PdfImporter).
         DOCUMENT = "document", "Document"
-        # Footage attached to a signal recording; the viewer ties playback to
-        # the main cursor via ``time_offset``. Served inline with HTTP Range
-        # support so the browser can seek.
+        # Footage, standalone or attached to a signal recording, where the
+        # viewer ties playback to the main cursor via ``time_offset``.
         VIDEO = "video", "Video"
-        # Future taxonomy seats; storage path and access plumbing are
-        # already media-type-agnostic, only the viewer dispatch table needs
-        # extending when these land.
-        # IMAGE = "image", "Image"
-        # AUDIO = "audio", "Audio"
+        # Raster images and sound. Video, audio and images are rendered by the
+        # browser's own elements and served inline with HTTP Range support,
+        # provided the file's type matches its media type.
+        IMAGE = "image", "Image"
+        AUDIO = "audio", "Audio"
 
     media_type = models.CharField(
         max_length=16,

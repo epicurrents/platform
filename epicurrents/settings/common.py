@@ -419,13 +419,13 @@ RECORDINGS_MAX_UPLOAD_SIZE = config("RECORDINGS_MAX_UPLOAD_SIZE", default=2 * 10
 # in thousands of small objects rather than megabytes of payload.
 DATA_UPLOAD_MAX_MEMORY_SIZE = config("DATA_UPLOAD_MAX_MEMORY_SIZE", default=10 * 1024 * 1024, cast=int)
 # ── Media (non-signal) uploads ────────────────────────────────────────────
-# Lowercase, dot-prefixed extensions the platform accepts as media files
-# (documents today; image / audio / video later). Consulted at both upload
-# and download time so a project switch retroactively gates files that no
-# longer belong to a supported type. The empty default disables media
-# uploads entirely; the active project sets this in its ``settings.py`` to
-# opt in (e.g. ``[".md", ".pdf", ".htm", ".html"]`` for a documents-only project).
-MEDIA_ALLOWED_UPLOAD_EXTENSIONS: list[str] = []
+# Extensions the platform accepts as media files, consulted at both upload and
+# download time so a narrower list retroactively gates files that no longer
+# belong to a supported type. The empty default disables media uploads entirely.
+# A deployment opts in from .env, comma-separated (``.md,.pdf,.mp4``; the dot
+# and the case are normalised on read); a project's ``settings.py`` that sets
+# the list replaces this value, as it does for any other setting.
+MEDIA_ALLOWED_UPLOAD_EXTENSIONS: list[str] = config("MEDIA_ALLOWED_UPLOAD_EXTENSIONS", default="", cast=Csv())
 # ── Reverse-proxy file offload ────────────────────────────────────────────
 # When the proxy sits in front and mounts the recordings volume read-only, a raw
 # download can be handed to it instead of streaming through a gunicorn thread for
@@ -446,8 +446,7 @@ PROXY_FILE_OFFLOAD_ENABLED = env_bool("PROXY_FILE_OFFLOAD_ENABLED", default=Fals
 MEDIA_UPLOAD_PATH = config("MEDIA_UPLOAD_PATH", default=str(BASE_DIR / "media_uploads"))
 MEDIA_STAGING_PATH = config("MEDIA_STAGING_PATH", default=str(BASE_DIR / "media_staging"))
 # Largest accepted media upload in bytes (default 256 MB). Documents sit well
-# under this; a project that accepts video raises it in its settings (2 GB,
-# say).
+# under this; a deployment or project that accepts video raises it (2 GB, say).
 MEDIA_MAX_UPLOAD_SIZE = config("MEDIA_MAX_UPLOAD_SIZE", default=256 * 1024 * 1024, cast=int)
 # Days a soft-deleted media file lingers before purge_deleted_media hard-deletes
 # the row + file. Mirrors RECORDINGS_TRASH_RETENTION_DAYS.

@@ -48,6 +48,7 @@ import group from '@material-symbols/svg-400/outlined/group.svg?raw'
 import groups from '@material-symbols/svg-400/outlined/groups.svg?raw'
 import handyman from '@material-symbols/svg-400/outlined/handyman.svg?raw'
 import home from '@material-symbols/svg-400/outlined/home.svg?raw'
+import image from '@material-symbols/svg-400/outlined/image.svg?raw'
 import info from '@material-symbols/svg-400/outlined/info.svg?raw'
 import key from '@material-symbols/svg-400/outlined/key.svg?raw'
 import light_mode from '@material-symbols/svg-400/outlined/light_mode.svg?raw'
@@ -60,6 +61,7 @@ import menu_book from '@material-symbols/svg-400/outlined/menu_book.svg?raw'
 import monitor_heart from '@material-symbols/svg-400/outlined/monitor_heart.svg?raw'
 import more_horiz from '@material-symbols/svg-400/outlined/more_horiz.svg?raw'
 import movie from '@material-symbols/svg-400/outlined/movie.svg?raw'
+import music_note from '@material-symbols/svg-400/outlined/music_note.svg?raw'
 import notifications from '@material-symbols/svg-400/outlined/notifications.svg?raw'
 import open_in_new from '@material-symbols/svg-400/outlined/open_in_new.svg?raw'
 import person from '@material-symbols/svg-400/outlined/person.svg?raw'
@@ -108,6 +110,7 @@ const ICON_SVGS: Record<string, string> = {
     groups,
     handyman,
     home,
+    image,
     info,
     key,
     light_mode,
@@ -120,6 +123,7 @@ const ICON_SVGS: Record<string, string> = {
     monitor_heart,
     more_horiz,
     movie,
+    music_note,
     notifications,
     open_in_new,
     person,
@@ -174,6 +178,7 @@ const FA_TO_MATERIAL: Record<string, string> = {
     'folders':                     'folder_copy',
     'graduation-cap':              'school',
     'home':                        'home',
+    'image':                       'image',
     'key':                         'key',
     'link-simple':                 'link',
     'list-ol':                     'format_list_numbered',
@@ -181,6 +186,7 @@ const FA_TO_MATERIAL: Record<string, string> = {
     'lock-open':                   'lock_open',
     'mail':                        'mail',
     'moon':                        'dark_mode',
+    'music':                       'music_note',
     'paperclip':                   'attach_file',
     'pencil':                      'edit',
     'play':                        'play_arrow',

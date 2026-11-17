@@ -294,6 +294,8 @@ export default defineConfig(({ mode }) => {
                     '/plugin/': { target: backend, changeOrigin: true },
                     '/recordings/': { target: backend, changeOrigin: true },
                     '/annotations/': { target: backend, changeOrigin: true },
+                    '/compute/': { target: backend, changeOrigin: true },
+                    '/media/': { target: backend, changeOrigin: true },
                 },
             } : {}),
         },

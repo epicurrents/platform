@@ -5,12 +5,7 @@ Non-signal media files for the epicurrents platform. Sister app to
 files with a format-specific processing pipeline, `MediaFile` carries
 opaque media that the viewer dispatches to per-format readers.
 
-Supported media types are `document` (markdown, HTML, PDF — rendered by the
-viewer's [doc-module](../frontend/viewer/epicurrents/doc-module/)) and `video`
-(MP4, served inline with HTTP Range support and synced to the recording cursor
-by the viewer's ACC module). `image` and `audio` remain taxonomy seats; the
-storage and access plumbing is media-type-agnostic, so they need only the
-viewer dispatch table and the per-project allowlist extended when they land.
+Supported media types are `document` (markdown, HTML, PDF — rendered by the viewer's [doc-module](../frontend/viewer/epicurrents/doc-module/)) and the three the browser renders itself: `video`, `audio` and `image`. Those are served inline with HTTP Range support and open in the viewer's native media module, which hands the file's URL to a `<video>`, `<audio>` or `<img>` element; a video attached to a recording also plays in the recording's video window, synced to the cursor.
 
 ## Models
 
@@ -18,7 +13,7 @@ viewer dispatch table and the per-project allowlist extended when they land.
 
 | Field | Type | Notes |
 |---|---|---|
-| `media_type` | `CharField(choices=MediaType)` | `document` or `video` |
+| `media_type` | `CharField(choices=MediaType)` | `document`, `video`, `audio` or `image`. Declared by the uploader, so it decides how a file opens but never alone whether it is served inline; see [Serving and Range requests](#serving-and-range-requests) |
 | `author` | FK → User | Owner; AccessRight grants `can_read`/`can_write` to anyone else |
 | `original_name` | `CharField` | Author-private; never returned to grantees, share-token holders, or federated peers |
 | `display_name` | `CharField`, nullable | Grantee-visible label; falls back to the stored-name hash prefix |
@@ -78,19 +73,20 @@ lands in `ObjectChangeLog` under one `media.purge` activity. See AGENTS.md →
 
 ## Allowed-extensions setting
 
-`MEDIA_ALLOWED_UPLOAD_EXTENSIONS` is a list of lower-cased, dot-prefixed
-file extensions consulted at both upload and download. The platform
-default is empty — media uploads are disabled until a project opts in by
-declaring the list in its `settings.py`:
+`MEDIA_ALLOWED_UPLOAD_EXTENSIONS` is the list of file extensions consulted at both upload and download. The platform default is empty, so media uploads are disabled until the deployment or its project opts in. A deployment sets it in `.env`, comma-separated, which is how one running without a project accepts media:
+
+```
+MEDIA_ALLOWED_UPLOAD_EXTENSIONS=.md,.pdf,.mp4
+```
+
+A project declares the list in its settings.py instead, and that list replaces the `.env` value:
 
 ```python
 # projects/<name>/settings.py
 MEDIA_ALLOWED_UPLOAD_EXTENSIONS = [".md", ".pdf", ".mp4"]
 ```
 
-A project that accepts video also raises `MEDIA_MAX_UPLOAD_SIZE` above the
-256 MB platform default (2 GB, say), since clips dwarf the
-documents the default was sized for.
+Entries are normalised on read, so `mp4`, `MP4` and `.mp4` are the same entry. A deployment that accepts video also raises `MEDIA_MAX_UPLOAD_SIZE` above the 256 MB default (2 GB, say), since clips dwarf the documents the default was sized for, and keeps it within the proxy's `PROXY_MAX_BODY_SIZE`.
 
 ### Upload-side
 
@@ -163,7 +159,7 @@ Mounted at `/media/api/v1/`.
 | `POST` | `/upload` | Authenticated | Upload a media file. Validates extension against `MEDIA_ALLOWED_UPLOAD_EXTENSIONS`; optional `attached_to_type` + `attached_to_id` attach to a parent object atomically; optional `time_offset` sets the timeline position. Returns `warnings` for a `display_name` that looks like an identifier |
 | `GET` | `/` | Authenticated | List media files visible to the caller. Optional filters: `media_type`, `attached_to_type` + `attached_to_id` |
 | `GET` | `/{content_hash}` | Authenticated | Detail. `original_name` is null for non-author / non-superuser callers (PHI policy mirrors `Recording`) |
-| `GET` | `/{content_hash}/file` | Authenticated | Stream the file bytes with HTTP Range support. Video is served inline so the browser can play and seek; other types download as an attachment. `410` when the extension is no longer in the live allowlist; `404` for missing on disk. See [Serving and Range requests](#serving-and-range-requests) |
+| `GET` | `/{content_hash}/file` | Authenticated | Stream the file bytes with HTTP Range support. Video, audio and raster images are served inline so the browser can render and seek them; other types download as an attachment. `410` when the extension is no longer in the live allowlist; `404` for missing on disk. See [Serving and Range requests](#serving-and-range-requests) |
 | `PATCH` | `/{content_hash}` | Author / superuser | Update `display_name`, `media_type`, `attached_to`, or `time_offset`. Pass `attached_to: {"type": "", "id": ""}` to detach; `time_offset: null` to clear the timeline position. Returns `warnings` for a new `display_name` that looks like an identifier; the activity row's metadata names the fields changed, never the new label |
 | `DELETE` | `/{content_hash}` | Author / superuser | Soft-delete (sets `deleted_at`) |
 
@@ -175,9 +171,7 @@ advertised; a `Range: bytes=` request gets a `206 Partial Content` stream, an
 unsatisfiable range gets `416`, and a request without a range gets the full
 `200`. Range support is what lets a `<video>` element seek.
 
-Video is served **inline** with its real MIME type (`Content-Type: video/mp4`)
-so the browser plays it in place; every other media type keeps the
-download-as-attachment behaviour. The branch is in `_serve_disposition`.
+Video, audio and images are served **inline** with their real MIME type (`Content-Type: video/mp4`) so the browser renders them in place, provided the type guessed from the file's extension belongs to the major type its `media_type` declares. `media_type` is the uploader's word: without the check, an HTML file uploaded as `video` would be served inline as `text/html` and run as a page on the platform's origin wherever the allowlist admits HTML. SVG is never inline, since an SVG image can carry script. Everything else downloads as an attachment with a generic type. The rule is in `_serve_disposition`.
 
 **Download logging is deduplicated.** A seeking video client issues one range
 request per seek; logging each would flood the audit trail. The endpoint logs
@@ -293,15 +287,7 @@ media items alongside recordings in three URL modes:
 - `?files=<hash>` and `?media=<hash>` can be combined on the same URL
   to load a mixed bundle in declared order.
 
-The viewer's UMD lib build runs the standalone viewer's
-[setups/standalone.ts](../frontend/viewer/interface/src/setups/standalone.ts)
-entry point, which already registers `doc/htm-file`
-for markdown and `doc/pdf-file` for PDF — the platform does not (and
-must not) re-register these because PdfImporter mutates a static worker
-URL on construction. ViewerView's dispatcher maps `.md → doc/htm-file`
-and `.pdf → doc/pdf-file`. Extensions outside this set are surfaced as
-`is_supported: false` so the frontend can grey them out, and the viewer
-loop skips them with a console warning.
+The viewer edition registers the importers the dispatcher names, and the platform does not re-register them: PdfImporter mutates a static worker URL on construction. ViewerView loads every media item by URL. A `video`, `audio` or `image` item goes to `media/<type>-url`, the native media module's loader, which reads nothing and hands the URL to the browser's element; a document goes by extension, `.md` to `doc/htm-url` and `.pdf` to `doc/pdf-url`. An item the dispatcher has no importer for is skipped with a console warning, and one whose extension has left the allowlist arrives as `is_supported: false` and is never loaded.
 
 ## Read auth — three modes
 
@@ -342,8 +328,7 @@ component embeds the upload flow inside the "Add media" picker used by
 serves both consumers; the parent provides the list of hashes already
 in its container so the picker excludes them.
 
-Clicking **Upload new file** opens a hidden file input scoped to the
-project's allowlist (`.md`, `.pdf`, `.mp4`, for instance). On change
+Clicking **Upload new file** opens a hidden file input accepting documents, audio, images and video; the server's allowlist has the last word. The upload declares a `media_type` from the file's extension through `mediaTypeForFilename` in [media.ts](../frontend/src/api/media.ts), since an undeclared upload is a document and a video stored as one downloads instead of playing. On change
 the file streams to `POST /media/api/v1/upload` via
 [uploadMedia](../frontend/src/api/media.ts) with an Axios upload
 progress hook; the button label reports `Uploading… N%` while the
@@ -367,9 +352,6 @@ a future iteration will surface it in a dedicated media library view.
   HTML (`.htm` / `.html`) needs a separate importer wiring in the viewer.
   Once `doc/html-file` is registered there, the allowlist can grow
   without touching ViewerView's dispatcher.
-- **Video player UI.** The backend serves MP4 inline with Range support
-  and carries `time_offset`; the viewer's ACC video pane — a cursor-synced
-  `<video>` reusing `useMediaCursorSync` — is a separate frontend task.
 - **Standalone media library page.** No `/media` route yet for
   rename / delete / attach across the user's whole library. The picker
   covers the immediate add-to-container case; a dedicated page lands
