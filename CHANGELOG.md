@@ -6,9 +6,9 @@ Below 1.0 the *minor* is the breaking bump, which is semver's rule for initial d
 
 Entries are written for the person deciding whether to upgrade, so the ones that matter are removals, renames and changed behaviour. A project reading this needs to know what it has to change, not what was added for someone else.
 
-## [Unreleased]
+## [0.2.0] — 2026-11-17
 
-Version 0.2.0: the recording lifecycle changes what a project can expect of `Recording.status`, so every project and plugin moves its pin to `>=0.2,<0.3` after checking the points below.
+The recording lifecycle changes what a project can expect of `Recording.status`, so every project and plugin moves its pin to `>=0.2,<0.3` after checking the points below.
 
 ### Changed
 
