@@ -104,11 +104,13 @@ The network is handled for you: a package is assembled onto one named after its 
 
 The port is not, and it is the quieter of the two hazards. A package publishes `HOST_PORT`, which defaults to what a checkout uses. Both runners build their health-check URL by grepping `.env`, so a package that cannot bind the port polls it anyway — and a dev stack listening there answers `"status": "ok"`. The smoke then reports a healthy stack it never started.
 
-Set the port in the deployment's own `.env`, which is gitignored, and leave `.env.example` alone:
+The dev stack runs on the default port, so stop it before a local smoke and bring it back afterwards:
 
 ```
-HOST_PORT=8001
+docker compose stop web
 ```
+
+Moving the dev stack off the default instead (`HOST_PORT=8001` in its gitignored `.env`) also works, for a run of smokes; leave `.env.example` alone either way.
 
 For the record of why the network default exists, since a package assembled before it will not have one: that name is host-wide rather than project-scoped, so two stacks sharing it share the alias `db`, and a package reaches whichever database answers first. It is refused only because each deployment generates its own password; where two share credentials, `manage.py migrate` applies migrations to the wrong database and reports success. Setting `EPICURRENTS_NETWORK_NAME` in an old package's `.env`, or rebuilding it, closes that.
 
