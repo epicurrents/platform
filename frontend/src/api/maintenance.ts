@@ -135,6 +135,8 @@ export type JobState =
 export interface MaintenanceJob {
     job_id: string
     operation: string
+    /** The registered label; the key itself for an operation no longer registered. */
+    operation_label: string
     executor: 'celery' | 'host'
     state: JobState
     reason: string
@@ -143,6 +145,8 @@ export interface MaintenanceJob {
     requested_by: string | null
     package_sha256: string | null
     args: Record<string, unknown>
+    /** The title of each argument as the request form shows it; an argument without one goes by its name. */
+    arg_labels: Record<string, string>
     created_at: string
     started_at: string | null
     finished_at: string | null

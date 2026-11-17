@@ -161,6 +161,28 @@ function databaseEffect (migrationsApplied: boolean | null) {
         : t('Unchanged by this update; a rollback keeps it', SCOPE)
 }
 
+/**
+ * The operation's label. A rollback of the release that added the labels restores an API without them while this
+ * page stays open on the newer bundle, so the key stands in, as do bare argument names.
+ */
+function operationName (current: MaintenanceJob) {
+    return current.operation_label || current.operation
+}
+
+/** An argument as the reader would have entered it. */
+function argValue (value: unknown) {
+    if (value === null || value === undefined || value === '') {
+        return t('Default', SCOPE)
+    }
+    if (typeof value === 'boolean') {
+        return value ? t('Yes', SCOPE) : t('No', SCOPE)
+    }
+    if (typeof value === 'object') {
+        return JSON.stringify(value)
+    }
+    return String(value)
+}
+
 /** Shown for a detail a running host job has not reported yet. */
 const NOT_YET = '—'
 
@@ -173,20 +195,20 @@ const facts = computed(() => {
     // A running host job reports its details one by one. Listing them all from the start keeps the log below them
     // from moving down the page while the reader watches it.
     const reserve = current.in_flight && current.executor === 'host'
-    const rows: { label: string, value: string }[] = [
-        { label: t('Operation', SCOPE), value: current.operation },
+    const rows: { key: string, label: string, value: string }[] = [
         {
+            key: 'executor',
             label: t('Executor', SCOPE),
             value: current.executor === 'host' ? t('Host agent', SCOPE) : t('Worker', SCOPE),
         },
-        { label: t('Requested by', SCOPE), value: current.requested_by ?? t('Unknown', SCOPE) },
-        { label: t('Requested', SCOPE), value: formatDateTime(current.created_at) },
+        { key: 'requested_by', label: t('Requested by', SCOPE), value: current.requested_by ?? t('Unknown', SCOPE) },
+        { key: 'requested', label: t('Requested', SCOPE), value: formatDateTime(current.created_at) },
     ]
     const add = (label: string, value: string | null | undefined, reserved = reserve) => {
         if (value) {
-            rows.push({ label, value })
+            rows.push({ key: label, label, value })
         } else if (reserved) {
-            rows.push({ label, value: NOT_YET })
+            rows.push({ key: label, label, value: NOT_YET })
         }
     }
     add(t('Started', SCOPE), current.started_at ? formatDateTime(current.started_at) : null)
@@ -205,8 +227,13 @@ const facts = computed(() => {
     if (isUpdate) {
         add(t('Database', SCOPE), databaseEffect(current.migrations_applied))
     }
-    if (Object.keys(current.args).length) {
-        rows.push({ label: t('Arguments', SCOPE), value: JSON.stringify(current.args) })
+    // An argument may share its title with a detail above, a rollback's snapshot for one, so its key is its own.
+    for (const [name, value] of Object.entries(current.args)) {
+        rows.push({
+            key: `arg:${name}`,
+            label: current.arg_labels?.[name] ?? name.replace(/_/g, ' '),
+            value: argValue(value),
+        })
     }
     return rows
 })
@@ -293,7 +320,7 @@ async function loadJob (): Promise<boolean> {
     job.value = fresh
     log.value = freshLog
     loadError.value = ''
-    setPageTitle(fresh.operation)
+    setPageTitle(operationName(fresh))
     if (changed) {
         const status = await maintenanceStore.refreshStatus()
         if (status) {
@@ -457,7 +484,7 @@ onBeforeUnmount(() => {
 
         <template v-else-if="job">
             <header class="page-header">
-                <h1>{{ job.operation }}</h1>
+                <h1>{{ operationName(job) }}</h1>
                 <div class="job-actions">
                     <wa-button v-if="canWrite && canCancel"
                         appearance="plain"
@@ -530,7 +557,7 @@ onBeforeUnmount(() => {
             </wa-callout>
 
             <dl class="job-facts">
-                <template v-for="fact in facts" :key="fact.label">
+                <template v-for="fact in facts" :key="fact.key">
                     <dt>{{ fact.label }}</dt>
                     <dd>{{ fact.value }}</dd>
                 </template>

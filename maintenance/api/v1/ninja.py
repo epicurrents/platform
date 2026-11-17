@@ -171,6 +171,7 @@ class JobOut(Schema):
 
     job_id: str
     operation: str
+    operation_label: str
     executor: str
     state: str
     reason: str
@@ -179,6 +180,7 @@ class JobOut(Schema):
     requested_by: str | None
     package_sha256: str | None
     args: dict
+    arg_labels: dict[str, str]
     created_at: str
     started_at: str | None
     finished_at: str | None
@@ -399,10 +401,24 @@ def _iso(value) -> str | None:
     return value.isoformat() if value is not None else None
 
 
+def _operation_labels(key: str) -> tuple[str, dict[str, str]]:
+    """The registered label of an operation and the titles of its arguments, as the request form shows them.
+
+    A job outlives its registration when a project or plugin is removed, and then shows its key and bare names.
+    """
+    operation = get_operation(key)
+    if operation is None:
+        return key, {}
+    properties = operation.args_schema.model_json_schema().get("properties", {})
+    return operation.label, {name: spec["title"] for name, spec in properties.items() if "title" in spec}
+
+
 def _serialize_job(job, *, for_superuser: bool) -> dict:
+    operation_label, arg_labels = _operation_labels(job.operation)
     return {
         "job_id": str(job.job_id),
         "operation": job.operation,
+        "operation_label": operation_label,
         "executor": job.executor,
         "state": job.state,
         "reason": job.reason,
@@ -411,6 +427,7 @@ def _serialize_job(job, *, for_superuser: bool) -> dict:
         "requested_by": job.requested_by.username if job.requested_by is not None else None,
         "package_sha256": job.package.sha256 if job.package is not None else None,
         "args": job.args or {},
+        "arg_labels": arg_labels,
         "created_at": job.created_at.isoformat(),
         "started_at": _iso(job.started_at),
         "finished_at": _iso(job.finished_at),

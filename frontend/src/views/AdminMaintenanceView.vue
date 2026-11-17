@@ -787,7 +787,7 @@ onBeforeUnmount(() => {
                     >
                         <div class="list-row-main">
                             <wa-icon class="icon-muted" name="screwdriver-wrench"></wa-icon>
-                            <span class="list-row-name">{{ job.operation }}</span>
+                            <span class="list-row-name">{{ job.operation_label || job.operation }}</span>
                             <div class="row-badges">
                                 <JobStateBadge :state="job.state" />
                             </div>

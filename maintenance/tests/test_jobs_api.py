@@ -307,6 +307,23 @@ class TestReadJobs:
         body = client.get(f"{BASE}/jobs").json()[0]
         assert "id" not in body and "requested_by_id" not in body and "pk" not in body
 
+    def test_a_job_names_its_operation_and_arguments_as_the_form_does(self, enabled, staff_client, superuser):
+        job = _host_job(superuser, args={"package_sha256": "b" * 64, "verify_window_minutes": 30})
+        client, _ = staff_client
+        body = client.get(f"{BASE}/jobs/{job.job_id}").json()
+        assert body["operation"] == "platform.update"
+        assert body["operation_label"] == "Update the platform"
+        assert body["arg_labels"]["package_sha256"] == "Package"
+        assert body["arg_labels"]["verify_window_minutes"] == "Verification window (in minutes)"
+
+    def test_a_job_whose_operation_is_no_longer_registered_goes_by_its_key(self, enabled, staff_client, superuser):
+        job = MaintenanceJob.objects.create(
+            operation="removed.operation", executor="celery", state="succeeded", in_flight=False, requested_by=superuser
+        )
+        client, _ = staff_client
+        body = client.get(f"{BASE}/jobs/{job.job_id}").json()
+        assert body["operation_label"] == "removed.operation" and body["arg_labels"] == {}
+
     def test_an_unknown_or_malformed_id_is_404(self, enabled, staff_client):
         client, _ = staff_client
         assert client.get(f"{BASE}/jobs/00000000-0000-4000-8000-000000000000").status_code == 404

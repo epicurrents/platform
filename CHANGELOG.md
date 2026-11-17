@@ -6,6 +6,12 @@ Below 1.0 the *minor* is the breaking bump, which is semver's rule for initial d
 
 Entries are written for the person deciding whether to upgrade, so the ones that matter are removals, renames and changed behaviour. A project reading this needs to know what it has to change, not what was added for someone else.
 
+## [Unreleased]
+
+### Fixed
+
+- **A maintenance job names its operation and arguments in words.** The job page and the job history showed the registry key, such as `platform.update`, where the Maintenance tab shows "Update the platform", and printed the arguments as one JSON string. Jobs now carry `operation_label` and `arg_labels`, and the job page lists each argument on its own row under the title the request form gives it. [maintenance/README.md](maintenance/README.md).
+
 ## [0.2.0] — 2026-11-17
 
 The recording lifecycle changes what a project can expect of `Recording.status`, so every project and plugin moves its pin to `>=0.2,<0.3` after checking the points below.

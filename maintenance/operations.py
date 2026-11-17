@@ -257,7 +257,9 @@ def _dataset_anonymity_report_args(args: DatasetAnonymityReportArgs) -> list[str
 class PlatformUpdateArgs(Schema):
     """Arguments of ``platform.update``: an already-uploaded package, by hash."""
 
-    package_sha256: str = Field(..., pattern=r"^[0-9a-f]{64}$", description="sha256 of an uploaded package.")
+    package_sha256: str = Field(
+        ..., pattern=r"^[0-9a-f]{64}$", title="Package", description="sha256 of an uploaded package."
+    )
     verify_window_minutes: int | None = Field(
         None,
         ge=5,
@@ -283,6 +285,7 @@ class PlatformRollbackArgs(Schema):
     )
     restore_database: bool = Field(
         True,
+        title="Restore the database",
         description=(
             "Restore the database from the snapshot as well; everything written since it is lost. Off, the "
             "database is kept, which the agent allows only when no migration was applied since the snapshot."

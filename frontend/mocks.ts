@@ -392,12 +392,12 @@ const MOCK_OPERATIONS = [
         available: true,
         args_schema: {
             properties: {
-                package_sha256: { type: 'string', pattern: '^[0-9a-f]{64}$', description: 'sha256 of an uploaded package.', title: 'Package Sha256' },
+                package_sha256: { type: 'string', pattern: '^[0-9a-f]{64}$', description: 'sha256 of an uploaded package.', title: 'Package' },
                 verify_window_minutes: {
                     anyOf: [{ type: 'integer', minimum: 5, maximum: 1440 }, { type: 'null' }],
                     default: null,
                     description: 'Minutes to wait for a confirmation before rolling back.',
-                    title: 'Verify Window Minutes',
+                    title: 'Verification window (in minutes)',
                 },
             },
             required: ['package_sha256'],
@@ -431,7 +431,7 @@ const MOCK_OPERATIONS = [
                     type: 'boolean',
                     default: true,
                     description: 'Restore the database from the snapshot as well; everything written since it is lost. Off, the database is kept, which the agent allows only when no migration was applied since the snapshot.',
-                    title: 'Restore Database',
+                    title: 'Restore the database',
                 },
             },
             required: ['snapshot'],
@@ -1390,8 +1390,18 @@ function enrichItem(contentTypeId: number, objectId: string): { object_name: str
 // ─── Maintenance helpers ──────────────────────────────────────────────────────
 
 function jobOut(job: MockJob) {
+    const operation = MOCK_OPERATIONS.find(op => op.key === job.operation)
+    const properties: Record<string, { title?: string } | undefined> = operation?.args_schema.properties ?? {}
+    const argLabels: Record<string, string> = {}
+    for (const [name, spec] of Object.entries(properties)) {
+        if (spec?.title) {
+            argLabels[name] = spec.title
+        }
+    }
     return {
         ...job,
+        operation_label: operation?.label ?? job.operation,
+        arg_labels: argLabels,
         migrations_applied: job.migrations_applied ?? null,
         in_flight: IN_FLIGHT_STATES.has(job.state),
         // Staff see no output; the mock user is a superuser, so it is included.
