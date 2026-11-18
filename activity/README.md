@@ -514,6 +514,7 @@ To check the table against the tree, walk the AST for `log_activity` / `with_sys
 | `library.dataset.pool.read` | `get_dataset_pool` |
 | `library.dataset.pool.update` | `update_dataset_pool` |
 | `library.dataset.read` | `get_dataset` |
+| `library.dataset.recording.list` | `browse_dataset` |
 | `library.dataset.release` | `handle` † |
 | `library.dataset.review.read` | `list_dataset_reviews` |
 | `library.dataset.snapshot.create` | `create_dataset_snapshot` |

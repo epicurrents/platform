@@ -24,6 +24,7 @@ from recordings.tests.test_metadata import _make_recording
 from recordings.tests.test_serve_pipeline_parity import _grant_with_middleware
 
 TOKEN = "shape-share-token"
+DATASET_TOKEN = "shape-dataset-share-token"
 
 _GIVEN_DATA_TABLE = (
     "the response shape changed; re-read the given-data table in docs/anonymisation-compliance.md "
@@ -125,6 +126,21 @@ SLICE_META_KEYS = {
     "deidentification_version",
     "annotation_text_preserved",
     "signals",
+}
+
+# Keys of a dataset browser row, ``DatasetBrowseRowOut`` in the library API. The same set for every reader.
+BROWSE_ROW_KEYS = {
+    "hash",
+    "display_name",
+    "modality",
+    "public_source",
+    "created_at",
+    "duration",
+    "channel_count",
+    "sampling_rate_max",
+    "sampling_rate_min",
+    "channel_layout",
+    "deidentification_version",
 }
 
 # Values that must never appear in any reader's response, whatever the key set.
@@ -308,3 +324,44 @@ class TestStoredHashOfPreservedText:
         client.force_login(preserved["author"])
         response = client.get(f"/recordings/api/v1/{_hash(recording)}/file?expect_stored_hash={recording.stored_hash}")
         assert response.status_code == 200
+
+
+@pytest.mark.django_db
+class TestDatasetBrowserRowShape:
+    """The dataset browser's row, read through a dataset grant and a dataset share token."""
+
+    @pytest.fixture
+    def browsed(self, shape):
+        from library.models import Dataset
+        from library.tests.test_release import _add
+        from library.tests.test_release import _grant as _object_grant
+
+        dataset = Dataset.objects.create(author=shape["author"], name="browsed")
+        _add(dataset, shape["recording"])
+        _object_grant(dataset, shape["author"], target=shape["grantee"], apply_middleware=True)
+        _object_grant(dataset, shape["author"], token=DATASET_TOKEN, apply_middleware=True)
+        shape["dataset"] = dataset
+        return shape
+
+    def _row(self, browsed, reader):
+        client = Client()
+        url = f"/api/v1/library/datasets/{browsed['dataset'].object_hash}/browse/"
+        if reader == "token":
+            url += f"?share_token={DATASET_TOKEN}"
+        else:
+            client.force_login(browsed[reader])
+        response = client.get(url)
+        assert response.status_code == 200, response.content
+        (row,) = response.json()["items"]
+        return row
+
+    @pytest.mark.parametrize("reader", ["author", "grantee", "token"])
+    def test_row_key_set_is_exact(self, browsed, reader):
+        row = self._row(browsed, reader)
+        assert set(row) == BROWSE_ROW_KEYS, _GIVEN_DATA_TABLE
+        assert not FORBIDDEN_KEYS & set(row)
+
+    @pytest.mark.parametrize("reader", ["grantee", "token"])
+    def test_created_at_is_month_truncated_for_non_authors(self, browsed, reader):
+        served = datetime.fromisoformat(self._row(browsed, reader)["created_at"])
+        assert served == _month_start(browsed["recording"].created_at)

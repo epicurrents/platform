@@ -182,6 +182,38 @@ class MoveCollectionItemIn(Schema):
     target_collection_id: int
 
 
+class DatasetBrowseRowOut(Schema):
+    """One recording of a dataset as the dataset browser shows it.
+
+    The ingest metadata a reader chooses recordings by, nothing author-private and no sequential id:
+    ``hash`` names the recording. ``display_name`` is the grantee-visible name for every caller, the
+    author included, so the table reads the same to everyone it is shared with. ``created_at`` is the
+    date the recording surfaces serve this caller: exact for its author and superusers, otherwise a
+    released gated member's release month or the first of its upload month. The metadata columns are
+    null until ingest has written them. ``channel_count`` and the sampling rates count signal channels
+    only, never an annotation channel.
+    """
+
+    hash: str
+    display_name: str
+    modality: str
+    public_source: str
+    created_at: datetime
+    duration: float | None
+    channel_count: int | None
+    sampling_rate_max: float | None
+    sampling_rate_min: float | None
+    channel_layout: str | None
+    deidentification_version: int | None
+
+
+class DatasetBrowseOut(Schema):
+    """A page of the dataset browser, with the number of rows across every page."""
+
+    count: int
+    items: list[DatasetBrowseRowOut]
+
+
 class CollectionItemOut(Schema):
     """Collection item response.
 
@@ -1939,6 +1971,7 @@ def list_dataset_items(
     when a valid *share_token* is provided.
     """
     from epicurrents.permissions import can_read_object
+    from library.release import member_name_subquery
 
     user = getattr(request, "user", None)
     if not (user and getattr(user, "is_authenticated", False)):
@@ -1952,27 +1985,14 @@ def list_dataset_items(
         or can_read_object(user=user, obj=dataset, share_token=share_token)
     ):
         raise HttpError(403, "You do not have permission to view this dataset")
-
-    from library.release import is_dataset_manager, member_name_subquery
-
-    qs = DatasetItem.objects.filter(dataset=dataset)
-    manager = True
+    qs, manager = _visible_members(dataset, user, share_token)
     if dataset.release_gated:
-        # A gated dataset lists unreleased members to its managers only, and
-        # orders by name: added_at is the arrival order the release month hides.
-        manager = is_dataset_manager(user, dataset)
-        if not manager:
-            qs = qs.filter(release__isnull=False)
+        # A gated dataset orders by name: added_at is the arrival order the release month hides.
         qs = qs.select_related("release").annotate(sort_name=member_name_subquery()).order_by("sort_name", "object_id")
     else:
         qs = qs.order_by("added_at")
     if content_type_id is not None:
         qs = qs.filter(content_type_id=content_type_id)
-    # A member gated elsewhere is listed only to whom the gate would let read it:
-    # nothing gated to a share-token request, nothing unreleased to a
-    # non-manager, whichever dataset the listing is of.
-    for member_ct, hidden in _gate_hidden_members(dataset, user, share_token).items():
-        qs = qs.exclude(content_type=member_ct, object_id__in=hidden)
     items = list(qs[offset : offset + limit])
     log_activity(
         verb="library.dataset.item.list",
@@ -1996,6 +2016,104 @@ def list_dataset_items(
                 row["added_at"] = row["release_month"]
     _null_sequential_ids(rows, user, all_rows=not manager)
     return rows
+
+
+@api.get("/datasets/{dataset_id}/browse/", response=DatasetBrowseOut)
+def browse_dataset(
+    request,
+    dataset_id: str,
+    sort: str = Query("name", description="A sort key, prefixed with '-' for descending"),
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+    share_token: str | None = None,
+):
+    """One page of the dataset's recordings with their ingest metadata, for the dataset browser.
+
+    The same access and the same members as the item listing, recordings only. Sort keys are an
+    allowlist (``library.browse.SORT_KEYS``), and none of them orders by arrival.
+    """
+    from epicurrents.permissions import can_read_object
+    from library.browse import browse_rows, member_recording_ids, parse_sort, recording_count
+    from library.release import release_months_by_id
+    from recordings.api.v1.ninja import _resolve_display_name, _visible_created_at
+    from recordings.models import Recording
+
+    try:
+        sort_key, descending = parse_sort(sort)
+    except ValueError as exc:
+        raise HttpError(400, "Unknown sort key") from exc
+    user = getattr(request, "user", None)
+    if not (user and getattr(user, "is_authenticated", False)):
+        if not (share_token or "").strip():
+            raise HttpError(401, "Authentication credentials were not provided")
+        user = None
+    dataset = _get_active_dataset(dataset_id)
+    if not (
+        (user and getattr(user, "is_superuser", False))
+        or (user and dataset.author_id == user.pk)
+        or can_read_object(user=user, obj=dataset, share_token=share_token)
+    ):
+        raise HttpError(403, "You do not have permission to view this dataset")
+    members, _manager = _visible_members(dataset, user, share_token)
+    member_ids = member_recording_ids(members)
+    total = recording_count(member_ids)
+    recordings = list(browse_rows(member_ids, sort=sort_key, descending=descending)[offset : offset + limit])
+    log_activity(
+        verb="library.dataset.recording.list",
+        target=dataset,
+        metadata={
+            "sort": sort_key,
+            "descending": descending,
+            "limit": limit,
+            "offset": offset,
+            "returned_count": len(recordings),
+            "share_token_used": bool((share_token or "").strip()),
+        },
+    )
+    superuser = user is not None and getattr(user, "is_superuser", False)
+    user_pk = user.pk if user is not None else None
+    exact_pks = {rec.pk for rec in recordings if superuser or rec.author_id == user_pk}
+    recording_ct = ContentType.objects.get_for_model(Recording, for_concrete_model=False)
+    months = release_months_by_id(recording_ct, [rec.pk for rec in recordings if rec.pk not in exact_pks])
+    items = [
+        {
+            "hash": rec.stored_name.split(".", 1)[0],
+            "display_name": _resolve_display_name(rec),
+            "modality": rec.modality,
+            "public_source": rec.public_source,
+            "created_at": _visible_created_at(rec, exact=rec.pk in exact_pks, release_month=months.get(str(rec.pk))),
+            "duration": rec.duration,
+            "channel_count": rec.channel_count,
+            "sampling_rate_max": rec.sampling_rate_max,
+            "sampling_rate_min": rec.sampling_rate_min,
+            "channel_layout": rec.channel_layout,
+            "deidentification_version": rec.deidentification_version,
+        }
+        for rec in recordings
+    ]
+    return {"count": total, "items": items}
+
+
+def _visible_members(dataset: Dataset, user, share_token: str | None) -> tuple:
+    """The unordered ``DatasetItem`` queryset of *dataset* this caller may see, and whether they manage it.
+
+    The single membership rule behind every listing of a dataset's members. A gated dataset lists
+    unreleased members to its managers only. A member gated elsewhere is listed only to whom the
+    gate would let read it: nothing gated to a share-token request, nothing unreleased to a
+    non-manager, whichever dataset the listing is of. Ordering is the caller's, and a listing of a
+    gated dataset to a reader who does not manage it must not order by arrival.
+    """
+    from library.release import is_dataset_manager
+
+    qs = DatasetItem.objects.filter(dataset=dataset)
+    manager = True
+    if dataset.release_gated:
+        manager = is_dataset_manager(user, dataset)
+        if not manager:
+            qs = qs.filter(release__isnull=False)
+    for member_ct, hidden in _gate_hidden_members(dataset, user, share_token).items():
+        qs = qs.exclude(content_type=member_ct, object_id__in=hidden)
+    return qs, manager
 
 
 def _gate_hidden_members(dataset: Dataset, user, share_token: str | None) -> dict:
