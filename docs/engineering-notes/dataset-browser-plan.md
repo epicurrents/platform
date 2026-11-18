@@ -1,6 +1,6 @@
 # Dataset browser — plan
 
-**Status:** planned 2026-11-18, with the scope and the [decisions](#decisions) settled the same day. Phase 1, the browse endpoint, was built the same day. Phase 2 was built the same day in four steps: the schema, the values, their endpoints and the browser's subject column; the sidecar key in the submission gate; the import command; and the displayed fields on a gated dataset with the anonymity report's second sizing.
+**Status:** planned 2026-11-18, with the scope and the [decisions](#decisions) settled the same day. Phase 1, the browse endpoint, was built the same day. Phase 2 was built the same day in four steps: the schema, the values, their endpoints and the browser's subject column; the sidecar key in the submission gate; the import command; and the displayed fields on a gated dataset with the anonymity report's second sizing. Phase 3, the tags per row with their batch endpoint and the code summary, was built the same day.
 
 A dataset is browsed today as the folder tree on its page, one row per member, carrying only its name. A reader choosing recordings to study or teach from needs more than a name: what was recorded, how, and from whom, at the level the dataset declares. This note plans a browser for every dataset: a table of its recordings with ingest metadata, the dataset's own subject fields and a few tags, and a details drawer per row with the recording's codes. It is a platform feature. The educational review project is the first that needs it, and the rules that apply only to a release-gated dataset are marked as such.
 
@@ -53,7 +53,7 @@ The subject fields the table shows are the quasi-identifiers a reader can combin
 
 ### 4. Tags per row
 
-A batch call answering "the tags on these objects", scoped by the reader's reach. `visible_tag_ids` walks every tagged item in the deployment, so the browser needs a form of it bounded to the page's objects first. Per row: curated tags before the reader's own, then by name, three at most.
+A batch call answering "the tags on these objects", scoped by the reader's reach. `visible_tag_ids` walks every tagged item in the deployment, so the browser uses `tags_on_objects`, its form bounded to the page's objects: a tag on an object the reader can read is in their reach, so only the page's tagged objects are checked. Per row: curated tags before the reader's own, then the rest, each by name, three at most, with a count of all of them; `GET /api/v1/library/recording-tags/` lists them all for the drawer. A reader holding a share token without an account gets no tags, as the tag endpoints take no share token.
 
 ### 5. Codes in the drawer
 

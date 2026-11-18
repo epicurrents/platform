@@ -43,6 +43,7 @@ Tags
     GET    /tags/{id}/items/                 List tagged items (optionally with descendants).
     POST   /tags/{id}/items/                 Tag an object.
     DELETE /tags/{id}/items/{iid}/          Untag an object.
+    GET    /recording-tags/                  The tags on recordings named by hash.
 """
 
 import hashlib
@@ -84,7 +85,7 @@ from library.permissions import (
     ensure_can_read_collection,
     ensure_can_write_collection,
 )
-from library.tag_scope import can_create_tag, tag_reachable, visible_tag_ids
+from library.tag_scope import can_create_tag, tag_reachable, tags_on_objects, visible_tag_ids
 from user.dedicated_groups import dedicated_group
 
 api = NinjaAPI(
@@ -182,6 +183,21 @@ class MoveCollectionItemIn(Schema):
     target_collection_id: int
 
 
+class TagChipOut(Schema):
+    """A tag as a row shows it: its id, its name and whether it is curated."""
+
+    id: int
+    name: str
+    curated: bool
+
+
+class RecordingTagsOut(Schema):
+    """The tags on one recording, named by its hash, in display order."""
+
+    hash: str
+    tags: list[TagChipOut]
+
+
 class DatasetBrowseRowOut(Schema):
     """One recording of a dataset as the dataset browser shows it.
 
@@ -192,7 +208,9 @@ class DatasetBrowseRowOut(Schema):
     released gated member's release month or the first of its upload month. The metadata columns are
     null until ingest has written them. ``channel_count`` and the sampling rates count signal channels
     only, never an annotation channel. ``subject`` maps each subject field the caller is shown to the
-    member's value, a key without a value absent (``library.subjects``).
+    member's value, a key without a value absent (``library.subjects``). ``tags`` are at most three of the
+    tags on the recording, curated first, then the caller's own, then the rest, and ``tag_count`` counts them all
+    (``library.tag_scope.tags_on_objects``); a share-token caller without an account gets none, as on the tag endpoints.
     """
 
     hash: str
@@ -207,6 +225,8 @@ class DatasetBrowseRowOut(Schema):
     channel_layout: str | None
     deidentification_version: int | None
     subject: dict[str, str]
+    tags: list[TagChipOut]
+    tag_count: int
 
 
 class SubjectFieldOut(Schema):
@@ -2061,6 +2081,10 @@ def list_dataset_items(
     return rows
 
 
+#: The most tags a browser row carries; the rest are listed by ``GET /recording-tags/``.
+BROWSE_ROW_TAGS = 3
+
+
 @api.get("/datasets/{dataset_id}/browse/", response=DatasetBrowseOut)
 def browse_dataset(
     request,
@@ -2123,6 +2147,7 @@ def browse_dataset(
     recording_ct = ContentType.objects.get_for_model(Recording, for_concrete_model=False)
     months = release_months_by_id(recording_ct, [rec.pk for rec in recordings if rec.pk not in exact_pks])
     subject_values = values_by_object_id(dataset, recording_ct, [rec.pk for rec in recordings], schema)
+    tags = tags_on_objects(user, recording_ct, [rec.pk for rec in recordings]) if user is not None else {}
     items = [
         {
             "hash": rec.stored_name.split(".", 1)[0],
@@ -2137,6 +2162,8 @@ def browse_dataset(
             "channel_layout": rec.channel_layout,
             "deidentification_version": rec.deidentification_version,
             "subject": subject_values.get(str(rec.pk), {}),
+            "tags": tags.get(str(rec.pk), [])[:BROWSE_ROW_TAGS],
+            "tag_count": len(tags.get(str(rec.pk), [])),
         }
         for rec in recordings
     ]
@@ -3394,3 +3421,45 @@ def untag_item(request, tag_id: int, item_id: int):
         log_activity(verb="library.tag.item.remove", target=item)
         item.delete()
     return {"status": "ok"}
+
+
+#: The most recordings one ``GET /recording-tags/`` names.
+MAX_TAGGED_RECORDINGS = 200
+
+
+@api.get("/recording-tags/", response=list[RecordingTagsOut])
+def list_recording_tags(request, hash: list[str] = Query(..., description="Recording hashes, repeated")):
+    """The tags on each recording named in ``hash`` that the caller can read, in display order.
+
+    The batch form of the browser row's tags, for the drawer that lists them all. A recording the caller cannot
+    read is left out, as is one without tags and a hash naming no recording, so the answer says nothing about a
+    recording the caller could not already see. Readability is the per-item check the tag scope uses
+    (``library.tag_scope.tags_on_objects``), which applies the FAILED-hidden rule and the release gate.
+    """
+    from django.db.models import Q
+
+    from recordings.models import Recording
+
+    user = _require_auth(request)
+    if len(hash) > MAX_TAGGED_RECORDINGS:
+        raise HttpError(400, f"At most {MAX_TAGGED_RECORDINGS} recordings per request")
+    hashes = {value.strip().upper() for value in hash if len(value.strip()) == 32 and value.strip().isalnum()}
+    by_pk: dict[str, str] = {}
+    if hashes:
+        names = Q()
+        for value in hashes:
+            names |= Q(stored_name__startswith=f"{value}.")
+        for pk, stored_name in Recording.objects.filter(names, deleted_at__isnull=True).values_list(
+            "pk", "stored_name"
+        ):
+            by_pk[str(pk)] = stored_name.split(".", 1)[0]
+    recording_ct = ContentType.objects.get_for_model(Recording, for_concrete_model=False)
+    tags = tags_on_objects(user, recording_ct, list(by_pk))
+    log_activity(
+        verb="library.tag.recording.list",
+        metadata={"requested_count": len(hash), "returned_count": len(tags)},
+    )
+    return sorted(
+        ({"hash": by_pk[object_id], "tags": object_tags} for object_id, object_tags in tags.items()),
+        key=lambda row: row["hash"],
+    )

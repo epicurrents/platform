@@ -418,6 +418,7 @@ To check the table against the tree, walk the AST for `log_activity` / `with_sys
 | `annotations.annotator.list` | `list_export_annotators` |
 | `annotations.code.create` | `create_code` |
 | `annotations.code.delete` | `delete_code` |
+| `annotations.code.list` | `summarise_recording_codes` |
 | `annotations.code.update` | `update_code` |
 | `annotations.event.create` | `create_event` |
 | `annotations.event.delete` | `delete_event` |
@@ -532,6 +533,7 @@ To check the table against the tree, walk the AST for `log_activity` / `with_sys
 | `library.tag.item.list` | `list_tagged_items` |
 | `library.tag.item.remove` | `untag_item` |
 | `library.tag.list` | `list_tags` |
+| `library.tag.recording.list` | `list_recording_tags` |
 | `library.tag.read` | `get_tag_detail` |
 | `library.tag.update` | `update_tag` |
 

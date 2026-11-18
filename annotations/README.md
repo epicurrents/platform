@@ -60,6 +60,8 @@ An event, interruption or label write takes its codes inline as `codes`, an obje
 
 `GET /vocabularies` lists the registered coding standards as `{standard, label, version, closed, confined}`, so a client renders an editor only for a standard the deployment validates. Any authenticated caller may read it; it writes an `annotations.vocabulary.list` row with the count.
 
+`GET /recordings/{hash}/codes/` summarises the codes on a recording for the dataset browser's drawer: the distinct `(standard, value)` pairs across the events, interruptions and labels attached to the recording itself, by every author, grouped by standard as `{standard, label, count, codes: [{value, name, count}]}`. `label` is the registered vocabulary's and null for an unregistered standard, `name` is the vocabulary's `term_name` for the value, and `count` is the number of rows carrying it. It never returns `meta`, so it serves nothing the [annotation-text rule](#permission-model) withholds, whatever the caller's grant. The recording is named by its hash only, never its primary key; one the caller may not see answers 404 and one they hold no grant on 403, as the listings answer. It writes an `annotations.code.list` row against the recording with the counts.
+
 `GET /export` downloads events and labels in bulk, `GET /export/types` lists the types this deployment can export, `GET /export/annotators` maps the exported annotator ids back to identities — see [bulk export](#bulk-export).
 
 `GET /health` returns `{"status": "ok"}`.

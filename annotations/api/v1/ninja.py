@@ -27,6 +27,7 @@ GET           /export/types           Annotation types this deployment can expor
 GET           /export/annotators      Annotator roster (id-to-identity mapping), on the export tier.
 
 GET           /vocabularies           Registered coding standards with label and version.
+GET           /recordings/{hash}/codes/  The distinct codes on a recording's annotations, counted.
 GET           /content-types          List available content types (for target lookup).
 GET           /health                 Health check.
 
@@ -40,6 +41,8 @@ from django.conf import settings
 from django.contrib.contenttypes.models import ContentType
 from django.core.exceptions import ValidationError
 from django.db import transaction
+from django.db.models import CharField
+from django.db.models.functions import Cast
 from django.http import HttpResponse
 from django.utils import timezone
 from django.utils.http import content_disposition_header
@@ -484,6 +487,19 @@ class VocabularyOut(Schema):
     confined: bool
 
 
+class CodeCountOut(Schema):
+    value: str
+    name: str | None  # the vocabulary's display name for the value, where it gives one
+    count: int
+
+
+class CodeSummaryOut(Schema):
+    standard: str
+    label: str | None  # null for a standard no vocabulary is registered for
+    count: int
+    codes: list[CodeCountOut]
+
+
 class CodePatch(Schema):
     standard: str | None = None
     value: str | None = None
@@ -513,6 +529,72 @@ def list_vocabularies(request):
         VocabularyOut(standard=v.standard, label=v.label, version=v.version, closed=v.closed, confined=v.confined)
         for v in vocabularies
     ]
+
+
+@api.get("/recordings/{recording_hash}/codes/", auth=None, response=list[CodeSummaryOut])
+def summarise_recording_codes(request, recording_hash: str):
+    """The distinct ``(standard, value)`` pairs across the events, interruptions and labels on a recording, each with
+    the number of rows that carry it, grouped by standard.
+
+    Counts rows attached to the recording itself, by every author, as the listings serve them; rows on an object
+    derived from the recording, such as an epoch, are not counted. A code's ``meta`` is never returned, so the
+    summary holds nothing the annotation-text rule withholds, whatever the caller's grant. The recording is named by
+    its hash only. One the caller may not see answers 404 like one that does not exist, and one they lack a grant on
+    403, as on the listings. Standards are in identifier order, and values by count and then by value.
+    """
+    from collections import Counter
+
+    from django.db.models import Count
+
+    from recordings.models import Recording
+
+    user = _require_auth(request)
+    candidate = (recording_hash or "").strip()
+    recording = None
+    if len(candidate) == _HASH_LENGTH and candidate.isalnum():
+        recording = Recording.objects.filter(stored_name__startswith=f"{candidate.upper()}.").first()
+    if recording is None or _recording_hidden(recording, user):
+        raise HttpError(404, "Recording not found")
+    if not get_read_access_result(user=user, obj=recording).granted:
+        raise HttpError(403, "You do not have permission to view this object")
+
+    recording_ct = ContentType.objects.get_for_model(Recording, for_concrete_model=False)
+    counts: Counter = Counter()
+    for model in (Event, Interruption, Label):
+        rows = model.objects.filter(target_content_type=recording_ct, target_object_id=str(recording.pk))
+        codes = Code.objects.filter(
+            content_type=ContentType.objects.get_for_model(model),
+            object_id__in=rows.values_list(Cast("pk", CharField()), flat=True),
+        )
+        for row in codes.values("standard", "value").annotate(n=Count("pk")):
+            counts[(row["standard"], row["value"])] += row["n"]
+
+    vocabularies = {v.standard: v for v in registered_vocabularies()}
+    by_standard: dict[str, list[tuple[str, int]]] = {}
+    for (standard, value), count in counts.items():
+        by_standard.setdefault(standard, []).append((value, count))
+    summary = []
+    for standard in sorted(by_standard):
+        vocabulary = vocabularies.get(standard)
+        term_name = vocabulary.term_name if vocabulary is not None else None
+        values = sorted(by_standard[standard], key=lambda pair: (-pair[1], pair[0]))
+        summary.append(
+            {
+                "standard": standard,
+                "label": vocabulary.label if vocabulary is not None else None,
+                "count": sum(count for _, count in values),
+                "codes": [
+                    {"value": value, "name": term_name(value) if term_name else None, "count": count}
+                    for value, count in values
+                ],
+            }
+        )
+    log_activity(
+        verb="annotations.code.list",
+        target=recording,
+        metadata={"standard_count": len(summary), "code_count": len(counts)},
+    )
+    return summary
 
 
 @api.get("/content-types", response=list[ContentTypeOut])

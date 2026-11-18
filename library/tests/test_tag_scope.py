@@ -227,3 +227,114 @@ class TestCreationPolicy:
         world["staff"].is_staff = False
         world["staff"].save(update_fields=["is_staff"])
         assert world["curated"].pk in visible_tag_ids(world["carol"])
+
+
+def _hashed(user, index, **kwargs):
+    return _recording(user, stored_name=f"{index:032X}.edf", **kwargs)
+
+
+def _hash_of(recording) -> str:
+    return recording.stored_name.split(".", 1)[0]
+
+
+@pytest.mark.django_db
+class TestTagsOnObjects:
+    def test_order_is_curated_then_own_then_others_by_name(self, make_user):
+        from library.tag_scope import tags_on_objects
+
+        staff, reader, other = make_user(), make_user(), make_user()
+        recording = _recording(reader)
+        for author, name, curated in [
+            (other, "a other", False),
+            (reader, "b own", False),
+            (staff, "z curated", True),
+            (reader, "A own", False),
+            (staff, "c curated", True),
+        ]:
+            _tag(recording, baker.make(Tag, author=author, name=name, curated=curated))
+        tags = tags_on_objects(reader, _recording_ct(), [recording.pk])[str(recording.pk)]
+        assert [tag.name for tag in tags] == ["c curated", "z curated", "A own", "b own", "a other"]
+
+    def test_an_unreadable_object_and_an_untagged_one_are_both_absent(self, make_user):
+        from library.tag_scope import tags_on_objects
+
+        owner, reader = make_user(), make_user()
+        unreadable, untagged = _recording(owner), _recording(reader)
+        _tag(unreadable, baker.make(Tag, author=owner, name="curated", curated=True))
+        assert tags_on_objects(reader, _recording_ct(), [unreadable.pk, untagged.pk]) == {}
+
+    def test_a_readable_object_shows_another_users_private_tag(self, make_user):
+        from library.tag_scope import tags_on_objects
+
+        owner, reader = make_user(), make_user()
+        recording = _recording(owner)
+        _grant_read(recording, reader)
+        _tag(recording, baker.make(Tag, author=owner, name="private"))
+        assert [tag.name for tag in tags_on_objects(reader, _recording_ct(), [recording.pk])[str(recording.pk)]] == [
+            "private"
+        ]
+
+    def test_a_failed_recording_of_another_author_is_not_read(self, make_user):
+        from library.tag_scope import tags_on_objects
+
+        owner, reader = make_user(), make_user()
+        recording = _recording(owner)
+        _grant_read(recording, reader)
+        Recording.objects.filter(pk=recording.pk).update(status=Recording.Status.FAILED)
+        _tag(recording, baker.make(Tag, author=owner, name="curated", curated=True))
+        assert tags_on_objects(reader, _recording_ct(), [recording.pk]) == {}
+
+
+@pytest.mark.django_db
+class TestRecordingTagsEndpoint:
+    URL = "/api/v1/library/recording-tags/"
+
+    def _get(self, user, *hashes):
+        return _client_for(user).get(self.URL, {"hash": list(hashes)})
+
+    def test_lists_the_tags_of_readable_recordings_only(self, make_user):
+        owner, reader = make_user(), make_user()
+        readable, unreadable = _hashed(owner, 1), _hashed(owner, 2)
+        _grant_read(readable, reader)
+        curated = baker.make(Tag, author=owner, name="curated", curated=True)
+        _tag(readable, curated)
+        _tag(unreadable, curated)
+        response = self._get(reader, _hash_of(readable), _hash_of(unreadable), "F" * 32, "not-a-hash")
+        assert response.status_code == 200, response.content
+        assert response.json() == [
+            {"hash": _hash_of(readable), "tags": [{"id": curated.pk, "name": "curated", "curated": True}]}
+        ]
+
+    def test_a_trashed_recording_is_left_out(self, make_user):
+        owner = make_user()
+        recording = _hashed(owner, 3, deleted_at=timezone.now())
+        _tag(recording, baker.make(Tag, author=owner, name="mine"))
+        assert self._get(owner, _hash_of(recording)).json() == []
+
+    def test_a_hidden_member_of_a_gated_dataset_is_left_out(self, make_user):
+        from library.tests.test_release import _gated_dataset
+        from library.tests.test_release import _grant as _object_grant
+
+        manager, reader = make_user(), make_user()
+        recording = _hashed(manager, 4)
+        dataset, _ = _gated_dataset(manager, recording)
+        _object_grant(dataset, manager, target=reader)
+        _tag(recording, baker.make(Tag, author=manager, name="curated", curated=True))
+        assert self._get(reader, _hash_of(recording)).json() == []
+        assert [row["hash"] for row in self._get(manager, _hash_of(recording)).json()] == [_hash_of(recording)]
+
+    def test_requires_an_account(self, make_user):
+        assert Client().get(self.URL, {"hash": ["F" * 32]}).status_code == 401
+
+    def test_refuses_too_many_hashes(self, make_user):
+        assert self._get(make_user(), *(f"{i:032X}" for i in range(201))).status_code == 400
+
+    def test_audit_row_counts_and_names_nothing(self, make_user):
+        from activity.models import Activity
+
+        owner = make_user()
+        recording = _hashed(owner, 5)
+        _tag(recording, baker.make(Tag, author=owner, name="mine"))
+        self._get(owner, _hash_of(recording), "F" * 32)
+        row = Activity.objects.filter(verb="library.tag.recording.list").latest("pk")
+        assert row.metadata == {"requested_count": 2, "returned_count": 1}

@@ -14,6 +14,10 @@ item listings use, over the distinct objects that carry a tag not already in
 reach. Tagging is manual, so that set is bounded by what people have tagged
 rather than by what the platform holds.
 
+A surface that shows the tags on a page of objects, such as the dataset browser,
+asks ``tags_on_objects`` instead, which reads only that page's tagged objects:
+every tag on an object the caller can read is in their reach by the rule above.
+
 Creation is reserved for staff while ``LIBRARY_TAG_CREATION_REQUIRES_STAFF`` is
 on, which is the default; a tag a staff member creates is stamped curated.
 """
@@ -67,6 +71,32 @@ def visible_tag_ids(user) -> set[int] | None:
             visible.add(parent_id)
             frontier.append(parent_id)
     return visible
+
+
+def tags_on_objects(user, content_type: ContentType, object_ids) -> dict[str, list[Tag]]:
+    """The tags on each object of *content_type* among *object_ids* that *user* can read, keyed by ``object_id``.
+
+    The bounded form of :func:`visible_tag_ids`. Every tag on an object a caller can read is in their reach, so the
+    answer needs the per-item check for the tagged objects among *object_ids* and nothing else. An object the caller
+    cannot read is absent from the answer, and so is one without tags, so the two cannot be told apart. Each list
+    is in display order: curated tags, then the caller's own, then the rest, each by name.
+    """
+    tags_by_object: dict[str, dict[int, Tag]] = {}
+    rows = TaggedItem.objects.filter(
+        content_type=content_type, object_id__in=[str(object_id) for object_id in object_ids]
+    ).select_related("tag")
+    for item in rows:
+        tags_by_object.setdefault(item.object_id, {})[item.tag_id] = item.tag
+    superuser = getattr(user, "is_superuser", False)
+
+    def rank(tag: Tag) -> tuple:
+        return (0 if tag.curated else 1 if tag.author_id == user.pk else 2, tag.name.casefold(), tag.pk)
+
+    return {
+        object_id: sorted(tags.values(), key=rank)
+        for object_id, tags in tags_by_object.items()
+        if superuser or user_can_read_item(user, content_type, object_id)
+    }
 
 
 def tag_reachable(user, tag_id: int) -> bool:

@@ -142,6 +142,8 @@ BROWSE_ROW_KEYS = {
     "channel_layout",
     "deidentification_version",
     "subject",
+    "tags",
+    "tag_count",
 }
 
 # Values that must never appear in any reader's response, whatever the key set.

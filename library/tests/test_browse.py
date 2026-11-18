@@ -235,3 +235,35 @@ class TestAudit:
             "returned_count": 1,
             "share_token_used": False,
         }
+
+
+class TestRowTags:
+    def test_three_tags_at_most_in_display_order_with_the_count(self, user, make_user):
+        from library.models import Tag, TaggedItem
+
+        staff = make_user()
+        recording = _recording(user)
+        dataset = Dataset.objects.create(author=user, name="d")
+        _add(dataset, recording)
+        ct = ContentType.objects.get_for_model(Recording, for_concrete_model=False)
+        for author, name, curated in [(user, "own b", False), (user, "own a", False), (staff, "curated", True)]:
+            tag = baker.make(Tag, author=author, name=name, curated=curated)
+            TaggedItem.objects.create(tag=tag, content_type=ct, object_id=str(recording.pk))
+        tag = baker.make(Tag, author=staff, name="other", curated=False)
+        TaggedItem.objects.create(tag=tag, content_type=ct, object_id=str(recording.pk))
+        (row,) = _browse(_client(user), dataset).json()["items"]
+        assert [tag["name"] for tag in row["tags"]] == ["curated", "own a", "own b"]
+        assert row["tag_count"] == 4
+
+    def test_a_share_token_caller_gets_no_tags(self, user):
+        from library.models import Tag, TaggedItem
+
+        recording = _recording(user)
+        dataset = Dataset.objects.create(author=user, name="d")
+        _add(dataset, recording)
+        _grant(dataset, user, token=TOKEN)
+        ct = ContentType.objects.get_for_model(Recording, for_concrete_model=False)
+        tag = baker.make(Tag, author=user, name="curated", curated=True)
+        TaggedItem.objects.create(tag=tag, content_type=ct, object_id=str(recording.pk))
+        (row,) = _browse(Client(), dataset, f"?share_token={TOKEN}").json()["items"]
+        assert row["tags"] == [] and row["tag_count"] == 0
