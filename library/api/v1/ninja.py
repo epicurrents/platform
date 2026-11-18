@@ -239,11 +239,41 @@ class SubjectFieldOut(Schema):
     displayed: bool = False
 
 
-class DatasetBrowseOut(Schema):
-    """A page of the dataset browser, with the number of rows across every page and the subject fields shown."""
+class FacetValueOut(Schema):
+    """One value of a browser facet and how many members it would match; ``count`` is null when suppressed."""
 
-    count: int
+    value: str
+    count: int | None
+
+
+class TagFacetOut(Schema):
+    """One tag of the browser's tag facet and how many matching members carry it; ``count`` is null when suppressed."""
+
+    id: int
+    name: str
+    curated: bool
+    count: int | None
+
+
+class DatasetFacetsOut(Schema):
+    """The browser's facets: the modalities present, each shown subject field's choices by key, and the tags."""
+
+    modality: list[FacetValueOut]
+    subject: dict[str, list[FacetValueOut]]
+    tags: list[TagFacetOut]
+
+
+class DatasetBrowseOut(Schema):
+    """A page of the dataset browser, with the number of matching rows across every page and the subject fields shown.
+
+    ``suppression_k`` is the threshold below which this caller is served no count (``library.browse.suppression_k``),
+    null where none applies. ``count`` is null, and ``items`` empty, when a filtered page matches fewer members.
+    """
+
+    count: int | None
+    suppression_k: int | None
     subject_fields: list[SubjectFieldOut]
+    facets: DatasetFacetsOut
     items: list[DatasetBrowseRowOut]
 
 
@@ -1492,6 +1522,93 @@ def list_datasets(
     return visible
 
 
+class CatalogueEntryOut(Schema):
+    """One dataset of the catalogue: a release-gated dataset the caller can read with released recordings.
+
+    ``recording_count`` counts the released recordings the caller can see, ``modalities`` names theirs, and
+    ``latest_release`` is the month of the latest run that released a member. ``subject_fields`` are the labels of the
+    fields the browser shows the caller. No sequential id and no author.
+    """
+
+    object_hash: str
+    name: str
+    description: str
+    license_spdx: str | None
+    license_url: str | None
+    recording_count: int
+    modalities: list[str]
+    latest_release: datetime
+    subject_fields: list[str]
+
+
+@api.get("/catalogue/", response=list[CatalogueEntryOut])
+def list_catalogue(request, limit: int = Query(50, ge=1, le=200), offset: int = Query(0, ge=0)):
+    """The release-gated datasets the caller can read that have released a member, by name.
+
+    Members are the browser's, through ``_visible_members``, released ones only, so a manager sees the same count as
+    any reader. A dataset whose released members have all been withdrawn is left out.
+    """
+    from django.db.models import Max
+
+    from epicurrents.permissions import can_read_object
+    from library.browse import member_recording_ids, recording_count
+    from library.subjects import shown_schema
+    from recordings.models import Recording
+
+    user = _require_auth(request)
+    superuser = getattr(user, "is_superuser", False)
+    candidates = (
+        Dataset.objects.filter(deleted_at__isnull=True, release_gated=True, releases__member_count__gt=0)
+        .annotate(latest_release=Max("releases__release_month"))
+        .select_related("meta")
+        .order_by("name", "pk")
+    )
+    entries = []
+    skipped = 0
+    for dataset in candidates.iterator():
+        if not (superuser or dataset.author_id == user.pk or can_read_object(user=user, obj=dataset)):
+            continue
+        members, manager = _visible_members(dataset, user, None)
+        released = member_recording_ids(members.filter(release__isnull=False))
+        count = recording_count(released)
+        if not count:
+            continue
+        if skipped < offset:
+            skipped += 1
+            continue
+        try:
+            meta = dataset.meta
+        except DatasetMeta.DoesNotExist:
+            meta = None
+        modalities = (
+            Recording.objects.filter(pk__in=released, deleted_at__isnull=True)
+            .exclude(status=Recording.Status.FAILED)
+            .exclude(modality="")
+            .values_list("modality", flat=True)
+            .distinct()
+        )
+        entries.append(
+            {
+                "object_hash": dataset.object_hash,
+                "name": dataset.name,
+                "description": dataset.description,
+                "license_spdx": (meta.license_spdx or None) if meta else None,
+                "license_url": (meta.license_url or None) if meta else None,
+                "recording_count": count,
+                "modalities": sorted({modality.lower() for modality in modalities}),
+                "latest_release": dataset.latest_release,
+                "subject_fields": [item["label"] for item in shown_schema(dataset, manager)],
+            }
+        )
+        if len(entries) >= limit:
+            break
+    log_activity(
+        verb="library.catalogue.list",
+        metadata={"limit": limit, "offset": offset, "returned_count": len(entries)},
+    )
+    return entries
+
+
 def _collection_write_out(collection: Collection, warnings: list[dict]) -> dict:
     """Serialise a collection for a create or update response, with the free-text warnings beside it."""
     return {
@@ -2099,10 +2216,23 @@ def browse_dataset(
 
     The same access and the same members as the item listing, recordings only. Sort keys are an
     allowlist (``library.browse.SORT_KEYS``, and ``subject.<key>`` for each subject field shown), and
-    none of them orders by arrival.
+    none of them orders by arrival. ``modality``, ``subject.<key>`` and ``tag`` (a tag id) filter the rows and may
+    repeat: any of a dimension's values, every one of the tags. The facets count each value under the other filters,
+    and on a release-gated dataset a reader who does not manage it is served no count below k
+    (``library.browse.facet_counts``).
     """
     from epicurrents.permissions import can_read_object
-    from library.browse import browse_rows, member_recording_ids, parse_sort, recording_count
+    from library.browse import (
+        browse_rows,
+        facet_counts,
+        matching_ids,
+        member_facts,
+        member_recording_ids,
+        parse_filters,
+        parse_sort,
+        suppressed,
+        suppression_k,
+    )
     from library.release import release_months_by_id
     from library.subjects import shown_schema, values_by_object_id
     from recordings.api.v1.ninja import _resolve_display_name, _visible_created_at
@@ -2126,10 +2256,21 @@ def browse_dataset(
         sort_key, descending = parse_sort(sort, [field["key"] for field in schema])
     except ValueError as exc:
         raise HttpError(400, "Unknown sort key") from exc
-    member_ids = member_recording_ids(members)
-    total = recording_count(member_ids)
-    rows = browse_rows(member_ids, sort=sort_key, descending=descending, dataset=dataset, schema=schema)
-    recordings = list(rows[offset : offset + limit])
+    try:
+        filters = parse_filters(request.GET, schema, tags_allowed=user is not None)
+    except ValueError as exc:
+        raise HttpError(400, f"Unknown filter: {exc}") from exc
+    k = suppression_k(dataset, manager)
+    facts, tag_rows = member_facts(member_recording_ids(members), dataset=dataset, schema=schema, user=user)
+    member_ids = matching_ids(facts, filters)
+    total = len(member_ids)
+    count = suppressed(total, k) if filters.active else total
+    facets = facet_counts(facts, filters, schema, k=k, tag_rows=tag_rows)
+    if count is None:
+        recordings = []
+    else:
+        rows = browse_rows(member_ids, sort=sort_key, descending=descending, dataset=dataset, schema=schema)
+        recordings = list(rows[offset : offset + limit])
     log_activity(
         verb="library.dataset.recording.list",
         target=dataset,
@@ -2138,6 +2279,8 @@ def browse_dataset(
             "descending": descending,
             "limit": limit,
             "offset": offset,
+            "filters": filters.fields,
+            "count_suppressed": count is None,
             "returned_count": len(recordings),
             "share_token_used": bool((share_token or "").strip()),
         },
@@ -2168,7 +2311,7 @@ def browse_dataset(
         }
         for rec in recordings
     ]
-    return {"count": total, "subject_fields": schema, "items": items}
+    return {"count": count, "suppression_k": k, "subject_fields": schema, "facets": facets, "items": items}
 
 
 def _subject_rule(rule, *args):

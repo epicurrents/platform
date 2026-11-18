@@ -1,6 +1,6 @@
 /**
  * Tests for the dataset browser's client calls: the item listing read to its end for the folder tree, the repeated
- * `hash` parameter of the tag lookup, and the subject write naming what to clear.
+ * `hash` parameter of the tag lookup, the subject write naming what to clear, and the filters as repeated parameters.
  */
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
@@ -11,7 +11,7 @@ vi.mock('#lib/http', () => ({
     },
 }))
 
-import { listAllDatasetItems, listRecordingTags, updateDatasetMemberSubject } from './library'
+import { browseDataset, listAllDatasetItems, listRecordingTags, updateDatasetMemberSubject } from './library'
 import { http } from '#lib/http'
 
 const mockGet = vi.mocked(http.get)
@@ -71,5 +71,31 @@ describe('updateDatasetMemberSubject', () => {
             { values: { age_band: '18-39', indication: null } },
         )
         expect(values).toEqual({ age_band: '18-39' })
+    })
+})
+
+describe('browseDataset', () => {
+    it('sends paging and each filter value as its own parameter', async () => {
+        mockGet.mockResolvedValueOnce({ data: {} })
+        await browseDataset('abc', { sort: '-name', limit: 50, offset: 0 }, {
+            modality: ['eeg', 'ecg'],
+            subject: { age_band: ['0-17', '65+'], indication: [] },
+            tags: [3, 7],
+        })
+        const params = mockGet.mock.calls[0][1]?.params as URLSearchParams
+        expect(mockGet.mock.calls[0][0]).toBe('/api/v1/library/datasets/abc/browse/')
+        expect(params.get('sort')).toBe('-name')
+        expect(params.get('offset')).toBe('0')
+        expect(params.getAll('modality')).toEqual(['eeg', 'ecg'])
+        expect(params.getAll('subject.age_band')).toEqual(['0-17', '65+'])
+        expect(params.has('subject.indication')).toBe(false)
+        expect(params.getAll('tag')).toEqual(['3', '7'])
+    })
+
+    it('sends no filter parameters without filters', async () => {
+        mockGet.mockResolvedValueOnce({ data: {} })
+        await browseDataset('abc', { sort: 'name' })
+        const params = mockGet.mock.calls[0][1]?.params as URLSearchParams
+        expect([...params.keys()]).toEqual(['sort'])
     })
 })

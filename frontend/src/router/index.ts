@@ -12,6 +12,7 @@ import AdminMaintenanceJobView from '#views/AdminMaintenanceJobView.vue'
 import AdminMaintenanceView from '#views/AdminMaintenanceView.vue'
 import AgreementView from '#views/AgreementView.vue'
 import AnnotationExportView from '#views/AnnotationExportView.vue'
+import CatalogueView from '#views/CatalogueView.vue'
 import CollectionView from '#views/CollectionView.vue'
 import DatasetView from '#views/DatasetView.vue'
 import DatasetsView from '#views/DatasetsView.vue'
@@ -151,6 +152,16 @@ export const router = createRouter({
                 navSection: 'datasets',
                 requiresAuth: true,
                 title: 'Datasets',
+            },
+        },
+        {
+            path: '/catalogue',
+            name: 'catalogue',
+            component: CatalogueView,
+            meta: {
+                navSection: 'catalogue',
+                requiresAuth: true,
+                title: 'Catalogue',
             },
         },
         {

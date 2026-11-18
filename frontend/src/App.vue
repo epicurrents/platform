@@ -156,6 +156,14 @@ const baseNavLinks: ProjectNavLink[] = [
         to: '/datasets',
     },
     {
+        id: 'catalogue',
+        icon: 'book-open',
+        label: 'Catalogue',
+        order: 35,
+        section: 'catalogue',
+        to: '/catalogue',
+    },
+    {
         id: 'annotation-export',
         icon: 'download',
         label: 'Export annotations',

@@ -548,10 +548,44 @@ export interface DatasetBrowseRow {
     tag_count: number
 }
 
-/** A page of the dataset browser, with the row count across every page and the subject fields the caller is shown. */
+/** One value of a browser facet and how many members it would match; `count` is null when suppressed. */
+export interface FacetValue {
+    value: string
+    count: number | null
+}
+
+/** One tag of the browser's tag facet and how many matching members carry it; `count` is null when suppressed. */
+export interface TagFacet extends TagChip {
+    count: number | null
+}
+
+/** The browser's facets: the modalities present, each shown subject field's choices by key, and the tags. */
+export interface DatasetFacets {
+    modality: FacetValue[]
+    subject: Record<string, FacetValue[]>
+    tags: TagFacet[]
+}
+
+/**
+ * What a browser page is narrowed to: any of the modalities, any of the choices of each subject field, and every one
+ * of the tags.
+ */
+export interface DatasetBrowseFilters {
+    modality: string[]
+    subject: Record<string, string[]>
+    tags: number[]
+}
+
+/**
+ * A page of the dataset browser, with the matching row count across every page, the subject fields the caller is
+ * shown and the facets. `suppression_k` is the count below which the caller is served none, null where none applies;
+ * `count` is null, and `items` empty, when a filtered page matches fewer members.
+ */
 export interface DatasetBrowsePage {
-    count: number
+    count: number | null
+    suppression_k: number | null
     subject_fields: SubjectField[]
+    facets: DatasetFacets
     items: DatasetBrowseRow[]
 }
 
@@ -565,12 +599,59 @@ export interface RecordingTags {
  * One page of a dataset's recordings for the browser.
  * @param datasetId - The dataset's object hash or primary key.
  * @param params - `sort` is a key from the server's allowlist, or `subject.<key>`, prefixed with `-` for descending.
+ * @param filters - Sent as repeated `modality`, `subject.<key>` and `tag` parameters.
  */
 export async function browseDataset(
     datasetId: number | string,
     params: { sort?: string; limit?: number; offset?: number },
+    filters?: DatasetBrowseFilters,
 ): Promise<DatasetBrowsePage> {
-    const response = await http.get<DatasetBrowsePage>(`/api/v1/library/datasets/${datasetId}/browse/`, { params })
+    const query = new URLSearchParams()
+    for (const [name, value] of Object.entries(params)) {
+        if (value !== undefined) {
+            query.append(name, String(value))
+        }
+    }
+    for (const modality of filters?.modality ?? []) {
+        query.append('modality', modality)
+    }
+    for (const [key, values] of Object.entries(filters?.subject ?? {})) {
+        for (const value of values) {
+            query.append(`subject.${key}`, value)
+        }
+    }
+    for (const tag of filters?.tags ?? []) {
+        query.append('tag', String(tag))
+    }
+    const response = await http.get<DatasetBrowsePage>(`/api/v1/library/datasets/${datasetId}/browse/`, {
+        params: query,
+    })
+    return response.data
+}
+
+/**
+ * One dataset of the catalogue: a release-gated dataset the caller can read with released recordings.
+ * `recording_count` counts the released recordings the caller can see, `latest_release` is the month of the latest
+ * run that released one, and `subject_fields` are the labels of the fields the browser shows the caller.
+ */
+export interface CatalogueEntry {
+    object_hash: string
+    name: string
+    description: string
+    license_spdx: string | null
+    license_url: string | null
+    recording_count: number
+    modalities: string[]
+    latest_release: string
+    subject_fields: string[]
+}
+
+/**
+ * A page of the catalogue, by name.
+ * @param params - Paging; the server caps `limit` at 200.
+ */
+export async function listCatalogue(params: { limit?: number; offset?: number } = {}): Promise<CatalogueEntry[]> {
+    const response = await http.get<CatalogueEntry[]>('/api/v1/library/catalogue/', { params })
     return response.data
 }
 

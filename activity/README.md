@@ -479,6 +479,7 @@ To check the table against the tree, walk the AST for `log_activity` / `with_sys
 
 | Verb | Emitted by |
 |---|---|
+| `library.catalogue.list` | `list_catalogue` |
 | `library.collection.create` | `create_collection` |
 | `library.collection.export` | `export_collection_to_dataset` |
 | `library.collection.item.add` | `add_item` |

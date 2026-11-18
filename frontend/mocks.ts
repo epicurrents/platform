@@ -73,7 +73,9 @@
  *   GET    /api/v1/library/datasets/{id}/items/
  *   POST   /api/v1/library/datasets/{id}/items/
  *   GET    /api/v1/library/datasets/{id}/folders/     (no dataset has folders)
- *   GET    /api/v1/library/datasets/{id}/browse/      (every dataset declares the same two subject fields)
+ *   GET    /api/v1/library/datasets/{id}/browse/      (every dataset declares the same two subject fields; a gated
+ *                                                       one answers as to a reader: displayed fields, k = 3)
+ *   GET    /api/v1/library/catalogue/                 (every gated dataset with members, as released)
  *   PATCH  /api/v1/library/datasets/{id}/recordings/{hash}/subject/
  *   GET    /api/v1/library/recording-tags/
  *   DELETE /api/v1/library/datasets/{id}/items/{itemId}/
@@ -310,6 +312,9 @@ const MOCK_SUBJECT_FIELDS = [
     { key: 'age_band', label: 'Age band', choices: ['0-17', '18-39', '40-64', '65+'], displayed: true },
     { key: 'indication', label: 'Indication', choices: ['Epilepsy', 'Sleep', 'Other'], displayed: false },
 ]
+
+/** The suppression threshold the mock applies to a release-gated dataset. */
+const MOCK_SUPPRESSION_K = 3
 
 /** Tags the mock hands out, a recording carrying a deterministic subset of them. */
 const MOCK_TAGS = [
@@ -2710,7 +2715,35 @@ export async function handleMock(
         return send(res, 200, [])
     }
 
-    // GET /api/v1/library/datasets/{id}/browse/ — the mock caller manages every dataset, so every field is shown
+    // GET /api/v1/library/catalogue/ — every gated dataset with recording members, dated as released last month
+    if (path === '/api/v1/library/catalogue/' && method === 'GET') {
+        const entries = _state.datasets
+            .filter(ds => ds.release_gated)
+            .map(ds => {
+                const members = _state.datasetItems
+                    .filter(i => i._parent_id === ds.id && i.content_type_id === RECORDING_CT_ID)
+                    .map(i => findRecording(i.object_id))
+                    .filter((r): r is MockRecording => !!r)
+                return {
+                    // The mock addresses datasets by id, so the id stands in for the hash.
+                    object_hash: String(ds.id),
+                    name: ds.name,
+                    description: ds.description,
+                    license_spdx: null,
+                    license_url: null,
+                    recording_count: members.length,
+                    modalities: [...new Set(members.map(r => r.modality).filter(Boolean))].sort(),
+                    latest_release: '2026-10-01T00:00:00Z',
+                    subject_fields: MOCK_SUBJECT_FIELDS.filter(f => f.displayed).map(f => f.label),
+                }
+            })
+            .filter(entry => entry.recording_count > 0)
+            .sort((a, b) => a.name.localeCompare(b.name))
+        return send(res, 200, entries)
+    }
+
+    // GET /api/v1/library/datasets/{id}/browse/ — the mock caller manages every ungated dataset, so every field is
+    // shown there; a gated one is answered as to a reader, with its displayed fields and counts below k suppressed
     {
         const m = path.match(/^\/api\/v1\/library\/datasets\/(\d+)\/browse\/$/)
         if (m && method === 'GET') {
@@ -2721,10 +2754,51 @@ export async function handleMock(
             const sortParam = query.get('sort') ?? 'name'
             const descending = sortParam.startsWith('-')
             const sortKey = sortParam.replace(/^-/, '')
-            const members = _state.datasetItems
+            const gated = !!_state.datasets.find(ds => ds.id === dsId)?.release_gated
+            const k = gated ? MOCK_SUPPRESSION_K : null
+            const fields = gated ? MOCK_SUBJECT_FIELDS.filter(f => f.displayed) : MOCK_SUBJECT_FIELDS
+            const subjectOf = (r: MockRecording) => _state.datasetSubjects[`${dsId}:${r.hash}`] ?? {}
+            const modalityFilter = query.getAll('modality')
+            const subjectFilter = fields
+                .map(f => [f.key, query.getAll(`subject.${f.key}`)] as const)
+                .filter(([, values]) => values.length)
+            const tagFilter = query.getAll('tag').map(Number)
+            const filtered = modalityFilter.length > 0 || subjectFilter.length > 0 || tagFilter.length > 0
+            const passes = (r: MockRecording, skip?: string) => {
+                if (skip !== 'modality' && modalityFilter.length && !modalityFilter.includes(r.modality)) {
+                    return false
+                }
+                for (const [key, values] of subjectFilter) {
+                    if (skip !== `subject.${key}` && !values.includes(subjectOf(r)[key] ?? '')) {
+                        return false
+                    }
+                }
+                const tagIds = new Set(mockTagsOf(r.hash).map(tag => tag.id))
+                return skip === 'tag' || tagFilter.every(id => tagIds.has(id))
+            }
+            const suppress = (count: number) => k !== null && count > 0 && count < k ? null : count
+            const all = _state.datasetItems
                 .filter(i => i._parent_id === dsId && i.content_type_id === RECORDING_CT_ID)
                 .map(i => findRecording(i.object_id))
                 .filter((r): r is MockRecording => !!r)
+            const tally = (values: string[], skip: string, valueOf: (r: MockRecording) => string | undefined) =>
+                values.map(value => ({
+                    value,
+                    count: suppress(all.filter(r => valueOf(r) === value && passes(r, skip)).length),
+                }))
+            const facets = {
+                modality: tally([...new Set(all.map(r => r.modality))].sort(), 'modality', r => r.modality),
+                subject: Object.fromEntries(fields.map(f => [
+                    f.key,
+                    tally(f.choices, `subject.${f.key}`, r => subjectOf(r)[f.key]),
+                ])),
+                tags: MOCK_TAGS.map(tag => ({
+                    ...tag,
+                    count: suppress(all.filter(r => passes(r) && mockTagsOf(r.hash).some(t => t.id === tag.id)).length),
+                })).filter(tag => tag.count !== 0 || tagFilter.includes(tag.id)),
+            }
+            const members = all.filter(r => passes(r))
+            const count = filtered ? suppress(members.length) : members.length
             const sortValue = (r: MockRecording): string | number => {
                 if (sortKey.startsWith('subject.')) {
                     return _state.datasetSubjects[`${dsId}:${r.hash}`]?.[sortKey.slice('subject.'.length)] ?? ''
@@ -2744,7 +2818,7 @@ export async function handleMock(
                 const order = left < right ? -1 : left > right ? 1 : 0
                 return (descending ? -order : order) || a.hash.localeCompare(b.hash)
             })
-            const items = members.slice(offset, offset + limit).map(r => {
+            const items = (count === null ? [] : members.slice(offset, offset + limit)).map(r => {
                 const tags = mockTagsOf(r.hash)
                 return {
                     hash: r.hash,
@@ -2758,12 +2832,14 @@ export async function handleMock(
                     sampling_rate_min: r.meta ? 256 : null,
                     channel_layout: null,
                     deidentification_version: r.meta ? 6 : null,
-                    subject: _state.datasetSubjects[`${dsId}:${r.hash}`] ?? {},
+                    subject: Object.fromEntries(
+                        Object.entries(subjectOf(r)).filter(([key]) => fields.some(f => f.key === key)),
+                    ),
                     tags: tags.slice(0, 3),
                     tag_count: tags.length,
                 }
             })
-            return send(res, 200, { count: members.length, subject_fields: MOCK_SUBJECT_FIELDS, items })
+            return send(res, 200, { count, suppression_k: k, subject_fields: fields, facets, items })
         }
     }
 

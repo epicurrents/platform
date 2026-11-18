@@ -363,7 +363,13 @@ class TestDatasetBrowserRowShape:
 
     @pytest.mark.parametrize("reader", ["author", "grantee", "token"])
     def test_page_key_set_is_exact(self, browsed, reader):
-        assert set(self._page(browsed, reader)) == {"count", "subject_fields", "items"}, _GIVEN_DATA_TABLE
+        assert set(self._page(browsed, reader)) == {
+            "count",
+            "suppression_k",
+            "subject_fields",
+            "facets",
+            "items",
+        }, _GIVEN_DATA_TABLE
 
     @pytest.mark.parametrize("reader", ["author", "grantee", "token"])
     def test_row_key_set_is_exact(self, browsed, reader):

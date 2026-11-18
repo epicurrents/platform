@@ -9,6 +9,10 @@
  * reader who does not manage a gated dataset gets its displayed fields only. A manager edits a member's subject
  * values in the drawer; the server refuses a released member's, and the refusal is shown as it comes.
  *
+ * Filtering is the server's too, and so are the facet counts the filters show. On a release-gated dataset a reader
+ * who does not manage it is served no count below k: a filtered page matching fewer members comes back without rows
+ * and is shown as such, never as an empty result.
+ *
  * @package    epicurrents-platform
  */
 import { computed, onMounted, reactive, ref, watch } from 'vue'
@@ -18,7 +22,9 @@ import {
     browseDataset,
     listRecordingTags,
     updateDatasetMemberSubject,
+    type DatasetBrowseFilters,
     type DatasetBrowseRow,
+    type DatasetFacets,
     type SubjectField,
     type TagChip,
 } from '#api/library'
@@ -28,6 +34,7 @@ import { errorDetail } from '#lib/http'
 import { formatDuration, formatMonth, formatSamplingRate } from '#lib/format'
 import { showToast } from '#lib/toast'
 import DataTable, { type DataTableColumn } from '#components/DataTable.vue'
+import DatasetBrowserFilters from '#components/DatasetBrowserFilters.vue'
 import RecordingDetailsDrawer from '#components/RecordingDetailsDrawer.vue'
 
 const SCOPE = 'DatasetBrowser'
@@ -47,7 +54,11 @@ const router = useRouter()
 
 const rows = ref<DatasetBrowseRow[]>([])
 const subjectFields = ref<SubjectField[]>([])
-const total = ref(0)
+const facets = ref<DatasetFacets>({ modality: [], subject: {}, tags: [] })
+const filters = ref<DatasetBrowseFilters>({ modality: [], subject: {}, tags: [] })
+const suppressionK = ref<number | null>(null)
+// The matching row count; null when the server suppressed it.
+const total = ref<number | null>(0)
 const page = ref(1)
 const sort = ref('name')
 const loading = ref(true)
@@ -64,12 +75,14 @@ async function load () {
             limit: PAGE_SIZE,
             offset: (page.value - 1) * PAGE_SIZE,
             sort: sort.value,
-        })
+        }, filters.value)
         if (seq !== loadSeq) {
             return
         }
         rows.value = result.items
         subjectFields.value = result.subject_fields
+        facets.value = result.facets
+        suppressionK.value = result.suppression_k
         total.value = result.count
     } catch (err) {
         if (seq === loadSeq) {
@@ -101,6 +114,44 @@ function onSort (next: string) {
 function onPage (next: number) {
     page.value = next
 }
+
+/** Fetch the first page under a new set of filters. */
+function onFilter (next: DatasetBrowseFilters) {
+    filters.value = next
+    if (page.value === 1) {
+        load()
+    } else {
+        page.value = 1
+    }
+}
+
+const filtered = computed(() => {
+    const { modality, subject, tags } = filters.value
+    return modality.length > 0 || tags.length > 0 || Object.values(subject).some(values => values.length > 0)
+})
+
+/** The line above the table: how many recordings match; empty when too few match to say, which the table says. */
+const summary = computed(() => {
+    if (total.value === null) {
+        return ''
+    }
+    if (filtered.value) {
+        return t('{count} matching recordings', SCOPE, { count: total.value })
+    }
+    return t('{count} recordings', SCOPE, { count: total.value })
+})
+
+const emptyText = computed(() => {
+    if (total.value === null) {
+        return t('Fewer than {k} recordings match these filters. Widen them to see the recordings.', SCOPE, {
+            k: suppressionK.value ?? '',
+        })
+    }
+    if (filtered.value) {
+        return t('No recordings match these filters.', SCOPE)
+    }
+    return t('No recordings in this dataset yet.', SCOPE)
+})
 
 /** Reload the current page, after something outside the browser changed the membership or the gate. */
 function reload () {
@@ -303,7 +354,14 @@ function standardLabel (group: CodeSummary) {
 <template>
     <div class="dataset-browser">
         <wa-callout v-if="error" variant="danger">{{ error }}</wa-callout>
-        <DataTable v-else
+        <DatasetBrowserFilters
+            :facets="facets"
+            :subject-fields="subjectFields"
+            :suppression-k="suppressionK"
+            @change="onFilter"
+        ></DatasetBrowserFilters>
+        <p v-if="summary && (!loading || rows.length)" class="dataset-browser__summary" role="status">{{ summary }}</p>
+        <DataTable v-if="!error"
             :columns="columns"
             :current-key="current?.hash ?? null"
             :label="t('Recordings in this dataset', SCOPE)"
@@ -313,7 +371,7 @@ function standardLabel (group: CodeSummary) {
             :row-key="rowKey"
             :rows="rows"
             :sort="sort"
-            :total="total"
+            :total="total ?? 0"
             @activate="openDetails"
             @update:page="onPage"
             @update:sort="onSort"
@@ -331,7 +389,7 @@ function standardLabel (group: CodeSummary) {
                     </span>
                 </span>
             </template>
-            <template #empty>{{ t('No recordings in this dataset yet.', SCOPE) }}</template>
+            <template #empty>{{ emptyText }}</template>
         </DataTable>
     </div>
 
@@ -440,6 +498,18 @@ function standardLabel (group: CodeSummary) {
 </template>
 
 <style scoped>
+.dataset-browser {
+    display: flex;
+    flex-direction: column;
+    gap: var(--wa-space-m);
+}
+
+.dataset-browser__summary {
+    color: var(--wa-color-text-quiet);
+    font-size: var(--wa-font-size-s);
+    margin: 0;
+}
+
 .dataset-browser__tags {
     align-items: center;
     display: flex;

@@ -232,6 +232,8 @@ class TestAudit:
             "descending": True,
             "limit": 10,
             "offset": 0,
+            "filters": [],
+            "count_suppressed": False,
             "returned_count": 1,
             "share_token_used": False,
         }
