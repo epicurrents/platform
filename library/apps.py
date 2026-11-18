@@ -60,6 +60,12 @@ class LibraryConfig(AppConfig):
         for model_label, guard in ROLLBACK_GUARDS.items():
             register_rollback_guard(model_label, guard)
 
+        # A member's subject values describe the data subject, and the trail is
+        # permanent: it records that they changed, never what they were.
+        from activity.audit import register_masked_fields
+
+        register_masked_fields("library.datasetitemsubject", {"values"}, withhold=True)
+
         # A submission pool's group exists for the pool alone: registering it as
         # dedicated makes the grant, role and group-delete endpoints refuse it.
         from library.pools import POOL_GROUP_KIND, resolve_pool_groups

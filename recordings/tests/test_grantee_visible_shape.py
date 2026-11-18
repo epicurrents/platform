@@ -141,6 +141,7 @@ BROWSE_ROW_KEYS = {
     "sampling_rate_min",
     "channel_layout",
     "deidentification_version",
+    "subject",
 }
 
 # Values that must never appear in any reader's response, whatever the key set.
@@ -343,7 +344,7 @@ class TestDatasetBrowserRowShape:
         shape["dataset"] = dataset
         return shape
 
-    def _row(self, browsed, reader):
+    def _page(self, browsed, reader):
         client = Client()
         url = f"/api/v1/library/datasets/{browsed['dataset'].object_hash}/browse/"
         if reader == "token":
@@ -352,8 +353,15 @@ class TestDatasetBrowserRowShape:
             client.force_login(browsed[reader])
         response = client.get(url)
         assert response.status_code == 200, response.content
-        (row,) = response.json()["items"]
+        return response.json()
+
+    def _row(self, browsed, reader):
+        (row,) = self._page(browsed, reader)["items"]
         return row
+
+    @pytest.mark.parametrize("reader", ["author", "grantee", "token"])
+    def test_page_key_set_is_exact(self, browsed, reader):
+        assert set(self._page(browsed, reader)) == {"count", "subject_fields", "items"}, _GIVEN_DATA_TABLE
 
     @pytest.mark.parametrize("reader", ["author", "grantee", "token"])
     def test_row_key_set_is_exact(self, browsed, reader):

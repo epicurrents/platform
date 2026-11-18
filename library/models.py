@@ -293,10 +293,11 @@ class Dataset(models.Model):
 class DatasetMeta(models.Model):
     """Governance metadata sidecar for a Dataset — the fields whose list is settled.
 
-    Holds the SPDX licence pair; the rest of the eventual field list (contributors, funding,
-    DOIs, subject-group description) lands when designed, as columns here. A sidecar rather than
+    Holds the SPDX licence pair and the subject schema; the rest of the eventual field list
+    (contributors, funding, DOIs) lands when designed, as columns here. A sidecar rather than
     Dataset columns so that growth never touches the dataset table or its serializer defaults.
-    Created on first write through the dataset PATCH endpoint; absence means "nothing declared".
+    Created on first write through the dataset PATCH endpoint or the subject-schema endpoint;
+    absence means "nothing declared".
     """
 
     dataset = models.OneToOneField(
@@ -309,6 +310,10 @@ class DatasetMeta(models.Model):
     # or export concern, not a storage constraint.
     license_spdx = models.CharField(max_length=64, blank=True, default="")
     license_url = models.URLField(max_length=512, blank=True, default="")
+    # The subject fields the dataset declares for its members, in display order:
+    # [{"key": ..., "label": ..., "choices": [...]}]. Written only through
+    # ``library.subjects.validate_schema``; fixed once the dataset's pool fills.
+    subject_schema = models.JSONField(default=list, blank=True)
 
     created_at = models.DateTimeField(auto_now_add=True)
     modified_at = models.DateTimeField(auto_now=True)
@@ -564,6 +569,24 @@ class DatasetItem(models.Model):
         indexes = [
             models.Index(fields=["content_type", "object_id"]),
         ]
+
+
+class DatasetItemSubject(models.Model):
+    """The subject field values of one dataset member, keyed by the dataset's subject schema.
+
+    One row per membership, deleted with it, so withdrawing a recording from a dataset takes its
+    values along. ``values`` maps a schema key to one of that field's choices; a key without a
+    value is absent. Every write goes through ``library.subjects.validate_values``. The values are
+    about the data subject, so the audit trail withholds them (``LibraryConfig.ready``): it records
+    that a member's values changed and never what they were.
+    """
+
+    item = models.OneToOneField(DatasetItem, on_delete=models.CASCADE, related_name="subject")
+    values = models.JSONField(default=dict, blank=True)
+    modified_at = models.DateTimeField(auto_now=True)
+
+    def __str__(self) -> str:
+        return f"DatasetItemSubject(item={self.item_id})"
 
 
 class MemberApproval(models.Model):

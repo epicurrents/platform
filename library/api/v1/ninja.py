@@ -191,7 +191,8 @@ class DatasetBrowseRowOut(Schema):
     date the recording surfaces serve this caller: exact for its author and superusers, otherwise a
     released gated member's release month or the first of its upload month. The metadata columns are
     null until ingest has written them. ``channel_count`` and the sampling rates count signal channels
-    only, never an annotation channel.
+    only, never an annotation channel. ``subject`` maps each subject field the caller is shown to the
+    member's value, a key without a value absent (``library.subjects``).
     """
 
     hash: str
@@ -205,13 +206,53 @@ class DatasetBrowseRowOut(Schema):
     sampling_rate_min: float | None
     channel_layout: str | None
     deidentification_version: int | None
+    subject: dict[str, str]
+
+
+class SubjectFieldOut(Schema):
+    """One field of a dataset's subject schema: its key, its label and its choices in declared order."""
+
+    key: str
+    label: str
+    choices: list[str]
 
 
 class DatasetBrowseOut(Schema):
-    """A page of the dataset browser, with the number of rows across every page."""
+    """A page of the dataset browser, with the number of rows across every page and the subject fields shown."""
 
     count: int
+    subject_fields: list[SubjectFieldOut]
     items: list[DatasetBrowseRowOut]
+
+
+class SubjectSchemaIn(Schema):
+    """A dataset's whole subject schema, replacing the one it has; validated by ``library.subjects``."""
+
+    fields: list
+
+
+class SubjectSchemaOut(Schema):
+    """A dataset's subject schema as the caller is shown it."""
+
+    fields: list[SubjectFieldOut]
+
+
+class SubjectSchemaWriteOut(SubjectSchemaOut):
+    """A schema write response, with a warning for each label or choice that looks like an identifier."""
+
+    warnings: list[NameWarningOut] = []
+
+
+class MemberSubjectIn(Schema):
+    """Subject values to set on a member, each a choice of its field, or ``null`` to clear it; other keys are kept."""
+
+    values: dict
+
+
+class MemberSubjectOut(Schema):
+    """A member's subject values after the write."""
+
+    values: dict[str, str]
 
 
 class CollectionItemOut(Schema):
@@ -2030,18 +2071,16 @@ def browse_dataset(
     """One page of the dataset's recordings with their ingest metadata, for the dataset browser.
 
     The same access and the same members as the item listing, recordings only. Sort keys are an
-    allowlist (``library.browse.SORT_KEYS``), and none of them orders by arrival.
+    allowlist (``library.browse.SORT_KEYS``, and ``subject.<key>`` for each subject field shown), and
+    none of them orders by arrival.
     """
     from epicurrents.permissions import can_read_object
     from library.browse import browse_rows, member_recording_ids, parse_sort, recording_count
     from library.release import release_months_by_id
+    from library.subjects import shown_schema, values_by_object_id
     from recordings.api.v1.ninja import _resolve_display_name, _visible_created_at
     from recordings.models import Recording
 
-    try:
-        sort_key, descending = parse_sort(sort)
-    except ValueError as exc:
-        raise HttpError(400, "Unknown sort key") from exc
     user = getattr(request, "user", None)
     if not (user and getattr(user, "is_authenticated", False)):
         if not (share_token or "").strip():
@@ -2054,10 +2093,16 @@ def browse_dataset(
         or can_read_object(user=user, obj=dataset, share_token=share_token)
     ):
         raise HttpError(403, "You do not have permission to view this dataset")
-    members, _manager = _visible_members(dataset, user, share_token)
+    members, manager = _visible_members(dataset, user, share_token)
+    schema = shown_schema(dataset, manager)
+    try:
+        sort_key, descending = parse_sort(sort, [field["key"] for field in schema])
+    except ValueError as exc:
+        raise HttpError(400, "Unknown sort key") from exc
     member_ids = member_recording_ids(members)
     total = recording_count(member_ids)
-    recordings = list(browse_rows(member_ids, sort=sort_key, descending=descending)[offset : offset + limit])
+    rows = browse_rows(member_ids, sort=sort_key, descending=descending, dataset=dataset, schema=schema)
+    recordings = list(rows[offset : offset + limit])
     log_activity(
         verb="library.dataset.recording.list",
         target=dataset,
@@ -2075,6 +2120,7 @@ def browse_dataset(
     exact_pks = {rec.pk for rec in recordings if superuser or rec.author_id == user_pk}
     recording_ct = ContentType.objects.get_for_model(Recording, for_concrete_model=False)
     months = release_months_by_id(recording_ct, [rec.pk for rec in recordings if rec.pk not in exact_pks])
+    subject_values = values_by_object_id(dataset, recording_ct, [rec.pk for rec in recordings]) if schema else {}
     items = [
         {
             "hash": rec.stored_name.split(".", 1)[0],
@@ -2088,10 +2134,122 @@ def browse_dataset(
             "sampling_rate_min": rec.sampling_rate_min,
             "channel_layout": rec.channel_layout,
             "deidentification_version": rec.deidentification_version,
+            "subject": subject_values.get(str(rec.pk), {}),
         }
         for rec in recordings
     ]
-    return {"count": total, "items": items}
+    return {"count": total, "subject_fields": schema, "items": items}
+
+
+def _subject_rule(rule, *args):
+    """Run a ``library.subjects`` rule, answering its refusal with the status it names."""
+    from library.subjects import SubjectError
+
+    try:
+        return rule(*args)
+    except SubjectError as exc:
+        raise HttpError(exc.status, exc.message) from exc
+
+
+@api.get("/datasets/{dataset_id}/subject-schema/", response=SubjectSchemaOut)
+def get_dataset_subject_schema(request, dataset_id: str, share_token: str | None = None):
+    """The dataset's subject schema as the caller is shown it: empty to a reader who does not manage a gated dataset."""
+    from epicurrents.permissions import can_read_object
+    from library.release import is_dataset_manager
+    from library.subjects import shown_schema
+
+    user = getattr(request, "user", None)
+    if not (user and getattr(user, "is_authenticated", False)):
+        if not (share_token or "").strip():
+            raise HttpError(401, "Authentication credentials were not provided")
+        user = None
+    dataset = _get_active_dataset(dataset_id)
+    if not (
+        (user and getattr(user, "is_superuser", False))
+        or (user and dataset.author_id == user.pk)
+        or can_read_object(user=user, obj=dataset, share_token=share_token)
+    ):
+        raise HttpError(403, "You do not have permission to view this dataset")
+    manager = is_dataset_manager(user, dataset) if dataset.release_gated else True
+    log_activity(
+        verb="library.dataset.subject_schema.read",
+        target=dataset,
+        metadata={"share_token_used": bool((share_token or "").strip())},
+    )
+    return {"fields": shown_schema(dataset, manager)}
+
+
+@api.put("/datasets/{dataset_id}/subject-schema/", response=SubjectSchemaWriteOut)
+def update_dataset_subject_schema(request, dataset_id: str, payload: SubjectSchemaIn):
+    """Replace the dataset's subject schema; dataset managers only.
+
+    Refused once the dataset's pool is filling, and when the new schema drops a field or a choice a
+    member still carries. ``warnings`` flags a label or a choice that looks like an identifier.
+    """
+    from library import subjects
+    from library.release import is_dataset_manager
+
+    user = _require_auth(request)
+    dataset = _get_active_dataset(dataset_id)
+    if not is_dataset_manager(user, dataset):
+        raise HttpError(403, "Only the dataset's managers may change its subject schema")
+    schema = _subject_rule(subjects.validate_schema, payload.fields)
+    with transaction.atomic():
+        # The pool writes and the submission path take the same lock, so the pool cannot fill in between.
+        dataset = Dataset.objects.select_for_update().get(pk=dataset.pk)
+        _subject_rule(subjects.ensure_schema_change_allowed, dataset, schema)
+        DatasetMeta.objects.update_or_create(dataset=dataset, defaults={"subject_schema": schema})
+        log_activity(
+            verb="library.dataset.subject_schema.update",
+            target=dataset,
+            metadata={
+                "field_count": len(schema),
+                "choice_count": sum(len(field["choices"]) for field in schema),
+            },
+        )
+    return {"fields": schema, "warnings": subjects.schema_warnings(schema)}
+
+
+@api.patch("/datasets/{dataset_id}/recordings/{recording_hash}/subject/", response=MemberSubjectOut)
+def update_dataset_member_subject(request, dataset_id: str, recording_hash: str, payload: MemberSubjectIn):
+    """Set or clear a member's subject values; dataset managers only.
+
+    Each value must be one of its field's choices. A released member of a release-gated dataset keeps
+    its values. The audit trail records that the values changed and how many, never what they are.
+    """
+    from library import subjects
+    from library.models import DatasetItemSubject
+    from library.release import is_dataset_manager
+
+    user = _require_auth(request)
+    dataset = _get_active_dataset(dataset_id)
+    if not is_dataset_manager(user, dataset):
+        raise HttpError(403, "Only the dataset's managers may set subject values")
+    item, _normalized = _recording_member(dataset, recording_hash, user)
+    with transaction.atomic():
+        # Under the schema write's lock, so the values are checked against the schema they are stored under.
+        dataset = Dataset.objects.select_for_update().get(pk=dataset.pk)
+        _subject_rule(subjects.ensure_values_editable, dataset, item)
+        row = DatasetItemSubject.objects.filter(item=item).first()
+        current = row.values if row is not None else {}
+        values = _subject_rule(subjects.apply_values, subjects.schema_of(dataset), current, payload.values)
+        if values != current:
+            if not values:
+                row.delete()
+            elif row is None:
+                DatasetItemSubject.objects.create(item=item, values=values)
+            else:
+                row.values = values
+                row.save(update_fields=["values", "modified_at"])
+        log_activity(
+            verb="library.dataset.member.subject.update",
+            target=item,
+            metadata={
+                "set_count": sum(1 for value in payload.values.values() if value is not None),
+                "cleared_count": sum(1 for value in payload.values.values() if value is None),
+            },
+        )
+    return {"values": values}
 
 
 def _visible_members(dataset: Dataset, user, share_token: str | None) -> tuple:

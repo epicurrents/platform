@@ -13,6 +13,9 @@ restoring what those paths would refuse:
   something that happened, and restoring or removing one rewrites what a release relied on;
 - a membership rollback in a release-gated dataset or a pool, or one that moves a member's release
   pointer: members arrive through the gate or the add endpoint and leave through purge or veto;
+- a dataset metadata rollback that changes the subject schema, which the schema endpoint checks
+  against the values in use and the pool's lock, and any rollback of a member's subject values,
+  which the trail withholds and so cannot restore;
 - any rollback of a contributor's ledger or a spooled submission file;
 - any rollback of a pooled (system-authored) recording, which would restore a withdrawn or vetoed
   member, or edit one past the pool's rules.
@@ -83,6 +86,16 @@ def dataset_item_guard(change, existing_obj: Any) -> str | None:
     return None
 
 
+def dataset_meta_guard(change, existing_obj: Any) -> str | None:
+    """Refuse a dataset metadata rollback that would change the subject schema."""
+    state = _restored_state(change)
+    current = getattr(existing_obj, "subject_schema", None) or []
+    restored = [] if state is None else state.get("subject_schema", current) or []
+    if restored != current:
+        return "A dataset's subject schema is changed through its endpoint, which checks it against the values in use."
+    return None
+
+
 def recording_guard(change, existing_obj: Any) -> str | None:
     """Refuse any rollback of a pooled (system-authored) recording."""
     from library.release import system_user_id
@@ -100,6 +113,10 @@ def recording_guard(change, existing_obj: Any) -> str | None:
 ROLLBACK_GUARDS = {
     "library.dataset": dataset_guard,
     "library.datasetitem": dataset_item_guard,
+    "library.datasetmeta": dataset_meta_guard,
+    "library.datasetitemsubject": refuse_always(
+        "A member's subject values are not kept in the audit trail, so a rollback has nothing to restore."
+    ),
     "library.datasetrelease": refuse_always("A release run is a record and is not rolled back."),
     "library.datasetreleasesignoff": refuse_always("A release run's sign-off is a record and is not rolled back."),
     "library.memberapproval": refuse_always("A curator's approval is withdrawn by its curator, not by rollback."),
