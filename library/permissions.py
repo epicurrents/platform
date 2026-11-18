@@ -78,6 +78,59 @@ def ensure_can_write_collection(user, collection: Collection) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _dataset_read_right(user, token_value: str, dataset_ids):
+    """The active ``can_read`` right on one of *dataset_ids* that targets the caller, or ``None``.
+
+    The caller is *user*, one of their groups, or the holder of the share token *token_value*.
+    """
+    from django.contrib.contenttypes.models import ContentType
+    from django.db.models import Q
+
+    from epicurrents.models import AccessRight
+    from library.models import Dataset
+
+    dataset_ct = ContentType.objects.get_for_model(Dataset, for_concrete_model=False)
+
+    # Gate the user-id branch on is_authenticated — an unauthenticated caller
+    # with a pk set (mock / stub) should never contribute to target_filter.
+    target_filter = Q()
+    user_id = getattr(user, "pk", None)
+    if user_id is not None and getattr(user, "is_authenticated", False):
+        target_filter |= Q(access_target_id=user_id)
+        group_ids = list(user.groups.values_list("id", flat=True))
+        if group_ids:
+            target_filter |= Q(access_target_group_id__in=group_ids)
+    if token_value:
+        target_filter |= Q(public_share_token=token_value)
+
+    if not target_filter:
+        return None
+
+    return (
+        AccessRight.objects.active()
+        .filter(
+            content_type=dataset_ct,
+            object_id__in=[str(did) for did in dataset_ids],
+            can_read=True,
+        )
+        .filter(target_filter)
+        .only("apply_middleware")
+        .first()
+    )
+
+
+def dataset_conveys_read(user, dataset, share_token: str | None = None) -> bool:
+    """Whether *dataset* itself grants this caller read on its members, as :func:`can_read_via_dataset` decides it.
+
+    The batch form of the extension for the members of one dataset: when true, every member resolves through the
+    dataset, short of a read-visibility gate hiding it. A release-gated dataset conveys nothing to a share token.
+    """
+    token_value = (share_token or "").strip()
+    if dataset.deleted_at is not None or (token_value and dataset.release_gated):
+        return False
+    return _dataset_read_right(user, token_value, [dataset.pk]) is not None
+
+
 def can_read_via_dataset(user, obj, share_token: str | None = None):
     """Return a ReadAccessTerms if user can read ``obj`` via membership in an accessible Dataset.
 
@@ -99,11 +152,9 @@ def can_read_via_dataset(user, obj, share_token: str | None = None):
     member of one resolves through it for a forwardable link, whoever controls the member.
     """
     from django.contrib.contenttypes.models import ContentType
-    from django.db.models import Q
 
-    from epicurrents.models import AccessRight
     from epicurrents.permissions import ReadAccessTerms
-    from library.models import Dataset, DatasetItem
+    from library.models import DatasetItem
 
     object_pk = getattr(obj, "pk", None)
     if object_pk is None:
@@ -131,33 +182,7 @@ def can_read_via_dataset(user, obj, share_token: str | None = None):
     if not dataset_ids:
         return ReadAccessTerms(granted=False)
 
-    dataset_ct = ContentType.objects.get_for_model(Dataset, for_concrete_model=False)
-
-    # Gate the user-id branch on is_authenticated — an unauthenticated caller
-    # with a pk set (mock / stub) should never contribute to target_filter.
-    target_filter = Q()
-    if user_id is not None and getattr(user, "is_authenticated", False):
-        target_filter |= Q(access_target_id=user_id)
-        group_ids = list(user.groups.values_list("id", flat=True))
-        if group_ids:
-            target_filter |= Q(access_target_group_id__in=group_ids)
-    if token_value:
-        target_filter |= Q(public_share_token=token_value)
-
-    if not target_filter:
-        return ReadAccessTerms(granted=False)
-
-    right = (
-        AccessRight.objects.active()
-        .filter(
-            content_type=dataset_ct,
-            object_id__in=[str(did) for did in dataset_ids],
-            can_read=True,
-        )
-        .filter(target_filter)
-        .only("apply_middleware")
-        .first()
-    )
+    right = _dataset_read_right(user, token_value, dataset_ids)
     if right is None:
         return ReadAccessTerms(granted=False)
     return ReadAccessTerms(granted=True, apply_middleware=right.apply_middleware)

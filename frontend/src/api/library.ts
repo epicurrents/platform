@@ -516,7 +516,7 @@ export interface TagChip {
 
 /**
  * One field of a dataset's subject schema. `displayed` marks a field a reader who does not manage a release-gated
- * dataset is shown; elsewhere it has no effect.
+ * dataset, or one that has had a release, is shown; elsewhere it has no effect.
  */
 export interface SubjectField {
     key: string
@@ -548,15 +548,15 @@ export interface DatasetBrowseRow {
     tag_count: number
 }
 
-/** One value of a browser facet and how many members it would match; `count` is null when suppressed. */
+/** One value of a browser facet and how many members it would match. */
 export interface FacetValue {
     value: string
-    count: number | null
+    count: number
 }
 
-/** One tag of the browser's tag facet and how many matching members carry it; `count` is null when suppressed. */
+/** One tag of the browser's tag facet and how many matching members carry it. */
 export interface TagFacet extends TagChip {
-    count: number | null
+    count: number
 }
 
 /** The browser's facets: the modalities present, each shown subject field's choices by key, and the tags. */
@@ -578,12 +578,10 @@ export interface DatasetBrowseFilters {
 
 /**
  * A page of the dataset browser, with the matching row count across every page, the subject fields the caller is
- * shown and the facets. `suppression_k` is the count below which the caller is served none, null where none applies;
- * `count` is null, and `items` empty, when a filtered page matches fewer members.
+ * shown and the facets.
  */
 export interface DatasetBrowsePage {
-    count: number | null
-    suppression_k: number | null
+    count: number
     subject_fields: SubjectField[]
     facets: DatasetFacets
     items: DatasetBrowseRow[]

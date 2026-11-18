@@ -240,19 +240,19 @@ class SubjectFieldOut(Schema):
 
 
 class FacetValueOut(Schema):
-    """One value of a browser facet and how many members it would match; ``count`` is null when suppressed."""
+    """One value of a browser facet and how many members it would match."""
 
     value: str
-    count: int | None
+    count: int
 
 
 class TagFacetOut(Schema):
-    """One tag of the browser's tag facet and how many matching members carry it; ``count`` is null when suppressed."""
+    """One tag of the browser's tag facet and how many matching members carry it."""
 
     id: int
     name: str
     curated: bool
-    count: int | None
+    count: int
 
 
 class DatasetFacetsOut(Schema):
@@ -264,14 +264,9 @@ class DatasetFacetsOut(Schema):
 
 
 class DatasetBrowseOut(Schema):
-    """A page of the dataset browser, with the number of matching rows across every page and the subject fields shown.
+    """A page of the dataset browser, with the number of matching rows across every page and the subject fields shown."""
 
-    ``suppression_k`` is the threshold below which this caller is served no count (``library.browse.suppression_k``),
-    null where none applies. ``count`` is null, and ``items`` empty, when a filtered page matches fewer members.
-    """
-
-    count: int | None
-    suppression_k: int | None
+    count: int
     subject_fields: list[SubjectFieldOut]
     facets: DatasetFacetsOut
     items: list[DatasetBrowseRowOut]
@@ -1597,7 +1592,7 @@ def list_catalogue(request, limit: int = Query(50, ge=1, le=200), offset: int = 
                 "recording_count": count,
                 "modalities": sorted({modality.lower() for modality in modalities}),
                 "latest_release": dataset.latest_release,
-                "subject_fields": [item["label"] for item in shown_schema(dataset, manager)],
+                "subject_fields": [item["label"] for item in shown_schema(dataset, user)],
             }
         )
         if len(entries) >= limit:
@@ -2217,9 +2212,8 @@ def browse_dataset(
     The same access and the same members as the item listing, recordings only. Sort keys are an
     allowlist (``library.browse.SORT_KEYS``, and ``subject.<key>`` for each subject field shown), and
     none of them orders by arrival. ``modality``, ``subject.<key>`` and ``tag`` (a tag id) filter the rows and may
-    repeat: any of a dimension's values, every one of the tags. The facets count each value under the other filters,
-    and on a release-gated dataset a reader who does not manage it is served no count below k
-    (``library.browse.facet_counts``).
+    repeat: any of a dimension's values, every one of the tags. The facets count each value under the other filters
+    (``library.browse.facet_counts``). A member the caller cannot read is in neither the rows nor the counts.
     """
     from epicurrents.permissions import can_read_object
     from library.browse import (
@@ -2230,8 +2224,6 @@ def browse_dataset(
         member_recording_ids,
         parse_filters,
         parse_sort,
-        suppressed,
-        suppression_k,
     )
     from library.release import release_months_by_id
     from library.subjects import shown_schema, values_by_object_id
@@ -2251,7 +2243,7 @@ def browse_dataset(
     ):
         raise HttpError(403, "You do not have permission to view this dataset")
     members, manager = _visible_members(dataset, user, share_token)
-    schema = shown_schema(dataset, manager)
+    schema = shown_schema(dataset, user)
     try:
         sort_key, descending = parse_sort(sort, [field["key"] for field in schema])
     except ValueError as exc:
@@ -2260,17 +2252,14 @@ def browse_dataset(
         filters = parse_filters(request.GET, schema, tags_allowed=user is not None)
     except ValueError as exc:
         raise HttpError(400, f"Unknown filter: {exc}") from exc
-    k = suppression_k(dataset, manager)
-    facts, tag_rows = member_facts(member_recording_ids(members), dataset=dataset, schema=schema, user=user)
+    facts, tag_rows = member_facts(
+        member_recording_ids(members), dataset=dataset, schema=schema, user=user, share_token=share_token
+    )
     member_ids = matching_ids(facts, filters)
-    total = len(member_ids)
-    count = suppressed(total, k) if filters.active else total
-    facets = facet_counts(facts, filters, schema, k=k, tag_rows=tag_rows)
-    if count is None:
-        recordings = []
-    else:
-        rows = browse_rows(member_ids, sort=sort_key, descending=descending, dataset=dataset, schema=schema)
-        recordings = list(rows[offset : offset + limit])
+    count = len(member_ids)
+    facets = facet_counts(facts, filters, schema, tag_rows=tag_rows)
+    rows = browse_rows(member_ids, sort=sort_key, descending=descending, dataset=dataset, schema=schema)
+    recordings = list(rows[offset : offset + limit])
     log_activity(
         verb="library.dataset.recording.list",
         target=dataset,
@@ -2280,7 +2269,6 @@ def browse_dataset(
             "limit": limit,
             "offset": offset,
             "filters": filters.fields,
-            "count_suppressed": count is None,
             "returned_count": len(recordings),
             "share_token_used": bool((share_token or "").strip()),
         },
@@ -2291,7 +2279,11 @@ def browse_dataset(
     recording_ct = ContentType.objects.get_for_model(Recording, for_concrete_model=False)
     months = release_months_by_id(recording_ct, [rec.pk for rec in recordings if rec.pk not in exact_pks])
     subject_values = values_by_object_id(dataset, recording_ct, [rec.pk for rec in recordings], schema)
-    tags = tags_on_objects(user, recording_ct, [rec.pk for rec in recordings]) if user is not None else {}
+    # Every row is a member the caller was found able to read, so the tags need no second check.
+    page_ids = [rec.pk for rec in recordings]
+    tags = (
+        tags_on_objects(user, recording_ct, page_ids, readable={str(pk) for pk in page_ids}) if user is not None else {}
+    )
     items = [
         {
             "hash": rec.stored_name.split(".", 1)[0],
@@ -2311,7 +2303,7 @@ def browse_dataset(
         }
         for rec in recordings
     ]
-    return {"count": count, "suppression_k": k, "subject_fields": schema, "facets": facets, "items": items}
+    return {"count": count, "subject_fields": schema, "facets": facets, "items": items}
 
 
 def _subject_rule(rule, *args):
@@ -2327,9 +2319,8 @@ def _subject_rule(rule, *args):
 @api.get("/datasets/{dataset_id}/subject-schema/", response=SubjectSchemaOut)
 def get_dataset_subject_schema(request, dataset_id: str, share_token: str | None = None):
     """The dataset's subject schema as the caller is shown it: its displayed fields to a reader who does not manage a
-    gated dataset."""
+    dataset that is release-gated or has had a release."""
     from epicurrents.permissions import can_read_object
-    from library.release import is_dataset_manager
     from library.subjects import shown_schema
 
     user = getattr(request, "user", None)
@@ -2344,13 +2335,12 @@ def get_dataset_subject_schema(request, dataset_id: str, share_token: str | None
         or can_read_object(user=user, obj=dataset, share_token=share_token)
     ):
         raise HttpError(403, "You do not have permission to view this dataset")
-    manager = is_dataset_manager(user, dataset) if dataset.release_gated else True
     log_activity(
         verb="library.dataset.subject_schema.read",
         target=dataset,
         metadata={"share_token_used": bool((share_token or "").strip())},
     )
-    return {"fields": shown_schema(dataset, manager)}
+    return {"fields": shown_schema(dataset, user)}
 
 
 @api.put("/datasets/{dataset_id}/subject-schema/", response=SubjectSchemaWriteOut)
@@ -2404,6 +2394,10 @@ def update_dataset_member_subject(request, dataset_id: str, recording_hash: str,
     with transaction.atomic():
         # Under the schema write's lock, so the values are checked against the schema they are stored under.
         dataset = Dataset.objects.select_for_update().get(pk=dataset.pk)
+        # Read again under the lock a release run takes, so a member released since it was resolved is seen as one.
+        item = DatasetItem.objects.filter(pk=item.pk).first()
+        if item is None:
+            raise HttpError(404, "No such member")
         _subject_rule(subjects.ensure_values_editable, dataset, item)
         row = DatasetItemSubject.objects.filter(item=item).first()
         current = row.values if row is not None else {}

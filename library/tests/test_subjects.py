@@ -211,6 +211,22 @@ class TestValuesEndpoint:
         assert _patch_values(_client(user), dataset, released, {"age": "65+"}).status_code == 409
         assert _patch_values(_client(user), dataset, unreleased, {"age": "65+"}).status_code == 200
 
+    def test_a_member_released_after_it_was_resolved_keeps_its_values(self, user, monkeypatch):
+        from library.api.v1 import ninja
+
+        recording = _recording(user, index=0)
+        dataset, (item,) = _gated_dataset(user, recording)
+        _with_schema(dataset, AGE)
+        resolve = ninja._recording_member
+
+        def resolve_then_release(*args):
+            found = resolve(*args)
+            _release(dataset, item)
+            return found
+
+        monkeypatch.setattr(ninja, "_recording_member", resolve_then_release)
+        assert _patch_values(_client(user), dataset, recording, {"age": "65+"}).status_code == 409
+
     def test_the_trail_withholds_the_values(self, user):
         dataset = Dataset.objects.create(author=user, name="d")
         _with_schema(dataset, {"key": "age", "label": "Age", "choices": [MARKER, "other"]})
@@ -357,6 +373,18 @@ class TestDisplayedFields:
         body = _client(reader).get(f"{DATASETS}/{dataset.object_hash}/browse/").json()
         assert body["subject_fields"] == _out(AGE_SHOWN, SEX)
         assert body["items"][0]["subject"] == {"age": "65+", "sex": "female"}
+
+    def test_an_ungated_dataset_with_a_release_still_hides_the_other_fields(self, user, released):
+        dataset, _item, reader = released
+        Dataset.objects.filter(pk=dataset.pk).update(release_gated=False)
+        fields = _client(reader).get(f"{DATASETS}/{dataset.object_hash}/subject-schema/").json()["fields"]
+        assert [field["key"] for field in fields] == ["age"]
+        page = _client(reader).get(f"{DATASETS}/{dataset.object_hash}/browse/").json()
+        assert [field["key"] for field in page["subject_fields"]] == ["age"]
+        assert all(set(row["subject"]) <= {"age"} for row in page["items"])
+        assert _client(reader).get(f"{DATASETS}/{dataset.object_hash}/browse/?subject.sex=female").status_code == 400
+        managed = _client(user).get(f"{DATASETS}/{dataset.object_hash}/subject-schema/").json()["fields"]
+        assert [field["key"] for field in managed] == ["age", "sex"]
 
     def test_the_displayed_set_is_fixed_once_the_dataset_has_a_release(self, user, released):
         dataset, _item, _reader = released

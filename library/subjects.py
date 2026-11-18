@@ -21,7 +21,14 @@ The rules, each enforced here and called by the endpoints in ``library.api.v1.ni
   anonymity report count a member's class as the project's class key together with its displayed values
   (:func:`subject_class_keys`), so a reader who combines what the table shows finds no class smaller than the one
   the release was sized on. Once a dataset has a release, which fields are displayed is fixed.
+* A dataset that has had a release keeps hiding the fields it does not display after its gate is turned off: its
+  released members were sized on the displayed fields alone, and their values are fixed, so the others could never
+  be cleared first.
 * Elsewhere ``displayed`` has no effect: a dataset's readers are shown every field it declares.
+
+Nothing here judges whether a schema is too fine-grained. Outside a release-gated dataset no class is sized at all,
+and inside one only the displayed fields are, so whether the fields a dataset declares could together identify a
+subject is a judgement made before the dataset is put on the platform, not one the platform makes.
 """
 
 from __future__ import annotations
@@ -204,11 +211,21 @@ def ensure_values_editable(dataset: Any, item: Any) -> None:
         raise SubjectError(409, "A released member's subject values are fixed.")
 
 
-def shown_schema(dataset: Any, manager: bool) -> list[dict]:
-    """The schema a caller is shown: all of it, or its displayed fields to a reader who does not manage a release-gated
-    dataset."""
+def hides_undisplayed(dataset: Any) -> bool:
+    """Whether the dataset shows only its displayed fields to readers who do not manage it: a release-gated dataset,
+    and one that has had a release, whatever has become of its gate."""
+    from library.models import DatasetRelease
+
+    return bool(dataset.release_gated) or DatasetRelease.objects.filter(dataset=dataset).exists()
+
+
+def shown_schema(dataset: Any, user: Any) -> list[dict]:
+    """The schema *user* is shown: all of it, or its displayed fields to a reader who does not manage a dataset that
+    hides the others (:func:`hides_undisplayed`). A caller without an account, *user* ``None``, manages nothing."""
+    from library.release import is_dataset_manager
+
     schema = schema_of(dataset)
-    if dataset.release_gated and not manager:
+    if hides_undisplayed(dataset) and not is_dataset_manager(user, dataset):
         return [field for field in schema if field.get("displayed")]
     return schema
 

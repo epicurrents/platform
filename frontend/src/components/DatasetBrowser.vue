@@ -56,9 +56,7 @@ const rows = ref<DatasetBrowseRow[]>([])
 const subjectFields = ref<SubjectField[]>([])
 const facets = ref<DatasetFacets>({ modality: [], subject: {}, tags: [] })
 const filters = ref<DatasetBrowseFilters>({ modality: [], subject: {}, tags: [] })
-const suppressionK = ref<number | null>(null)
-// The matching row count; null when the server suppressed it.
-const total = ref<number | null>(0)
+const total = ref(0)
 const page = ref(1)
 const sort = ref('name')
 const loading = ref(true)
@@ -82,7 +80,6 @@ async function load () {
         rows.value = result.items
         subjectFields.value = result.subject_fields
         facets.value = result.facets
-        suppressionK.value = result.suppression_k
         total.value = result.count
     } catch (err) {
         if (seq === loadSeq) {
@@ -132,9 +129,6 @@ const filtered = computed(() => {
 
 /** The line above the table: how many recordings match; empty when too few match to say, which the table says. */
 const summary = computed(() => {
-    if (total.value === null) {
-        return ''
-    }
     if (filtered.value) {
         return t('{count} matching recordings', SCOPE, { count: total.value })
     }
@@ -142,11 +136,6 @@ const summary = computed(() => {
 })
 
 const emptyText = computed(() => {
-    if (total.value === null) {
-        return t('Fewer than {k} recordings match these filters. Widen them to see the recordings.', SCOPE, {
-            k: suppressionK.value ?? '',
-        })
-    }
     if (filtered.value) {
         return t('No recordings match these filters.', SCOPE)
     }
@@ -357,7 +346,6 @@ function standardLabel (group: CodeSummary) {
         <DatasetBrowserFilters
             :facets="facets"
             :subject-fields="subjectFields"
-            :suppression-k="suppressionK"
             @change="onFilter"
         ></DatasetBrowserFilters>
         <p v-if="summary && (!loading || rows.length)" class="dataset-browser__summary" role="status">{{ summary }}</p>
@@ -371,7 +359,7 @@ function standardLabel (group: CodeSummary) {
             :row-key="rowKey"
             :rows="rows"
             :sort="sort"
-            :total="total ?? 0"
+            :total="total"
             @activate="openDetails"
             @update:page="onPage"
             @update:sort="onSort"

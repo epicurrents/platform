@@ -1,8 +1,8 @@
-"""Filters, facets and small-count suppression in the dataset browser, and the catalogue of released datasets.
+"""Filters and facets in the dataset browser, and the catalogue of released datasets.
 
 Covers each filter and how they combine, the refusal of a filter on a field the caller is not shown, the facet counts
-under the other dimensions' filters, suppression below k on a release-gated dataset to a reader who does not manage
-it (counts, rows and the second count of a partition), where k comes from, and ``GET /catalogue/``.
+under the other dimensions' filters, the counts a reader of a release-gated dataset is served, the members a caller
+cannot read, and ``GET /catalogue/``.
 """
 
 from __future__ import annotations
@@ -15,7 +15,6 @@ from django.test import Client
 from model_bakery import baker
 
 from activity.models import Activity
-from library.browse import FALLBACK_SUPPRESSION_K
 from library.models import Dataset, DatasetItemSubject, DatasetMeta, Tag, TaggedItem
 from library.tests.test_release import _add, _grant, _release
 from recordings.models import Recording
@@ -175,12 +174,11 @@ class TestFacets:
         facets = _browse(_client(user), dataset, "?modality=ecg")["facets"]
         assert facets["tags"][0]["count"] == 1
 
-    def test_an_ungated_dataset_suppresses_nothing(self, user, make_user, ungated):
+    def test_a_reader_is_served_a_page_of_one(self, user, make_user, ungated):
         dataset, _ = ungated
         reader = make_user()
         _grant(dataset, user, target=reader)
         page = _browse(_client(reader), dataset, "?modality=emg")
-        assert page["suppression_k"] is None
         assert page["count"] == 1 and _names(page) == ["rec 05"]
 
 
@@ -205,75 +203,21 @@ def gated(user, make_user):
     return dataset, reader, tag
 
 
-class TestSuppression:
-    def test_counts_below_k_are_withheld_from_a_reader(self, gated):
+class TestGatedReader:
+    def test_every_count_is_served(self, gated):
         dataset, reader, tag = gated
         page = _browse(_client(reader), dataset)
-        assert page["suppression_k"] == 3
-        assert page["count"] == 10, "the unfiltered count is the listing's, which the reader pages through anyway"
-        assert _counts(page["facets"]["modality"]) == {"ecg": None, "eeg": None}
-        assert page["facets"]["tags"][0]["count"] is None
+        assert page["count"] == 10
+        assert _counts(page["facets"]["modality"]) == {"ecg": 1, "eeg": 9}
+        assert _counts(page["facets"]["subject"]["age"]) == {"0-17": 5, "18-64": 4, "65+": 1}
+        assert page["facets"]["tags"][0]["count"] == 2
 
-    def test_a_single_suppressed_value_takes_the_smallest_shown_one_with_it(self, gated):
-        dataset, reader, _ = gated
-        ages = _counts(_browse(_client(reader), dataset)["facets"]["subject"]["age"])
-        assert ages == {"0-17": 5, "18-64": None, "65+": None}, "10 less 5 less 4 would name the 65+ count"
-
-    def test_zero_is_not_suppressed(self, gated):
-        dataset, reader, _ = gated
-        ages = _counts(_browse(_client(reader), dataset, "?modality=ecg")["facets"]["subject"]["age"])
-        assert ages["0-17"] == 0 and ages["18-64"] == 0
-
-    def test_a_filtered_page_matching_fewer_than_k_serves_no_rows(self, gated):
+    def test_a_small_filtered_page_is_served_with_its_rows(self, gated):
         dataset, reader, tag = gated
         page = _browse(_client(reader), dataset, f"?tag={tag.pk}")
-        assert page["count"] is None and page["items"] == []
-        activity = Activity.objects.filter(verb="library.dataset.recording.list").latest("created_at")
-        assert activity.metadata["count_suppressed"] is True
-        assert activity.metadata["filters"] == ["tag"]
-
-    def test_a_filtered_page_matching_k_or_more_is_served(self, gated):
-        dataset, reader, _ = gated
-        page = _browse(_client(reader), dataset, "?subject.age=18-64")
-        assert page["count"] == 4 and len(page["items"]) == 4
-
-    def test_managers_see_every_count(self, user, gated):
-        dataset, _, tag = gated
-        page = _browse(_client(user), dataset, f"?tag={tag.pk}")
-        assert page["suppression_k"] is None
         assert page["count"] == 2 and len(page["items"]) == 2
-
-
-class TestSuppressionK:
-    def _dataset(self, user, **fields):
-        return Dataset.objects.create(author=user, name="pool", release_gated=True, **fields)
-
-    def test_the_largest_k_any_release_recorded_class_k_included(self, user):
-        from library.browse import suppression_k
-
-        dataset = self._dataset(user)
-        baker.make("library.DatasetRelease", dataset=dataset, released_on=date(2026, 9, 1), k=3)
-        baker.make("library.DatasetRelease", dataset=dataset, released_on=date(2026, 10, 1), k=4, class_k={"x": 7})
-        assert suppression_k(dataset, manager=False) == 7
-
-    def test_the_pool_profile_without_a_recorded_k(self, user, monkeypatch):
-        from library.browse import suppression_k
-        from recordings import submissions
-
-        monkeypatch.setitem(submissions._PROFILES, "facet-test", submissions.IngestProfile(key="facet-test", k=6))
-        dataset = self._dataset(user, submission_profile="facet-test")
-        assert suppression_k(dataset, manager=False) == 6
-
-    def test_the_fallback_without_either(self, user):
-        from library.browse import suppression_k
-
-        assert suppression_k(self._dataset(user), manager=False) == FALLBACK_SUPPRESSION_K
-
-    def test_none_for_a_manager_or_an_ungated_dataset(self, user):
-        from library.browse import suppression_k
-
-        assert suppression_k(self._dataset(user), manager=True) is None
-        assert suppression_k(Dataset.objects.create(author=user, name="open"), manager=False) is None
+        activity = Activity.objects.filter(verb="library.dataset.recording.list").latest("created_at")
+        assert activity.metadata["filters"] == ["tag"]
 
 
 class TestCatalogue:
@@ -336,13 +280,57 @@ class TestCatalogue:
         assert activity.metadata == {"limit": 50, "offset": 0, "returned_count": 1}
 
 
-class TestTagReach:
-    def test_a_member_the_dataset_author_cannot_read_contributes_no_tag(self, user, make_user):
-        owner = make_user()
+class TestUnreadableMembers:
+    """A dataset author holding no grant on the dataset reads its members one by one; a member they cannot read
+    is in neither the rows nor the counts."""
+
+    def _dataset(self, user, owner):
         dataset = Dataset.objects.create(author=user, name="mine")
-        theirs = _recording(owner, 1)
+        theirs = _recording(owner, 1, modality="ecg")
         _member(dataset, theirs)
         _member(dataset, _recording(user, 2))
+        return dataset, theirs
+
+    def test_the_member_has_no_row_count_or_tag(self, user, make_user):
+        owner = make_user()
+        dataset, theirs = self._dataset(user, owner)
         _tag(theirs, baker.make(Tag, author=owner, name="private label"))
         page = _browse(_client(user), dataset)
-        assert page["facets"]["tags"] == [], "the row carries no tag of a recording the author cannot read"
+        assert _names(page) == ["rec 02"] and page["count"] == 1
+        assert _counts(page["facets"]["modality"]) == {"eeg": 1}
+        assert page["facets"]["tags"] == []
+
+    def test_a_direct_grant_on_the_member_lists_it(self, user, make_user):
+        from epicurrents.models import AccessRight
+
+        owner = make_user()
+        dataset, theirs = self._dataset(user, owner)
+        AccessRight.objects.create(
+            content_type=ContentType.objects.get_for_model(Recording, for_concrete_model=False),
+            object_id=str(theirs.pk),
+            access_giver=owner,
+            access_target=user,
+            can_read=True,
+        )
+        assert _names(_browse(_client(user), dataset)) == ["rec 01", "rec 02"]
+
+    def test_the_dataset_grant_lists_every_member_without_a_check_per_member(self, user, make_user, monkeypatch):
+        from epicurrents import permissions
+
+        owner = make_user()
+        dataset, _ = self._dataset(user, owner)
+        reader = make_user()
+        _grant(dataset, user, target=reader)
+
+        real = permissions.can_read_object
+
+        def per_object(**kwargs):
+            assert not isinstance(kwargs["obj"], Recording), "the dataset's grant decides for every member"
+            return real(**kwargs)
+
+        monkeypatch.setattr(permissions, "can_read_object", per_object)
+        page = Client()
+        page.force_login(reader)
+        response = page.get(f"{DATASETS}/{dataset.object_hash}/browse/")
+        assert response.status_code == 200, response.content
+        assert _names(response.json()) == ["rec 01", "rec 02"]

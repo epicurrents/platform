@@ -14,8 +14,8 @@ item listings use, over the distinct objects that carry a tag not already in
 reach. Tagging is manual, so that set is bounded by what people have tagged
 rather than by what the platform holds.
 
-A surface that shows the tags on a page of objects, such as the dataset browser,
-asks ``tags_on_objects`` instead, which reads only that page's tagged objects:
+A surface that shows the tags on a set of objects, such as the dataset browser,
+asks ``tags_on_objects`` instead, which reads only the tagged objects of that set:
 every tag on an object the caller can read is in their reach by the rule above.
 
 Creation is reserved for staff while ``LIBRARY_TAG_CREATION_REQUIRES_STAFF`` is
@@ -73,13 +73,17 @@ def visible_tag_ids(user) -> set[int] | None:
     return visible
 
 
-def tags_on_objects(user, content_type: ContentType, object_ids) -> dict[str, list[Tag]]:
+def tags_on_objects(user, content_type: ContentType, object_ids, *, readable=None) -> dict[str, list[Tag]]:
     """The tags on each object of *content_type* among *object_ids* that *user* can read, keyed by ``object_id``.
 
     The bounded form of :func:`visible_tag_ids`. Every tag on an object a caller can read is in their reach, so the
     answer needs the per-item check for the tagged objects among *object_ids* and nothing else. An object the caller
     cannot read is absent from the answer, and so is one without tags, so the two cannot be told apart. Each list
     is in display order: curated tags, then the caller's own, then the rest, each by name.
+
+    *readable* is the set of ``object_id`` strings a caller has already decided *user* can read, and replaces the
+    per-item check: a listing that has read-checked its whole membership passes it so the check is not run again
+    per tagged object.
     """
     tags_by_object: dict[str, dict[int, Tag]] = {}
     rows = TaggedItem.objects.filter(
@@ -95,7 +99,8 @@ def tags_on_objects(user, content_type: ContentType, object_ids) -> dict[str, li
     return {
         object_id: sorted(tags.values(), key=rank)
         for object_id, tags in tags_by_object.items()
-        if superuser or user_can_read_item(user, content_type, object_id)
+        if superuser
+        or (object_id in readable if readable is not None else user_can_read_item(user, content_type, object_id))
     }
 
 

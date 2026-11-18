@@ -11,12 +11,11 @@ bands sort as declared rather than as strings.
 
 Filters narrow the rows by modality, by the subject fields the caller is shown and by tag, and facets count the
 members under each value (:func:`facet_counts`). A filter on a field the caller is not shown is refused, since its
-counts would describe the hidden values. On a release-gated dataset, to a reader who does not manage it, a count
-between one and k - 1 is suppressed (:func:`suppression_k`): the facet value is served without its count, and a
-filtered page that matches so few members is served without its rows. Displayed fields alone cannot isolate a member
-once every class holds k, but combined with a tag they can. Suppression is a guard on what one answer says, not part
-of the anonymity argument, which rests on the class sizes the release was decided on: two answers can still be
-differenced.
+counts would describe the hidden values. Every count is a sum over rows the caller can page through.
+
+A member the caller cannot read is left out of the rows and the counts (:func:`readable_ids`), which is decided once
+for the dataset where the dataset's own grant conveys the read, so the whole membership can be filtered and sorted
+without a check per member.
 """
 
 import dataclasses
@@ -163,9 +162,6 @@ def member_recording_ids(members) -> list[int]:
 # Filters and facets
 # ---------------------------------------------------------------------------
 
-#: The suppression threshold on a release-gated dataset whose releases recorded no k and whose pool sets none.
-FALLBACK_SUPPRESSION_K = 5
-
 #: The most tags a tag facet lists, by count; the selected tags are listed besides.
 FACET_TAGS = 30
 
@@ -229,13 +225,39 @@ class MemberFacts:
     tags: frozenset[int]
 
 
-def member_facts(member_ids, *, dataset, schema, user) -> tuple[dict[int, MemberFacts], dict[int, Any]]:
+def readable_ids(rows, *, dataset, user, share_token: str | None = None) -> set[int]:
+    """The recordings among *rows*, ``(pk, author_id)`` pairs, that the caller can read.
+
+    *rows* are live, not FAILED, and among the members the release gate lets the caller see, so no read-visibility
+    gate is left to hide one. A superuser reads them all, and so does a caller the dataset's own grant conveys read
+    to (:func:`library.permissions.dataset_conveys_read`): one query for the dataset. Anyone else, an author browsing
+    a dataset they hold no grant on, reads the recordings they authored and those the per-object check grants.
+    """
+    from epicurrents.permissions import can_read_object
+    from library.permissions import dataset_conveys_read
+
+    pks = {pk for pk, _ in rows}
+    if user is not None and getattr(user, "is_superuser", False):
+        return pks
+    if dataset_conveys_read(user, dataset, share_token):
+        return pks
+    user_pk = getattr(user, "pk", None)
+    readable = {pk for pk, author_id in rows if user_pk is not None and author_id == user_pk}
+    for recording in Recording.objects.filter(pk__in=pks - readable):
+        if can_read_object(user=user, obj=recording, share_token=share_token):
+            readable.add(recording.pk)
+    return readable
+
+
+def member_facts(
+    member_ids, *, dataset, schema, user, share_token: str | None = None
+) -> tuple[dict[int, MemberFacts], dict[int, Any]]:
     """The modality, shown subject values and tag ids of each recording among *member_ids* the browser lists, and the
     ``Tag`` rows those ids name.
 
-    The tags are those :func:`library.tag_scope.tags_on_objects` serves *user*, so a member listed to a dataset author
-    who can no longer read it contributes no tag, as its row carries none. A caller without an account, *user*
-    ``None``, is served no tags.
+    Only the members the caller can read (:func:`readable_ids`) have facts, so a member listed in a dataset whose
+    author can no longer read it has no row and is in no count. A caller without an account, *user* ``None``, is
+    served no tags.
     """
     from library.subjects import values_by_object_id
     from library.tag_scope import tags_on_objects
@@ -244,11 +266,15 @@ def member_facts(member_ids, *, dataset, schema, user) -> tuple[dict[int, Member
     rows = list(
         Recording.objects.filter(pk__in=list(member_ids), deleted_at__isnull=True)
         .exclude(status=Recording.Status.FAILED)
-        .values_list("pk", "modality")
+        .values_list("pk", "author_id", "modality")
     )
+    readable = readable_ids(
+        [(pk, author_id) for pk, author_id, _ in rows], dataset=dataset, user=user, share_token=share_token
+    )
+    rows = [(pk, modality) for pk, _, modality in rows if pk in readable]
     pks = [pk for pk, _ in rows]
     values = values_by_object_id(dataset, recording_ct, pks, schema)
-    tags = tags_on_objects(user, recording_ct, pks) if user is not None else {}
+    tags = tags_on_objects(user, recording_ct, pks, readable={str(pk) for pk in pks}) if user is not None else {}
     tag_rows = {tag.pk: tag for object_tags in tags.values() for tag in object_tags}
     facts = {
         pk: MemberFacts(
@@ -276,54 +302,8 @@ def matching_ids(facts: dict[int, MemberFacts], filters: Filters) -> list[int]:
     return [pk for pk, member in facts.items() if _matches(member, filters)]
 
 
-def suppression_k(dataset, manager: bool) -> int | None:
-    """The count below which a browser count is suppressed for this caller, or ``None`` when none is.
-
-    Only on a release-gated dataset, and never to its managers. The threshold is the largest k any of the dataset's
-    releases recorded, a class's own k included, since a count is suppressed for whichever class it describes; then
-    the k of the pool's profile; then :data:`FALLBACK_SUPPRESSION_K`, so a dataset released without the class-size
-    condition still serves no count of one.
-    """
-    from library.models import DatasetRelease
-    from recordings.submissions import get_ingest_profile
-
-    if not dataset.release_gated or manager:
-        return None
-    recorded = [
-        value
-        for k, class_k in DatasetRelease.objects.filter(dataset=dataset).values_list("k", "class_k")
-        for value in [k, *(class_k or {}).values()]
-        if isinstance(value, int) and value > 0
-    ]
-    if recorded:
-        return max(recorded)
-    profile = get_ingest_profile(getattr(dataset, "submission_profile", "") or "")
-    if profile is not None and profile.k:
-        return profile.k
-    return FALLBACK_SUPPRESSION_K
-
-
-def suppressed(count: int, k: int | None) -> int | None:
-    """*count*, or ``None`` when it lies between one and k - 1."""
-    return None if k is not None and 0 < count < k else count
-
-
-def _partition(counts: list[tuple[str, int]], k: int | None) -> list[dict]:
-    """Facet values of one dimension whose values partition the members, with their counts suppressed below *k*.
-
-    A single suppressed count in a partition is the total less the others, so when exactly one is suppressed the
-    smallest count still shown is suppressed with it.
-    """
-    shown = [suppressed(count, k) for _, count in counts]
-    if k is not None and sum(1 for value, (_, count) in zip(shown, counts) if value is None and count) == 1:
-        rest = [(count, index) for index, (value, (_, count)) in enumerate(zip(shown, counts)) if value]
-        if rest:
-            shown[min(rest)[1]] = None
-    return [{"value": value, "count": count} for (value, _), count in zip(counts, shown)]
-
-
-def facet_counts(facts: dict[int, MemberFacts], filters: Filters, schema, *, k: int | None, tag_rows) -> dict:
-    """The facets of the browser: per value, how many members it would match, suppressed below *k*.
+def facet_counts(facts: dict[int, MemberFacts], filters: Filters, schema, *, tag_rows) -> dict:
+    """The facets of the browser: per value, how many members it would match.
 
     A modality or subject value is counted under every filter but its own dimension's, so the other values of a
     filtered dimension stay countable; a tag is counted under every filter, since tags combine with *and*. Modality
@@ -345,7 +325,7 @@ def facet_counts(facts: dict[int, MemberFacts], filters: Filters, schema, *, k: 
             value = member.subject.get(item["key"])
             if value in counts and _matches(member, filters, skip=skip):
                 counts[value] += 1
-        subject[item["key"]] = _partition(list(counts.items()), k)
+        subject[item["key"]] = [{"value": value, "count": count} for value, count in counts.items()]
     tag_counts: dict[int, int] = {}
     for member in facts.values():
         if _matches(member, filters):
@@ -357,14 +337,14 @@ def facet_counts(facts: dict[int, MemberFacts], filters: Filters, schema, *, k: 
     )[:FACET_TAGS]
     listed += sorted(tag_id for tag_id in filters.tags if tag_id in tag_rows and tag_id not in listed)
     return {
-        "modality": _partition(sorted(modality.items()), k),
+        "modality": [{"value": value, "count": count} for value, count in sorted(modality.items())],
         "subject": subject,
         "tags": [
             {
                 "id": tag_id,
                 "name": tag_rows[tag_id].name,
                 "curated": tag_rows[tag_id].curated,
-                "count": suppressed(tag_counts.get(tag_id, 0), k),
+                "count": tag_counts.get(tag_id, 0),
             }
             for tag_id in listed
         ],

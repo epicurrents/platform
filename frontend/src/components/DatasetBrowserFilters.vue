@@ -3,10 +3,9 @@
  * The dataset browser's filters: one multiple select per facet, modality, each subject field the caller is shown and
  * the tags, each option carrying how many members it would match.
  *
- * The counts are the server's facets. A count the server suppresses, below k on a release-gated dataset to a reader
- * who does not manage it, arrives as null and is shown as "fewer than k", never estimated. An option that would match
- * nothing is disabled unless it is already selected, so a selection can always be undone. Every change emits the
- * whole selection; the host fetches the first page under it.
+ * The counts are the server's facets. An option that would match nothing is disabled unless it is already selected,
+ * so a selection can always be undone. Every change emits the whole selection; the host fetches the first page under
+ * it.
  *
  * @package    epicurrents-platform
  */
@@ -23,8 +22,6 @@ const props = defineProps<{
     facets: DatasetFacets
     /** The subject fields the caller is shown, in schema order. */
     subjectFields: SubjectField[]
-    /** The count below which the server serves none, or null. */
-    suppressionK: number | null
 }>()
 
 const emit = defineEmits<{ change: [filters: DatasetBrowseFilters] }>()
@@ -48,14 +45,11 @@ interface FilterControl {
 }
 
 /**
- * An option's text: the value and its count, or "fewer than k" for a suppressed count.
+ * An option's text: the value and its count.
  * @param label - The value as shown.
- * @param count - The facet count, null when suppressed.
+ * @param count - The facet count.
  */
-function optionLabel (label: string, count: number | null) {
-    if (count === null) {
-        return t('{value} (fewer than {k})', SCOPE, { value: label, k: props.suppressionK ?? '' })
-    }
+function optionLabel (label: string, count: number) {
     return t('{value} ({count})', SCOPE, { value: label, count })
 }
 
@@ -64,7 +58,7 @@ function optionLabel (label: string, count: number | null) {
  * @param name - The facet's key in the selection.
  * @param entries - Each option's value, label and count.
  */
-function options (name: string, entries: { value: string; label: string; count: number | null }[]) {
+function options (name: string, entries: { value: string; label: string; count: number }[]) {
     const selected = new Set(selection[name] ?? [])
     return entries.map(entry => ({
         value: entry.value,
