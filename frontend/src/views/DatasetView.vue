@@ -5,6 +5,7 @@ import { useRecordingSelection } from '#composables/useRecordingSelection'
 import { t } from '#i18n'
 import { setPageTitle } from '#router'
 import AccessRightsPanel from '#components/AccessRightsPanel.vue'
+import DatasetBrowser from '#components/DatasetBrowser.vue'
 import DatasetPoolSection from '#components/DatasetPoolSection.vue'
 import MediaListRow from '#components/MediaListRow.vue'
 import EditRecordingDialog from '#components/EditRecordingDialog.vue'
@@ -14,7 +15,7 @@ import {
     getDataset,
     updateDataset,
     deleteDataset,
-    listDatasetItems,
+    listAllDatasetItems,
     addDatasetItem,
     removeDatasetItem,
     listDatasetFolders,
@@ -77,7 +78,7 @@ onMounted(async () => {
     try {
         const [ds, its, tree, rights] = await Promise.all([
             getDataset(datasetId.value),
-            listDatasetItems(datasetId.value),
+            listAllDatasetItems(datasetId.value),
             listDatasetFolders(datasetId.value),
             listDatasetAccess(datasetId.value),
         ])
@@ -346,6 +347,32 @@ function openSelectionInViewer() {
     clearSelection()
 }
 
+// ── Browse tab ────────────────────────────────────────────────────────────
+
+const browser = ref<InstanceType<typeof DatasetBrowser> | null>(null)
+// The browser mounts the first time its tab is shown and stays mounted, so its page and sort survive a tab switch.
+const browseOpened = ref(false)
+
+// The dataset's managers set subject values in the browser. The owner check covers ungated datasets; the review,
+// answered to managers only, covers a write-grant holder of a gated one. The server decides either way.
+const canManageMembers = computed(() => canEditConfig.value || review.value !== null)
+
+/**
+ * Mount the browser on its first showing and refresh it on every later one, since the items tab may have changed
+ * the membership in between.
+ * @param event - The tab group's show event.
+ */
+function onTabShow (event: Event) {
+    if ((event as CustomEvent<{ name: string }>).detail.name !== 'browse') {
+        return
+    }
+    if (browseOpened.value) {
+        browser.value?.reload()
+    } else {
+        browseOpened.value = true
+    }
+}
+
 // ── Folder tree ───────────────────────────────────────────────────────────
 
 /** One rendered line of the items section: a folder header or an item, with its tree depth. */
@@ -422,6 +449,47 @@ function folderOptionLabel(option: { folder: DatasetFolder; depth: number }) {
  */
 function itemKey (item: DatasetItem) {
     return item.id !== null ? `i${item.id}` : `h${item.object_hash ?? ''}`
+}
+
+/**
+ * The key of a line of the items section.
+ * @param row - A folder header or an item.
+ */
+function rowKey (row: DisplayRow) {
+    return row.kind === 'folder' ? `f${row.folder!.id}` : itemKey(row.item!)
+}
+
+/**
+ * Whether an item is a member of a release-gated dataset that no release has published yet.
+ * @param item - A row of the items section.
+ */
+function isUnreleased (item: DatasetItem) {
+    return !!dataset.value?.release_gated && !item.release_month
+}
+
+/**
+ * Whether the caller reviews this item and it is still waiting for release.
+ * @param item - A row of the items section.
+ */
+function awaitsApproval (item: DatasetItem) {
+    const member = reviewOf(item)
+    return !!member && !member.released
+}
+
+/**
+ * Whether the caller can move an item between folders: a folder manager, an addressable item, a folder to go to.
+ * @param item - A row of the items section.
+ */
+function canMoveItem (item: DatasetItem) {
+    return canManageFolders.value && folders.value.length > 0 && item.id !== null
+}
+
+/**
+ * Whether the caller can remove an item by hand, which a pool never offers.
+ * @param item - A row of the items section.
+ */
+function canRemoveItem (item: DatasetItem) {
+    return !isPool.value && item.id !== null
 }
 
 /**
@@ -641,11 +709,12 @@ async function submitEdit() {
  */
 async function reloadAfterGateChange () {
     try {
-        items.value = await listDatasetItems(datasetId.value)
+        items.value = await listAllDatasetItems(datasetId.value)
     } catch {
         // The update itself succeeded; a stale list corrects itself on the next load.
     }
     await loadReview()
+    browser.value?.reload()
 }
 
 // ── Delete dataset ────────────────────────────────────────────────────────
@@ -947,164 +1016,186 @@ const assessFn = (right: AccessRight, payload: AssessmentPayload) =>
                 </wa-dropdown>
             </div>
 
-            <p v-if="!items.length" class="empty-state recordings-empty">
-                {{ t('No items in this dataset yet.', SCOPE) }}
-            </p>
+            <wa-tab-group @wa-tab-show="onTabShow">
+                <wa-tab panel="items" slot="nav">{{ t('All items', SCOPE) }}</wa-tab>
+                <wa-tab panel="browse" slot="nav">{{ t('Browse recordings', SCOPE) }}</wa-tab>
+                <wa-tab-panel name="items">
+                    <p v-if="!items.length" class="empty-state recordings-empty">
+                        {{ t('No items in this dataset yet.', SCOPE) }}
+                    </p>
 
-            <div v-else class="list-rows" ref="listRef">
-                <template v-for="row in displayRows" :key="row.kind === 'folder' ? `f${row.folder!.id}` : itemKey(row.item!)">
-                    <div v-if="row.kind === 'folder' && row.folder"
-                        class="folder-row"
-                        :style="{ paddingLeft: `${row.depth * 1.5}rem` }"
-                    >
-                        <div class="folder-row__main">
-                            <wa-icon class="folder-row__icon" name="folder"></wa-icon>
-                            <span class="folder-row__name">{{ row.folder.name }}</span>
-                        </div>
-                        <wa-dropdown v-if="canManageFolders"
-                            placement="bottom-end"
-                            @click.stop
-                            @wa-select="onFolderAction($event, row.folder)"
-                        >
-                            <wa-button appearance="plain" size="s" slot="trigger" variant="neutral">
-                                <wa-icon name="ellipsis"></wa-icon>
-                            </wa-button>
-                            <wa-dropdown-item value="edit">
-                                <wa-icon name="pencil" slot="icon"></wa-icon>
-                                {{ t('Rename or move', SCOPE) }}
-                            </wa-dropdown-item>
-                            <wa-dropdown-item value="delete" variant="danger">
-                                <wa-icon name="trash" slot="icon"></wa-icon>
-                                {{ t('Delete folder', SCOPE) }}
-                            </wa-dropdown-item>
-                        </wa-dropdown>
-                    </div>
-                    <template v-else-if="row.item">
-                        <div v-for="item in [row.item]"
-                            class="tree-row"
-                            :key="itemKey(item)"
-                            :style="{ paddingLeft: `${row.depth * 1.5}rem` }"
-                        >
-                            <RecordingListRow v-if="item.object_type === 'recording' && item.object_hash"
-                                :hash="item.object_hash"
-                                :is-focused="focusedHash === item.object_hash"
-                                :is-selected="selected.has(item.object_hash)"
-                                :name="itemName(item)"
-                                :selection-active="selected.size > 0"
-                                @checkbox-click="onCheckboxClick(item.object_hash)"
-                                @dropdown-action="onRecordingAction($event, item)"
-                                @open="openRecordings([item.object_hash])"
-                                @row-click="onRowClick(item.object_hash, $event)"
-                                @row-dblclick="openRecordings([item.object_hash])"
+                    <div v-else class="list-rows" ref="listRef">
+                        <template v-for="row in displayRows" :key="rowKey(row)">
+                            <div v-if="row.kind === 'folder' && row.folder"
+                                class="folder-row"
+                                :style="{ paddingLeft: `${row.depth * 1.5}rem` }"
                             >
-                                <template #meta>
-                                    <wa-tag v-if="dataset?.release_gated && !item.release_month" size="s" variant="warning">
-                                        {{ t('Unreleased', SCOPE) }}
-                                    </wa-tag>
-                                    <wa-tag v-if="reviewOf(item) && !reviewOf(item)?.released" size="s" variant="neutral">
-                                        {{ approvalLabel(reviewOf(item)!) }}
-                                    </wa-tag>
-                                </template>
-                                <template #actions>
-                                    <template v-if="!isPool">
-                                        <wa-dropdown-item value="edit">
-                                            <wa-icon name="pencil" slot="icon"></wa-icon>
-                                            {{ t('Edit', SCOPE) }}
-                                        </wa-dropdown-item>
-                                        <wa-dropdown-item value="attach-media">
-                                            <wa-icon name="paperclip" slot="icon"></wa-icon>
-                                            {{ t('Attach media', SCOPE) }}
-                                        </wa-dropdown-item>
-                                    </template>
-                                    <wa-dropdown-item v-if="canManageFolders && folders.length && item.id !== null" value="move-folder">
-                                        <wa-icon name="folder-open" slot="icon"></wa-icon>
-                                        {{ t('Move to folder', SCOPE) }}
-                                    </wa-dropdown-item>
-                                    <template v-if="reviewOf(item) && !reviewOf(item)?.released">
-                                        <wa-dropdown-item v-if="!reviewOf(item)?.approved_by_me"
-                                            :disabled="approvalPending(item)"
-                                            value="approve"
-                                        >
-                                            <wa-icon name="check" slot="icon"></wa-icon>
-                                            {{ t('Approve for release', SCOPE) }}
-                                        </wa-dropdown-item>
-                                        <wa-dropdown-item v-else :disabled="approvalPending(item)" value="withdraw-approval">
-                                            <wa-icon name="rotate-left" slot="icon"></wa-icon>
-                                            {{ t('Withdraw approval', SCOPE) }}
-                                        </wa-dropdown-item>
-                                    </template>
-                                    <wa-dropdown-item v-if="reviewOf(item)" value="veto" variant="danger">
-                                        <wa-icon name="ban" slot="icon"></wa-icon>
-                                        {{ t('Veto…', SCOPE) }}
-                                    </wa-dropdown-item>
-                                    <wa-dropdown-item v-if="!isPool && item.id !== null" value="remove" variant="danger">
-                                        <wa-icon name="xmark" slot="icon"></wa-icon>
-                                        {{ t('Remove from dataset', SCOPE) }}
-                                    </wa-dropdown-item>
-                                </template>
-                            </RecordingListRow>
-                            <MediaListRow v-else-if="item.object_type === 'mediafile' && item.object_hash"
-                                :file-extension="item.file_extension"
-                                :hash="item.object_hash"
-                                :is-focused="false"
-                                :is-selected="false"
-                                :is-supported="item.is_supported ?? false"
-                                :media-type="item.media_type"
-                                :name="itemName(item)"
-                                @dropdown-action="onMediaAction($event, item)"
-                                @open="openMedia(item.object_hash)"
-                                @row-dblclick="openMedia(item.object_hash)"
-                            >
-                                <template #actions>
-                                    <wa-dropdown-item v-if="canManageFolders && folders.length && item.id !== null" value="move-folder">
-                                        <wa-icon name="folder-open" slot="icon"></wa-icon>
-                                        {{ t('Move to folder', SCOPE) }}
-                                    </wa-dropdown-item>
-                                    <wa-dropdown-item v-if="!isPool && item.id !== null" value="remove" variant="danger">
-                                        <wa-icon name="xmark" slot="icon"></wa-icon>
-                                        {{ t('Remove from dataset', SCOPE) }}
-                                    </wa-dropdown-item>
-                                </template>
-                            </MediaListRow>
-                            <div v-else class="list-row">
-                                <div class="list-row-main">
-                                    <wa-icon class="icon-muted" name="file"></wa-icon>
-                                    <span class="list-row-name">
-                                        {{ itemName(item) }}
-                                    </span>
+                                <div class="folder-row__main">
+                                    <wa-icon class="folder-row__icon" name="folder"></wa-icon>
+                                    <span class="folder-row__name">{{ row.folder.name }}</span>
                                 </div>
+                                <wa-dropdown v-if="canManageFolders"
+                                    placement="bottom-end"
+                                    @click.stop
+                                    @wa-select="onFolderAction($event, row.folder)"
+                                >
+                                    <wa-button appearance="plain" size="s" slot="trigger" variant="neutral">
+                                        <wa-icon name="ellipsis"></wa-icon>
+                                    </wa-button>
+                                    <wa-dropdown-item value="edit">
+                                        <wa-icon name="pencil" slot="icon"></wa-icon>
+                                        {{ t('Rename or move', SCOPE) }}
+                                    </wa-dropdown-item>
+                                    <wa-dropdown-item value="delete" variant="danger">
+                                        <wa-icon name="trash" slot="icon"></wa-icon>
+                                        {{ t('Delete folder', SCOPE) }}
+                                    </wa-dropdown-item>
+                                </wa-dropdown>
                             </div>
+                            <template v-else-if="row.item">
+                                <div v-for="item in [row.item]"
+                                    class="tree-row"
+                                    :key="itemKey(item)"
+                                    :style="{ paddingLeft: `${row.depth * 1.5}rem` }"
+                                >
+                                    <RecordingListRow v-if="item.object_type === 'recording' && item.object_hash"
+                                        :hash="item.object_hash"
+                                        :is-focused="focusedHash === item.object_hash"
+                                        :is-selected="selected.has(item.object_hash)"
+                                        :name="itemName(item)"
+                                        :selection-active="selected.size > 0"
+                                        @checkbox-click="onCheckboxClick(item.object_hash)"
+                                        @dropdown-action="onRecordingAction($event, item)"
+                                        @open="openRecordings([item.object_hash])"
+                                        @row-click="onRowClick(item.object_hash, $event)"
+                                        @row-dblclick="openRecordings([item.object_hash])"
+                                    >
+                                        <template #meta>
+                                            <wa-tag v-if="isUnreleased(item)" size="s" variant="warning">
+                                                {{ t('Unreleased', SCOPE) }}
+                                            </wa-tag>
+                                            <wa-tag v-if="awaitsApproval(item)" size="s" variant="neutral">
+                                                {{ approvalLabel(reviewOf(item)!) }}
+                                            </wa-tag>
+                                        </template>
+                                        <template #actions>
+                                            <template v-if="!isPool">
+                                                <wa-dropdown-item value="edit">
+                                                    <wa-icon name="pencil" slot="icon"></wa-icon>
+                                                    {{ t('Edit', SCOPE) }}
+                                                </wa-dropdown-item>
+                                                <wa-dropdown-item value="attach-media">
+                                                    <wa-icon name="paperclip" slot="icon"></wa-icon>
+                                                    {{ t('Attach media', SCOPE) }}
+                                                </wa-dropdown-item>
+                                            </template>
+                                            <wa-dropdown-item v-if="canMoveItem(item)" value="move-folder">
+                                                <wa-icon name="folder-open" slot="icon"></wa-icon>
+                                                {{ t('Move to folder', SCOPE) }}
+                                            </wa-dropdown-item>
+                                            <template v-if="awaitsApproval(item)">
+                                                <wa-dropdown-item v-if="!reviewOf(item)?.approved_by_me"
+                                                    :disabled="approvalPending(item)"
+                                                    value="approve"
+                                                >
+                                                    <wa-icon name="check" slot="icon"></wa-icon>
+                                                    {{ t('Approve for release', SCOPE) }}
+                                                </wa-dropdown-item>
+                                                <wa-dropdown-item v-else
+                                                    :disabled="approvalPending(item)"
+                                                    value="withdraw-approval"
+                                                >
+                                                    <wa-icon name="rotate-left" slot="icon"></wa-icon>
+                                                    {{ t('Withdraw approval', SCOPE) }}
+                                                </wa-dropdown-item>
+                                            </template>
+                                            <wa-dropdown-item v-if="reviewOf(item)" value="veto" variant="danger">
+                                                <wa-icon name="ban" slot="icon"></wa-icon>
+                                                {{ t('Veto…', SCOPE) }}
+                                            </wa-dropdown-item>
+                                            <wa-dropdown-item v-if="canRemoveItem(item)"
+                                                value="remove"
+                                                variant="danger"
+                                            >
+                                                <wa-icon name="xmark" slot="icon"></wa-icon>
+                                                {{ t('Remove from dataset', SCOPE) }}
+                                            </wa-dropdown-item>
+                                        </template>
+                                    </RecordingListRow>
+                                    <MediaListRow v-else-if="item.object_type === 'mediafile' && item.object_hash"
+                                        :file-extension="item.file_extension"
+                                        :hash="item.object_hash"
+                                        :is-focused="false"
+                                        :is-selected="false"
+                                        :is-supported="item.is_supported ?? false"
+                                        :media-type="item.media_type"
+                                        :name="itemName(item)"
+                                        @dropdown-action="onMediaAction($event, item)"
+                                        @open="openMedia(item.object_hash)"
+                                        @row-dblclick="openMedia(item.object_hash)"
+                                    >
+                                        <template #actions>
+                                            <wa-dropdown-item v-if="canMoveItem(item)" value="move-folder">
+                                                <wa-icon name="folder-open" slot="icon"></wa-icon>
+                                                {{ t('Move to folder', SCOPE) }}
+                                            </wa-dropdown-item>
+                                            <wa-dropdown-item v-if="canRemoveItem(item)"
+                                                value="remove"
+                                                variant="danger"
+                                            >
+                                                <wa-icon name="xmark" slot="icon"></wa-icon>
+                                                {{ t('Remove from dataset', SCOPE) }}
+                                            </wa-dropdown-item>
+                                        </template>
+                                    </MediaListRow>
+                                    <div v-else class="list-row">
+                                        <div class="list-row-main">
+                                            <wa-icon class="icon-muted" name="file"></wa-icon>
+                                            <span class="list-row-name">
+                                                {{ itemName(item) }}
+                                            </span>
+                                        </div>
+                                    </div>
+                                </div>
+                            </template>
+                        </template>
+                        <!-- Selection action bar -->
+                        <div v-if="selected.size > 0" class="selection-bar">
+                            <span class="selection-bar__count">
+                                {{ t('{count} selected', SCOPE, { count: selected.size }) }}
+                            </span>
+                            <wa-button
+                                appearance="plain"
+                                size="s"
+                                variant="neutral"
+                                @click="clearSelection"
+                            >
+                                {{ t('Clear selection', SCOPE) }}
+                            </wa-button>
+                            <wa-button
+                                appearance="filled-outlined"
+                                size="s"
+                                variant="brand"
+                                @click="openSelectionInViewer"
+                            >
+                                <wa-icon name="arrow-up-right-from-square" slot="start"></wa-icon>
+                                {{
+                                    selected.size === 1
+                                    ? t('Open recording', SCOPE)
+                                    : t('Open {count} recordings', SCOPE, { count: selected.size })
+                                }}
+                            </wa-button>
                         </div>
-                    </template>
-                </template>
-                <!-- Selection action bar -->
-                <div v-if="selected.size > 0" class="selection-bar">
-                    <span class="selection-bar__count">
-                        {{ t('{count} selected', SCOPE, { count: selected.size }) }}
-                    </span>
-                    <wa-button
-                        appearance="plain"
-                        size="s"
-                        variant="neutral"
-                        @click="clearSelection"
-                    >
-                        {{ t('Clear selection', SCOPE) }}
-                    </wa-button>
-                    <wa-button
-                        appearance="filled-outlined"
-                        size="s"
-                        variant="brand"
-                        @click="openSelectionInViewer"
-                    >
-                        <wa-icon name="arrow-up-right-from-square" slot="start"></wa-icon>
-                        {{
-                            selected.size === 1
-                            ? t('Open recording', SCOPE)
-                            : t('Open {count} recordings', SCOPE, { count: selected.size })
-                        }}
-                    </wa-button>
-                </div>
-            </div>
+                    </div>
+                </wa-tab-panel>
+                <wa-tab-panel name="browse">
+                    <DatasetBrowser v-if="browseOpened"
+                        :can-manage="canManageMembers"
+                        :dataset-id="datasetId"
+                        ref="browser"
+                    ></DatasetBrowser>
+                </wa-tab-panel>
+            </wa-tab-group>
 
             <wa-divider class="section-divider"></wa-divider>
 

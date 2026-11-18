@@ -1,6 +1,6 @@
 # Dataset browser — plan
 
-**Status:** planned 2026-11-18, with the scope and the [decisions](#decisions) settled the same day. Phase 1, the browse endpoint, was built the same day. Phase 2 was built the same day in four steps: the schema, the values, their endpoints and the browser's subject column; the sidecar key in the submission gate; the import command; and the displayed fields on a gated dataset with the anonymity report's second sizing. Phase 3, the tags per row with their batch endpoint and the code summary, was built the same day.
+**Status:** planned 2026-11-18, with the scope and the [decisions](#decisions) settled the same day. Phase 1, the browse endpoint, was built the same day. Phase 2 was built the same day in four steps: the schema, the values, their endpoints and the browser's subject column; the sidecar key in the submission gate; the import command; and the displayed fields on a gated dataset with the anonymity report's second sizing. Phase 3, the tags per row with their batch endpoint and the code summary, was built the same day, and so was phase 4, the table, the shared drawer and the Browse tab.
 
 A dataset is browsed today as the folder tree on its page, one row per member, carrying only its name. A reader choosing recordings to study or teach from needs more than a name: what was recorded, how, and from whom, at the level the dataset declares. This note plans a browser for every dataset: a table of its recordings with ingest metadata, the dataset's own subject fields and a few tags, and a details drawer per row with the recording's codes. It is a platform feature. The educational review project is the first that needs it, and the rules that apply only to a release-gated dataset are marked as such.
 
@@ -63,7 +63,7 @@ A batch call answering "the tags on these objects", scoped by the reader's reach
 
 - **`DataTable.vue`:** a plain `<table>` on Web Awesome's native styles, inside the usual centred scroller; sortable headers that emit a sort key and set `aria-sort`; a column configuration (key, label, formatter, sortable); `wa-pagination`; `wa-skeleton` rows while loading; row click and keyboard focus. Sorting and filtering stay on the server, which a gated dataset requires anyway.
 - **`RecordingDetailsDrawer.vue`:** the drawer body moves out of HomeView so both views share it. The browser adds the tag list, the subject fields, the code summary and an "Open in viewer" action.
-- **A Browse tab on the dataset page,** beside the folder tree, which also gains paging and so stops at 50 no longer.
+- **A Browse tab on the dataset page,** beside the folder tree. The tree groups the whole membership under its folders, so it cannot be shown a page at a time; it reads the item listing to its end instead, two hundred at a time, and the browser is the paged view of a large dataset. The ungated item listing breaks ties between members added together by primary key, so the pages neither repeat nor skip one.
 
 ## Phases
 

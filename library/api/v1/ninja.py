@@ -2053,7 +2053,8 @@ def list_dataset_items(
         # A gated dataset orders by name: added_at is the arrival order the release month hides.
         qs = qs.select_related("release").annotate(sort_name=member_name_subquery()).order_by("sort_name", "object_id")
     else:
-        qs = qs.order_by("added_at")
+        # The pk breaks ties between members added together, so offset paging neither repeats nor skips one.
+        qs = qs.order_by("added_at", "pk")
     if content_type_id is not None:
         qs = qs.filter(content_type_id=content_type_id)
     items = list(qs[offset : offset + limit])

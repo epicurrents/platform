@@ -19,7 +19,9 @@
 import add from '@material-symbols/svg-400/outlined/add.svg?raw'
 import admin_panel_settings from '@material-symbols/svg-400/outlined/admin_panel_settings.svg?raw'
 import arrow_back from '@material-symbols/svg-400/outlined/arrow_back.svg?raw'
+import arrow_downward from '@material-symbols/svg-400/outlined/arrow_downward.svg?raw'
 import arrow_forward from '@material-symbols/svg-400/outlined/arrow_forward.svg?raw'
+import arrow_upward from '@material-symbols/svg-400/outlined/arrow_upward.svg?raw'
 import attach_file from '@material-symbols/svg-400/outlined/attach_file.svg?raw'
 import block from '@material-symbols/svg-400/outlined/block.svg?raw'
 import check from '@material-symbols/svg-400/outlined/check.svg?raw'
@@ -74,6 +76,7 @@ import school from '@material-symbols/svg-400/outlined/school.svg?raw'
 import share from '@material-symbols/svg-400/outlined/share.svg?raw'
 import tune from '@material-symbols/svg-400/outlined/tune.svg?raw'
 import undo from '@material-symbols/svg-400/outlined/undo.svg?raw'
+import unfold_more from '@material-symbols/svg-400/outlined/unfold_more.svg?raw'
 import vital_signs from '@material-symbols/svg-400/outlined/vital_signs.svg?raw'
 import warning from '@material-symbols/svg-400/outlined/warning.svg?raw'
 
@@ -81,7 +84,9 @@ const ICON_SVGS: Record<string, string> = {
     add,
     admin_panel_settings,
     arrow_back,
+    arrow_downward,
     arrow_forward,
+    arrow_upward,
     attach_file,
     block,
     check,
@@ -136,6 +141,7 @@ const ICON_SVGS: Record<string, string> = {
     share,
     tune,
     undo,
+    unfold_more,
     vital_signs,
     warning,
 }
@@ -148,8 +154,10 @@ const ICON_SVGS: Record<string, string> = {
  */
 const FA_TO_MATERIAL: Record<string, string> = {
     'angle-right':                 'chevron_right',
+    'arrow-down':                  'arrow_downward',
     'arrow-left':                  'arrow_back',
     'arrow-right':                 'arrow_forward',
+    'arrow-up':                    'arrow_upward',
     'arrow-up-right-from-square':  'open_in_new',
     'arrows-rotate':               'directory_sync',
     'ban':                        'block',
@@ -197,6 +205,7 @@ const FA_TO_MATERIAL: Record<string, string> = {
     'screwdriver-wrench':         'handyman',
     'share':                       'share',
     'sliders':                     'tune',
+    'sort':                        'unfold_more',
     'spinner':                     'progress_activity',
     'square':                      'check_box_outline_blank',
     'square-check':                'check_box',

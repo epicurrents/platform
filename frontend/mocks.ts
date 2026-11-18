@@ -44,6 +44,7 @@
  *
  *   GET    /annotations/api/v1/content-types
  *   GET    /annotations/api/v1/vocabularies
+ *   GET    /annotations/api/v1/recordings/{hash}/codes/
  *   GET    /plugin/hedscore/api/v1/policy
  *
  *   GET    /recordings/api/v1/
@@ -71,6 +72,10 @@
  *   DELETE /api/v1/library/datasets/{id}/
  *   GET    /api/v1/library/datasets/{id}/items/
  *   POST   /api/v1/library/datasets/{id}/items/
+ *   GET    /api/v1/library/datasets/{id}/folders/     (no dataset has folders)
+ *   GET    /api/v1/library/datasets/{id}/browse/      (every dataset declares the same two subject fields)
+ *   PATCH  /api/v1/library/datasets/{id}/recordings/{hash}/subject/
+ *   GET    /api/v1/library/recording-tags/
  *   DELETE /api/v1/library/datasets/{id}/items/{itemId}/
  *   GET    /api/v1/library/datasets/{id}/pool/        (never a pool: no ingest profiles)
  *   GET    /api/v1/library/datasets/{id}/access/
@@ -283,6 +288,8 @@ interface MockState {
     datasets: MockGroup[]
     datasetItems: MockItem[]
     datasetAccess: MockAccess[]
+    /** Subject values per dataset member, keyed `<dataset id>:<recording hash>`. */
+    datasetSubjects: Record<string, Record<string, string>>
     seq: {
         rec: number
         coll: number
@@ -297,6 +304,21 @@ interface MockState {
 // ─── Constants ────────────────────────────────────────────────────────────────
 
 const RECORDING_CT_ID = 42
+
+/** The subject schema every mock dataset declares, so the browser's subject columns and the drawer's form show. */
+const MOCK_SUBJECT_FIELDS = [
+    { key: 'age_band', label: 'Age band', choices: ['0-17', '18-39', '40-64', '65+'], displayed: true },
+    { key: 'indication', label: 'Indication', choices: ['Epilepsy', 'Sleep', 'Other'], displayed: false },
+]
+
+/** Tags the mock hands out, a recording carrying a deterministic subset of them. */
+const MOCK_TAGS = [
+    { id: 1, name: 'Teaching', curated: true },
+    { id: 2, name: 'Artefacts', curated: true },
+    { id: 3, name: 'Interesting', curated: false },
+    { id: 4, name: 'Review later', curated: false },
+    { id: 5, name: 'Photic', curated: false },
+]
 const MOCK_USER_ID = 1
 
 /**
@@ -893,6 +915,7 @@ function buildSeed(): MockState {
         datasets,
         datasetItems,
         datasetAccess,
+        datasetSubjects: {},
         seq: { rec: 17, coll: 3, ds: 3, item: 4, access: 2, account: 7, group: 3 },
         snapshots: [
             {
@@ -1285,6 +1308,16 @@ function lastSuperuserRefusal(account: MockAccount, nextActive: boolean, nextSup
     if (remaining > 0) return null
     return 'This is the last active superuser. Promote another account first, or the deployment loses '
         + 'access to account administration entirely.'
+}
+
+/**
+ * The mock tags on a recording: a subset picked by the hash's digits, curated first, then by name.
+ * @param hash - The recording's hash.
+ */
+function mockTagsOf(hash: string) {
+    return MOCK_TAGS
+        .filter((_, index) => parseInt(hash[index] ?? '0', 16) % 2 === 1)
+        .sort((a, b) => Number(b.curated) - Number(a.curated) || a.name.localeCompare(b.name))
 }
 
 /** Strip internal _parent_id before sending an item to the client. */
@@ -2224,6 +2257,33 @@ export async function handleMock(
         ])
     }
 
+    // GET /annotations/api/v1/recordings/{hash}/codes/ — the same summary for every recording
+    {
+        const m = path.match(/^\/annotations\/api\/v1\/recordings\/([0-9a-z]+)\/codes\/$/)
+        if (m && method === 'GET') {
+            if (!findRecording(m[1])) {
+                return notFound(res)
+            }
+            return send(res, 200, [
+                {
+                    standard: 'epicurrents.eeg',
+                    label: 'Epicurrents EEG events',
+                    count: 5,
+                    codes: [
+                        { value: 'EEG_ACT_HV', name: 'Hyperventilation', count: 3 },
+                        { value: 'EEG_ACT_PHOTIC', name: 'Photic stimulation', count: 2 },
+                    ],
+                },
+                {
+                    standard: 'local.unregistered',
+                    label: null,
+                    count: 1,
+                    codes: [{ value: 'x', name: null, count: 1 }],
+                },
+            ])
+        }
+    }
+
     if (path === '/plugin/hedscore/api/v1/policy' && method === 'GET') {
         // The release the viewer's index names, so the picker never reads the mock as a mismatch. Without the
         // viewer checkout the plugin answers as if it were not installed.
@@ -2618,7 +2678,11 @@ export async function handleMock(
             if (method === 'GET') {
                 // The mock caller manages every dataset, so ids are always served; a non-manager of a release-gated
                 // dataset receives `id` and `object_id` as null.
-                return send(res, 200, _state.datasetItems.filter(i => i._parent_id === dsId).map(itemOut))
+                const query = new URL(req.url ?? path, 'http://mock').searchParams
+                const limit = Number(query.get('limit') ?? 50)
+                const offset = Number(query.get('offset') ?? 0)
+                const rows = _state.datasetItems.filter(i => i._parent_id === dsId)
+                return send(res, 200, rows.slice(offset, offset + limit).map(itemOut))
             }
             if (method === 'POST') {
                 const body = await readBody(req)
@@ -2639,6 +2703,104 @@ export async function handleMock(
                 return send(res, 201, itemOut(item))
             }
         }
+    }
+
+    // GET /api/v1/library/datasets/{id}/folders/ — the mock keeps no folders, so every item sits at the root
+    if (/^\/api\/v1\/library\/datasets\/\d+\/folders\/$/.test(path) && method === 'GET') {
+        return send(res, 200, [])
+    }
+
+    // GET /api/v1/library/datasets/{id}/browse/ — the mock caller manages every dataset, so every field is shown
+    {
+        const m = path.match(/^\/api\/v1\/library\/datasets\/(\d+)\/browse\/$/)
+        if (m && method === 'GET') {
+            const dsId = Number(m[1])
+            const query = new URL(req.url ?? path, 'http://mock').searchParams
+            const limit = Number(query.get('limit') ?? 50)
+            const offset = Number(query.get('offset') ?? 0)
+            const sortParam = query.get('sort') ?? 'name'
+            const descending = sortParam.startsWith('-')
+            const sortKey = sortParam.replace(/^-/, '')
+            const members = _state.datasetItems
+                .filter(i => i._parent_id === dsId && i.content_type_id === RECORDING_CT_ID)
+                .map(i => findRecording(i.object_id))
+                .filter((r): r is MockRecording => !!r)
+            const sortValue = (r: MockRecording): string | number => {
+                if (sortKey.startsWith('subject.')) {
+                    return _state.datasetSubjects[`${dsId}:${r.hash}`]?.[sortKey.slice('subject.'.length)] ?? ''
+                }
+                switch (sortKey) {
+                    case 'modality': return r.modality
+                    case 'duration': return r.meta?.duration ?? -1
+                    case 'channels': return r.meta?.signal_count ?? -1
+                    case 'sampling_rate': return 256
+                    case 'date': return r.created_at
+                    default: return resolvedDisplayName(r).toLowerCase()
+                }
+            }
+            members.sort((a, b) => {
+                const left = sortValue(a)
+                const right = sortValue(b)
+                const order = left < right ? -1 : left > right ? 1 : 0
+                return (descending ? -order : order) || a.hash.localeCompare(b.hash)
+            })
+            const items = members.slice(offset, offset + limit).map(r => {
+                const tags = mockTagsOf(r.hash)
+                return {
+                    hash: r.hash,
+                    display_name: resolvedDisplayName(r),
+                    modality: r.modality,
+                    public_source: r.public_source ?? '',
+                    created_at: r.created_at,
+                    duration: r.meta?.duration ?? null,
+                    channel_count: r.meta?.signal_count ?? null,
+                    sampling_rate_max: r.meta ? 256 : null,
+                    sampling_rate_min: r.meta ? 256 : null,
+                    channel_layout: null,
+                    deidentification_version: r.meta ? 6 : null,
+                    subject: _state.datasetSubjects[`${dsId}:${r.hash}`] ?? {},
+                    tags: tags.slice(0, 3),
+                    tag_count: tags.length,
+                }
+            })
+            return send(res, 200, { count: members.length, subject_fields: MOCK_SUBJECT_FIELDS, items })
+        }
+    }
+
+    // PATCH /api/v1/library/datasets/{id}/recordings/{hash}/subject/
+    {
+        const m = path.match(/^\/api\/v1\/library\/datasets\/(\d+)\/recordings\/([0-9a-z]+)\/subject\/$/)
+        if (m && method === 'PATCH') {
+            const key = `${m[1]}:${m[2]}`
+            const body = await readBody(req)
+            const values = { ...(_state.datasetSubjects[key] ?? {}) }
+            for (const [field, value] of Object.entries((body.values ?? {}) as Record<string, string | null>)) {
+                const declared = MOCK_SUBJECT_FIELDS.find(f => f.key === field)
+                if (!declared) {
+                    return send(res, 400, { detail: `The dataset declares no subject field ${field}.` })
+                }
+                if (value === null) {
+                    delete values[field]
+                } else if (!declared.choices.includes(value)) {
+                    return send(res, 400, { detail: `The value for ${field} is not one of its choices.` })
+                } else {
+                    values[field] = value
+                }
+            }
+            _state.datasetSubjects[key] = values
+            return send(res, 200, { values })
+        }
+    }
+
+    // GET /api/v1/library/recording-tags/
+    if (path === '/api/v1/library/recording-tags/' && method === 'GET') {
+        const hashes = new URL(req.url ?? path, 'http://mock').searchParams.getAll('hash')
+        const answer = hashes
+            .filter(hash => findRecording(hash))
+            .map(hash => ({ hash, tags: mockTagsOf(hash) }))
+            .filter(row => row.tags.length)
+            .sort((a, b) => a.hash.localeCompare(b.hash))
+        return send(res, 200, answer)
     }
 
     // GET /api/v1/library/datasets/{id}/pool/ — the mock has no ingest profiles, so no dataset is a pool

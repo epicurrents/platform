@@ -2,13 +2,14 @@
 import { ref, computed, onMounted, onUnmounted } from 'vue'
 import { RouterLink, useRouter } from 'vue-router'
 import { t } from '#i18n'
-import { formatDate } from '#lib/datetime'
+import { formatDuration } from '#lib/format'
 import { useRecordingsStore } from '#stores/recordings'
 import { deleteRecording, recordingName, type Recording } from '#api/recordings'
 import { showToast } from '#lib/toast'
 import { useRecordingSelection } from '#composables/useRecordingSelection'
 import EditRecordingDialog from '#components/EditRecordingDialog.vue'
 import NeedsAttentionRow from '#components/NeedsAttentionRow.vue'
+import RecordingDetailsDrawer from '#components/RecordingDetailsDrawer.vue'
 import RecordingJobsBadge from '#components/RecordingJobsBadge.vue'
 import RecordingListRow from '#components/RecordingListRow.vue'
 import RecordingMediaDialog from '#components/RecordingMediaDialog.vue'
@@ -51,25 +52,6 @@ const attentionRecs = computed(() => failedRecs.value.slice(0, NEEDS_ATTENTION_L
 const showProcessingDetail = computed(() =>
     processingRecs.value.length <= PROCESSING_DETAIL_THRESHOLD,
 )
-
-// ── Formatters ───────────────────────────────────────────────────────────
-
-function formatDuration (secs: number) {
-    if (secs < 60) {
-        return `${secs.toFixed(0)} s`
-    }
-    if (secs < 3600) {
-        return `${Math.floor(secs / 60)} m ${Math.floor(secs % 60)} s`
-    }
-    return `${Math.floor(secs / 3600)} h ${Math.floor((secs % 3600) / 60)} m`
-}
-
-function formatSize (bytes: number) {
-    if (bytes < 1024 * 1024) {
-        return `${(bytes / 1024).toFixed(0)} KB`
-    }
-    return `${(bytes / 1024 / 1024).toFixed(1)} MB`
-}
 
 function openRecordings (hashes: string[]) {
     const { href } = router.resolve({ name: 'viewer', query: { files: hashes.join(',') } })
@@ -347,54 +329,12 @@ async function confirmDelete () {
     </main>
 
     <!-- Details drawer -->
-    <wa-drawer
+    <RecordingDetailsDrawer
         :label="detailsRec ? recordingName(detailsRec) : ''"
         :open="!!detailsRec"
-        @wa-hide="closeDetails"
-    >
-        <div v-if="detailsRec" class="wa-stack">
-            <p class="wa-caption-s dialog-text">{{ t('File and recording details', SCOPE) }}</p>
-            <wa-divider></wa-divider>
-            <dl class="wa-stack dialog-text">
-                <div v-if="detailsRec.modality" class="wa-flank details-flank">
-                    <dt>{{ t('Modality', SCOPE) }}</dt>
-                    <dd>{{ detailsRec.modality.toUpperCase() }}</dd>
-                </div>
-                <div v-if="detailsRec.meta" class="wa-flank details-flank">
-                    <dt>{{ t('Format', SCOPE) }}</dt>
-                    <dd>{{ detailsRec.meta.format.toUpperCase() }}</dd>
-                </div>
-                <div v-if="detailsRec.meta" class="wa-flank details-flank">
-                    <dt>{{ t('Duration', SCOPE) }}</dt>
-                    <dd>{{ formatDuration(detailsRec.meta.duration) }}</dd>
-                </div>
-                <div v-if="detailsRec.meta" class="wa-flank details-flank">
-                    <dt>{{ t('Channels', SCOPE) }}</dt>
-                    <dd>{{ detailsRec.meta.signal_count }}</dd>
-                </div>
-                <div v-if="detailsRec.meta?.discontinuous" class="wa-flank details-flank">
-                    <dt>{{ t('Discontinuous', SCOPE) }}</dt>
-                    <dd>{{ t('Yes', SCOPE) }}</dd>
-                </div>
-                <div class="wa-flank details-flank">
-                    <dt>{{ t('File size', SCOPE) }}</dt>
-                    <dd>{{ formatSize(detailsRec.file_size) }}</dd>
-                </div>
-                <div class="wa-flank details-flank">
-                    <dt>{{ t('Added', SCOPE) }}</dt>
-                    <dd>{{ formatDate(detailsRec.created_at) }}</dd>
-                </div>
-                <div v-if="detailsRec.stored_hash" class="wa-flank details-flank">
-                    <dt>{{ t('File hash', SCOPE) }}</dt>
-                    <dd class="details-hash">{{ detailsRec.stored_hash }}</dd>
-                </div>
-                <div v-if="detailsRec.public_source" class="wa-flank details-flank">
-                    <dt>{{ t('Published source', SCOPE) }}</dt>
-                    <dd class="details-hash">{{ detailsRec.public_source }}</dd>
-                </div>
-            </dl>
-        </div>
-    </wa-drawer>
+        :recording="detailsRec"
+        @close="closeDetails"
+    ></RecordingDetailsDrawer>
 
     <!-- Edit recording dialog -->
     <EditRecordingDialog
@@ -489,17 +429,7 @@ async function confirmDelete () {
     font-size: 0.85em;
 }
 
-.dialog-form {
-    display: flex;
-    flex-direction: column;
-    gap: 1rem;
-}
-
 .dialog-text {
     margin: 0;
-}
-
-.details-flank {
-    --flank-size: 14ch;
 }
 </style>

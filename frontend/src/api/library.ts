@@ -374,6 +374,25 @@ export async function listDatasetItems(datasetId: number | string, params?: { co
     return response.data
 }
 
+/** The page size `listAllDatasetItems` asks for: the most the item listing serves at once. */
+const ITEM_PAGE_SIZE = 200
+
+/**
+ * Every item of a dataset, read a page at a time until a short page. The folder tree groups the whole membership,
+ * so it cannot be shown one page at a time; the browser is the paged view of a large dataset.
+ * @param datasetId - The dataset's object hash or primary key.
+ */
+export async function listAllDatasetItems(datasetId: number | string, shareToken?: string): Promise<DatasetItem[]> {
+    const items: DatasetItem[] = []
+    for (;;) {
+        const page = await listDatasetItems(datasetId, { limit: ITEM_PAGE_SIZE, offset: items.length }, shareToken)
+        items.push(...page)
+        if (page.length < ITEM_PAGE_SIZE) {
+            return items
+        }
+    }
+}
+
 export async function addDatasetItem(datasetId: number | string, payload: { content_type_id: number; object_id: string }): Promise<CollectionItem> {
     const response = await http.post<CollectionItem>(`/api/v1/library/datasets/${datasetId}/items/`, payload)
     return response.data
@@ -482,4 +501,108 @@ export async function assessDatasetAccess(
 ): Promise<AccessRight> {
     const response = await http.patch<AccessRight>(`/api/v1/library/datasets/${datasetId}/access/${rightId}/`, payload)
     return response.data
+}
+
+// ---------------------------------------------------------------------------
+// Dataset browser
+// ---------------------------------------------------------------------------
+
+/** A tag as a browser row shows it. */
+export interface TagChip {
+    id: number
+    name: string
+    curated: boolean
+}
+
+/**
+ * One field of a dataset's subject schema. `displayed` marks a field a reader who does not manage a release-gated
+ * dataset is shown; elsewhere it has no effect.
+ */
+export interface SubjectField {
+    key: string
+    label: string
+    choices: string[]
+    displayed: boolean
+}
+
+/**
+ * One recording of a dataset as the browser shows it. `created_at` is the date the caller is served: exact for the
+ * author, otherwise a release month or the first of the upload month. The metadata columns are null until ingest has
+ * written them. `subject` holds a value for each shown field the member has one for; `tags` are at most three of the
+ * recording's tags, and `tag_count` counts them all.
+ */
+export interface DatasetBrowseRow {
+    hash: string
+    display_name: string
+    modality: string
+    public_source: string
+    created_at: string
+    duration: number | null
+    channel_count: number | null
+    sampling_rate_max: number | null
+    sampling_rate_min: number | null
+    channel_layout: string | null
+    deidentification_version: number | null
+    subject: Record<string, string>
+    tags: TagChip[]
+    tag_count: number
+}
+
+/** A page of the dataset browser, with the row count across every page and the subject fields the caller is shown. */
+export interface DatasetBrowsePage {
+    count: number
+    subject_fields: SubjectField[]
+    items: DatasetBrowseRow[]
+}
+
+/** The tags on one recording, in display order. */
+export interface RecordingTags {
+    hash: string
+    tags: TagChip[]
+}
+
+/**
+ * One page of a dataset's recordings for the browser.
+ * @param datasetId - The dataset's object hash or primary key.
+ * @param params - `sort` is a key from the server's allowlist, or `subject.<key>`, prefixed with `-` for descending.
+ */
+export async function browseDataset(
+    datasetId: number | string,
+    params: { sort?: string; limit?: number; offset?: number },
+): Promise<DatasetBrowsePage> {
+    const response = await http.get<DatasetBrowsePage>(`/api/v1/library/datasets/${datasetId}/browse/`, { params })
+    return response.data
+}
+
+/**
+ * The tags on each of *hashes* the caller can read. A recording the caller cannot read is left out, as is one
+ * without tags.
+ * @param hashes - Recording hashes, at most 200.
+ */
+export async function listRecordingTags(hashes: string[]): Promise<RecordingTags[]> {
+    const params = new URLSearchParams()
+    for (const hash of hashes) {
+        params.append('hash', hash)
+    }
+    const response = await http.get<RecordingTags[]>('/api/v1/library/recording-tags/', { params })
+    return response.data
+}
+
+/**
+ * Set or clear a member's subject values; dataset managers only. A key set to `null` is cleared, a key left out is
+ * kept.
+ * @param datasetId - The dataset's object hash or primary key.
+ * @param hash - The member recording's hash.
+ * @param values - Each value one of its field's choices, or null.
+ */
+export async function updateDatasetMemberSubject(
+    datasetId: number | string,
+    hash: string,
+    values: Record<string, string | null>,
+): Promise<Record<string, string>> {
+    const response = await http.patch<{ values: Record<string, string> }>(
+        `/api/v1/library/datasets/${datasetId}/recordings/${hash}/subject/`,
+        { values },
+    )
+    return response.data.values
 }

@@ -1404,6 +1404,20 @@ class TestDatasetItemMembership:
         assert resp.status_code == 201
         assert DatasetItem.objects.filter(dataset=ds, content_type=ct, object_id=str(rec.pk)).exists()
 
+    def test_paging_members_added_together_repeats_and_skips_none(self, auth_client):
+        c, user = auth_client
+        ds = baker.make(Dataset, author=user)
+        ct = _recording_ct()
+        items = [
+            DatasetItem.objects.create(dataset=ds, content_type=ct, object_id=str(_make_recording(user).pk))
+            for _ in range(5)
+        ]
+        DatasetItem.objects.filter(pk__in=[item.pk for item in items]).update(added_at=items[0].added_at)
+        paged = [
+            row["id"] for offset in range(5) for row in c.get(_ds_url(ds.pk, f"items/?limit=1&offset={offset}")).json()
+        ]
+        assert sorted(paged) == sorted(item.pk for item in items)
+
     def test_add_duplicate_returns_409(self, auth_client):
         c, user = auth_client
         ds = baker.make(Dataset, author=user)
