@@ -6,9 +6,12 @@ prints the record the run stored (profile version, pass versions, k and m, sign-
 assessment reference, member count), how many of those members are still present, the pass
 version now stamped on each with any member re-written since the run flagged, and the sizes of the
 equivalence classes over the pool as released up to that run: the minimum k, the fraction of
-members below the recorded k, the prosecutor risk and the entropy in bits.
+members below the recorded k, the prosecutor risk and the entropy in bits. A second sizing counts the
+classes over the subject fields the dataset displays to its readers alone, with its minimum k and the
+fraction below the recorded k.
 
-Classes come from the function the project registers with ``library.release.register_equivalence_class``.
+Classes come from the function the project registers with ``library.release.register_equivalence_class``,
+joined with the displayed subject fields.
 Without one the report prints the record and says that no class function is registered. The m
 condition is repeated as recorded and never recomputed, because the pooled ingest keeps no
 contributor per recording; journalist risk is not computed, because it needs population
@@ -106,6 +109,19 @@ class Command(BaseCommand):
             for cls in report["classes"]:
                 own_k = f" (k {cls['k']})" if cls["k"] != report["k"] else ""
                 self.stdout.write(f"    {cls['key']}: {cls['size']}{own_k}")
+        displayed = report["displayed"]
+        if displayed is None:
+            self.stdout.write("  displayed fields: none")
+        else:
+            below = displayed["below_k_fraction"]
+            self.stdout.write(
+                f"  displayed fields ({', '.join(report['displayed_fields'])}) alone: "
+                f"{len(displayed['classes'])} classes over the pool, "
+                f"min k {displayed['min_k'] if displayed['min_k'] is not None else '-'}, "
+                f"below k {f'{below:.0%}' if below is not None else '-'}"
+            )
+            for cls in displayed["classes"]:
+                self.stdout.write(f"    {cls['key']}: {cls['size']}")
         for member in report["members"]:
             flag = "  re-written" if member["changed_since_release"] else ""
             version = member["deidentification_version"]

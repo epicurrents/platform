@@ -1,6 +1,6 @@
 # Dataset browser — plan
 
-**Status:** planned 2026-11-18, with the scope and the [decisions](#decisions) settled the same day. Phase 1, the browse endpoint, was built the same day. Phase 2 is under way in four steps: the schema, the values, their endpoints and the browser's subject column (built 2026-11-18); the sidecar key in the submission gate (built 2026-11-18); the import command (built 2026-11-18); and the displayed fields on a gated dataset with the anonymity report's second sizing. Until the last step, a reader who does not manage a gated dataset is shown no subject fields.
+**Status:** planned 2026-11-18, with the scope and the [decisions](#decisions) settled the same day. Phase 1, the browse endpoint, was built the same day. Phase 2 was built the same day in four steps: the schema, the values, their endpoints and the browser's subject column; the sidecar key in the submission gate; the import command; and the displayed fields on a gated dataset with the anonymity report's second sizing.
 
 A dataset is browsed today as the folder tree on its page, one row per member, carrying only its name. A reader choosing recordings to study or teach from needs more than a name: what was recorded, how, and from whom, at the level the dataset declares. This note plans a browser for every dataset: a table of its recordings with ingest metadata, the dataset's own subject fields and a few tags, and a details drawer per row with the recording's codes. It is a platform feature. The educational review project is the first that needs it, and the rules that apply only to a release-gated dataset are marked as such.
 
@@ -47,8 +47,8 @@ A dataset is browsed today as the folder tree on its page, one row per member, c
 
 The subject fields the table shows are the quasi-identifiers a reader can combine. On a gated dataset:
 
-- The schema marks the fields that may be displayed, and a displayed field must be part of the equivalence class. The platform supplies `subject_class_key(item)`, the tuple of displayed values, for a project's registered class function to return or to combine with its own.
-- The anonymity report in [library/reports.py](../../library/reports.py) also sizes the classes over the displayed fields directly, whatever function the project registered, so a class function that ignores them shows up as a disagreement in the report rather than nowhere.
+- The schema marks the fields that may be displayed, and a displayed field must be part of the equivalence class. The platform supplies `subject_class_key(item)`, the tuple of displayed values, and joins it to the registered class function's key wherever it counts classes, in the release gate and the anonymity report, rather than leaving the project's function to return it: that function takes a recording, not a membership, so it cannot tell which dataset's values to read. Once a dataset has a release, which fields are displayed is fixed.
+- The anonymity report in [library/reports.py](../../library/reports.py) also sizes the classes over the displayed fields directly, whatever function the project registered or none, so a selector that releases without a class function still shows up in the report rather than nowhere.
 - Facet and filter counts below the release's k are shown as "fewer than k". Filters on displayed fields alone cannot isolate a member once every class meets k; combined with a tag or a code they can, which is why the counts are suppressed rather than trusted.
 
 ### 4. Tags per row

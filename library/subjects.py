@@ -16,8 +16,12 @@ The rules, each enforced here and called by the endpoints in ``library.api.v1.ni
   classes a past release was sized on, and the submissions were checked against it. Before it fills, a key the
   pool's profile forbids in a sidecar is refused, since no submission could carry it.
 * A released member of a release-gated dataset keeps its values. The release was decided on them.
-* On a release-gated dataset, a reader who does not manage it is shown no fields and no values. Which fields may
-  be shown to readers there is a separate declaration, made against the equivalence class.
+* On a release-gated dataset, a reader who does not manage it is shown only the fields the schema marks
+  ``displayed``, and only their values. A displayed field is part of the equivalence class: the release gate and the
+  anonymity report count a member's class as the project's class key together with its displayed values
+  (:func:`subject_class_keys`), so a reader who combines what the table shows finds no class smaller than the one
+  the release was sized on. Once a dataset has a release, which fields are displayed is fixed.
+* Elsewhere ``displayed`` has no effect: a dataset's readers are shown every field it declares.
 """
 
 from __future__ import annotations
@@ -33,6 +37,7 @@ MAX_LABEL_LENGTH = 80
 MAX_CHOICE_LENGTH = 64
 _KEY_RE = re.compile(r"^[a-z][a-z0-9_]{0,39}$")
 _FIELD_KEYS = {"key", "label", "choices"}
+_OPTIONAL_FIELD_KEYS = {"displayed"}
 
 
 @dataclass
@@ -59,8 +64,9 @@ def validate_schema(raw: Any) -> list[dict]:
     """The normalised form of a submitted schema, or :class:`SubjectError` (400) naming the first fault.
 
     Strings are stripped. Keys are lower-case identifiers, unique within the schema; choices are unique within
-    their field. A field carries exactly ``key``, ``label`` and ``choices``, so a misspelt attribute is refused
-    rather than dropped.
+    their field. A field carries ``key``, ``label`` and ``choices`` and may carry ``displayed``, a boolean, so a
+    misspelt attribute is refused rather than dropped. ``displayed`` is stored only when it is true, so a field
+    without it and the same field with ``displayed: false`` compare equal.
     """
     if not isinstance(raw, list):
         raise SubjectError(400, "The subject schema must be a list of fields.")
@@ -69,8 +75,10 @@ def validate_schema(raw: Any) -> list[dict]:
     fields: list[dict] = []
     seen_keys: set[str] = set()
     for index, field in enumerate(raw):
-        if not isinstance(field, dict) or set(field) != _FIELD_KEYS:
-            raise SubjectError(400, f"Field {index} must have exactly the attributes key, label and choices.")
+        if not isinstance(field, dict) or not _FIELD_KEYS <= set(field) <= _FIELD_KEYS | _OPTIONAL_FIELD_KEYS:
+            raise SubjectError(
+                400, f"Field {index} must have the attributes key, label and choices, and may have displayed."
+            )
         key = field["key"]
         if not isinstance(key, str) or not _KEY_RE.match(key):
             raise SubjectError(
@@ -88,8 +96,16 @@ def validate_schema(raw: Any) -> list[dict]:
         normalised = [_text(choice, f"A choice of {key}", MAX_CHOICE_LENGTH) for choice in choices]
         if len(set(normalised)) != len(normalised):
             raise SubjectError(400, f"The choices of {key} are not unique.")
-        fields.append({"key": key, "label": label, "choices": normalised})
+        displayed = field.get("displayed", False)
+        if not isinstance(displayed, bool):
+            raise SubjectError(400, f"displayed of {key} must be true or false.")
+        fields.append({"key": key, "label": label, "choices": normalised, **({"displayed": True} if displayed else {})})
     return fields
+
+
+def displayed_keys(schema: list[dict]) -> list[str]:
+    """The keys of the fields *schema* marks ``displayed``, in declared order."""
+    return [field["key"] for field in schema if field.get("displayed")]
 
 
 def schema_warnings(schema: list[dict]) -> list[dict[str, str]]:
@@ -123,13 +139,15 @@ def values_in_use(dataset: Any) -> Counter:
 
 
 def ensure_schema_change_allowed(dataset: Any, schema: list[dict]) -> None:
-    """Refuse a schema change to a filling pool, or one that drops a field or choice a member still carries.
+    """Refuse a schema change to a filling pool, one that drops a field or choice a member still carries, or one that
+    changes which fields a dataset with a release displays.
 
     The dataset row must already be locked by the caller, so a submission cannot fill the pool in between.
     """
     from library.pools import is_filling, is_pool
 
-    if schema == schema_of(dataset):
+    current = schema_of(dataset)
+    if schema == current:
         return
     if is_pool(dataset) and is_filling(dataset):
         raise SubjectError(
@@ -144,6 +162,13 @@ def ensure_schema_change_allowed(dataset: Any, schema: list[dict]) -> None:
         if clashing:
             raise SubjectError(
                 400, f"The key {clashing[0]} is forbidden in the pool's sidecars, so no submission could carry it."
+            )
+    if displayed_keys(schema) != displayed_keys(current):
+        from library.models import DatasetRelease
+
+        if DatasetRelease.objects.filter(dataset=dataset).exists():
+            raise SubjectError(
+                409, "The displayed fields of a dataset with a release are fixed: its classes were sized on them."
             )
     declared = {(field["key"], choice) for field in schema for choice in field["choices"]}
     dropped = sorted(pair for pair in values_in_use(dataset) if pair not in declared)
@@ -180,19 +205,65 @@ def ensure_values_editable(dataset: Any, item: Any) -> None:
 
 
 def shown_schema(dataset: Any, manager: bool) -> list[dict]:
-    """The schema a caller is shown: all of it, or nothing to a reader who does not manage a release-gated dataset."""
+    """The schema a caller is shown: all of it, or its displayed fields to a reader who does not manage a release-gated
+    dataset."""
+    schema = schema_of(dataset)
     if dataset.release_gated and not manager:
-        return []
-    return schema_of(dataset)
+        return [field for field in schema if field.get("displayed")]
+    return schema
 
 
-def values_by_object_id(dataset: Any, content_type: Any, object_ids: list) -> dict[str, dict]:
-    """The values of the dataset's members of *content_type* among *object_ids*, keyed by ``object_id``."""
+def values_by_object_id(dataset: Any, content_type: Any, object_ids: list, schema: list[dict]) -> dict[str, dict]:
+    """The values of the dataset's members of *content_type* among *object_ids*, keyed by ``object_id``, restricted
+    to the fields of *schema*, the schema the caller is shown."""
     from library.models import DatasetItemSubject
 
+    keys = {field["key"] for field in schema}
+    if not keys:
+        return {}
     rows = DatasetItemSubject.objects.filter(
         item__dataset=dataset,
         item__content_type=content_type,
         item__object_id__in=[str(object_id) for object_id in object_ids],
     ).values_list("item__object_id", "values")
-    return {object_id: values or {} for object_id, values in rows}
+    return {object_id: {k: v for k, v in (values or {}).items() if k in keys} for object_id, values in rows}
+
+
+def subject_class_keys(items: list) -> dict[int, tuple]:
+    """The displayed values of each ``DatasetItem`` among *items*, as a tuple in the schema's order, keyed by item pk.
+
+    A field without a value is ``None`` in the tuple, since a reader sees the blank as well. A member of a dataset
+    that displays no field gets the empty tuple. This is the part of the equivalence class a reader of the dataset
+    browser can see; the release gate and the anonymity report join it to the project's class key.
+    """
+    from library.models import DatasetItemSubject, DatasetMeta
+
+    dataset_ids = {item.dataset_id for item in items}
+    displayed = {
+        dataset_id: displayed_keys(schema or [])
+        for dataset_id, schema in DatasetMeta.objects.filter(dataset_id__in=dataset_ids).values_list(
+            "dataset_id", "subject_schema"
+        )
+    }
+    with_fields = [item.pk for item in items if displayed.get(item.dataset_id)]
+    values = dict(DatasetItemSubject.objects.filter(item_id__in=with_fields).values_list("item_id", "values"))
+    return {
+        item.pk: tuple((values.get(item.pk) or {}).get(key) for key in displayed.get(item.dataset_id, []))
+        for item in items
+    }
+
+
+def subject_class_key(item: Any) -> tuple:
+    """The displayed values of one ``DatasetItem``, as :func:`subject_class_keys` gives them."""
+    return subject_class_keys([item])[item.pk]
+
+
+def joined_class_key(project_key: Any, subject_key: tuple) -> Any:
+    """The class a member is counted in: the project's key alone, or with the displayed values when there are any.
+
+    ``None`` stays ``None``: a member the project leaves unclassified is unclassified whatever it displays. Without
+    displayed fields the key is the project's own, so a dataset that displays nothing is counted by that key alone.
+    """
+    if project_key is None or not subject_key:
+        return project_key
+    return (project_key, subject_key)

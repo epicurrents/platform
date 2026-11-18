@@ -333,6 +333,54 @@ class TestAnonymityReport:
         assert (report["member_count"], report["present_count"], report["withdrawn_count"]) == (1, 0, 1)
         assert report["pool_count"] == 0 and report["classes"] == [] and report["min_k"] is None
 
+    def test_displayed_fields_join_the_classes_and_are_sized_alone(self, make_user):
+        from library.models import DatasetItemSubject, DatasetMeta
+
+        register_equivalence_class(_by_display_name)
+        author = make_user()
+        recordings = [_recording(author, index=i, display_name=name) for i, name in enumerate("aab")]
+        unclassified = _recording(author, index=3, display_name="")
+        dataset, items = _gated_dataset(author, *recordings, unclassified)
+        age = {"key": "age", "label": "Age", "choices": ["0-17", "65+"], "displayed": True}
+        DatasetMeta.objects.create(dataset=dataset, subject_schema=[age])
+        for item, value in zip(items[:3], ("65+", "0-17", "65+"), strict=True):
+            DatasetItemSubject.objects.create(item=item, values={"age": value})
+        release = _release(dataset, *items)
+        release.k = 2
+        release.save()
+        report = anonymity_report(dataset, release)
+        assert [cls["key"] for cls in report["classes"]] == [
+            str(("a", ("0-17",))),
+            str(("a", ("65+",))),
+            str(("b", ("65+",))),
+        ]
+        assert report["min_k"] == 1 and report["unclassified"] == 1
+        assert report["displayed_fields"] == ["age"]
+        assert report["displayed"] == {
+            "classes": [{"key": "('0-17',)", "size": 1}, {"key": "('65+',)", "size": 2}, {"key": "(None,)", "size": 1}],
+            "min_k": 1,
+            "below_k_fraction": pytest.approx(2 / 4),
+        }
+
+    def test_the_displayed_sizing_runs_without_a_class_function(self, make_user):
+        from library.models import DatasetItemSubject, DatasetMeta
+
+        author = make_user()
+        dataset, items = _gated_dataset(author, _recording(author, index=0), _recording(author, index=1))
+        age = {"key": "age", "label": "Age", "choices": ["65+"], "displayed": True}
+        DatasetMeta.objects.create(dataset=dataset, subject_schema=[age])
+        for item in items:
+            DatasetItemSubject.objects.create(item=item, values={"age": "65+"})
+        report = anonymity_report(dataset, _release(dataset, *items))
+        assert report["class_function_registered"] is False
+        assert report["displayed"]["classes"] == [{"key": "('65+',)", "size": 2}]
+
+    def test_no_displayed_field_reports_none(self, make_user):
+        author = make_user()
+        dataset, items = _gated_dataset(author, _recording(author, index=0))
+        report = anonymity_report(dataset, _release(dataset, *items))
+        assert report["displayed_fields"] == [] and report["displayed"] is None
+
     def test_registration_is_replaceable_and_clearable(self):
         register_equivalence_class(_by_display_name)
         assert equivalence_class_function() is _by_display_name
@@ -382,6 +430,21 @@ class TestAnonymityReportCommand:
         release.save()
         out = self._run(dataset.object_hash)
         assert "    a: 1\n" in out and "    b: 1 (k 3)\n" in out
+
+    def test_the_displayed_sizing_is_printed(self, make_user):
+        from library.models import DatasetItemSubject, DatasetMeta
+
+        author = make_user()
+        dataset, items = _gated_dataset(author, _recording(author, index=0))
+        age = {"key": "age", "label": "Age", "choices": ["65+"], "displayed": True}
+        DatasetMeta.objects.create(dataset=dataset, subject_schema=[age])
+        DatasetItemSubject.objects.create(item=items[0], values={"age": "65+"})
+        release = _release(dataset, *items)
+        release.k = 2
+        release.save()
+        out = self._run(dataset.object_hash)
+        assert "displayed fields (age) alone: 1 classes over the pool, min k 1, below k 100%" in out
+        assert "    ('65+',): 1\n" in out
 
     def test_one_release_as_json_and_the_unregistered_case(self, make_user):
         author = make_user()

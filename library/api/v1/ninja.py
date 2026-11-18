@@ -210,11 +210,13 @@ class DatasetBrowseRowOut(Schema):
 
 
 class SubjectFieldOut(Schema):
-    """One field of a dataset's subject schema: its key, its label and its choices in declared order."""
+    """One field of a dataset's subject schema: its key, its label, its choices in declared order, and whether a
+    reader who does not manage a release-gated dataset is shown it."""
 
     key: str
     label: str
     choices: list[str]
+    displayed: bool = False
 
 
 class DatasetBrowseOut(Schema):
@@ -2120,7 +2122,7 @@ def browse_dataset(
     exact_pks = {rec.pk for rec in recordings if superuser or rec.author_id == user_pk}
     recording_ct = ContentType.objects.get_for_model(Recording, for_concrete_model=False)
     months = release_months_by_id(recording_ct, [rec.pk for rec in recordings if rec.pk not in exact_pks])
-    subject_values = values_by_object_id(dataset, recording_ct, [rec.pk for rec in recordings]) if schema else {}
+    subject_values = values_by_object_id(dataset, recording_ct, [rec.pk for rec in recordings], schema)
     items = [
         {
             "hash": rec.stored_name.split(".", 1)[0],
@@ -2153,7 +2155,8 @@ def _subject_rule(rule, *args):
 
 @api.get("/datasets/{dataset_id}/subject-schema/", response=SubjectSchemaOut)
 def get_dataset_subject_schema(request, dataset_id: str, share_token: str | None = None):
-    """The dataset's subject schema as the caller is shown it: empty to a reader who does not manage a gated dataset."""
+    """The dataset's subject schema as the caller is shown it: its displayed fields to a reader who does not manage a
+    gated dataset."""
     from epicurrents.permissions import can_read_object
     from library.release import is_dataset_manager
     from library.subjects import shown_schema
@@ -2183,8 +2186,9 @@ def get_dataset_subject_schema(request, dataset_id: str, share_token: str | None
 def update_dataset_subject_schema(request, dataset_id: str, payload: SubjectSchemaIn):
     """Replace the dataset's subject schema; dataset managers only.
 
-    Refused once the dataset's pool is filling, and when the new schema drops a field or a choice a
-    member still carries. ``warnings`` flags a label or a choice that looks like an identifier.
+    Refused once the dataset's pool is filling, when the new schema drops a field or a choice a member
+    still carries, and when it changes which fields a dataset with a release displays.
+    ``warnings`` flags a label or a choice that looks like an identifier.
     """
     from library import subjects
     from library.release import is_dataset_manager

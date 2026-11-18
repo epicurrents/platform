@@ -60,6 +60,11 @@ def _with_schema(dataset, *fields):
     DatasetMeta.objects.update_or_create(dataset=dataset, defaults={"subject_schema": list(fields)})
 
 
+def _out(*fields):
+    """*fields* as ``SubjectFieldOut`` serves them, with ``displayed`` false where the field does not set it."""
+    return [{"displayed": False, **field} for field in fields]
+
+
 def _set(item, **values):
     return DatasetItemSubject.objects.update_or_create(item=item, defaults={"values": values})[0]
 
@@ -69,12 +74,18 @@ class TestValidateSchema:
         (field,) = subjects.validate_schema([{"key": "age", "label": " Age ", "choices": [" 0-17 ", "18+"]}])
         assert field == {"key": "age", "label": "Age", "choices": ["0-17", "18+"]}
 
+    def test_displayed_is_stored_only_when_true(self):
+        shown, hidden = subjects.validate_schema([{**AGE, "displayed": True}, {**SEX, "displayed": False}])
+        assert shown == {**AGE, "displayed": True}
+        assert hidden == SEX
+
     @pytest.mark.parametrize(
         "fields",
         [
             {"key": "age"},
             [{"key": "age", "label": "Age"}],
-            [{**AGE, "displayed": True}],
+            [{**AGE, "displayed": "yes"}],
+            [{**AGE, "shown": True}],
             [{**AGE, "key": "Age"}],
             [{**AGE, "key": "1age"}],
             [AGE, AGE],
@@ -99,9 +110,9 @@ class TestSchemaEndpoint:
         _grant(dataset, user, target=reader)
         response = _put_schema(_client(user), dataset, [AGE, SEX])
         assert response.status_code == 200, response.content
-        assert response.json()["fields"] == [AGE, SEX]
+        assert response.json()["fields"] == _out(AGE, SEX)
         read = _client(reader).get(f"{DATASETS}/{dataset.object_hash}/subject-schema/")
-        assert read.json() == {"fields": [AGE, SEX]}
+        assert read.json() == {"fields": _out(AGE, SEX)}
 
     def test_a_write_grantee_is_a_manager_and_a_reader_is_not(self, user, make_user):
         writer, reader = make_user(), make_user()
@@ -146,7 +157,7 @@ class TestSchemaEndpoint:
         _with_schema(dataset, AGE)
         _grant(dataset, user, target=reader)
         assert _client(reader).get(f"{DATASETS}/{dataset.object_hash}/subject-schema/").json() == {"fields": []}
-        assert _client(user).get(f"{DATASETS}/{dataset.object_hash}/subject-schema/").json() == {"fields": [AGE]}
+        assert _client(user).get(f"{DATASETS}/{dataset.object_hash}/subject-schema/").json() == {"fields": _out(AGE)}
 
     def test_the_audit_row_counts_and_names_nothing(self, user):
         dataset = Dataset.objects.create(author=user, name="d")
@@ -275,7 +286,7 @@ class TestBrowse:
         reader = make_user()
         _grant(dataset, user, target=reader)
         body = self._browse(_client(reader), dataset)
-        assert body["subject_fields"] == [AGE]
+        assert body["subject_fields"] == _out(AGE)
         by_hash = {row["hash"]: row["subject"] for row in body["items"]}
         assert by_hash[_hash(old)] == {"age": "65+"}
         assert by_hash[_hash(unknown)] == {}
@@ -305,3 +316,72 @@ class TestBrowse:
         refused = _client(reader).get(f"{DATASETS}/{dataset.object_hash}/browse/?sort=subject.age")
         assert refused.status_code == 400
         assert self._browse(_client(user), dataset)["items"][0]["subject"] == {"age": "65+"}
+
+
+AGE_SHOWN = {**AGE, "displayed": True}
+
+
+class TestDisplayedFields:
+    """A release-gated dataset shows its readers the displayed fields only, and counts them into the class."""
+
+    @pytest.fixture
+    def released(self, user, make_user):
+        reader = make_user()
+        recording = _recording(user)
+        dataset, (item,) = _gated_dataset(user, recording)
+        _with_schema(dataset, AGE_SHOWN, SEX)
+        _set(item, age="65+", sex="female")
+        _release(dataset, item)
+        _grant(dataset, user, target=reader)
+        return dataset, item, reader
+
+    def test_a_reader_is_shown_the_displayed_fields_and_their_values_only(self, user, released):
+        dataset, _item, reader = released
+        schema = _client(reader).get(f"{DATASETS}/{dataset.object_hash}/subject-schema/").json()
+        assert schema == {"fields": [AGE_SHOWN]}
+        body = _client(reader).get(f"{DATASETS}/{dataset.object_hash}/browse/").json()
+        assert body["subject_fields"] == [AGE_SHOWN]
+        assert body["items"][0]["subject"] == {"age": "65+"}
+        assert _client(reader).get(f"{DATASETS}/{dataset.object_hash}/browse/?sort=subject.age").status_code == 200
+        assert _client(reader).get(f"{DATASETS}/{dataset.object_hash}/browse/?sort=subject.sex").status_code == 400
+        managed = _client(user).get(f"{DATASETS}/{dataset.object_hash}/browse/").json()
+        assert managed["subject_fields"] == _out(AGE_SHOWN, SEX)
+        assert managed["items"][0]["subject"] == {"age": "65+", "sex": "female"}
+
+    def test_an_ungated_dataset_shows_every_field_whatever_is_displayed(self, user, make_user):
+        reader = make_user()
+        dataset = Dataset.objects.create(author=user, name="d")
+        _with_schema(dataset, AGE_SHOWN, SEX)
+        _set(_add(dataset, _recording(user)), age="65+", sex="female")
+        _grant(dataset, user, target=reader)
+        body = _client(reader).get(f"{DATASETS}/{dataset.object_hash}/browse/").json()
+        assert body["subject_fields"] == _out(AGE_SHOWN, SEX)
+        assert body["items"][0]["subject"] == {"age": "65+", "sex": "female"}
+
+    def test_the_displayed_set_is_fixed_once_the_dataset_has_a_release(self, user, released):
+        dataset, _item, _reader = released
+        assert _put_schema(_client(user), dataset, [AGE, SEX]).status_code == 409
+        assert _put_schema(_client(user), dataset, [AGE_SHOWN, {**SEX, "displayed": True}]).status_code == 409
+        relabelled = [{**AGE_SHOWN, "label": "Age band"}, SEX]
+        assert _put_schema(_client(user), dataset, relabelled).status_code == 200
+        assert subjects.displayed_keys(subjects.schema_of(dataset)) == ["age"]
+
+    def test_the_displayed_set_may_change_before_a_release(self, user):
+        dataset, _items = _gated_dataset(user, _recording(user))
+        _with_schema(dataset, AGE, SEX)
+        assert _put_schema(_client(user), dataset, [AGE_SHOWN, SEX]).status_code == 200
+        assert _put_schema(_client(user), dataset, [AGE, SEX]).status_code == 200
+
+    def test_the_subject_class_key_follows_the_schema_order_with_blanks(self, user):
+        dataset, (one, two) = _gated_dataset(user, _recording(user, index=0), _recording(user, index=1))
+        _with_schema(dataset, {**SEX, "displayed": True}, AGE_SHOWN)
+        _set(one, age="65+", sex="male")
+        assert subjects.subject_class_key(one) == ("male", "65+")
+        assert subjects.subject_class_key(two) == (None, None)
+        ungated = Dataset.objects.create(author=user, name="u")
+        assert subjects.subject_class_key(_add(ungated, _recording(user, index=2))) == ()
+
+    def test_the_joined_key_keeps_the_project_key_alone_without_displayed_values(self):
+        assert subjects.joined_class_key("a", ()) == "a"
+        assert subjects.joined_class_key(None, ("65+",)) is None
+        assert subjects.joined_class_key("a", ("65+",)) == ("a", ("65+",))

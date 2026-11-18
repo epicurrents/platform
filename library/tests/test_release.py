@@ -595,6 +595,36 @@ class TestClassSize:
         dataset, items = _gated_dataset(author, _recording(author, index=0, display_name="c"))
         assert select_by_class_size(dataset, items, k=1) == []
 
+    def test_displayed_subject_values_split_a_class(self, make_user):
+        from library.models import DatasetItemSubject, DatasetMeta
+
+        author = make_user()
+        members = [_recording(author, index=n, display_name="c") for n in range(4)]
+        dataset, items = _gated_dataset(author, *members)
+        age = {"key": "age", "label": "Age", "choices": ["0-17", "65+"], "displayed": True}
+        DatasetMeta.objects.create(dataset=dataset, subject_schema=[age])
+        for item, value in zip(items, ("65+", "65+", "65+", "0-17"), strict=True):
+            DatasetItemSubject.objects.create(item=item, values={"age": value})
+        assert [item.pk for item in select_by_class_size(dataset, items, k=3)] == [item.pk for item in items[:3]]
+        k_of = {"c": 3}.__getitem__
+        assert class_k_at_run(dataset, items, k=k_of, default=2) == {
+            str(("c", ("0-17",))): 3,
+            str(("c", ("65+",))): 3,
+        }
+
+    def test_an_undisplayed_field_does_not_split_a_class(self, make_user):
+        from library.models import DatasetItemSubject, DatasetMeta
+
+        author = make_user()
+        members = [_recording(author, index=n, display_name="c") for n in range(2)]
+        dataset, items = _gated_dataset(author, *members)
+        DatasetMeta.objects.create(
+            dataset=dataset, subject_schema=[{"key": "age", "label": "Age", "choices": ["0-17", "65+"]}]
+        )
+        for item, value in zip(items, ("65+", "0-17"), strict=True):
+            DatasetItemSubject.objects.create(item=item, values={"age": value})
+        assert len(select_by_class_size(dataset, items, k=2)) == 2
+
 
 @pytest.mark.usefixtures("frozen_today")
 class TestReleaseCommand:

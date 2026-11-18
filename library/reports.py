@@ -30,7 +30,11 @@ since, and the equivalence-class sizes over the pool as released up to that run,
 minimum k, the fraction of members below the recorded k, the prosecutor risk and the entropy
 follow. A run that held some classes to a k other than its own records them in ``class_k``, and
 each of those classes is measured against the k it was held to. The classes come from the
-project's registered function; without one the report says so and computes nothing.
+project's registered function, joined with the subject fields the dataset displays to its readers;
+without a function the report says so and computes nothing. The report also sizes the classes over
+the displayed fields alone, whatever function is registered or none, which is what a reader of the
+browser can partition the pool into: a class function that is not what a reader sees, or a selector
+that releases without one, shows up there.
 
 What the platform cannot recompute, it reports as recorded. m is the number of contributors the
 pool was held to before the pooled ingest took any of its files; checking it against the released
@@ -169,16 +173,21 @@ def access_report(dataset: Dataset, *, since: datetime, until: datetime | None =
 def class_sizes(items: list[DatasetItem]) -> tuple[dict[str, int] | None, int]:
     """Size every equivalence class among the recording members in *items*.
 
+    A member's class is the registered function's key joined with the values of the fields its
+    dataset displays (``library.subjects.joined_class_key``), as the release gate counts it.
     Returns the sizes keyed by the class key's string form, and the number of members the
     function left unclassified. The sizes are ``None`` when no function is registered, which
     is a different fact from every class being empty. A recording that is not live and READY
     is counted as unclassified rather than handed to the function; the anonymity report passes
     only present members, as :func:`library.release.select_by_class_size` counts only them.
     """
+    from library.subjects import joined_class_key, subject_class_keys
+
     fn = equivalence_class_function()
     if fn is None:
         return None, len(items)
     by_pk = _present_recordings(items)
+    subject_keys = subject_class_keys(items)
     sizes: dict[str, int] = {}
     unclassified = 0
     for item in items:
@@ -187,9 +196,25 @@ def class_sizes(items: list[DatasetItem]) -> tuple[dict[str, int] | None, int]:
         if key is None:
             unclassified += 1
             continue
-        name = str(key)
+        name = str(joined_class_key(key, subject_keys[item.pk]))
         sizes[name] = sizes.get(name, 0) + 1
     return dict(sorted(sizes.items())), unclassified
+
+
+def displayed_class_sizes(items: list[DatasetItem]) -> dict[str, int]:
+    """Size the classes among *items* over the displayed subject values alone, whatever class function is registered.
+
+    The second sizing: what a reader can partition the pool into from the browser's subject column, a blank
+    included. Every item is counted, so a member the class function leaves unclassified still shows up here. Empty
+    when the dataset displays no field.
+    """
+    from library.subjects import subject_class_keys
+
+    sizes: dict[str, int] = {}
+    for key in subject_class_keys(items).values():
+        if key:
+            sizes[str(key)] = sizes.get(str(key), 0) + 1
+    return dict(sorted(sizes.items()))
 
 
 def class_summary(
@@ -284,7 +309,10 @@ def anonymity_report(dataset: Dataset, release: DatasetRelease) -> dict[str, Any
                 "changed_since_release": changed,
             }
         )
+    from library.subjects import displayed_keys, schema_of
+
     sizes, unclassified = class_sizes(pool)
+    displayed = displayed_keys(schema_of(dataset))
     return {
         "dataset": dataset.object_hash,
         "release_id": release.pk,
@@ -304,4 +332,18 @@ def anonymity_report(dataset: Dataset, release: DatasetRelease) -> dict[str, Any
         "pool_count": len(pool),
         "members": members,
         **class_summary(sizes, unclassified, release.k, release.class_k),
+        "displayed_fields": displayed,
+        "displayed": _displayed_summary(displayed_class_sizes(pool), release.k) if displayed else None,
+    }
+
+
+def _displayed_summary(sizes: dict[str, int], k: int | None) -> dict[str, Any]:
+    """The figures of the second sizing, each class measured against the run's *k*."""
+    counted = sum(sizes.values())
+    min_k = min(sizes.values()) if sizes else None
+    below = sum(size for size in sizes.values() if k is not None and size < k)
+    return {
+        "classes": [{"key": key, "size": size} for key, size in sizes.items()],
+        "min_k": min_k,
+        "below_k_fraction": (below / counted) if (k is not None and counted) else None,
     }
