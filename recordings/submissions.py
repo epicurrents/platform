@@ -6,7 +6,8 @@ bytes that might identify someone from being written anywhere. Every check in
 :func:`validate_file` and :func:`validate_sidecar` is a fingerprint or an identifier the profile
 promised is absent: blanked identification fields as the de-identifier writes them, no
 annotation channel, the channel set and order, the rate, ranges, length, the forbidden sidecar
-keys, the declared hash and the embargo attestation. Dropping one, or letting a failing check repair the file instead of
+keys, the declared hash, the embargo attestation and the subject field values against the pool's
+schema. Dropping one, or letting a failing check repair the file instead of
 refusing it, admits the site's or the vendor's signature into the pool with every locally
 written test still green. The accept path is the other half: :func:`accept_submission` runs the
 gate before any write, so a refused submission writes no row and no file, and a file the server
@@ -31,8 +32,9 @@ that read the EDF header and the sidecar's shape: identification fields blanked 
 as the platform's own de-identifier writes them, no annotation channel, the channel set
 and order, the sampling rate, the physical and digital ranges, the length on one of the
 fixed durations, forbidden sidecar keys refused rather than dropped, the declared hash
-equal to the received bytes, and the contributor's attestation of the profile's
-embargo. The project owns the profile's values, whatever the sidecar
+equal to the received bytes, the contributor's attestation of the profile's
+embargo, and the subject field values each a declared choice of the pool's subject schema
+(``library.subjects``). The project owns the profile's values, whatever the sidecar
 must say beyond its shape (``validate_sidecar``) and what happens to the sidecar once the
 recording exists (``ingest``). A deployment that registers no profile has no submission
 path; its upload endpoint and bulk import are untouched.
@@ -95,6 +97,10 @@ SOURCE_NOT_HELD_KEY = "source_not_on_platform"
 
 #: The attested embargo, inside the attestation: the profile's ``min_recording_age_months``, repeated.
 EMBARGO_KEY = "min_recording_age_months"
+
+#: The sidecar key carrying the recording's subject field values: an object of the pool's schema keys, each set
+#: to one of the field's declared choices. ``subject`` stays forbidden; this key admits only what the schema declares.
+SUBJECT_FIELDS_KEY = "subject_fields"
 
 #: The deepest nesting a sidecar may have. The viewer's sidecar is a few levels deep; a document
 #: nested far past that is not one, and the gate's walk over it would exhaust the stack.
@@ -561,11 +567,44 @@ def _same_json(value: Any, expected: Any) -> bool:
     return type(value) is type(expected) and value == expected
 
 
+def validate_subject_fields(schema: list[dict], sidecar: Any) -> list[Violation]:
+    """Every subject field value in the sidecar that the pool's *schema* does not declare.
+
+    A sidecar without :data:`SUBJECT_FIELDS_KEY` passes: values are optional unless the profile requires the key. An
+    unknown key, a value outside its field's choices and anything but a string are each refused, never dropped, so a
+    value that reaches the pool names a category the pool declared. A message names a declared key and never a value
+    or an undeclared key, so the answer stays as small as the schema whatever the sidecar holds.
+    """
+    if not isinstance(sidecar, dict) or SUBJECT_FIELDS_KEY not in sidecar:
+        return []
+    values = sidecar[SUBJECT_FIELDS_KEY]
+    if not isinstance(values, dict):
+        return [Violation("sidecar_subject_fields", f"The sidecar's {SUBJECT_FIELDS_KEY!r} must be an object.")]
+    choices = {field["key"]: field["choices"] for field in schema}
+    violations = []
+    if any(key not in choices for key in values):
+        violations.append(
+            Violation("sidecar_subject_fields", "The sidecar names a subject field the pool does not declare.")
+        )
+    for key, value in values.items():
+        if key in choices and (not isinstance(value, str) or value not in choices[key]):
+            violations.append(
+                Violation(
+                    "sidecar_subject_fields", f"The value for {key!r} is not one of the field's declared choices."
+                )
+            )
+    return violations
+
+
 def validate_submission(
-    profile: IngestProfile, data: bytes, sidecar: Any, *, server_built: bool = False
+    profile: IngestProfile, data: bytes, sidecar: Any, *, server_built: bool = False, subject_schema: list[dict] = ()
 ) -> list[Violation]:
-    """Every violation of ``profile`` by the pair. Empty means the submission may be accepted."""
-    return validate_file(profile, data) + validate_sidecar(profile, sidecar, data, server_built=server_built)
+    """Every violation of ``profile`` and the pool's *subject_schema* by the pair. Empty means it may be accepted."""
+    return (
+        validate_file(profile, data)
+        + validate_sidecar(profile, sidecar, data, server_built=server_built)
+        + validate_subject_fields(list(subject_schema), sidecar)
+    )
 
 
 def validate_upload(profile: IngestProfile, data: bytes) -> list[Violation]:
@@ -750,7 +789,8 @@ def accept_submission(
 
     The gate runs before any write. A refusal raises :class:`SubmissionRefused` and writes nothing; received
     bytes were never written and a held copy is unlinked. Under the pool's row lock, the lock its configuration
-    writes take, the contributor must still be allowed to submit, or :class:`PoolUnavailable` is raised. The
+    and subject-schema writes take, the contributor must still be allowed to submit, or :class:`PoolUnavailable` is
+    raised, and the subject field values are checked again against the schema as it then stands. The
     contributor's ledger for the pool is created with their first accepted file. ``not_before`` holds the file
     back from the pooled run until that time.
 
@@ -762,6 +802,7 @@ def accept_submission(
     from django.db import transaction
 
     from library.models import Dataset
+    from library.subjects import schema_of
     from recordings.models import SubmissionFile, SubmissionLedger
 
     if (data is None) == (held is None):
@@ -785,7 +826,9 @@ def accept_submission(
         if profile is None:
             raise PoolUnavailable("The pool's ingest profile is no longer registered")
         # A held copy's sidecar is the server's own; one that arrived with the request is the contributor's.
-        violations = validate_submission(profile, data, sidecar, server_built=held is not None)
+        violations = validate_submission(
+            profile, data, sidecar, server_built=held is not None, subject_schema=schema_of(dataset)
+        )
         if violations:
             raise SubmissionRefused(violations)
         if path is None:
@@ -794,6 +837,11 @@ def accept_submission(
             locked = Dataset.objects.select_for_update().get(pk=dataset.pk)
             if not can_submit_to_dataset(contributor, locked):
                 raise PoolUnavailable("The pool no longer accepts files from this contributor")
+            # The schema of a pool that has not filled may have changed since the gate ran; once this
+            # file's ledger exists it cannot.
+            late = validate_subject_fields(schema_of(locked), sidecar)
+            if late:
+                raise SubmissionRefused(late)
             ledger, created = SubmissionLedger.objects.get_or_create(dataset=locked, contributor=contributor)
             SubmissionFile.objects.create(
                 ledger=ledger,

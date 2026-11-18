@@ -1278,11 +1278,12 @@ def _ingest_submission_file(item) -> str | None:
 
     from epicurrents.models import AccessRight
     from epicurrents.system_user import get_system_user
-    from library.models import DatasetItem
+    from library.models import DatasetItem, DatasetItemSubject
+    from library.subjects import apply_values, schema_of
     from recordings.container import save_viewer_sidecar
     from recordings.models import Recording, SubmissionFile, stored_original_name
     from recordings.processors.redither import redither_edf
-    from recordings.submissions import get_ingest_profile
+    from recordings.submissions import SUBJECT_FIELDS_KEY, get_ingest_profile
 
     pool = item.ledger.dataset
     profile = get_ingest_profile(pool.submission_profile)
@@ -1336,7 +1337,12 @@ def _ingest_submission_file(item) -> str | None:
                 can_write=True,
                 can_share=True,
             )
-            DatasetItem.objects.create(dataset=pool, content_type=recording_ct, object_id=str(recording.pk))
+            member = DatasetItem.objects.create(dataset=pool, content_type=recording_ct, object_id=str(recording.pk))
+            # The gate checked these under the pool's lock, and a pool with an accepted file refuses every
+            # schema change; checked again so an undeclared value fails the file rather than reaching the pool.
+            subject_values = apply_values(schema_of(pool), {}, (item.sidecar or {}).get(SUBJECT_FIELDS_KEY) or {})
+            if subject_values:
+                DatasetItemSubject.objects.create(item=member, values=subject_values)
             # The gate checked the sidecar's shape, so a failure here is a bug and
             # fails the file. A pool keeps none of the file's text, whatever the
             # deployment setting says.

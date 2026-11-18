@@ -3646,12 +3646,21 @@ class SubmissionProfileOut(Schema):
     attestation: dict | None
 
 
+class SubmissionSubjectFieldOut(Schema):
+    """One field of a pool's subject schema, which a sidecar's ``subject_fields`` key is checked against."""
+
+    key: str
+    label: str
+    choices: list[str]
+
+
 class SubmissionPoolOut(Schema):
-    """An open pool the caller may submit to, with the profile a file is prepared against."""
+    """An open pool the caller may submit to, with the profile a file is prepared against and its subject fields."""
 
     dataset_hash: str
     name: str
     profile: SubmissionProfileOut
+    subject_fields: list[SubmissionSubjectFieldOut]
 
 
 class SubmissionViolationOut(Schema):
@@ -3710,6 +3719,7 @@ def list_submission_pools(request):
     A pool whose profile this deployment no longer registers is left out: nothing sent to it could pass.
     """
     from library.models import Dataset
+    from library.subjects import schema_of
     from recordings.submissions import get_ingest_profile, public_profile
 
     user = _require_auth(request)
@@ -3724,7 +3734,14 @@ def list_submission_pools(request):
         profile = get_ingest_profile(dataset.submission_profile)
         if profile is None:
             continue
-        pools.append({"dataset_hash": dataset.object_hash, "name": dataset.name, "profile": public_profile(profile)})
+        pools.append(
+            {
+                "dataset_hash": dataset.object_hash,
+                "name": dataset.name,
+                "profile": public_profile(profile),
+                "subject_fields": schema_of(dataset),
+            }
+        )
     log_activity(verb="recordings.submission.pool.list", metadata={"returned_count": len(pools)})
     return pools
 

@@ -29,7 +29,7 @@ from activity.system_activity import with_system_activity
 from epicurrents.models import AccessRight
 from epicurrents.permissions import can_read_object
 from epicurrents.system_user import get_system_user
-from library.models import Dataset, DatasetItem
+from library.models import Dataset, DatasetItem, DatasetItemSubject, DatasetMeta
 from maintenance.operations import get_operation
 from recordings import tasks
 from recordings.models import Recording, SubmissionFile, SubmissionLedger
@@ -42,6 +42,7 @@ from recordings.submissions import (
     BLANK_START_DATE,
     BLANK_START_TIME,
     DEFAULT_FORBIDDEN_SIDECAR_KEYS,
+    SUBJECT_FIELDS_KEY,
     IngestProfile,
     PoolUnavailable,
     SubmissionRefused,
@@ -58,6 +59,7 @@ from recordings.submissions import (
     spool_held_file,
     validate_file,
     validate_sidecar,
+    validate_subject_fields,
     validate_submission,
     validate_upload,
 )
@@ -455,7 +457,8 @@ class TestPoolEndpoints:
         response = client.get(POOLS_URL)
         assert response.status_code == 200, response.content
         (row,) = response.json()
-        assert set(row) == {"dataset_hash", "name", "profile"}
+        assert set(row) == {"dataset_hash", "name", "profile", "subject_fields"}
+        assert row["subject_fields"] == []
         assert row["dataset_hash"] == dataset.object_hash
         assert row["name"] == "Pool"
         assert row["profile"] == {
@@ -1647,3 +1650,115 @@ class TestUploadAgainstProfile:
         assert validate_file(profile, stored) == []
         labels = [s.label.strip() for s in parse_signal_infos(stored, parse_edf_header(stored))]
         assert labels[-1] == "ECG"
+
+
+# ---------------------------------------------------------------------------
+# Subject fields in the sidecar
+# ---------------------------------------------------------------------------
+
+AGE = {"key": "age", "label": "Age", "choices": ["0-17", "18-64", "65+"]}
+#: Distinctive, so a search of the trail or a message for it cannot match anything else.
+AGE_MARKER = "band-seventy-plus"
+MARKED_AGE = {**AGE, "choices": [*AGE["choices"], AGE_MARKER]}
+
+
+def _with_schema(dataset, *fields):
+    DatasetMeta.objects.update_or_create(dataset=dataset, defaults={"subject_schema": list(fields)})
+
+
+class TestSubjectFields:
+    def test_a_sidecar_without_the_key_passes(self):
+        assert validate_subject_fields([AGE], {}) == []
+
+    @pytest.mark.parametrize(
+        "values",
+        [["65+"], {"weight": "70"}, {"age": "42"}, {"age": 65}, {"age": None}],
+    )
+    def test_anything_the_schema_does_not_declare_is_refused(self, values):
+        assert _codes(validate_subject_fields([AGE], {SUBJECT_FIELDS_KEY: values})) == {"sidecar_subject_fields"}
+
+    def test_a_pool_without_a_schema_takes_no_values(self):
+        assert validate_subject_fields([], {SUBJECT_FIELDS_KEY: {"age": "65+"}})
+
+    def test_the_message_names_the_key_and_never_the_value(self):
+        (violation,) = validate_subject_fields([AGE], {SUBJECT_FIELDS_KEY: {"age": AGE_MARKER}})
+        assert "age" in violation.message and AGE_MARKER not in violation.message
+
+    def test_undeclared_keys_are_one_violation_and_never_quoted(self):
+        keys = {f"{AGE_MARKER}-{i}": "65+" for i in range(1000)}
+        (violation,) = validate_subject_fields([AGE], {SUBJECT_FIELDS_KEY: keys})
+        assert AGE_MARKER not in violation.message
+
+    def test_the_endpoint_accepts_declared_values(self, pool, spool):
+        dataset, contributor, _group = pool
+        _with_schema(dataset, AGE)
+        data = _edf()
+        response = _submit(_client(contributor), dataset, data, _sidecar(data, subject_fields={"age": "65+"}))
+        assert response.status_code == 202, response.content
+        assert SubmissionFile.objects.get().sidecar[SUBJECT_FIELDS_KEY] == {"age": "65+"}
+
+    def test_the_endpoint_refuses_an_undeclared_value_and_writes_nothing(self, pool, spool):
+        dataset, contributor, _group = pool
+        _with_schema(dataset, AGE)
+        data = _edf()
+        response = _submit(_client(contributor), dataset, data, _sidecar(data, subject_fields={"age": "42"}))
+        assert response.status_code == 422
+        assert [v["code"] for v in response.json()["violations"]] == ["sidecar_subject_fields"]
+        assert SubmissionFile.objects.count() == 0
+        assert SubmissionLedger.objects.count() == 0
+        assert not spool.exists() or list(spool.iterdir()) == []
+
+    def test_a_schema_changed_before_the_lock_refuses_and_writes_nothing(self, pool, spool, monkeypatch):
+        import library.subjects
+
+        dataset, contributor, _group = pool
+        answers = iter([[AGE], []])
+        monkeypatch.setattr(library.subjects, "schema_of", lambda _dataset: next(answers))
+        data = _edf()
+        with pytest.raises(SubmissionRefused) as refused:
+            accept_submission(
+                dataset, contributor, sidecar=_sidecar(data, subject_fields={"age": "65+"}), data=data, extension=".edf"
+            )
+        assert _codes(refused.value.violations) == {"sidecar_subject_fields"}
+        assert SubmissionFile.objects.count() == 0
+        assert SubmissionLedger.objects.count() == 0
+        assert not spool.exists() or list(spool.iterdir()) == []
+
+    def test_the_listing_publishes_the_schema(self, pool):
+        dataset, contributor, _group = pool
+        _with_schema(dataset, AGE)
+        (row,) = _client(contributor).get(POOLS_URL).json()
+        assert row["subject_fields"] == [AGE]
+
+    def test_a_schema_key_the_profile_forbids_is_refused(self, pool):
+        dataset, _contributor, _group = pool
+        response = _client(dataset.author).put(
+            f"/api/v1/library/datasets/{dataset.object_hash}/subject-schema/",
+            json.dumps({"fields": [{**AGE, "key": "patient"}]}),
+            content_type="application/json",
+        )
+        assert response.status_code == 400
+
+    def test_the_pooled_ingest_writes_the_values_with_the_member(self, pool, spool):
+        dataset, _contributor, _group = pool
+        _with_schema(dataset, MARKED_AGE)
+        with with_system_activity("tests.submission.accept", interface=Activity.Interface.COMMAND):
+            _spooled(pool, spool, sidecar_extra={SUBJECT_FIELDS_KEY: {"age": AGE_MARKER}})
+            _spooled(pool, spool)
+        assert ingest_pooled_submissions() == {"ingested": 2, "failed": 0}
+        (subject,) = DatasetItemSubject.objects.all()
+        assert subject.item.dataset == dataset
+        assert subject.values == {"age": AGE_MARKER}
+        trail = ObjectChangeLog.objects.filter(content_type=ContentType.objects.get_for_model(DatasetItemSubject))
+        assert trail.exists()
+        assert AGE_MARKER not in json.dumps([[c.before_state, c.changes] for c in trail])
+
+    def test_a_value_the_schema_no_longer_declares_fails_the_file(self, pool, spool):
+        dataset, _contributor, _group = pool
+        _with_schema(dataset, AGE)
+        row = _spooled(pool, spool, sidecar_extra={SUBJECT_FIELDS_KEY: {"age": AGE_MARKER}})
+        assert ingest_pooled_submissions() == {"ingested": 0, "failed": 1}
+        row.refresh_from_db()
+        assert row.status == SubmissionFile.Status.FAILED
+        assert Recording.objects.count() == 0
+        assert DatasetItemSubject.objects.count() == 0

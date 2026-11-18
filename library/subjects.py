@@ -4,14 +4,17 @@ A dataset's *subject schema* (``DatasetMeta.subject_schema``) is an ordered list
 a fixed list of choices. There is no free-text field and no exact number: an age is declared as bands, a diagnosis
 as categories, so a value names a category rather than describing a person, the line the annotation-text rule
 draws for a code's value. A member's *values* (``DatasetItemSubject.values``) map a schema key to one of its
-choices.
+choices. They are set by the dataset's managers, and in a submission pool they also arrive with each submission,
+in its sidecar's ``subject_fields`` key, which the submission gate checks against the schema
+(``recordings.submissions.validate_subject_fields``).
 
 The rules, each enforced here and called by the endpoints in ``library.api.v1.ninja``:
 
 * A schema is validated as a whole at every write, and a change that removes a field or a choice still in use is
   refused, so a stored value always names a declared choice.
 * A pool's schema is fixed once the pool fills, as its profile is: removing or rebanding a field changes the
-  classes a past release was sized on, and the submissions were checked against it.
+  classes a past release was sized on, and the submissions were checked against it. Before it fills, a key the
+  pool's profile forbids in a sidecar is refused, since no submission could carry it.
 * A released member of a release-gated dataset keeps its values. The release was decided on them.
 * On a release-gated dataset, a reader who does not manage it is shown no fields and no values. Which fields may
   be shown to readers there is a separate declaration, made against the equivalence class.
@@ -132,6 +135,16 @@ def ensure_schema_change_allowed(dataset: Any, schema: list[dict]) -> None:
         raise SubjectError(
             409, "The subject schema of a filling pool cannot change: its members were checked against it."
         )
+    if is_pool(dataset):
+        from recordings.submissions import get_ingest_profile
+
+        profile = get_ingest_profile(dataset.submission_profile)
+        forbidden = profile.all_forbidden_sidecar_keys if profile is not None else frozenset()
+        clashing = [field["key"] for field in schema if field["key"] in forbidden]
+        if clashing:
+            raise SubjectError(
+                400, f"The key {clashing[0]} is forbidden in the pool's sidecars, so no submission could carry it."
+            )
     declared = {(field["key"], choice) for field in schema for choice in field["choices"]}
     dropped = sorted(pair for pair in values_in_use(dataset) if pair not in declared)
     if dropped:
