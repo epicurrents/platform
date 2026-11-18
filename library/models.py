@@ -576,7 +576,7 @@ class DatasetItemSubject(models.Model):
 
     One row per membership, deleted with it, so withdrawing a recording from a dataset takes its
     values along. ``values`` maps a schema key to one of that field's choices; a key without a
-    value is absent. Every write goes through ``library.subjects.validate_values``. The values are
+    value is absent. Every write goes through ``library.subjects.apply_values``. The values are
     about the data subject, so the audit trail withholds them (``LibraryConfig.ready``): it records
     that a member's values changed and never what they were.
     """
