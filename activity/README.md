@@ -525,6 +525,8 @@ To check the table against the tree, walk the AST for `log_activity` / `with_sys
 | `library.dataset.snapshot.read` | `get_dataset_snapshot` |
 | `library.dataset.subject_schema.read` | `get_dataset_subject_schema` |
 | `library.dataset.subject_schema.update` | `update_dataset_subject_schema` |
+| `library.dataset.tag.add` | `tag_dataset_members` |
+| `library.dataset.tag.remove` | `untag_dataset_members` |
 | `library.dataset.trash` | `delete_dataset` |
 | `library.dataset.update` | `update_dataset` |
 | `library.purge` | `purge_deleted_library` † |
@@ -532,7 +534,7 @@ To check the table against the tree, walk the AST for `log_activity` / `with_sys
 | `library.tag.delete` | `delete_tag` |
 | `library.tag.item.add` | `tag_item` |
 | `library.tag.item.list` | `list_tagged_items` |
-| `library.tag.item.remove` | `untag_item` |
+| `library.tag.item.remove` | `untag_item`, `untag_object` |
 | `library.tag.list` | `list_tags` |
 | `library.tag.recording.list` | `list_recording_tags` |
 | `library.tag.read` | `get_tag_detail` |

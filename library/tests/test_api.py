@@ -1978,7 +1978,7 @@ class TestTagItem:
         post_json(c, _tag_url(tag.pk, "items/"), payload)
         assert post_json(c, _tag_url(tag.pk, "items/"), payload).status_code == 409
 
-    def test_no_write_access_to_object_returns_403(self, auth_client, make_user):
+    def test_an_object_the_caller_cannot_read_is_404(self, auth_client, make_user):
         c, user = auth_client
         owner = make_user(username="owner")
         rec = _make_recording(owner)
@@ -1992,6 +1992,18 @@ class TestTagItem:
                 "object_id": str(rec.pk),
             },
         )
+        assert resp.status_code == 404
+
+    def test_no_write_access_to_a_readable_object_returns_403(self, auth_client, make_user):
+        c, user = auth_client
+        owner = make_user(username="owner")
+        rec = _make_recording(owner)
+        tag = baker.make(Tag, author=user)
+        ct = ContentType.objects.get_for_model(rec, for_concrete_model=False)
+        AccessRight.objects.create(
+            content_type=ct, object_id=str(rec.pk), access_giver=owner, access_target=user, can_read=True
+        )
+        resp = post_json(c, _tag_url(tag.pk, "items/"), {"content_type_id": ct.pk, "object_id": str(rec.pk)})
         assert resp.status_code == 403
 
     def test_missing_tag_returns_404(self, auth_client, make_user):

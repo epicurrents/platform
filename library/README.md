@@ -162,11 +162,19 @@ Same CRUD + items shape as Collections at `/datasets/`, plus the access surface 
 | `PATCH` | `/tags/{id}/` | Update. Requires tag authorship; a new parent must be within reach. Returns `warnings`. |
 | `DELETE` | `/tags/{id}/` | Hard-delete. Requires tag authorship. |
 | `GET` | `/tags/{id}/items/?include_children=true` | List items tagged with this tag, by default including items tagged with any descendant. Set `include_children=false` to exclude descendants. 404 outside the caller's reach. |
-| `POST` | `/tags/{id}/items/` | Tag an object. Requires write access to the object and a tag within the caller's reach. |
-| `DELETE` | `/tags/{id}/items/{item_id}/` | Untag. Requires write access on the object **or** authorship of the tag. |
+| `POST` | `/tags/{id}/items/` | Tag an object. Requires write access to the object and a tag within the caller's reach; an object the caller cannot read is 404, the answer for one that does not exist, on this route and the next. A recording is named by its hash and a media file by its content hash, as in the collection and dataset item adds; any other type by its primary key. |
+| `DELETE` | `/tags/{id}/items/?content_type_id=…&object_id=…` | Untag the object named, by hash for a recording or media file. Requires read access to the object, then write access to it **or** authorship of the tag, checked before whether the object carries the tag, so the answer says nothing to a caller who could not remove it. |
+| `DELETE` | `/tags/{id}/items/{item_id}/` | Untag by tagged-item id, under the same rule. |
+| `POST` / `DELETE` | `/datasets/{id}/tags/{tag_id}/?<browser filters>` | Tag or untag every recording of the dataset that the browser's filters match; see Batch tagging below. |
 | `GET` | `/recording-tags/?hash=...` | The tags on each recording named, repeated up to 200 times, as `{hash, tags}` in display order. A recording the caller cannot read, one without tags and a hash naming nothing are all left out alike. |
 
 `include_children` uses `_get_tag_subtree_ids` — a single DB query + in-memory BFS to expand the tag's descendant set, so a deeply-nested taxonomy doesn't fan out into many queries.
+
+Tagged-item responses carry `object_hash` beside `object_id`, so a client never needs the sequential key; `id` and `object_id` are nulled for pooled recordings as in the dataset item listing.
+
+### Batch tagging
+
+`POST /datasets/{id}/tags/{tag_id}/` tags the members a dataset browser query matches, and `DELETE` on the same path untags them. The query string takes the filters of `GET /datasets/{id}/browse/`, so what the browser listed is what gets written, and no object identifiers travel at all. The caller needs read access to the dataset and a tag within reach. Each member is then held to the single-object rule: write access to tag it, and for untagging write access or authorship of the tag. A member the rule refuses is skipped and counted rather than failing the request, so one query covers a dataset of mixed ownership. The response is `{matched, changed, unchanged, skipped}`. Rows are written one at a time in one transaction, so each lands in the change log, beside one `library.dataset.tag.add` or `.remove` activity carrying the counts and the filtered dimensions. A query matching more than 5,000 recordings is refused with 400.
 
 ### Tag reach
 
@@ -310,7 +318,7 @@ Datasets are addressed by `Dataset.object_hash` — a 32-character random identi
 
 Collections and Tags are identified by **integer PK** in URLs (`/collections/42/`, `/tags/3/`). A collection PK reveals nothing about the contained data — items keep their own opaque identifiers — and the tag taxonomy is global and browseable by all authenticated users, so PK leakage is not meaningful for either.
 
-Items inside collections / datasets / tags are still referenced by the contained object's opaque identifier (e.g. recording `content_hash`), not the membership row's PK.
+Items inside collections, datasets and tags are named by the contained object's opaque identifier, a recording's hash or a media file's `content_hash`, on every add, listing and untag path; the object's primary key stays accepted for internal callers and for types without a hash.
 
 ## Settings consumed
 
@@ -337,7 +345,7 @@ The app also consumes the cross-app `AccessRight` model from `epicurrents`.
 pytest library/tests/
 ```
 
-The permission tests live in [tests/test_permissions.py](tests/test_permissions.py) and cover `can_read_via_dataset`, the author-only collection gate, and the inertness of stale collection-targeted rows. API tests are in [tests/test_api.py](tests/test_api.py). Release gating, the cadence and the `release_dataset` command are in [tests/test_release.py](tests/test_release.py); the two reports and their commands in [tests/test_reports.py](tests/test_reports.py); the curator review, its endpoints and the run's sign-off in [tests/test_review.py](tests/test_review.py). The dataset browser is in [tests/test_browse.py](tests/test_browse.py), its filters, facets and suppression with the catalogue in [tests/test_browse_facets.py](tests/test_browse_facets.py), the tags on a page of objects with the rest of the tag reach in [tests/test_tag_scope.py](tests/test_tag_scope.py), the subject fields in [tests/test_subjects.py](tests/test_subjects.py), and their import from a published table in [tests/test_subject_import.py](tests/test_subject_import.py).
+The permission tests live in [tests/test_permissions.py](tests/test_permissions.py) and cover `can_read_via_dataset`, the author-only collection gate, and the inertness of stale collection-targeted rows. API tests are in [tests/test_api.py](tests/test_api.py). Release gating, the cadence and the `release_dataset` command are in [tests/test_release.py](tests/test_release.py); the two reports and their commands in [tests/test_reports.py](tests/test_reports.py); the curator review, its endpoints and the run's sign-off in [tests/test_review.py](tests/test_review.py). The dataset browser is in [tests/test_browse.py](tests/test_browse.py), its filters, facets and suppression with the catalogue in [tests/test_browse_facets.py](tests/test_browse_facets.py), the tags on a page of objects with the rest of the tag reach in [tests/test_tag_scope.py](tests/test_tag_scope.py), tagging by hash and the batch tag in [tests/test_tag_hashes.py](tests/test_tag_hashes.py), the subject fields in [tests/test_subjects.py](tests/test_subjects.py), and their import from a published table in [tests/test_subject_import.py](tests/test_subject_import.py).
 
 ## Gotchas
 

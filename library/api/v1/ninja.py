@@ -30,6 +30,8 @@ Datasets
     GET    /datasets/{id}/access/            List access rights.
     POST   /datasets/{id}/access/            Grant an access right.
     DELETE /datasets/{id}/access/{rid}/     Revoke an access right.
+    POST   /datasets/{id}/tags/{tid}/        Tag every member matching the browser filters.
+    DELETE /datasets/{id}/tags/{tid}/        Untag every member matching the browser filters.
     POST   /datasets/{id}/snapshots/         Seal current membership (create-only).
     GET    /datasets/{id}/snapshots/         List snapshots, newest first.
     GET    /datasets/snapshots/{hash}/       One snapshot, manifest included.
@@ -42,7 +44,8 @@ Tags
     DELETE /tags/{id}/                       Delete a tag.
     GET    /tags/{id}/items/                 List tagged items (optionally with descendants).
     POST   /tags/{id}/items/                 Tag an object.
-    DELETE /tags/{id}/items/{iid}/          Untag an object.
+    DELETE /tags/{id}/items/                 Untag an object named by content type and identifier.
+    DELETE /tags/{id}/items/{iid}/          Untag by tagged-item id.
     GET    /recording-tags/                  The tags on recordings named by hash.
 """
 
@@ -172,7 +175,11 @@ class CollectionWriteOut(CollectionOut):
 
 
 class CollectionItemIn(Schema):
-    """Payload for adding an object to a collection."""
+    """An object to add to a collection or a dataset, or to tag.
+
+    ``object_id`` is the object's primary key as a string; a recording is also named by its 32-hex hash and a media
+    file by its content hash, which is what clients hold (``_resolve_item_object_id``).
+    """
 
     content_type_id: int
     object_id: str
@@ -436,13 +443,28 @@ class TaggedItemOut(Schema):
 
     ``id`` and ``object_id`` are null for a pooled recording listed to anyone but a superuser or a
     manager of its pool: both are sequential and would give away the pool's arrival order.
+    ``object_hash`` names a recording or a media file whoever is listed it; null for other types.
     """
 
     id: int | None
     tag_id: int
     content_type_id: int
     object_id: str | None
+    object_hash: str | None = None
     tagged_at: datetime
+
+
+class DatasetTagBatchOut(Schema):
+    """The outcome of tagging or untagging the members a browser query matches.
+
+    ``matched`` members the caller can read pass the filters; of those, ``changed`` were tagged or untagged,
+    ``unchanged`` already were, and ``skipped`` the caller may not tag or untag.
+    """
+
+    matched: int
+    changed: int
+    unchanged: int
+    skipped: int
 
 
 # ---------------------------------------------------------------------------
@@ -553,6 +575,76 @@ def _resolve_recording_object_id(object_id: str) -> str:
     if rec is None:
         raise HttpError(404, "Recording not found")
     return str(rec.pk)
+
+
+def _resolve_item_object_id(ct: ContentType, object_id: str) -> str:
+    """The primary key string an item payload's *object_id* names: a recording's or a media file's hash resolved,
+    any other type's taken as given."""
+    if ct.app_label == "recordings" and ct.model == "recording":
+        return _resolve_recording_object_id(object_id)
+    if ct.app_label == "media" and ct.model == "mediafile":
+        return _resolve_media_object_id(object_id)
+    return object_id
+
+
+def _tag_target(user, ct: ContentType, object_id: str) -> str:
+    """The primary key string of the object a tag write names, or 404 alike for one that does not exist and one the
+    caller cannot read, so a tag endpoint answers nothing about an object the caller could not already see.
+
+    A malformed identifier is still 400: that is the shape of the request, not a fact about any object.
+    """
+    try:
+        resolved = _resolve_item_object_id(ct, object_id)
+    except HttpError as exc:
+        if exc.status_code != 404:
+            raise
+        resolved = None
+    if resolved is None or not user_can_read_item(user, ct, resolved):
+        raise HttpError(404, "Object not found")
+    return resolved
+
+
+def _object_hashes(rows: list[dict]) -> dict[tuple[int, str], str]:
+    """The public hash of each recording and media file among *rows*, keyed ``(content_type_id, object_id)``."""
+    from django.apps import apps
+
+    from recordings.models import Recording
+
+    found: dict[tuple[int, str], str] = {}
+    recording_ct = ContentType.objects.get_for_model(Recording, for_concrete_model=False)
+    recording_pks = {row["object_id"] for row in rows if row["content_type_id"] == recording_ct.pk}
+    recording_pks = {pk for pk in recording_pks if pk and pk.isdigit()}
+    for pk, stored_name in Recording.objects.filter(pk__in=recording_pks).values_list("pk", "stored_name"):
+        found[(recording_ct.pk, str(pk))] = stored_name.split(".", 1)[0]
+    if apps.is_installed("media"):
+        from media.models import MediaFile
+
+        media_ct = ContentType.objects.get_for_model(MediaFile, for_concrete_model=False)
+        media_pks = {row["object_id"] for row in rows if row["content_type_id"] == media_ct.pk}
+        media_pks = {pk for pk in media_pks if pk and pk.isdigit()}
+        for pk, content_hash in MediaFile.objects.filter(pk__in=media_pks).values_list("pk", "content_hash"):
+            found[(media_ct.pk, str(pk))] = content_hash
+    return found
+
+
+def _tagged_item_rows(items: list, user) -> list[dict]:
+    """Serialise ``TaggedItem`` rows for *user*: each named by its object's hash, sequential ids nulled where they
+    would give away arrival order."""
+    rows = [
+        {
+            "id": item.pk,
+            "tag_id": item.tag_id,
+            "content_type_id": item.content_type_id,
+            "object_id": item.object_id,
+            "tagged_at": item.tagged_at,
+        }
+        for item in items
+    ]
+    hashes = _object_hashes(rows)
+    for row in rows:
+        row["object_hash"] = hashes.get((row["content_type_id"], row["object_id"]))
+    _null_sequential_ids(rows, user, all_rows=False)
+    return rows
 
 
 def _enrich_collection_items(items: list, user) -> list[dict]:
@@ -972,11 +1064,7 @@ def add_item(request, collection_id: int, payload: CollectionItemIn):
     if ct is None:
         raise HttpError(404, f"ContentType {payload.content_type_id} not found")
 
-    object_id = payload.object_id
-    if ct.app_label == "recordings" and ct.model == "recording":
-        object_id = _resolve_recording_object_id(object_id)
-    elif ct.app_label == "media" and ct.model == "mediafile":
-        object_id = _resolve_media_object_id(object_id)
+    object_id = _resolve_item_object_id(ct, payload.object_id)
 
     _check_item_readable(user=user, ct=ct, object_id=object_id)
 
@@ -2214,6 +2302,25 @@ def list_dataset_items(
 BROWSE_ROW_TAGS = 3
 
 
+def _browse_facts(request, dataset: Dataset, user, share_token: str | None) -> tuple:
+    """The subject schema the caller is shown, the browser filters of *request*'s query, and the facts and tag rows
+    of the members the caller can read, as ``library.browse.member_facts`` gives them. A filter not allowed is 400.
+    """
+    from library.browse import member_facts, member_recording_ids, parse_filters
+    from library.subjects import shown_schema
+
+    members, _manager = _visible_members(dataset, user, share_token)
+    schema = shown_schema(dataset, user)
+    try:
+        filters = parse_filters(request.GET, schema, tags_allowed=user is not None)
+    except ValueError as exc:
+        raise HttpError(400, f"Unknown filter: {exc}") from exc
+    facts, tag_rows = member_facts(
+        member_recording_ids(members), dataset=dataset, schema=schema, user=user, share_token=share_token
+    )
+    return schema, filters, facts, tag_rows
+
+
 @api.get("/datasets/{dataset_id}/browse/", response=DatasetBrowseOut)
 def browse_dataset(
     request,
@@ -2234,17 +2341,9 @@ def browse_dataset(
     rows nor the counts.
     """
     from epicurrents.permissions import can_read_object
-    from library.browse import (
-        browse_rows,
-        facet_counts,
-        matching_ids,
-        member_facts,
-        member_recording_ids,
-        parse_filters,
-        parse_sort,
-    )
+    from library.browse import browse_rows, facet_counts, matching_ids, parse_sort
     from library.release import release_months_by_id
-    from library.subjects import shown_schema, values_by_object_id
+    from library.subjects import values_by_object_id
     from recordings.api.v1.ninja import _resolve_display_name, _visible_created_at
     from recordings.models import Recording
 
@@ -2260,19 +2359,11 @@ def browse_dataset(
         or can_read_object(user=user, obj=dataset, share_token=share_token)
     ):
         raise HttpError(403, "You do not have permission to view this dataset")
-    members, manager = _visible_members(dataset, user, share_token)
-    schema = shown_schema(dataset, user)
+    schema, filters, facts, tag_rows = _browse_facts(request, dataset, user, share_token)
     try:
         sort_key, descending = parse_sort(sort, [field["key"] for field in schema])
     except ValueError as exc:
         raise HttpError(400, "Unknown sort key") from exc
-    try:
-        filters = parse_filters(request.GET, schema, tags_allowed=user is not None)
-    except ValueError as exc:
-        raise HttpError(400, f"Unknown filter: {exc}") from exc
-    facts, tag_rows = member_facts(
-        member_recording_ids(members), dataset=dataset, schema=schema, user=user, share_token=share_token
-    )
     member_ids = matching_ids(facts, filters)
     count = len(member_ids)
     facets = facet_counts(facts, filters, schema, tag_rows=tag_rows)
@@ -2551,11 +2642,7 @@ def add_dataset_item(request, dataset_id: str, payload: CollectionItemIn):
     if ct is None:
         raise HttpError(404, f"ContentType {payload.content_type_id} not found")
 
-    object_id = payload.object_id
-    if ct.app_label == "recordings" and ct.model == "recording":
-        object_id = _resolve_recording_object_id(object_id)
-    elif ct.app_label == "media" and ct.model == "mediafile":
-        object_id = _resolve_media_object_id(object_id)
+    object_id = _resolve_item_object_id(ct, payload.object_id)
 
     _check_item_readable(user=user, ct=ct, object_id=object_id)
     member = ct.model_class()._default_manager.filter(pk=object_id).first()
@@ -3510,18 +3597,7 @@ def list_tagged_items(
             "returned_count": len(items),
         },
     )
-    rows = [
-        {
-            "id": item.pk,
-            "tag_id": item.tag_id,
-            "content_type_id": item.content_type_id,
-            "object_id": item.object_id,
-            "tagged_at": item.tagged_at,
-        }
-        for item in items
-    ]
-    _null_sequential_ids(rows, user, all_rows=False)
-    return rows
+    return _tagged_item_rows(items, user)
 
 
 @api.post("/tags/{tag_id}/items/", response={201: TaggedItemOut})
@@ -3529,9 +3605,11 @@ def tag_item(request, tag_id: int, payload: CollectionItemIn):
     """Apply a tag to an object.
 
     The caller must have write access to the referenced object, and the tag
-    must be within the caller's reach (404 otherwise, as everywhere else).
+    must be within the caller's reach (404 otherwise, as everywhere else). An
+    object the caller cannot read is 404 like one that does not exist; one
+    they read but may not write is 403.
     ``content_type_id`` is a Django ``ContentType`` PK; ``object_id`` is the
-    target object's PK as a string.
+    target object's PK as a string, or a recording's or media file's hash.
     """
     user = _require_auth(request)
     tag = _get_tag(tag_id, user=user)
@@ -3540,19 +3618,53 @@ def tag_item(request, tag_id: int, payload: CollectionItemIn):
     if ct is None:
         raise HttpError(404, f"ContentType {payload.content_type_id} not found")
 
-    _check_item_writable(user=user, ct=ct, object_id=payload.object_id)
+    object_id = _tag_target(user, ct, payload.object_id)
+    _check_item_writable(user=user, ct=ct, object_id=object_id)
 
     with transaction.atomic():
         item, created = TaggedItem.objects.get_or_create(
             tag=tag,
             content_type=ct,
-            object_id=payload.object_id,
+            object_id=object_id,
         )
         if not created:
             raise HttpError(409, "This object already has this tag")
         log_activity(verb="library.tag.item.add", target=item)
 
-    return 201, item
+    return 201, _tagged_item_rows([item], user)[0]
+
+
+@api.delete("/tags/{tag_id}/items/")
+def untag_object(
+    request,
+    tag_id: int,
+    content_type_id: int = Query(..., description="The tagged object's content type"),
+    object_id: str = Query(..., description="The object's primary key, or a recording's or media file's hash"),
+):
+    """Remove a tag from the object named by its content type and identifier, the form a client holding only
+    hashes can address.
+
+    The same rule as untagging by item id: write access to the object, or authorship of the tag, checked before
+    whether the object carries the tag. A tag outside the caller's reach is 404, and so are an object the caller
+    cannot read and one without the tag.
+    """
+    user = _require_auth(request)
+    tag = _get_tag(tag_id, user=user)
+    ct = ContentType.objects.filter(pk=content_type_id).first()
+    if ct is None:
+        raise HttpError(404, f"ContentType {content_type_id} not found")
+    resolved = _tag_target(user, ct, object_id)
+    # Permission before the lookup, so whether an object carries the tag is answered only to whom may remove it.
+    if not can_modify_object(user=user, obj=tag):
+        _check_item_writable(user=user, ct=ct, object_id=resolved)
+    item = TaggedItem.objects.filter(tag=tag, content_type=ct, object_id=resolved).first()
+    if item is None:
+        raise HttpError(404, "Tagged item not found")
+
+    with transaction.atomic():
+        log_activity(verb="library.tag.item.remove", target=item)
+        item.delete()
+    return {"status": "ok"}
 
 
 @api.delete("/tags/{tag_id}/items/{item_id}/")
@@ -3577,6 +3689,94 @@ def untag_item(request, tag_id: int, item_id: int):
         log_activity(verb="library.tag.item.remove", target=item)
         item.delete()
     return {"status": "ok"}
+
+
+#: The most members one batch tag or untag writes; a larger match is refused, to be narrowed by the filters.
+MAX_BATCH_TAGGED = 5000
+
+
+def _batch_tag(request, user, dataset_id: str, tag_id: int, *, remove: bool) -> dict:
+    """Tag or untag, by *remove*, the recordings of a dataset that the browser query of *request* matches, as *user*.
+
+    The members are the browser's: those the caller can read, narrowed by the same filters, so what was listed is
+    what is written. Each is tagged under the rule ``POST /tags/{id}/items/`` applies, write access to the
+    recording; untagged under the rule of ``DELETE /tags/{id}/items/``, that or authorship of the tag. A member
+    the rule refuses is skipped and counted, not refused, so one query can cover a dataset of mixed ownership.
+    Every row is written one by one inside one transaction, so each lands in the audit trail.
+    """
+    from epicurrents.permissions import can_read_object, can_write_object
+    from library.browse import matching_ids
+    from recordings.models import Recording
+
+    dataset = _get_active_dataset(dataset_id)
+    if not (user.is_superuser or dataset.author_id == user.pk or can_read_object(user=user, obj=dataset)):
+        raise HttpError(403, "You do not have permission to view this dataset")
+    tag = _get_tag(tag_id, user=user)
+    _schema, filters, facts, _tag_rows = _browse_facts(request, dataset, user, None)
+    member_ids = matching_ids(facts, filters)
+    if len(member_ids) > MAX_BATCH_TAGGED:
+        raise HttpError(400, f"The filters match more than {MAX_BATCH_TAGGED} recordings; narrow them")
+
+    recording_ct = ContentType.objects.get_for_model(Recording, for_concrete_model=False)
+    if remove and can_modify_object(user=user, obj=tag):
+        allowed = set(member_ids)
+    else:
+        allowed = {
+            recording.pk
+            for recording in Recording.objects.filter(pk__in=member_ids)
+            if can_write_object(user=user, obj=recording)
+        }
+    existing = {
+        item.object_id: item
+        for item in TaggedItem.objects.filter(
+            tag=tag, content_type=recording_ct, object_id__in=[str(pk) for pk in allowed]
+        )
+    }
+    changed = 0
+    with transaction.atomic():
+        for pk in sorted(allowed):
+            item = existing.get(str(pk))
+            if remove and item is not None:
+                item.delete()
+                changed += 1
+            elif not remove and item is None:
+                # A tagging that landed since the read above is left as it is and counted unchanged.
+                _item, created = TaggedItem.objects.get_or_create(tag=tag, content_type=recording_ct, object_id=str(pk))
+                changed += int(created)
+        counts = {
+            "matched": len(member_ids),
+            "changed": changed,
+            "unchanged": len(allowed) - changed,
+            "skipped": len(member_ids) - len(allowed),
+        }
+        log_activity(
+            verb="library.dataset.tag.remove" if remove else "library.dataset.tag.add",
+            target=dataset,
+            metadata={"tag_id": tag.pk, "filters": filters.fields, **counts},
+        )
+    return counts
+
+
+@api.post("/datasets/{dataset_id}/tags/{tag_id}/", response=DatasetTagBatchOut)
+def tag_dataset_members(request, dataset_id: str, tag_id: int):
+    """Tag every recording of the dataset that the browser filters in the query string match.
+
+    The query takes the filters of ``GET /datasets/{id}/browse/``; none tags every member the caller can read.
+    Requires read access to the dataset and a tag within reach; a member the caller may not write is skipped.
+    """
+    user = _require_auth(request)
+    return _batch_tag(request, user, dataset_id, tag_id, remove=False)
+
+
+@api.delete("/datasets/{dataset_id}/tags/{tag_id}/", response=DatasetTagBatchOut)
+def untag_dataset_members(request, dataset_id: str, tag_id: int):
+    """Remove the tag from every recording of the dataset that the browser filters in the query string match.
+
+    The filters and access are those of the batch tag; a member is untagged where the caller may write it or
+    authored the tag, and skipped otherwise.
+    """
+    user = _require_auth(request)
+    return _batch_tag(request, user, dataset_id, tag_id, remove=True)
 
 
 #: The most recordings one ``GET /recording-tags/`` names.
