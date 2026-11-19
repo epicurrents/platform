@@ -508,6 +508,9 @@ To check the table against the tree, walk the AST for `log_activity` / `with_sys
 | `library.dataset.item.move` | `move_dataset_item` |
 | `library.dataset.item.remove` | `remove_dataset_item` |
 | `library.dataset.list` | `list_datasets` |
+| `library.dataset.listing.clear` | `clear_public_listing` |
+| `library.dataset.listing.read` | `get_public_listing` |
+| `library.dataset.listing.set` | `set_public_listing` |
 | `library.dataset.member.approval.create` | `approve_dataset_member` |
 | `library.dataset.member.approval.delete` | `withdraw_dataset_member_approval` |
 | `library.dataset.member.subject.update` | `update_dataset_member_subject` |
@@ -516,6 +519,7 @@ To check the table against the tree, walk the AST for `log_activity` / `with_sys
 | `library.dataset.pool.delete` | `dissolve_dataset_pool` |
 | `library.dataset.pool.read` | `get_dataset_pool` |
 | `library.dataset.pool.update` | `update_dataset_pool` |
+| `library.dataset.public.list` | `list_public_datasets` |
 | `library.dataset.read` | `get_dataset` |
 | `library.dataset.recording.list` | `browse_dataset` |
 | `library.dataset.release` | `handle` † |

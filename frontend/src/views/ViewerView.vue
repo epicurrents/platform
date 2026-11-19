@@ -5,7 +5,13 @@ import { t } from '#i18n'
 import { showToast } from '#lib/toast'
 import { useAuthStore } from '#stores/auth'
 import { getRecordingDetail } from '#api/recordings'
-import { getDataset, listAllDatasetItems } from '#api/library'
+import {
+    browseFiltersFromQuery,
+    getDataset,
+    listAllDatasetItems,
+    listMatchingRecordingHashes,
+    type DatasetBrowseFilters,
+} from '#api/library'
 import { getMediaDetail, listMediaFiles, type MediaFileDetail, type MediaFileSummary } from '#api/media'
 import type {
     BiosignalResource,
@@ -195,6 +201,15 @@ const shareToken = computed(() => (route.query.token as string | undefined) || u
  */
 const sessionToken = computed(() => (route.query.session as string | undefined) || undefined)
 
+/**
+ * The dataset browser's query, when a `?dataset=` link carries one: its filters (`modality`, `subject.<key>`, `tag`)
+ * and its `sort`, named as the browse endpoint names them. The viewer then opens the recordings the browser lists
+ * under that query, in its order. Carrying the query rather than the matching hashes keeps the link short however
+ * many recordings it opens.
+ */
+const datasetFilters = computed(() => browseFiltersFromQuery(route.query))
+const datasetSort = computed(() => (route.query.sort as string | undefined)?.trim() || null)
+
 const bundles = ref<DatasetBundle[]>([])
 const loading = ref(true)
 const error = ref<string | null>(null)
@@ -215,11 +230,33 @@ const emptyMode = computed(() =>
     && !mediaHashes.value.length,
 )
 
-async function loadDatasetBundle(id: number | string, token: string | undefined): Promise<DatasetBundle> {
-    const [dataset, items] = await Promise.all([
+/**
+ * A dataset's members as a bundle the viewer lists, each resolved to its detail row. With a browser query, only the
+ * recordings the dataset browser lists under it, in its order; without one, every member in the dataset's order.
+ * @param id - The dataset's object hash or primary key.
+ * @param token - Share token the dataset is read with, if any.
+ * @param filters - The browser filters the link carries, or null.
+ * @param sort - The browser sort the link carries, or null.
+ */
+async function loadDatasetBundle(
+    id: number | string,
+    token: string | undefined,
+    filters: DatasetBrowseFilters | null = null,
+    sort: string | null = null,
+): Promise<DatasetBundle> {
+    const browsed = filters !== null || sort !== null
+    const [dataset, allItems, listed] = await Promise.all([
         getDataset(id, token),
         listAllDatasetItems(id, token),
+        browsed ? listMatchingRecordingHashes(id, filters, sort ?? 'name', token) : Promise.resolve(null),
     ])
+    // The browser lists recordings only, so a browsed link opens no media.
+    const byHash = new Map(
+        allItems.filter(item => item.object_type === 'recording' && item.object_hash).map(item => [item.object_hash, item]),
+    )
+    const items = listed
+        ? listed.map(hash => byHash.get(hash)).filter((item): item is NonNullable<typeof item> => !!item)
+        : allItems
     // Preserve dataset order; resolve each item to its detail row (or null
     // when the item type / state is not viewable). Unsupported media files
     // are dropped here so the mount loop never tries to load them.
@@ -307,7 +344,9 @@ onMounted(async () => {
             )
         } else if (datasetId.value !== null) {
             // Single-dataset mode.
-            bundles.value = [await loadDatasetBundle(datasetId.value, shareToken.value)]
+            bundles.value = [
+                await loadDatasetBundle(datasetId.value, shareToken.value, datasetFilters.value, datasetSort.value),
+            ]
         } else if (hashes.value.length || mediaHashes.value.length) {
             // Individual items mode — one unauthenticated bundle that mixes
             // recordings (`?files=`) and media (`?media=`) in the order they

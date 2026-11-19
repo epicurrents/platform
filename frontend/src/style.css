@@ -32,6 +32,10 @@ wa-icon.inline {
     top: -0.05em;
 }
 
+wa-pagination::part(pagination) {
+  margin-left: auto;
+}
+
 /* ── Navigation bar ─────────────────────────────────────────────────── */
 
 .app-nav {
@@ -156,7 +160,7 @@ wa-icon.inline {
 .empty-state {
   color: var(--wa-color-text-quiet);
   text-align: center;
-  padding: var(--wa-space-3xl) 0;
+  padding: var(--wa-space-l) 0;
 }
 
 /* ── Home sections ───────────────────────────────────────────────────── */

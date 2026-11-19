@@ -371,6 +371,9 @@ onMounted(load)
 </template>
 
 <style scoped>
+.section-header {
+    margin: 0;
+}
 .dataset-pool__facts {
     display: grid;
     gap: var(--wa-space-2xs) var(--wa-space-m);

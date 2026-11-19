@@ -164,7 +164,7 @@ function onPageChange (event: Event) {
                                 {{ column.label }}
                                 <wa-icon class="data-table__sort-icon" :name="sortIcon(column)"></wa-icon>
                             </button>
-                            <template v-else>{{ column.label }}</template>
+                            <span v-else class="data-table__label">{{ column.label }}</span>
                         </th>
                     </tr>
                 </thead>
@@ -235,6 +235,17 @@ function onPageChange (event: Event) {
 .data-table__table th,
 .data-table__table td {
     white-space: nowrap;
+}
+
+/* A sortable header is a flex button with an icon, so a plain one is laid out the same way, centred in its cell, or
+   its text sits on a different line from its neighbours'. */
+.data-table__table th {
+    vertical-align: middle;
+}
+
+.data-table__label {
+    align-items: center;
+    display: inline-flex;
 }
 
 .data-table__table td.data-table__wrap {

@@ -58,8 +58,6 @@ interface RangeControl {
     /** The lowest and highest value under the other filters, as shown; empty when no member has one. */
     low: string
     high: string
-    /** How many members under the other filters carry a value. */
-    count: number
 }
 
 type FilterControl = SelectControl | RangeControl
@@ -100,7 +98,6 @@ function rangeControl (field: SubjectField): RangeControl {
         label: field.label,
         low: facet?.min === null || facet?.min === undefined ? '' : formatSubjectValue(facet.min),
         high: facet?.max === null || facet?.max === undefined ? '' : formatSubjectValue(facet.max),
-        count: facet?.count ?? 0,
     }
 }
 
@@ -295,9 +292,6 @@ function clearAll () {
                         @change="onRange(control.name, 'max', $event)"
                     ></wa-input>
                 </div>
-                <span class="browser-filters__hint">
-                    {{ t('{count} with a value', SCOPE, { count: control.count }) }}
-                </span>
             </fieldset>
         </template>
         <wa-button
@@ -358,11 +352,6 @@ function clearAll () {
 
 .browser-filters__dash {
     color: var(--wa-color-text-quiet);
-}
-
-.browser-filters__hint {
-    color: var(--wa-color-text-quiet);
-    font-size: var(--wa-font-size-xs);
 }
 
 .browser-filters__clear {

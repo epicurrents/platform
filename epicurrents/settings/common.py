@@ -837,6 +837,10 @@ LIBRARY_TAG_CREATION_REQUIRES_STAFF = env_bool("LIBRARY_TAG_CREATION_REQUIRES_ST
 # memory a worker, for every loaded recording, and a browser tab gives out somewhere in the hundreds; the viewer's own
 # eagerStudyLoadLimit (also 50) caps what it loads regardless, so a deployment raising this raises that too.
 LIBRARY_DATASET_PRELOAD_LIMIT = config("LIBRARY_DATASET_PRELOAD_LIMIT", default=50, cast=int)
+# Whether the deployment serves the public dataset listing, GET /api/v1/library/public-datasets/, which names to anyone
+# the datasets their authors list there and the share token of each. Off by default: the listing publishes those
+# links on the platform's own authority, so a deployment turns it on deliberately (see library.public_listing).
+LIBRARY_PUBLIC_DATASET_LISTING = env_bool("LIBRARY_PUBLIC_DATASET_LISTING", default=False)
 # A deployment whose datasets are release-gated (a multi-centre pool released to readers by
 # release runs) keeps no copy of a submission its contributor does not also hold, so the
 # originals volume is refused at boot while this is on (library/checks.py). Set by the project.

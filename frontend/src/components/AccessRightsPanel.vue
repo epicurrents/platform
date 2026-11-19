@@ -18,6 +18,10 @@ const props = defineProps<{
     assessFn?: (right: AccessRight, payload: AssessmentPayload) => Promise<AccessRight>
     infoMessage?: string
     readPermLabel?: string
+    /** The links a share-token grant opens, each offered with a copy button on its row. */
+    tokenLinks?: (right: AccessRight) => { label: string, url: string }[]
+    /** The grant the object is listed publicly through, marked on its row. */
+    listedRightId?: number | null
 }>()
 
 const emit = defineEmits<{
@@ -281,6 +285,21 @@ async function revokeAccess(right: AccessRight) {
     }
 }
 
+// ── Token links ───────────────────────────────────────────────────────────────
+
+/**
+ * Copy a token's link to the clipboard. Where the browser refuses, the toast carries the link to copy by hand.
+ * @param url - The link.
+ */
+async function copyLink(url: string) {
+    try {
+        await navigator.clipboard.writeText(url)
+        showToast(t('Link copied.', SCOPE), 'neutral')
+    } catch {
+        showToast(t('The link could not be copied: {url}', SCOPE, { url }), 'warning')
+    }
+}
+
 // ── Display helpers ───────────────────────────────────────────────────────────
 
 function accessTargetLabel(right: AccessRight): string {
@@ -340,7 +359,7 @@ function userDisplayName(user: UserSearchResult): string {
         {{ infoMessage }}
     </wa-callout>
 
-    <p v-else-if="!accessRights.length" class="empty-state">
+    <p v-if="!accessRights.length" class="empty-state">
         {{ t('No access grants yet.', SCOPE) }}
     </p>
 
@@ -357,7 +376,21 @@ function userDisplayName(user: UserSearchResult): string {
                 {{ accessTargetLabel(right) }}
                 <span v-if="right.assessment_reference" class="access-assessment">{{ assessmentLabel(right) }}</span>
             </span>
+            <wa-badge v-if="listedRightId != null && right.id === listedRightId" pill variant="brand">
+                {{ t('Listed publicly', SCOPE) }}
+            </wa-badge>
             <span class="access-perms">{{ accessPermsLabel(right) }}</span>
+            <template v-if="right.public_share_token && tokenLinks">
+                <wa-button v-for="link in tokenLinks(right)" :key="link.label"
+                    appearance="plain"
+                    size="s"
+                    :title="link.label"
+                    @click="copyLink(link.url)"
+                >
+                    <wa-icon name="link-simple" slot="start"></wa-icon>
+                    {{ link.label }}
+                </wa-button>
+            </template>
             <wa-button v-if="assessFn && right.can_assess"
                 appearance="plain"
                 size="s"

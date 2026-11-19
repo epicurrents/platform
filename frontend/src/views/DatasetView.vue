@@ -6,6 +6,7 @@ import { t } from '#i18n'
 import { setPageTitle } from '#router'
 import AccessRightsPanel from '#components/AccessRightsPanel.vue'
 import DatasetBrowser from '#components/DatasetBrowser.vue'
+import DatasetPublicListingSection from '#components/DatasetPublicListingSection.vue'
 import DatasetPoolSection from '#components/DatasetPoolSection.vue'
 import MediaListRow from '#components/MediaListRow.vue'
 import EditRecordingDialog from '#components/EditRecordingDialog.vue'
@@ -320,6 +321,38 @@ function openDatasetInViewer() {
 function openRecordings(hashes: string[]) {
     const { href } = router.resolve({ name: 'viewer', query: { files: hashes.join(',') } })
     window.open(href, '_blank')
+}
+
+/**
+ * The links a share token of this dataset opens, for the access panel's copy buttons: the read-only browser and the
+ * viewer, each absolute so it works pasted anywhere.
+ * @param right - A share-token access right.
+ */
+function tokenLinks(right: AccessRight) {
+    const token = right.public_share_token ?? ''
+    const id = dataset.value?.object_hash ?? datasetId.value
+    const absolute = (href: string) => new URL(href, window.location.origin).toString()
+    return [
+        {
+            label: t('Copy browse link', SCOPE),
+            url: absolute(router.resolve({ name: 'dataset-browse', params: { id }, query: { token } }).href),
+        },
+        {
+            label: t('Copy viewer link', SCOPE),
+            url: absolute(router.resolve({ name: 'viewer', query: { dataset: id, token } }).href),
+        },
+    ]
+}
+
+/** The access right the dataset is listed publicly through, as the listing section last read it. */
+const listedRightId = ref<number | null>(null)
+
+/**
+ * Keep the listed token marked in the access panel.
+ * @param rightId - The token the dataset is listed through, or null.
+ */
+function onListingChange(rightId: number | null) {
+    listedRightId.value = rightId
 }
 
 function openMedia(hash: string) {
@@ -1213,13 +1246,21 @@ const assessFn = (right: AccessRight, payload: AssessmentPayload) =>
                 :assessFn="assessFn"
                 :grantFn="grantFn"
                 :infoMessage="t('Anyone with read access to this dataset can read all recordings in it, including recordings added in the future.', SCOPE)"
+                :listedRightId="listedRightId"
                 :readPermLabel="t('Read (grants access to all recordings)', SCOPE)"
                 :revokeFn="revokeFn"
                 :tokenHint="t('Provide this token to users so they can access the dataset.', SCOPE)"
+                :tokenLinks="tokenLinks"
                 :tokenPlaceholder="t('e.g. team-neuro-2025', SCOPE)"
             ></AccessRightsPanel>
 
             <template v-if="canEditConfig">
+                <wa-divider class="section-divider"></wa-divider>
+                <DatasetPublicListingSection
+                    :accessRights="accessRights"
+                    :datasetId="datasetId"
+                    @change="onListingChange"
+                ></DatasetPublicListingSection>
                 <wa-divider class="section-divider"></wa-divider>
                 <DatasetPoolSection :datasetId="datasetId" @change="onPoolChange"></DatasetPoolSection>
                 <wa-divider class="section-divider"></wa-divider>
@@ -1599,12 +1640,17 @@ const assessFn = (right: AccessRight, payload: AssessmentPayload) =>
     flex: 1;
     display: flex;
     flex-direction: column;
+    gap: var(--wa-space-m);
     margin: 0 auto;
     max-width: var(--content-width);
     min-height: 0;
     overflow: hidden;
     width: 100%;
 }
+    .dataset-view__scroll-wrap > * {
+        /* Clear the margins from the flex children to avoid extra spacing inside the scroll wrap. */
+        margin: 0;
+    }
 
 .dataset-view__error {
     /* Held to the content column now that the host no longer centres its children. */

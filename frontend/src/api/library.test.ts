@@ -1,7 +1,9 @@
 /**
  * Tests for the library's client calls: the collection, collection item and dataset item listings read to their end,
  * the repeated `hash` parameter of the tag lookup, the subject write naming what to clear, the filters as repeated
- * parameters, the tag search, tagging by hash, and the batch tagging sending the browser's filters.
+ * parameters, the share token a browser page is read with, the tag search, tagging by hash, the batch tagging sending
+ * the browser's filters, the browser query carried in a viewer link and read back in its order, and the public
+ * listing naming the token to list through.
  */
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
@@ -11,16 +13,22 @@ vi.mock('#lib/http', () => ({
         get: vi.fn(),
         patch: vi.fn(),
         post: vi.fn(),
+        put: vi.fn(),
     },
 }))
 
 import {
     browseDataset,
+    browseFiltersFromQuery,
+    browseFiltersToQuery,
+    clearPublicListing,
     listAllCollectionItems,
     listAllCollections,
     listAllDatasetItems,
+    listMatchingRecordingHashes,
     listRecordingTags,
     listTags,
+    setPublicListing,
     tagDatasetMembers,
     tagObject,
     untagDatasetMembers,
@@ -34,6 +42,7 @@ const mockDelete = vi.mocked(http.delete)
 const mockGet = vi.mocked(http.get)
 const mockPatch = vi.mocked(http.patch)
 const mockPost = vi.mocked(http.post)
+const mockPut = vi.mocked(http.put)
 
 /** A page of *count* placeholder items; only the length matters to the paging. */
 function page (count: number, from = 0) {
@@ -45,6 +54,7 @@ beforeEach(() => {
     mockGet.mockReset()
     mockPatch.mockReset()
     mockPost.mockReset()
+    mockPut.mockReset()
 })
 
 describe('listAllDatasetItems', () => {
@@ -125,6 +135,14 @@ describe('updateDatasetMemberSubject', () => {
 })
 
 describe('browseDataset', () => {
+    it('sends the share token a page is read with, and none without one', async () => {
+        mockGet.mockResolvedValue({ data: {} })
+        await browseDataset('abc', { sort: 'name' }, undefined, 'shared-token')
+        await browseDataset('abc', { sort: 'name' })
+        expect((mockGet.mock.calls[0][1]?.params as URLSearchParams).get('share_token')).toBe('shared-token')
+        expect((mockGet.mock.calls[1][1]?.params as URLSearchParams).has('share_token')).toBe(false)
+    })
+
     it('sends paging and each filter value as its own parameter', async () => {
         mockGet.mockResolvedValueOnce({ data: {} })
         await browseDataset('abc', { sort: '-name', limit: 50, offset: 0 }, {
@@ -241,5 +259,57 @@ describe('batch tagging', () => {
         mockPost.mockResolvedValueOnce({ data: {} })
         await tagDatasetMembers('abc', 9)
         expect(sent(mockPost.mock.calls[0])).toEqual([])
+    })
+})
+
+describe('public listing', () => {
+    it('lists through the access right named, and clears with a delete', async () => {
+        mockPut.mockResolvedValueOnce({ data: {} })
+        mockDelete.mockResolvedValueOnce({ data: {} })
+        await setPublicListing('abc', 12)
+        await clearPublicListing('abc')
+        expect(mockPut).toHaveBeenCalledWith('/api/v1/library/datasets/abc/public-listing/', { access_right_id: 12 })
+        expect(mockDelete).toHaveBeenCalledWith('/api/v1/library/datasets/abc/public-listing/')
+    })
+})
+
+describe('browser query in a link', () => {
+    const filters: DatasetBrowseFilters = {
+        modality: ['eeg'],
+        subject: { age_band: ['0-17', '65+'] },
+        ranges: { age_years: { min: 2, max: 10.5 } },
+        tags: [4],
+    }
+
+    it('round-trips the filters through the query parameters', () => {
+        const query = browseFiltersToQuery(filters)
+        expect(query).toEqual({
+            'modality': ['eeg'],
+            'subject.age_band': ['0-17', '65+'],
+            'subject.age_years.min': ['2'],
+            'subject.age_years.max': ['10.5'],
+            'tag': ['4'],
+        })
+        expect(browseFiltersFromQuery({ ...query, dataset: 'abc', sort: '-duration', token: 't' })).toEqual(filters)
+    })
+
+    it('reads a query carrying no filters as none', () => {
+        expect(browseFiltersToQuery({ modality: [], subject: {}, ranges: {}, tags: [] })).toEqual({})
+        expect(browseFiltersFromQuery({ dataset: 'abc', sort: 'name', 'subject.age_years.min': 'x' })).toBeNull()
+    })
+
+    it('reads every page under the sort, in the order the server lists them', async () => {
+        const rows = (from: number, count: number) => Array.from({ length: count }, (_, i) => ({ hash: `h${from + i}` }))
+        mockGet
+            .mockResolvedValueOnce({ data: { count: 203, items: rows(0, 200) } })
+            .mockResolvedValueOnce({ data: { count: 203, items: rows(200, 3) } })
+        const hashes = await listMatchingRecordingHashes('abc', null, '-duration', 'tok')
+        expect(hashes).toHaveLength(203)
+        expect(hashes[0]).toBe('h0')
+        expect(hashes[202]).toBe('h202')
+        const second = mockGet.mock.calls[1][1]?.params as URLSearchParams
+        expect(second.get('sort')).toBe('-duration')
+        expect(second.get('offset')).toBe('200')
+        expect(second.get('share_token')).toBe('tok')
     })
 })

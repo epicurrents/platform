@@ -14,6 +14,7 @@ import AgreementView from '#views/AgreementView.vue'
 import AnnotationExportView from '#views/AnnotationExportView.vue'
 import CatalogueView from '#views/CatalogueView.vue'
 import CollectionView from '#views/CollectionView.vue'
+import DatasetBrowseView from '#views/DatasetBrowseView.vue'
 import DatasetView from '#views/DatasetView.vue'
 import DatasetsView from '#views/DatasetsView.vue'
 import HomeView from '#views/HomeView.vue'
@@ -21,6 +22,7 @@ import LibraryView from '#views/LibraryView.vue'
 import LoginView from '#views/LoginView.vue'
 import NeedsAttentionView from '#views/NeedsAttentionView.vue'
 import ProfileView from '#views/ProfileView.vue'
+import PublicDatasetsView from '#views/PublicDatasetsView.vue'
 import ResetPasswordView from '#views/ResetPasswordView.vue'
 import UnassignedRecordingsView from '#views/UnassignedRecordingsView.vue'
 import UploadView from '#views/UploadView.vue'
@@ -162,6 +164,28 @@ export const router = createRouter({
                 navSection: 'catalogue',
                 requiresAuth: true,
                 title: 'Catalogue',
+            },
+        },
+        {
+            // Read-only, and the page a shared or publicly listed link opens, so a ?token= stands in for an account.
+            path: '/datasets/:id/browse',
+            name: 'dataset-browse',
+            component: DatasetBrowseView,
+            meta: {
+                navSection: 'datasets',
+                requiresAuthUnlessToken: true,
+                // DatasetBrowseView swaps in the dataset name once loaded.
+                title: 'Dataset',
+            },
+        },
+        {
+            // Needs no account: the deployment's public dataset listing, empty unless it serves one.
+            path: '/public-datasets',
+            name: 'public-datasets',
+            component: PublicDatasetsView,
+            meta: {
+                navSection: 'catalogue',
+                title: 'Public datasets',
             },
         },
         {

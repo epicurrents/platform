@@ -30,7 +30,11 @@ Datasets
     GET    /datasets/{id}/access/            List access rights.
     POST   /datasets/{id}/access/            Grant an access right.
     DELETE /datasets/{id}/access/{rid}/     Revoke an access right.
-    POST   /datasets/{id}/tags/{tid}/        Tag every member matching the browser filters.
+    GET    /datasets/{id}/public-listing/    The dataset's public listing and why it is not listed.
+    PUT    /datasets/{id}/public-listing/    List the dataset publicly through one of its share tokens.
+    DELETE /datasets/{id}/public-listing/    Take the dataset off the public listing.
+    GET    /public-datasets/                 The public dataset listing; needs no account.
+    POST   /datasets/{id}/tags/{tid}/      Tag every member matching the browser filters.
     DELETE /datasets/{id}/tags/{tid}/        Untag every member matching the browser filters.
     POST   /datasets/{id}/snapshots/         Seal current membership (create-only).
     GET    /datasets/{id}/snapshots/         List snapshots, newest first.
@@ -1741,6 +1745,182 @@ def list_catalogue(request, limit: int = Query(50, ge=1, le=200), offset: int = 
     return entries
 
 
+class PublicDatasetOut(Schema):
+    """One dataset of the public listing, with the share token it is listed through.
+
+    ``recording_count`` and ``modalities`` describe the recordings the token reads, and ``public_sources`` are the
+    distinct published datasets those recordings name. No sequential id and no author.
+    """
+
+    object_hash: str
+    name: str
+    description: str
+    license_spdx: str | None
+    license_url: str | None
+    recording_count: int
+    modalities: list[str]
+    public_sources: list[str]
+    subject_fields: list[str]
+    share_token: str
+
+
+@api.get("/public-datasets/", response=list[PublicDatasetOut])
+def list_public_datasets(request):
+    """The public dataset listing: every dataset its author lists through a share token and that qualifies, by name.
+
+    Needs no account. 404 when the deployment does not serve the listing. What qualifies is decided by
+    ``library.public_listing.listing_problems`` on every read, and each entry describes what the listed token reads,
+    through the same membership rule as the browser.
+    """
+    from library.browse import member_recording_ids, recording_count
+    from library.public_listing import listed_datasets
+    from library.subjects import shown_schema
+    from recordings.models import Recording
+
+    if not settings.LIBRARY_PUBLIC_DATASET_LISTING:
+        raise HttpError(404, "Not found")
+    entries = []
+    for dataset in listed_datasets():
+        token = dataset.public_listing.public_share_token
+        members, _manager = _visible_members(dataset, None, token)
+        recording_ids = member_recording_ids(members)
+        readable = Recording.objects.filter(pk__in=recording_ids, deleted_at__isnull=True).exclude(
+            status=Recording.Status.FAILED
+        )
+        try:
+            meta = dataset.meta
+        except DatasetMeta.DoesNotExist:
+            meta = None
+        entries.append(
+            {
+                "object_hash": dataset.object_hash,
+                "name": dataset.name,
+                "description": dataset.description,
+                "license_spdx": (meta.license_spdx or None) if meta else None,
+                "license_url": (meta.license_url or None) if meta else None,
+                "recording_count": recording_count(recording_ids),
+                "modalities": sorted(
+                    {m.lower() for m in readable.exclude(modality="").values_list("modality", flat=True).distinct()}
+                ),
+                "public_sources": sorted(set(readable.values_list("public_source", flat=True).distinct())),
+                "subject_fields": [item["label"] for item in shown_schema(dataset, None)],
+                "share_token": token,
+            }
+        )
+    log_activity(verb="library.dataset.public.list", metadata={"returned_count": len(entries)})
+    return entries
+
+
+class PublicListingIn(Schema):
+    """Payload for listing a dataset publicly: the id of the dataset's share-token access right to list it through."""
+
+    access_right_id: int
+
+
+class ListingProblemOut(Schema):
+    """One reason a dataset cannot be listed: its code, a sentence, and the members it concerns where it is one."""
+
+    code: str
+    detail: str
+    count: int | None = None
+
+
+class PublicListingOut(Schema):
+    """A dataset's public listing as its author sees it.
+
+    ``access_right_id`` is the token it is listed through, null when it is not. ``listed`` is whether the public
+    listing names it today, and ``problems`` why it cannot, for the listed token or, when none is, for the dataset.
+    ``enabled`` is whether the deployment serves the listing at all.
+    """
+
+    enabled: bool
+    access_right_id: int | None
+    listed: bool
+    problems: list[ListingProblemOut]
+
+
+def _public_listing_out(dataset: Dataset) -> dict:
+    from library.public_listing import PROBLEMS, listing_problems
+
+    right = dataset.public_listing
+    problems = listing_problems(dataset, right)
+    if right is None:
+        # With no token chosen yet, the dataset's own problems are what the author can act on.
+        problems = [problem for problem in problems if problem["code"] != "not_share_token"]
+    return {
+        "enabled": settings.LIBRARY_PUBLIC_DATASET_LISTING,
+        "access_right_id": right.pk if right is not None else None,
+        "listed": right is not None and not problems,
+        "problems": [{**problem, "detail": PROBLEMS[problem["code"]]} for problem in problems],
+    }
+
+
+def _require_listing_author(request, dataset_id: str) -> tuple:
+    """The caller and the dataset, when the caller is its author or a superuser; 403 otherwise.
+
+    Listing a dataset publishes its link to anyone, so it is the author's decision, as release gating is, and not a
+    write or share grantee's.
+    """
+    from epicurrents.permissions import can_modify_object
+
+    user = _require_auth(request)
+    dataset = _get_active_dataset(dataset_id)
+    if not can_modify_object(user=user, obj=dataset):
+        raise HttpError(403, "Only the dataset's author or a superuser may list it publicly")
+    return user, dataset
+
+
+@api.get("/datasets/{dataset_id}/public-listing/", response=PublicListingOut)
+def get_public_listing(request, dataset_id: str):
+    """The dataset's public listing: the token it is listed through, whether it is listed today, and why not."""
+    _user, dataset = _require_listing_author(request, dataset_id)
+    out = _public_listing_out(dataset)
+    log_activity(
+        verb="library.dataset.listing.read",
+        target=dataset,
+        metadata={"listed": out["listed"], "problem_codes": [problem["code"] for problem in out["problems"]]},
+    )
+    return out
+
+
+@api.put("/datasets/{dataset_id}/public-listing/", response=PublicListingOut)
+def set_public_listing(request, dataset_id: str, payload: PublicListingIn):
+    """List the dataset publicly through one of its share tokens, replacing any token it was listed through.
+
+    409 with every reason when the dataset or the token does not qualify (``library.public_listing``), and nothing is
+    written. 404 for an access right that is not this dataset's.
+    """
+    from library.public_listing import PROBLEMS, listing_problems
+
+    _user, dataset = _require_listing_author(request, dataset_id)
+    right = AccessRight.objects.filter(
+        pk=payload.access_right_id, content_type=_dataset_ct(), object_id=str(dataset.pk)
+    ).first()
+    if right is None:
+        raise HttpError(404, "Access right not found")
+    problems = listing_problems(dataset, right)
+    if problems:
+        raise HttpError(409, " ".join(PROBLEMS[problem["code"]] for problem in problems))
+    with transaction.atomic():
+        dataset.public_listing = right
+        dataset.save(update_fields=["public_listing", "modified_at"])
+        log_activity(verb="library.dataset.listing.set", target=dataset)
+    return _public_listing_out(dataset)
+
+
+@api.delete("/datasets/{dataset_id}/public-listing/", response=PublicListingOut)
+def clear_public_listing(request, dataset_id: str):
+    """Take the dataset off the public listing. The token stays; revoking it is a separate act."""
+    _user, dataset = _require_listing_author(request, dataset_id)
+    was_listed = dataset.public_listing_id is not None
+    with transaction.atomic():
+        if was_listed:
+            dataset.public_listing = None
+            dataset.save(update_fields=["public_listing", "modified_at"])
+        log_activity(verb="library.dataset.listing.clear", target=dataset, metadata={"was_listed": was_listed})
+    return _public_listing_out(dataset)
+
+
 def _collection_write_out(collection: Collection, warnings: list[dict]) -> dict:
     """Serialise a collection for a create or update response, with the free-text warnings beside it."""
     return {
@@ -3371,6 +3551,11 @@ def revoke_dataset_access(request, dataset_id: str, right_id: int):
 
     with transaction.atomic():
         log_activity(verb="library.dataset.access.revoke", target=right)
+        if dataset.public_listing_id == right.pk:
+            # The FK's SET_NULL would unlist the dataset by a bulk update the audit signals never see, so the field is
+            # cleared here first and the dataset's change record carries the unlisting.
+            dataset.public_listing = None
+            dataset.save(update_fields=["public_listing", "modified_at"])
         right.delete()
     return {"status": "ok"}
 

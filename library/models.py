@@ -250,6 +250,17 @@ class Dataset(models.Model):
         default=False,
         help_text="Whether the pool accepts new submissions; closing it leaves the spool and the ledgers alone.",
     )
+    # The share token the public dataset listing names this dataset by, null when it is not listed. Revoking the
+    # token unlists the dataset. Whether a listed dataset still qualifies is checked on every read of the listing, in
+    # ``library.public_listing``, so the value alone publishes nothing.
+    public_listing = models.OneToOneField(
+        "epicurrents.AccessRight",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="listed_dataset",
+        help_text="The share token of this dataset the public dataset listing names it by; empty when not listed.",
+    )
 
     # Reverse GenericRelations so hard-delete cascades cleanly through every
     # reference row that targets this dataset via a GenericForeignKey.

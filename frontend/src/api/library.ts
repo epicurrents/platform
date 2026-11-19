@@ -686,11 +686,13 @@ function appendFilters (query: URLSearchParams, filters?: DatasetBrowseFilters) 
  * @param datasetId - The dataset's object hash or primary key.
  * @param params - `sort` is a key from the server's allowlist, or `subject.<key>`, prefixed with `-` for descending.
  * @param filters - Sent as repeated `modality`, `subject.<key>` and `tag` parameters, and a range as `subject.<key>.min` and `subject.<key>.max`.
+ * @param shareToken - Share token the dataset is read with, for a reader without an account.
  */
 export async function browseDataset(
     datasetId: number | string,
     params: { sort?: string; limit?: number; offset?: number },
     filters?: DatasetBrowseFilters,
+    shareToken?: string,
 ): Promise<DatasetBrowsePage> {
     const query = new URLSearchParams()
     for (const [name, value] of Object.entries(params)) {
@@ -699,10 +701,96 @@ export async function browseDataset(
         }
     }
     appendFilters(query, filters)
+    if (shareToken) {
+        query.append('share_token', shareToken)
+    }
     const response = await http.get<DatasetBrowsePage>(`/api/v1/library/datasets/${datasetId}/browse/`, {
         params: query,
     })
     return response.data
+}
+
+/**
+ * A browser query's filters as the parameters of a page URL, named as the browse endpoint names them, so a link can
+ * carry the query to another page. Empty when nothing is filtered.
+ * @param filters - The filters.
+ */
+export function browseFiltersToQuery (filters: DatasetBrowseFilters): Record<string, string[]> {
+    const params = new URLSearchParams()
+    appendFilters(params, filters)
+    const query: Record<string, string[]> = {}
+    for (const [name, value] of params) {
+        (query[name] ??= []).push(value)
+    }
+    return query
+}
+
+/**
+ * The browser filters a page URL carries, or null when it carries none. Parameters that are not filters are ignored,
+ * and so is a range end that is not a number; the server refuses a filter the caller may not use.
+ * @param query - The route's query.
+ */
+export function browseFiltersFromQuery (query: Record<string, unknown>): DatasetBrowseFilters | null {
+    const filters: DatasetBrowseFilters = { modality: [], subject: {}, ranges: {}, tags: [] }
+    let found = false
+    for (const [name, raw] of Object.entries(query)) {
+        const values = (Array.isArray(raw) ? raw : [raw]).filter(
+            (value): value is string => typeof value === 'string' && value !== '',
+        )
+        if (!values.length) {
+            continue
+        }
+        if (name === 'modality') {
+            filters.modality.push(...values)
+            found = true
+        } else if (name === 'tag') {
+            const ids = values.map(Number).filter(Number.isInteger)
+            filters.tags.push(...ids)
+            found = found || ids.length > 0
+        } else {
+            const match = name.match(/^subject\.([a-z][a-z0-9_]*)(?:\.(min|max))?$/)
+            if (!match) {
+                continue
+            }
+            const [, key, end] = match
+            if (end === 'min' || end === 'max') {
+                const bound = Number(values[0])
+                if (Number.isFinite(bound)) {
+                    (filters.ranges[key] ??= {})[end] = bound
+                    found = true
+                }
+            } else {
+                filters.subject[key] = values
+                found = true
+            }
+        }
+    }
+    return found ? filters : null
+}
+
+/**
+ * The hashes of every recording of the dataset the filters match, in the browser's order under *sort*, read a page
+ * of 200 at a time.
+ * @param datasetId - The dataset's object hash or primary key.
+ * @param filters - The browser filters, or null for every recording.
+ * @param sort - A browser sort key, `-` prefixed for descending.
+ * @param shareToken - Share token the dataset is read with, if any.
+ */
+export async function listMatchingRecordingHashes (
+    datasetId: number | string,
+    filters: DatasetBrowseFilters | null,
+    sort: string,
+    shareToken?: string,
+): Promise<string[]> {
+    const limit = 200
+    const hashes: string[] = []
+    for (let offset = 0; ; offset += limit) {
+        const page = await browseDataset(datasetId, { sort, limit, offset }, filters ?? undefined, shareToken)
+        hashes.push(...page.items.map(row => row.hash))
+        if (page.items.length < limit || hashes.length >= page.count) {
+            return hashes
+        }
+    }
 }
 
 /**
@@ -728,6 +816,77 @@ export interface CatalogueEntry {
  */
 export async function listCatalogue(params: { limit?: number; offset?: number } = {}): Promise<CatalogueEntry[]> {
     const response = await http.get<CatalogueEntry[]>('/api/v1/library/catalogue/', { params })
+    return response.data
+}
+
+/**
+ * One dataset of the public listing, with the share token it is listed through. `recording_count` and `modalities`
+ * describe the recordings the token reads, and `public_sources` the published datasets they name.
+ */
+export interface PublicDataset {
+    object_hash: string
+    name: string
+    description: string
+    license_spdx: string | null
+    license_url: string | null
+    recording_count: number
+    modalities: string[]
+    public_sources: string[]
+    subject_fields: string[]
+    share_token: string
+}
+
+/** The public dataset listing, which needs no account; a 404 means the deployment does not serve it. */
+export async function listPublicDatasets(): Promise<PublicDataset[]> {
+    const response = await http.get<PublicDataset[]>('/api/v1/library/public-datasets/')
+    return response.data
+}
+
+/** One reason a dataset cannot be listed publicly, with the number of members it concerns where it is one. */
+export interface ListingProblem {
+    code: string
+    detail: string
+    count: number | null
+}
+
+/**
+ * A dataset's public listing as its author sees it: the share token it is listed through, whether the listing names
+ * it today, why not, and whether the deployment serves the listing at all.
+ */
+export interface PublicListing {
+    enabled: boolean
+    access_right_id: number | null
+    listed: boolean
+    problems: ListingProblem[]
+}
+
+/**
+ * The dataset's public listing. Its author or a superuser only.
+ * @param datasetId - The dataset's object hash or primary key.
+ */
+export async function getPublicListing(datasetId: number | string): Promise<PublicListing> {
+    const response = await http.get<PublicListing>(`/api/v1/library/datasets/${datasetId}/public-listing/`)
+    return response.data
+}
+
+/**
+ * List the dataset publicly through one of its share tokens; a 409 carries every reason it does not qualify.
+ * @param datasetId - The dataset's object hash or primary key.
+ * @param accessRightId - The id of the dataset's share-token access right.
+ */
+export async function setPublicListing(datasetId: number | string, accessRightId: number): Promise<PublicListing> {
+    const response = await http.put<PublicListing>(`/api/v1/library/datasets/${datasetId}/public-listing/`, {
+        access_right_id: accessRightId,
+    })
+    return response.data
+}
+
+/**
+ * Take the dataset off the public listing. The token stays.
+ * @param datasetId - The dataset's object hash or primary key.
+ */
+export async function clearPublicListing(datasetId: number | string): Promise<PublicListing> {
+    const response = await http.delete<PublicListing>(`/api/v1/library/datasets/${datasetId}/public-listing/`)
     return response.data
 }
 

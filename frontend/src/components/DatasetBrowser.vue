@@ -15,6 +15,10 @@
  * "Tag recordings…" (`POST` / `DELETE /datasets/{id}/tags/{tid}/`), which sends the same filters the page was fetched
  * with. A member the caller may not change is skipped by the server and counted in the outcome.
  *
+ * Given a `shareToken`, the browser reads the dataset with it, for a reader without an account opening a shared or
+ * publicly listed link. The server gives such a reader no tags and the annotation API takes no token, so the tag
+ * column and the drawer's tags and codes are left out rather than shown empty; a signed-in reader keeps them.
+ *
  * @package    epicurrents-platform
  */
 import { computed, onMounted, reactive, ref, watch } from 'vue'
@@ -22,6 +26,7 @@ import { useRouter } from 'vue-router'
 import { t } from '#i18n'
 import {
     browseDataset,
+    browseFiltersToQuery,
     getRecordingContentTypeId,
     listRecordingTags,
     tagDatasetMembers,
@@ -59,6 +64,8 @@ const props = defineProps<{
     datasetId: string
     /** Whether the caller may set subject values; the server decides in the end. */
     canManage: boolean
+    /** Share token the dataset is read with, for a reader opening a shared link. */
+    shareToken?: string
 }>()
 
 const router = useRouter()
@@ -66,6 +73,9 @@ const authStore = useAuthStore()
 
 /** Whether the tag picker offers to create a tag; creation is staff-only unless the deployment opens it. */
 const canCreateTags = computed(() => authStore.isStaff)
+
+/** Whether the caller reads through a share token alone, which reaches no tags and no annotations. */
+const tokenOnly = computed(() => !!props.shareToken && !authStore.isAuthenticated)
 
 // ── Page ─────────────────────────────────────────────────────────────────
 
@@ -90,7 +100,7 @@ async function load () {
             limit: PAGE_SIZE,
             offset: (page.value - 1) * PAGE_SIZE,
             sort: sort.value,
-        }, filters.value)
+        }, filters.value, props.shareToken)
         if (seq !== loadSeq) {
             return
         }
@@ -111,7 +121,9 @@ async function load () {
 
 onMounted(() => {
     load()
-    loadVocabularies()
+    if (!tokenOnly.value) {
+        loadVocabularies()
+    }
 })
 
 watch(page, load)
@@ -203,7 +215,7 @@ const columns = computed<DataTableColumn<DatasetBrowseRow>[]>(() => [
         format: (row: DatasetBrowseRow) => formatSubjectValue(row.subject[field.key]),
     })),
     { key: 'date', label: t('Date', SCOPE), sortable: true, format: row => formatMonth(row.created_at) },
-    { key: 'tags', label: t('Tags', SCOPE) },
+    ...(tokenOnly.value ? [] : [{ key: 'tags', label: t('Tags', SCOPE) }]),
 ])
 
 function rowKey (row: DatasetBrowseRow) {
@@ -280,7 +292,7 @@ async function openDetails (row: DatasetBrowseRow) {
     codes.value = null
     codesError.value = false
     resetSubjectDraft(row)
-    getRecordingDetail(hash).then(rec => {
+    getRecordingDetail(hash, props.shareToken).then(rec => {
         if (stillShowing(hash)) {
             detail.value = rec
         }
@@ -290,6 +302,9 @@ async function openDetails (row: DatasetBrowseRow) {
             closeDetails()
         }
     })
+    if (tokenOnly.value) {
+        return
+    }
     getRecordingCodes(hash).then(summary => {
         if (stillShowing(hash)) {
             codes.value = summary
@@ -319,11 +334,33 @@ function closeDetails () {
     current.value = null
 }
 
+/**
+ * Open the recordings the current filters match in the viewer, in the browser's order, every recording of the
+ * dataset when nothing is filtered. The link carries the filters and the sort rather than the matching recordings,
+ * so its length does not grow with them.
+ */
+function openMatchingInViewer () {
+    const query: Record<string, string | string[]> = {
+        dataset: props.datasetId,
+        sort: sort.value,
+        ...browseFiltersToQuery(filters.value),
+    }
+    if (props.shareToken) {
+        query.token = props.shareToken
+    }
+    const { href } = router.resolve({ name: 'viewer', query })
+    window.open(href, '_blank')
+}
+
 function openInViewer () {
     if (!current.value) {
         return
     }
-    const { href } = router.resolve({ name: 'viewer', query: { files: current.value.hash } })
+    const query: Record<string, string> = { files: current.value.hash }
+    if (props.shareToken) {
+        query.token = props.shareToken
+    }
+    const { href } = router.resolve({ name: 'viewer', query })
     window.open(href, '_blank')
 }
 
@@ -592,7 +629,6 @@ function standardLabel (group: CodeSummary) {
             <p v-if="!loading || rows.length" class="dataset-browser__summary" role="status">{{ summary }}</p>
             <wa-button v-if="canManage"
                 appearance="plain"
-                class="dataset-browser__batch"
                 :disabled="loading || !total"
                 size="s"
                 variant="brand"
@@ -600,6 +636,16 @@ function standardLabel (group: CodeSummary) {
             >
                 <wa-icon name="tag" slot="start"></wa-icon>
                 {{ t('Tag recordings…', SCOPE) }}
+            </wa-button>
+            <wa-button
+                appearance="plain"
+                :disabled="loading || !total"
+                size="s"
+                variant="brand"
+                @click="openMatchingInViewer"
+            >
+                <wa-icon name="arrow-up-right-from-square" slot="start"></wa-icon>
+                {{ filtered ? t('Open matching in viewer', SCOPE) : t('Open all in viewer', SCOPE) }}
             </wa-button>
         </div>
         <DataTable v-if="!error"
@@ -644,7 +690,7 @@ function standardLabel (group: CodeSummary) {
             <section v-if="subjectFields.length" class="dataset-browser__section">
                 <h3 class="dataset-browser__heading">{{ t('Subject', SCOPE) }}</h3>
                 <div v-if="canManage" class="dataset-browser__subject-form">
-                    <template v-for="field in subjectFields" :key="field.key">
+                    <div v-for="(field, idx) in subjectFields" :key="field.key" class="dataset-browser__subject-row">
                         <wa-input v-if="field.type === 'number'"
                             :disabled="savingSubject"
                             inputmode="decimal"
@@ -665,26 +711,26 @@ function standardLabel (group: CodeSummary) {
                                 {{ choice }}
                             </wa-option>
                         </wa-select>
-                    </template>
-                    <div class="form-actions">
-                        <wa-button
-                            appearance="plain"
-                            :disabled="!subjectChanged || savingSubject"
-                            size="s"
-                            @click="revertSubject"
-                        >
-                            {{ t('Revert', SCOPE) }}
-                        </wa-button>
-                        <wa-button
-                            appearance="filled-outlined"
-                            :disabled="!subjectChanged || subjectInvalid"
-                            :loading="savingSubject"
-                            size="s"
-                            variant="brand"
-                            @click="saveSubject"
-                        >
-                            {{ t('Save', SCOPE) }}
-                        </wa-button>
+                        <div v-if="idx === subjectFields.length - 1" class="form-actions">
+                            <wa-button
+                                appearance="plain"
+                                :disabled="!subjectChanged || savingSubject"
+                                size="s"
+                                @click="revertSubject"
+                            >
+                                {{ t('Revert', SCOPE) }}
+                            </wa-button>
+                            <wa-button
+                                appearance="filled-outlined"
+                                :disabled="!subjectChanged || subjectInvalid"
+                                :loading="savingSubject"
+                                size="s"
+                                variant="brand"
+                                @click="saveSubject"
+                            >
+                                {{ t('Save', SCOPE) }}
+                            </wa-button>
+                        </div>
                     </div>
                 </div>
                 <dl v-else class="wa-stack dataset-browser__list">
@@ -695,7 +741,7 @@ function standardLabel (group: CodeSummary) {
                 </dl>
             </section>
 
-            <section class="dataset-browser__section">
+            <section v-if="!tokenOnly" class="dataset-browser__section">
                 <h3 class="dataset-browser__heading">{{ t('Tags', SCOPE) }}</h3>
                 <TagPicker v-if="canManage"
                     :can-create="canCreateTags"
@@ -719,7 +765,7 @@ function standardLabel (group: CodeSummary) {
                 </div>
             </section>
 
-            <section class="dataset-browser__section">
+            <section v-if="!tokenOnly" class="dataset-browser__section">
                 <h3 class="dataset-browser__heading">{{ t('Codes', SCOPE) }}</h3>
                 <p v-if="codesError" class="dataset-browser__quiet">{{ t('The codes could not be loaded.', SCOPE) }}</p>
                 <wa-spinner v-else-if="codes === null"></wa-spinner>
@@ -831,10 +877,8 @@ function standardLabel (group: CodeSummary) {
     color: var(--wa-color-text-quiet);
     font-size: var(--wa-font-size-s);
     margin: 0;
-}
-
-.dataset-browser__batch {
-    margin-inline-start: auto;
+    /* Holds the buttons at the end of the row, whichever of them a reader is offered. */
+    margin-inline-end: auto;
 }
 
 .dataset-browser__dialog {
@@ -877,6 +921,19 @@ function standardLabel (group: CodeSummary) {
     display: flex;
     flex-direction: column;
     gap: var(--wa-space-s);
+}
+.dataset-browser__subject-row {
+    display: flex;
+    gap: var(--wa-space-s);
+}
+.dataset-browser__subject-row wa-input,
+.dataset-browser__subject-row wa-select {
+    flex: 1;
+}
+
+.dataset-browser__subject-row .form-actions {
+    display: flex;
+    align-items: flex-end;
 }
 
 .dataset-browser__list {

@@ -76,6 +76,10 @@
  *   GET    /api/v1/library/datasets/{id}/browse/      (every dataset declares the same three subject fields, one a
  *                                                       number; a gated one answers as to a reader: displayed fields)
  *   GET    /api/v1/library/catalogue/                 (every gated dataset with members, as released)
+ *   GET    /api/v1/library/public-datasets/           (always served; the rules of library/public_listing.py)
+ *   GET    /api/v1/library/datasets/{id}/public-listing/
+ *   PUT    /api/v1/library/datasets/{id}/public-listing/
+ *   DELETE /api/v1/library/datasets/{id}/public-listing/
  *   PATCH  /api/v1/library/datasets/{id}/recordings/{hash}/subject/
  *   GET    /api/v1/library/recording-tags/
  *   GET    /api/v1/library/tags/                      (a flat set: no tag has a parent)
@@ -176,6 +180,8 @@ interface MockGroup {
     release_gated?: boolean
     /** Datasets only. */
     preload_members?: boolean
+    /** Datasets only: the share-token access right the dataset is listed publicly through. */
+    public_listing_id?: number | null
 }
 
 /**
@@ -1253,6 +1259,54 @@ function maintenanceRefusal(res: ServerResponse, lock: MockLock): true {
     })
     res.end(body)
     return true
+}
+
+/** The recordings among a dataset's members. */
+function mockDatasetRecordings(dsId: number): MockRecording[] {
+    return _state.datasetItems
+        .filter(i => i._parent_id === dsId && i.content_type_id === RECORDING_CT_ID)
+        .map(i => findRecording(i.object_id))
+        .filter((r): r is MockRecording => !!r)
+}
+
+/** Why a dataset cannot be listed through an access right, mirroring library/public_listing.py. */
+function mockListingProblems(ds: MockGroup, rightId: number | null) {
+    const problems: { code: string, detail: string, count: number | null }[] = []
+    if (ds.release_gated) {
+        problems.push({ code: 'release_gated', detail: 'A release-gated dataset cannot be shared by link.', count: null })
+    }
+    const right = _state.datasetAccess.find(a => a.id === rightId && a._parent_id === ds.id)
+    if (rightId !== null && !right?.public_share_token) {
+        problems.push({ code: 'not_share_token', detail: 'Only a share token of this dataset can be listed.', count: null })
+    }
+    const others = _state.datasetItems.filter(i => i._parent_id === ds.id && i.content_type_id !== RECORDING_CT_ID)
+    if (others.length) {
+        problems.push({
+            code: 'other_members',
+            detail: 'Only recordings can be listed; the dataset holds other members.',
+            count: others.length,
+        })
+    }
+    const recordings = mockDatasetRecordings(ds.id)
+    if (!recordings.length) {
+        problems.push({ code: 'no_recordings', detail: 'The dataset holds no recordings.', count: null })
+    }
+    const unsourced = recordings.filter(r => !r.public_source).length
+    if (unsourced) {
+        problems.push({
+            code: 'unsourced_recordings',
+            detail: 'Every recording must name the published dataset it was taken from.',
+            count: unsourced,
+        })
+    }
+    return problems
+}
+
+/** A dataset's public listing as its author sees it. */
+function mockListingOut(ds: MockGroup) {
+    const rightId = ds.public_listing_id ?? null
+    const problems = mockListingProblems(ds, rightId)
+    return { enabled: true, access_right_id: rightId, listed: rightId !== null && !problems.length, problems }
 }
 
 function send(res: ServerResponse, status: number, data: unknown): true {
@@ -2892,6 +2946,54 @@ export async function handleMock(
         return send(res, 200, entries)
     }
 
+    // GET /api/v1/library/public-datasets/ — every dataset listed through a token that still qualifies
+    if (path === '/api/v1/library/public-datasets/' && method === 'GET') {
+        const entries = _state.datasets
+            .filter(ds => ds.public_listing_id != null && !mockListingProblems(ds, ds.public_listing_id).length)
+            .map(ds => {
+                const members = mockDatasetRecordings(ds.id)
+                const token = _state.datasetAccess.find(a => a.id === ds.public_listing_id)?.public_share_token ?? ''
+                return {
+                    object_hash: String(ds.id),
+                    name: ds.name,
+                    description: ds.description,
+                    license_spdx: null,
+                    license_url: null,
+                    recording_count: members.length,
+                    modalities: [...new Set(members.map(r => r.modality).filter(Boolean))].sort(),
+                    public_sources: [...new Set(members.map(r => r.public_source ?? ''))].sort(),
+                    subject_fields: MOCK_SUBJECT_FIELDS.map(f => f.label),
+                    share_token: token,
+                }
+            })
+            .sort((a, b) => a.name.localeCompare(b.name))
+        return send(res, 200, entries)
+    }
+
+    // GET|PUT|DELETE /api/v1/library/datasets/{id}/public-listing/
+    {
+        const m = path.match(/^\/api\/v1\/library\/datasets\/(\d+)\/public-listing\/$/)
+        if (m) {
+            const ds = _state.datasets.find(d => d.id === Number(m[1]))
+            if (!ds) return notFound(res)
+            if (method === 'PUT') {
+                const body = await readBody(req)
+                const rightId = Number(body.access_right_id)
+                if (!_state.datasetAccess.some(a => a.id === rightId && a._parent_id === ds.id)) return notFound(res)
+                const problems = mockListingProblems(ds, rightId)
+                if (problems.length) {
+                    return conflict(res, problems.map(p => p.detail).join(' '))
+                }
+                ds.public_listing_id = rightId
+            } else if (method === 'DELETE') {
+                ds.public_listing_id = null
+            } else if (method !== 'GET') {
+                return false
+            }
+            return send(res, 200, mockListingOut(ds))
+        }
+    }
+
     // GET /api/v1/library/datasets/{id}/browse/ — the mock caller manages every ungated dataset, so every field is
     // shown there; a gated one is answered as to a reader, with its displayed fields only
     {
@@ -3180,6 +3282,11 @@ export async function handleMock(
             const idx = _state.datasetAccess.findIndex(a => a.id === rightId && a._parent_id === dsId)
             if (idx === -1) return notFound(res)
             _state.datasetAccess.splice(idx, 1)
+            // Revoking the listed token unlists the dataset, as the server's SET_NULL does.
+            const ds = _state.datasets.find(d => d.id === dsId)
+            if (ds?.public_listing_id === rightId) {
+                ds.public_listing_id = null
+            }
             return noContent(res)
         }
     }

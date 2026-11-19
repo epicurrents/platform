@@ -35,6 +35,7 @@ function onHide () {
 <template>
     <wa-drawer
         :label="label"
+        light-dismiss
         :open="open"
         @wa-hide.self="onHide"
     >

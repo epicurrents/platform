@@ -388,7 +388,7 @@ function onListPointerdown (event: PointerEvent) {
 .tag-picker {
     display: flex;
     flex-direction: column;
-    gap: var(--wa-space-xs);
+    gap: var(--wa-space-s);
 }
 
 .tag-picker__chips {
