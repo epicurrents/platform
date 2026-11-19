@@ -1,7 +1,7 @@
 /**
- * Tests for the dataset browser's client calls: the item listing read to its end for the folder tree, the repeated
- * `hash` parameter of the tag lookup, the subject write naming what to clear, the filters as repeated parameters,
- * the tag search, tagging by hash, and the batch tagging sending the browser's filters.
+ * Tests for the library's client calls: the collection, collection item and dataset item listings read to their end,
+ * the repeated `hash` parameter of the tag lookup, the subject write naming what to clear, the filters as repeated
+ * parameters, the tag search, tagging by hash, and the batch tagging sending the browser's filters.
  */
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
@@ -16,6 +16,8 @@ vi.mock('#lib/http', () => ({
 
 import {
     browseDataset,
+    listAllCollectionItems,
+    listAllCollections,
     listAllDatasetItems,
     listRecordingTags,
     listTags,
@@ -68,6 +70,36 @@ describe('listAllDatasetItems', () => {
         mockGet.mockResolvedValueOnce(page(1))
         await listAllDatasetItems('abc', 'token')
         expect(mockGet.mock.calls[0][1]?.params).toEqual({ limit: 200, offset: 0, share_token: 'token' })
+    })
+})
+
+describe('listAllCollectionItems', () => {
+    it('reads past the first page, which a dataset made from the collection needs whole', async () => {
+        mockGet.mockResolvedValueOnce(page(200)).mockResolvedValueOnce(page(200, 200)).mockResolvedValueOnce(page(0, 400))
+        const items = await listAllCollectionItems(7)
+        expect(items).toHaveLength(400)
+        expect(mockGet.mock.calls.map(call => [call[0], call[1]?.params])).toEqual([
+            ['/api/v1/library/collections/7/items/', { limit: 200, offset: 0 }],
+            ['/api/v1/library/collections/7/items/', { limit: 200, offset: 200 }],
+            ['/api/v1/library/collections/7/items/', { limit: 200, offset: 400 }],
+        ])
+    })
+})
+
+describe('listAllCollections', () => {
+    it('reads the children of a parent to the end', async () => {
+        mockGet.mockResolvedValueOnce(page(200)).mockResolvedValueOnce(page(12, 200))
+        expect(await listAllCollections(3)).toHaveLength(212)
+        expect(mockGet.mock.calls.map(call => call[1]?.params)).toEqual([
+            { parent_id: 3, limit: 200, offset: 0 },
+            { parent_id: 3, limit: 200, offset: 200 },
+        ])
+    })
+
+    it('reads the roots with no parent', async () => {
+        mockGet.mockResolvedValueOnce(page(5))
+        await listAllCollections()
+        expect(mockGet.mock.calls[0][1]?.params).toEqual({ parent_id: undefined, limit: 200, offset: 0 })
     })
 })
 

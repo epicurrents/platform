@@ -159,6 +159,33 @@ export async function listCollections(params?: { parent_id?: number; limit?: num
     return response.data
 }
 
+/** The page size the `listAll*` readers ask for: the most a library listing serves at once. */
+const PAGE_SIZE = 200
+
+/**
+ * Every row of a paged listing, read a page at a time until a short page.
+ * @param fetchPage - Reads one page from `offset`, at most `PAGE_SIZE` rows.
+ */
+async function readAllPages<T> (fetchPage: (offset: number) => Promise<T[]>): Promise<T[]> {
+    const rows: T[] = []
+    for (;;) {
+        const page = await fetchPage(rows.length)
+        rows.push(...page)
+        if (page.length < PAGE_SIZE) {
+            return rows
+        }
+    }
+}
+
+/**
+ * Every root collection, or every child of `parentId`, read to the end: a listing that stops at the server's page
+ * would leave collections out of a tree with nothing to show it.
+ * @param parentId - The parent collection; omitted for the roots.
+ */
+export async function listAllCollections(parentId?: number): Promise<Collection[]> {
+    return readAllPages(offset => listCollections({ parent_id: parentId, limit: PAGE_SIZE, offset }))
+}
+
 export async function getCollection(id: number): Promise<Collection> {
     const response = await http.get<Collection>(`/api/v1/library/collections/${id}/`)
     return response.data
@@ -203,6 +230,15 @@ export async function listCollectionItems(collectionId: number, params?: { conte
     return response.data
 }
 
+/**
+ * Every item of a collection, read to the end. A selection, a dataset made from one or a name check against one
+ * covers the whole collection, which a single page does not.
+ * @param collectionId - The collection.
+ */
+export async function listAllCollectionItems(collectionId: number): Promise<CollectionItem[]> {
+    return readAllPages(offset => listCollectionItems(collectionId, { limit: PAGE_SIZE, offset }))
+}
+
 export async function addCollectionItem(collectionId: number, payload: { content_type_id: number; object_id: string }): Promise<CollectionItem> {
     const response = await http.post<CollectionItem>(`/api/v1/library/collections/${collectionId}/items/`, payload)
     return response.data
@@ -231,6 +267,11 @@ export async function moveCollectionItem(
 export async function listDatasets(params?: { limit?: number; offset?: number }): Promise<Collection[]> {
     const response = await http.get<Collection[]>('/api/v1/library/datasets/', { params })
     return response.data
+}
+
+/** Every dataset the caller can read, read to the end. */
+export async function listAllDatasets(): Promise<Collection[]> {
+    return readAllPages(offset => listDatasets({ limit: PAGE_SIZE, offset }))
 }
 
 export async function getDataset(id: number | string, shareToken?: string): Promise<Collection> {
@@ -374,23 +415,13 @@ export async function listDatasetItems(datasetId: number | string, params?: { co
     return response.data
 }
 
-/** The page size `listAllDatasetItems` asks for: the most the item listing serves at once. */
-const ITEM_PAGE_SIZE = 200
-
 /**
  * Every item of a dataset, read a page at a time until a short page. The folder tree groups the whole membership,
  * so it cannot be shown one page at a time; the browser is the paged view of a large dataset.
  * @param datasetId - The dataset's object hash or primary key.
  */
 export async function listAllDatasetItems(datasetId: number | string, shareToken?: string): Promise<DatasetItem[]> {
-    const items: DatasetItem[] = []
-    for (;;) {
-        const page = await listDatasetItems(datasetId, { limit: ITEM_PAGE_SIZE, offset: items.length }, shareToken)
-        items.push(...page)
-        if (page.length < ITEM_PAGE_SIZE) {
-            return items
-        }
-    }
+    return readAllPages(offset => listDatasetItems(datasetId, { limit: PAGE_SIZE, offset }, shareToken))
 }
 
 export async function addDatasetItem(datasetId: number | string, payload: { content_type_id: number; object_id: string }): Promise<CollectionItem> {

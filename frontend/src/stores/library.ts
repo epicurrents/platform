@@ -1,9 +1,9 @@
 import { defineStore } from 'pinia'
 import { ref } from 'vue'
 import {
-    listCollections,
+    listAllCollections,
     createCollection,
-    listDatasets,
+    listAllDatasets,
     createDataset,
     type Collection,
 } from '#api/library'
@@ -25,7 +25,7 @@ export const useLibraryStore = defineStore('library', () => {
         collectionsLoading.value = true
         collectionsError.value = null
         try {
-            collections.value = await listCollections()
+            collections.value = await listAllCollections()
         } catch (e) {
             collectionsError.value = e instanceof Error ? e.message : 'Failed to load collections'
         } finally {
@@ -54,7 +54,7 @@ export const useLibraryStore = defineStore('library', () => {
         datasetsLoading.value = true
         datasetsError.value = null
         try {
-            datasets.value = await listDatasets()
+            datasets.value = await listAllDatasets()
         } catch (e) {
             datasetsError.value = e instanceof Error ? e.message : 'Failed to load datasets'
         } finally {

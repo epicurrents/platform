@@ -756,6 +756,33 @@ def _enrich_collection_items(items: list, user) -> list[dict]:
     return result
 
 
+def _listable_items(qs):
+    """Narrow a ``CollectionItem`` or ``DatasetItem`` queryset to the rows ``_enrich_collection_items`` serves.
+
+    Leaves out the items whose recording is trashed, FAILED or gone, and whose media file is trashed or gone, which
+    the enrichment would drop. Applied before a page is sliced, so a page comes back short only at the end of the
+    listing: a client reading pages until a short one reads every row, and its next offset is the rows it holds.
+    """
+    from django.db.models import CharField, Q
+    from django.db.models.functions import Cast
+
+    from media.models import MediaFile
+    from recordings.models import Recording
+
+    live_recordings = (
+        Recording.objects.filter(deleted_at__isnull=True)
+        .exclude(status=Recording.Status.FAILED)
+        .annotate(key=Cast("pk", CharField()))
+        .values("key")
+    )
+    live_media = MediaFile.objects.filter(deleted_at__isnull=True).annotate(key=Cast("pk", CharField())).values("key")
+    recording_ct = ContentType.objects.get_for_model(Recording, for_concrete_model=False)
+    media_ct = ContentType.objects.get_for_model(MediaFile, for_concrete_model=False)
+    return qs.exclude(Q(content_type=recording_ct) & ~Q(object_id__in=live_recordings)).exclude(
+        Q(content_type=media_ct) & ~Q(object_id__in=live_media)
+    )
+
+
 # ---------------------------------------------------------------------------
 # Collection CRUD
 # ---------------------------------------------------------------------------
@@ -809,21 +836,21 @@ def list_collections(
         qs = Collection.objects.filter(
             parent_id=parent_id,
             deleted_at__isnull=not trash,
-        ).order_by("name")
+        ).order_by("name", "pk")
         visible = list(qs[offset : offset + limit])
     elif trash:
         qs = Collection.objects.filter(
             deleted_at__isnull=False,
             author=user,
-        ).order_by("-deleted_at")
+        ).order_by("-deleted_at", "pk")
         visible = list(qs[offset : offset + limit])
     elif getattr(user, "is_superuser", False):
-        qs = Collection.objects.filter(parent__isnull=True, deleted_at__isnull=True).order_by("name")
+        qs = Collection.objects.filter(parent__isnull=True, deleted_at__isnull=True).order_by("name", "pk")
         visible = list(qs[offset : offset + limit])
     else:
         # Collections are author-private, so a plain author filter is the
         # complete visibility rule — no per-row permission walk.
-        qs = Collection.objects.filter(parent__isnull=True, deleted_at__isnull=True, author=user).order_by("name")
+        qs = Collection.objects.filter(parent__isnull=True, deleted_at__isnull=True, author=user).order_by("name", "pk")
         visible = list(qs[offset : offset + limit])
 
     log_activity(
@@ -1022,15 +1049,15 @@ def list_items(
     if not (getattr(user, "is_superuser", False) or collection.author_id == user.pk):
         ensure_can_read_collection(user=user, collection=collection)
 
-    qs = CollectionItem.objects.filter(collection=collection, deleted_at__isnull=True)
+    qs = _listable_items(CollectionItem.objects.filter(collection=collection, deleted_at__isnull=True))
     if content_type_id is not None:
         qs = qs.filter(content_type_id=content_type_id)
 
     # Superusers see everything without per-item checks.
     if getattr(user, "is_superuser", False):
-        items = list(qs.order_by("added_at")[offset : offset + limit])
+        items = list(qs.order_by("added_at", "pk")[offset : offset + limit])
     else:
-        items = _filter_readable(user, qs, order_by="added_at", offset=offset, limit=limit)
+        items = _filter_readable(user, qs, order_by=("added_at", "pk"), offset=offset, limit=limit)
     log_activity(
         verb="library.collection.item.list",
         target=collection,
@@ -1403,7 +1430,7 @@ def export_collection_to_dataset(request, collection_id: int, payload: Collectio
     }
 
 
-def _filter_readable(user, qs, order_by: str, offset: int, limit: int) -> list:
+def _filter_readable(user, qs, order_by: str | tuple[str, ...], offset: int, limit: int) -> list:
     """Iterate *qs* and return up to *limit* items the user can read.
 
     Handles pagination correctly even when items are filtered out: skips
@@ -1413,7 +1440,8 @@ def _filter_readable(user, qs, order_by: str, offset: int, limit: int) -> list:
     """
     visible = []
     skipped = 0
-    for item in qs.select_related("content_type").order_by(order_by).iterator():
+    ordering = (order_by,) if isinstance(order_by, str) else order_by
+    for item in qs.select_related("content_type").order_by(*ordering).iterator():
         if user_can_read_item(user, item.content_type, item.object_id):
             if skipped < offset:
                 skipped += 1
@@ -1587,17 +1615,19 @@ def list_datasets(
 
     if trash:
         qs = (
-            Dataset.objects.filter(deleted_at__isnull=False, author=user).select_related("meta").order_by("-deleted_at")
+            Dataset.objects.filter(deleted_at__isnull=False, author=user)
+            .select_related("meta")
+            .order_by("-deleted_at", "pk")
         )
         visible = [_dataset_out(d) for d in qs[offset : offset + limit]]
     elif getattr(user, "is_superuser", False):
-        qs = Dataset.objects.filter(deleted_at__isnull=True).select_related("meta").order_by("name")
+        qs = Dataset.objects.filter(deleted_at__isnull=True).select_related("meta").order_by("name", "pk")
         visible = [_dataset_out(d) for d in qs[offset : offset + limit]]
     else:
         visible = []
         skipped = 0
         for dataset in (
-            Dataset.objects.filter(deleted_at__isnull=True).select_related("meta").order_by("name").iterator()
+            Dataset.objects.filter(deleted_at__isnull=True).select_related("meta").order_by("name", "pk").iterator()
         ):
             if dataset.author_id == user.pk or can_read_object(user=user, obj=dataset):
                 if skipped < offset:
@@ -2265,6 +2295,7 @@ def list_dataset_items(
     ):
         raise HttpError(403, "You do not have permission to view this dataset")
     qs, manager = _visible_members(dataset, user, share_token)
+    qs = _listable_items(qs)
     if dataset.release_gated:
         # A gated dataset orders by name: added_at is the arrival order the release month hides.
         qs = qs.select_related("release").annotate(sort_name=member_name_subquery()).order_by("sort_name", "object_id")

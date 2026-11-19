@@ -1440,6 +1440,18 @@ function mockBrowseQuery(dsId: number, query: URLSearchParams) {
     return { fields, subjectOf, tagFilter, passes, all }
 }
 
+/**
+ * One page of a listing, by the request's `limit` and `offset` with the server's default of 50, so a client
+ * reading pages until a short one stops here as it does against the server.
+ * @param rows - Every row of the listing, in its order.
+ * @param query - The request's query parameters.
+ */
+function mockPage<T>(rows: T[], query: URLSearchParams): T[] {
+    const limit = Number(query.get('limit') ?? 50)
+    const offset = Number(query.get('offset') ?? 0)
+    return rows.slice(offset, offset + limit)
+}
+
 /** Strip internal _parent_id before sending an item to the client. */
 function itemOut(item: MockItem) {
     const { _parent_id: _, ...rest } = item
@@ -2545,7 +2557,13 @@ export async function handleMock(
 
     if (path === '/api/v1/library/collections/') {
         if (method === 'GET') {
-            return send(res, 200, _state.collections.filter(c => !c.deleted_at))
+            // The roots, or a parent's children, a page at a time as the server pages them.
+            const query = new URL(req.url ?? path, 'http://mock').searchParams
+            const parentId = query.get('parent_id') === null ? null : Number(query.get('parent_id'))
+            const rows = _state.collections
+                .filter(c => !c.deleted_at && (c.parent_id ?? null) === parentId)
+                .sort((a, b) => a.name.localeCompare(b.name) || a.id - b.id)
+            return send(res, 200, mockPage(rows, query))
         }
         if (method === 'POST') {
             const body = await readBody(req)
@@ -2646,7 +2664,9 @@ export async function handleMock(
         if (m) {
             const collId = Number(m[1])
             if (method === 'GET') {
-                return send(res, 200, _state.collectionItems.filter(i => i._parent_id === collId && !i.deleted_at).map(itemOut))
+                const query = new URL(req.url ?? path, 'http://mock').searchParams
+                const rows = _state.collectionItems.filter(i => i._parent_id === collId && !i.deleted_at)
+                return send(res, 200, mockPage(rows, query).map(itemOut))
             }
             if (method === 'POST') {
                 const body = await readBody(req)
@@ -2746,7 +2766,8 @@ export async function handleMock(
 
     if (path === '/api/v1/library/datasets/') {
         if (method === 'GET') {
-            return send(res, 200, _state.datasets.filter(d => !d.deleted_at))
+            const query = new URL(req.url ?? path, 'http://mock').searchParams
+            return send(res, 200, mockPage(_state.datasets.filter(d => !d.deleted_at), query))
         }
         if (method === 'POST') {
             const body = await readBody(req)

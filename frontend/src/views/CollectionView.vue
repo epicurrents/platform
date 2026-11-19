@@ -15,9 +15,9 @@ import {
     updateCollection,
     deleteCollection,
     bulkRenameCollectionRecordings,
-    listCollections,
+    listAllCollections,
     createCollection,
-    listCollectionItems,
+    listAllCollectionItems,
     addCollectionItem,
     removeCollectionItem,
     moveCollectionItem,
@@ -56,8 +56,8 @@ async function loadCollection () {
     try {
         const [col, its, subs] = await Promise.all([
             getCollection(collectionId.value),
-            listCollectionItems(collectionId.value),
-            listCollections({ parent_id: collectionId.value }),
+            listAllCollectionItems(collectionId.value),
+            listAllCollections(collectionId.value),
         ])
         collection.value = col
         items.value = its
@@ -289,8 +289,8 @@ async function onMovePickerSelect (selection: PickerSelection) {
     try {
         if (target) {
             const [targetItems, targetSubs] = await Promise.all([
-                listCollectionItems(target.id),
-                listCollections({ parent_id: target.id }),
+                listAllCollectionItems(target.id),
+                listAllCollections(target.id),
             ])
             targetItemNames = new Set(
                 targetItems.map(i => i.object_name).filter((n): n is string => !!n),
@@ -298,8 +298,8 @@ async function onMovePickerSelect (selection: PickerSelection) {
             targetSubNames = new Set(targetSubs.map(s => s.name))
         } else {
             // Root: only check subcollection name collisions against root
-            // collections.  listCollections() with no parent_id returns roots.
-            const rootSubs = await listCollections()
+            // collections. listAllCollections() with no parent returns roots.
+            const rootSubs = await listAllCollections()
             targetSubNames = new Set(rootSubs.map(s => s.name))
         }
     } catch {

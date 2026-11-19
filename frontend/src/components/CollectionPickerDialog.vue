@@ -2,9 +2,9 @@
 import { reactive, ref, computed, watch, nextTick } from 'vue'
 import { t } from '#i18n'
 import {
-    listCollections,
+    listAllCollections,
     createCollection,
-    listCollectionItems,
+    listAllCollectionItems,
     type Collection,
     type CollectionItem,
 } from '#api/library'
@@ -102,8 +102,8 @@ async function _loadChildren (parentId: number | null) {
     }
     try {
         const children = parentId === null
-            ? await listCollections()
-            : await listCollections({ parent_id: parentId, limit: 200 })
+            ? await listAllCollections()
+            : await listAllCollections(parentId)
         loadedChildren.set(parentId, children)
     } catch {
         loadedChildren.set(parentId, [])
@@ -151,7 +151,7 @@ watch(currentParentId, async (id) => {
     }
     loadingItems.value = true
     try {
-        currentItems.value = await listCollectionItems(id)
+        currentItems.value = await listAllCollectionItems(id)
     } catch {
         currentItems.value = []
     } finally {

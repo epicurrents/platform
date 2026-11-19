@@ -3,7 +3,7 @@ import { computed, onMounted, reactive, ref } from 'vue'
 import { t } from '#i18n'
 import { downloadAnnotationExport, listExportAnnotators, listExportTypes } from '#api/annotationExport'
 import type { ExportAnnotator, ExportFormat, ExportType, ExportTypeChoice } from '#api/annotationExport'
-import { listDatasets } from '#api/library'
+import { listAllDatasets } from '#api/library'
 import type { Collection } from '#api/library'
 import { readBlobError } from '#lib/download'
 import { showToast } from '#lib/toast'
@@ -89,8 +89,7 @@ onMounted(async () => {
         showToast(t('Could not load the annotation type list; only events and labels are offered.', SCOPE), 'warning')
     }
     try {
-        // 200 is the server-side maximum for the datasets listing (422 above it).
-        datasets.value = await listDatasets({ limit: 200 })
+        datasets.value = await listAllDatasets()
     } catch {
         // A dataset list is a convenience filter, not a precondition for exporting.
         showToast(t('Could not load the dataset list; the dataset filter is unavailable.', SCOPE), 'warning')

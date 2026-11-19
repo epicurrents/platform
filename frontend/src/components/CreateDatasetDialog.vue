@@ -25,8 +25,8 @@ import CollectionTreeItem, { TREE_CTX_KEY } from '#components/CollectionTreeItem
 import type { TreeContext } from '#components/CollectionTreeItem.vue'
 import {
     getCollection,
-    listCollections,
-    listCollectionItems,
+    listAllCollections,
+    listAllCollectionItems,
     createDataset,
     type Collection,
     type CollectionItem,
@@ -138,8 +138,8 @@ function loadCollection (id: number): Promise<void> {
         loadingIds.add(id)
         try {
             const [children, items] = await Promise.all([
-                listCollections({ parent_id: id, limit: 200 }),
-                listCollectionItems(id, { limit: 200 }),
+                listAllCollections(id),
+                listAllCollectionItems(id),
             ])
             loadedChildren.set(id, children)
             loadedItems.set(id, items)
@@ -325,7 +325,7 @@ watch(() => props.open, async (open) => {
     _reset()
     rootLoading.value = true
     try {
-        rootCollections.value = await listCollections({ limit: 200 })
+        rootCollections.value = await listAllCollections()
     } catch {
         showToast(t('Failed to load library.', SCOPE), 'danger')
     } finally {

@@ -5,7 +5,7 @@ import { t } from '#i18n'
 import { showToast } from '#lib/toast'
 import { useAuthStore } from '#stores/auth'
 import { getRecordingDetail, recordingName } from '#api/recordings'
-import { getDataset, listDatasetItems } from '#api/library'
+import { getDataset, listAllDatasetItems } from '#api/library'
 import { getMediaDetail, listMediaFiles, type MediaFileDetail, type MediaFileSummary } from '#api/media'
 import type {
     BiosignalResource,
@@ -222,7 +222,7 @@ const emptyMode = computed(() =>
 async function loadDatasetBundle(id: number | string, token: string | undefined): Promise<DatasetBundle> {
     const [dataset, items] = await Promise.all([
         getDataset(id, token),
-        listDatasetItems(id, undefined, token),
+        listAllDatasetItems(id, token),
     ])
     // Preserve dataset order; resolve each item to its detail row (or null
     // when the item type / state is not viewable). Unsupported media files

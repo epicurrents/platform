@@ -263,7 +263,7 @@ A rejected role value aborts the rename with it — the server writes both in on
 | File | Backend prefix | Covers |
 |---|---|---|
 | `recordings.ts` | `/recordings/api/v1/` | List, upload, status, patch (rename/modality), delete |
-| `library.ts` | `/api/v1/library/` | Collections, datasets, their items and access rights; the dataset browser's page with its filters, the tags of many recordings, a member's subject values, and the catalogue; tags, their name search and creation, tagging one object by hash, and tagging the members a browser query matches with the same filters the page sends. `listAllDatasetItems` reads the item listing to its end |
+| `library.ts` | `/api/v1/library/` | Collections, datasets, their items and access rights; the dataset browser's page with its filters, the tags of many recordings, a member's subject values, and the catalogue; tags, their name search and creation, tagging one object by hash, and tagging the members a browser query matches with the same filters the page sends. `listAllCollections`, `listAllCollectionItems`, `listAllDatasets` and `listAllDatasetItems` read a listing to its end, and every view, picker and dialog that shows or acts on a whole collection or dataset uses them: the server serves at most 200 rows a page, and a caller reading one page leaves the rest out with nothing to show it |
 | `annotations.ts` | `/annotations/api/v1/` | The code summary of a recording, and the registered vocabularies |
 | `user.ts` | `/api/v1/user/` | Login, logout, me, password change |
 | `admin.ts` | `/api/v1/user/admin/` | Account and group administration; `rolesPayload` builds the partial role map, `rolesForGroup` picks the roles a group takes |
