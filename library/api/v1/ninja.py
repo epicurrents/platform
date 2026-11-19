@@ -3400,6 +3400,7 @@ def _check_no_tag_cycle(tag: Tag, new_parent_id: int):
 def list_tags(
     request,
     parent_id: int | None = Query(None, description="List children of this tag. Omit for root tags."),
+    q: str = Query("", max_length=100, description="List the tags whose name contains this, at every level."),
     limit: int = Query(50, ge=1, le=200),
     offset: int = Query(0, ge=0),
 ):
@@ -3407,18 +3408,25 @@ def list_tags(
 
     - Omit ``parent_id`` to list root-level tags (no parent).
     - Pass ``parent_id`` to list direct children of a tag.
+    - Pass ``q`` to list the tags whose name contains it, case-insensitively, at every level of the tree, or under
+      ``parent_id`` when one is given; the search a tag picker types into.
 
     Reach is ``library.tag_scope``: curated tags, the caller's own, the tags on
     objects the caller can read, and their ancestors. Superusers see every tag.
     """
     user = _require_auth(request)
     reachable = visible_tag_ids(user)
+    search = q.strip()
     if parent_id is not None:
         if not Tag.objects.filter(pk=parent_id).exists() or (reachable is not None and parent_id not in reachable):
             raise HttpError(404, "Tag not found")
         qs = Tag.objects.filter(parent_id=parent_id).order_by("name")
+    elif search:
+        qs = Tag.objects.order_by("name")
     else:
         qs = Tag.objects.filter(parent__isnull=True).order_by("name")
+    if search:
+        qs = qs.filter(name__icontains=search)
     if reachable is not None:
         qs = qs.filter(pk__in=reachable)
     tags = list(qs[offset : offset + limit])
@@ -3426,6 +3434,7 @@ def list_tags(
         verb="library.tag.list",
         metadata={
             "parent_id": parent_id,
+            "searched": bool(search),
             "limit": limit,
             "offset": offset,
             "returned_count": len(tags),

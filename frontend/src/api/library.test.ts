@@ -1,21 +1,37 @@
 /**
  * Tests for the dataset browser's client calls: the item listing read to its end for the folder tree, the repeated
- * `hash` parameter of the tag lookup, the subject write naming what to clear, and the filters as repeated parameters.
+ * `hash` parameter of the tag lookup, the subject write naming what to clear, the filters as repeated parameters,
+ * the tag search, tagging by hash, and the batch tagging sending the browser's filters.
  */
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 vi.mock('#lib/http', () => ({
     http: {
+        delete: vi.fn(),
         get: vi.fn(),
         patch: vi.fn(),
+        post: vi.fn(),
     },
 }))
 
-import { browseDataset, listAllDatasetItems, listRecordingTags, updateDatasetMemberSubject } from './library'
+import {
+    browseDataset,
+    listAllDatasetItems,
+    listRecordingTags,
+    listTags,
+    tagDatasetMembers,
+    tagObject,
+    untagDatasetMembers,
+    untagObject,
+    updateDatasetMemberSubject,
+    type DatasetBrowseFilters,
+} from './library'
 import { http } from '#lib/http'
 
+const mockDelete = vi.mocked(http.delete)
 const mockGet = vi.mocked(http.get)
 const mockPatch = vi.mocked(http.patch)
+const mockPost = vi.mocked(http.post)
 
 /** A page of *count* placeholder items; only the length matters to the paging. */
 function page (count: number, from = 0) {
@@ -23,8 +39,10 @@ function page (count: number, from = 0) {
 }
 
 beforeEach(() => {
+    mockDelete.mockReset()
     mockGet.mockReset()
     mockPatch.mockReset()
+    mockPost.mockReset()
 })
 
 describe('listAllDatasetItems', () => {
@@ -113,5 +131,83 @@ describe('browseDataset', () => {
         await browseDataset('abc', { sort: 'name' })
         const params = mockGet.mock.calls[0][1]?.params as URLSearchParams
         expect([...params.keys()]).toEqual(['sort'])
+    })
+})
+
+describe('listTags', () => {
+    it('sends the search and leaves out an empty one', async () => {
+        mockGet.mockResolvedValue({ data: [] })
+        await listTags({ q: 'norm', limit: 20 })
+        await listTags({ q: '' })
+        expect(mockGet.mock.calls[0]).toEqual([
+            '/api/v1/library/tags/',
+            { params: { q: 'norm', parent_id: undefined, limit: 20, offset: undefined } },
+        ])
+        expect(mockGet.mock.calls[1][1]?.params).toEqual({
+            q: undefined,
+            parent_id: undefined,
+            limit: undefined,
+            offset: undefined,
+        })
+    })
+})
+
+describe('tagging one object', () => {
+    it('names the recording by its hash in the body when tagging', async () => {
+        mockPost.mockResolvedValueOnce({ data: {} })
+        await tagObject(4, 42, 'ab'.repeat(16))
+        expect(mockPost).toHaveBeenCalledWith('/api/v1/library/tags/4/items/', {
+            content_type_id: 42,
+            object_id: 'ab'.repeat(16),
+        })
+    })
+
+    it('names the recording by its hash in the query when untagging', async () => {
+        mockDelete.mockResolvedValueOnce({ data: { status: 'ok' } })
+        await untagObject(4, 42, 'ab'.repeat(16))
+        expect(mockDelete).toHaveBeenCalledWith('/api/v1/library/tags/4/items/', {
+            params: { content_type_id: 42, object_id: 'ab'.repeat(16) },
+        })
+    })
+})
+
+describe('batch tagging', () => {
+    const FILTERS: DatasetBrowseFilters = {
+        modality: ['eeg'],
+        subject: { sex: ['female'] },
+        ranges: { age_years: { max: 12 } },
+        tags: [3],
+    }
+
+    /** The parameters *call* sent, as name and value pairs in order. */
+    function sent (call: unknown[]) {
+        return [...((call[call.length - 1] as { params: URLSearchParams }).params)]
+    }
+
+    it('sends the filters the browser sends', async () => {
+        mockGet.mockResolvedValueOnce({ data: {} })
+        mockPost.mockResolvedValueOnce({ data: {} })
+        mockDelete.mockResolvedValueOnce({ data: {} })
+        await browseDataset('abc', {}, FILTERS)
+        await tagDatasetMembers('abc', 9, FILTERS)
+        await untagDatasetMembers('abc', 9, FILTERS)
+        const browsed = sent(mockGet.mock.calls[0])
+        expect(browsed).toEqual([
+            ['modality', 'eeg'],
+            ['subject.sex', 'female'],
+            ['subject.age_years.max', '12'],
+            ['tag', '3'],
+        ])
+        expect(mockPost.mock.calls[0][0]).toBe('/api/v1/library/datasets/abc/tags/9/')
+        expect(mockPost.mock.calls[0][1]).toBeNull()
+        expect(sent(mockPost.mock.calls[0])).toEqual(browsed)
+        expect(mockDelete.mock.calls[0][0]).toBe('/api/v1/library/datasets/abc/tags/9/')
+        expect(sent(mockDelete.mock.calls[0])).toEqual(browsed)
+    })
+
+    it('sends no parameters without filters, which covers every member', async () => {
+        mockPost.mockResolvedValueOnce({ data: {} })
+        await tagDatasetMembers('abc', 9)
+        expect(sent(mockPost.mock.calls[0])).toEqual([])
     })
 })

@@ -143,6 +143,33 @@ class TestReach:
 
 
 @pytest.mark.django_db
+class TestSearch:
+    def test_matches_names_at_every_level_within_reach(self, world):
+        client = _client_for(world["bob"])
+        assert _ids(client.get(TAGS, {"q": "ROOT"})) == {world["alice_root"].pk, world["bob_root"].pk}
+        assert _ids(client.get(TAGS, {"q": "child"})) == {world["alice_child"].pk}
+
+    def test_leaves_out_what_is_out_of_reach(self, world):
+        assert _ids(_client_for(world["carol"]).get(TAGS, {"q": "r"})) == {world["curated"].pk}
+
+    def test_narrows_to_the_children_of_a_parent(self, world):
+        client = _client_for(world["alice"])
+        assert _ids(client.get(TAGS, {"q": "child", "parent_id": world["alice_root"].pk})) == {world["alice_child"].pk}
+        assert _ids(client.get(TAGS, {"q": "root", "parent_id": world["alice_root"].pk})) == set()
+
+    def test_a_blank_search_lists_the_roots(self, world):
+        assert _ids(_client_for(world["alice"]).get(TAGS, {"q": "  "})) == {world["curated"].pk, world["alice_root"].pk}
+
+    def test_the_audit_row_does_not_carry_the_search(self, world):
+        from activity.models import Activity
+
+        _client_for(world["alice"]).get(TAGS, {"q": "Alice"})
+        row = Activity.objects.filter(verb="library.tag.list").latest("pk")
+        assert row.metadata["searched"] is True
+        assert "Alice" not in json.dumps(row.metadata)
+
+
+@pytest.mark.django_db
 class TestUnreachableTagsAreNotFound:
     """The same 404 as a missing tag, so the id space cannot be walked for names."""
 

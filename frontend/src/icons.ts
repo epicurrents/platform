@@ -73,6 +73,7 @@ import progress_activity from '@material-symbols/svg-400/outlined/progress_activ
 import save from '@material-symbols/svg-400/outlined/save.svg?raw'
 import schedule from '@material-symbols/svg-400/outlined/schedule.svg?raw'
 import school from '@material-symbols/svg-400/outlined/school.svg?raw'
+import sell from '@material-symbols/svg-400/outlined/sell.svg?raw'
 import share from '@material-symbols/svg-400/outlined/share.svg?raw'
 import tune from '@material-symbols/svg-400/outlined/tune.svg?raw'
 import undo from '@material-symbols/svg-400/outlined/undo.svg?raw'
@@ -138,6 +139,7 @@ const ICON_SVGS: Record<string, string> = {
     save,
     schedule,
     school,
+    sell,
     share,
     tune,
     undo,
@@ -210,6 +212,7 @@ const FA_TO_MATERIAL: Record<string, string> = {
     'square':                      'check_box_outline_blank',
     'square-check':                'check_box',
     'sun':                         'light_mode',
+    'tag':                         'sell',
     'trash':                       'delete',
     'triangle-exclamation':        'warning',
     'user':                        'person',

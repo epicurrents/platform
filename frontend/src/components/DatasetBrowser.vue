@@ -9,9 +9,11 @@
  * reader who does not manage a gated dataset gets its displayed fields only. A manager edits a member's subject
  * values in the drawer; the server refuses a released member's, and the refusal is shown as it comes.
  *
- * Filtering is the server's too, and so are the facet counts the filters show. On a release-gated dataset a reader
- * who does not manage it is served no count below k: a filtered page matching fewer members comes back without rows
- * and is shown as such, never as an empty result.
+ * Filtering is the server's too, and so are the facet counts the filters show.
+ *
+ * A manager tags and untags a recording in the drawer, and every recording the current filters match at once from
+ * "Tag recordings…" (`POST` / `DELETE /datasets/{id}/tags/{tid}/`), which sends the same filters the page was fetched
+ * with. A member the caller may not change is skipped by the server and counted in the outcome.
  *
  * @package    epicurrents-platform
  */
@@ -20,11 +22,17 @@ import { useRouter } from 'vue-router'
 import { t } from '#i18n'
 import {
     browseDataset,
+    getRecordingContentTypeId,
     listRecordingTags,
+    tagDatasetMembers,
+    tagObject,
+    untagDatasetMembers,
+    untagObject,
     updateDatasetMemberSubject,
     type DatasetBrowseFilters,
     type DatasetBrowseRow,
     type DatasetFacets,
+    type DatasetTagBatch,
     type SubjectField,
     type SubjectValue,
     type TagChip,
@@ -37,10 +45,14 @@ import { showToast } from '#lib/toast'
 import DataTable, { type DataTableColumn } from '#components/DataTable.vue'
 import DatasetBrowserFilters from '#components/DatasetBrowserFilters.vue'
 import RecordingDetailsDrawer from '#components/RecordingDetailsDrawer.vue'
+import TagPicker from '#components/TagPicker.vue'
+import { useAuthStore } from '#stores/auth'
 
 const SCOPE = 'DatasetBrowser'
 const PAGE_SIZE = 50
 const SUBJECT_PREFIX = 'subject.'
+/** The most recordings one batch tagging covers; the server refuses a query matching more. */
+const MAX_BATCH_TAGGED = 5000
 
 const props = defineProps<{
     /** The dataset's object hash or primary key. */
@@ -50,6 +62,10 @@ const props = defineProps<{
 }>()
 
 const router = useRouter()
+const authStore = useAuthStore()
+
+/** Whether the tag picker offers to create a tag; creation is staff-only unless the deployment opens it. */
+const canCreateTags = computed(() => authStore.isStaff)
 
 // ── Page ─────────────────────────────────────────────────────────────────
 
@@ -131,7 +147,7 @@ const filtered = computed(() => {
         || Object.keys(ranges).length > 0
 })
 
-/** The line above the table: how many recordings match; empty when too few match to say, which the table says. */
+/** The line above the table: how many recordings match. */
 const summary = computed(() => {
     if (filtered.value) {
         return t('{count} matching recordings', SCOPE, { count: total.value })
@@ -207,6 +223,10 @@ function hiddenTagCount (row: DatasetBrowseRow) {
 const current = ref<DatasetBrowseRow | null>(null)
 const detail = ref<Recording | null>(null)
 const tags = ref<TagChip[]>([])
+/** Whether `tags` holds every tag of the open recording, not only the row's first ones; the picker waits for it. */
+const tagsLoaded = ref(false)
+/** Whether reading the open recording's full tag list failed, which leaves the picker read-only. */
+const tagsFailed = ref(false)
 const codes = ref<CodeSummary[] | null>(null)
 const codesError = ref(false)
 // Each field's value as the form holds it: a choice, or a number field's value as typed; empty for none.
@@ -255,6 +275,8 @@ async function openDetails (row: DatasetBrowseRow) {
     current.value = row
     detail.value = null
     tags.value = row.tags
+    tagsLoaded.value = row.tag_count <= row.tags.length
+    tagsFailed.value = false
     codes.value = null
     codesError.value = false
     resetSubjectDraft(row)
@@ -280,11 +302,15 @@ async function openDetails (row: DatasetBrowseRow) {
     if (row.tag_count > row.tags.length) {
         try {
             const [answer] = await listRecordingTags([hash])
-            if (stillShowing(hash) && answer) {
-                tags.value = answer.tags
+            if (stillShowing(hash)) {
+                tags.value = answer?.tags ?? []
+                tagsLoaded.value = true
             }
         } catch {
-            // The row's first tags stay shown; the drawer says how many there are.
+            // The row's first tags stay shown, and the picker stays read-only rather than editing a partial list.
+            if (stillShowing(hash)) {
+                tagsFailed.value = true
+            }
         }
     }
 }
@@ -347,6 +373,186 @@ function revertSubject () {
     }
 }
 
+// ── Tagging ──────────────────────────────────────────────────────────────
+
+const savingTags = ref(false)
+
+/**
+ * Show the tags the open recording carries after a write, in the drawer and in its row: the server's list, read
+ * again so the order and the count are the server's, or *fallback* when that read fails.
+ * @param row - The row written.
+ * @param fallback - Every tag the recording carries as the write implies, from the tags shown before it.
+ */
+async function showTagsAfterWrite (row: DatasetBrowseRow, fallback: TagChip[]) {
+    let next = fallback
+    try {
+        const [answer] = await listRecordingTags([row.hash])
+        next = answer?.tags ?? []
+    } catch {
+        // The write landed; the drawer shows what it implies.
+    }
+    row.tags = next.slice(0, 3)
+    row.tag_count = next.length
+    if (stillShowing(row.hash)) {
+        tags.value = next
+    }
+}
+
+/**
+ * Tag the open recording.
+ * @param tag - The tag picked.
+ */
+async function addTag (tag: TagChip) {
+    const row = current.value
+    if (!row) {
+        return
+    }
+    const before = tags.value
+    savingTags.value = true
+    try {
+        await tagObject(tag.id, await getRecordingContentTypeId(), row.hash)
+        await showTagsAfterWrite(row, [...before, tag])
+    } catch (err) {
+        showToast(errorDetail(err, t('The tag could not be added.', SCOPE)), 'danger')
+    } finally {
+        savingTags.value = false
+    }
+}
+
+/**
+ * Remove a tag from the open recording.
+ * @param tag - The chip's tag.
+ */
+async function removeTag (tag: TagChip) {
+    const row = current.value
+    if (!row) {
+        return
+    }
+    const before = tags.value
+    savingTags.value = true
+    try {
+        await untagObject(tag.id, await getRecordingContentTypeId(), row.hash)
+        await showTagsAfterWrite(row, before.filter(other => other.id !== tag.id))
+    } catch (err) {
+        showToast(errorDetail(err, t('The tag could not be removed.', SCOPE)), 'danger')
+    } finally {
+        savingTags.value = false
+    }
+}
+
+const batchOpen = ref(false)
+const batchTag = ref<TagChip | null>(null)
+const batchBusy = ref<'add' | 'remove' | null>(null)
+
+/** The batch dialog's account of what it applies to. */
+const batchScope = computed(() => {
+    if (filtered.value) {
+        return t('The tag is added to or removed from the {count} recordings that match the current filters.', SCOPE, {
+            count: total.value,
+        })
+    }
+    return t('The tag is added to or removed from all {count} recordings in this dataset.', SCOPE, {
+        count: total.value,
+    })
+})
+
+const batchTooMany = computed(() => total.value > MAX_BATCH_TAGGED)
+
+/** The batch picker's selection: the one tag chosen, if any. */
+const batchSelected = computed(() => batchTag.value ? [batchTag.value] : [])
+
+function openBatch () {
+    batchTag.value = null
+    batchOpen.value = true
+}
+
+/**
+ * Close the batch dialog, unless a batch is running: the dialog's own close is then cancelled too, so it cannot
+ * close while `batchOpen` stays set.
+ * @param event - The dialog's `wa-hide`, when it asked to close.
+ */
+function closeBatch (event?: Event) {
+    if (batchBusy.value) {
+        event?.preventDefault()
+        return
+    }
+    batchOpen.value = false
+}
+
+/**
+ * Choose the batch's tag, replacing any chosen before.
+ * @param tag - The tag picked.
+ */
+function chooseBatchTag (tag: TagChip) {
+    batchTag.value = tag
+}
+
+function clearBatchTag () {
+    batchTag.value = null
+}
+
+/**
+ * The outcome of a batch as a sentence per count that is not zero.
+ * @param result - The server's counts.
+ * @param remove - Whether the tag was removed.
+ */
+function batchOutcome (result: DatasetTagBatch, remove: boolean) {
+    if (!result.matched) {
+        return t('No recordings matched.', SCOPE)
+    }
+    const parts = [
+        remove
+            ? t('{count} recordings untagged.', SCOPE, { count: result.changed })
+            : t('{count} recordings tagged.', SCOPE, { count: result.changed }),
+    ]
+    if (result.unchanged) {
+        parts.push(remove
+            ? t('{count} did not have the tag.', SCOPE, { count: result.unchanged })
+            : t('{count} already had it.', SCOPE, { count: result.unchanged }))
+    }
+    if (result.skipped) {
+        parts.push(t('{count} skipped, as you cannot change them.', SCOPE, { count: result.skipped }))
+    }
+    return parts.join(' ')
+}
+
+/**
+ * Add the chosen tag to, or remove it from, every recording the current filters match.
+ * @param remove - Whether to remove the tag.
+ */
+async function runBatch (remove: boolean) {
+    const tag = batchTag.value
+    if (!tag || batchBusy.value) {
+        return
+    }
+    batchBusy.value = remove ? 'remove' : 'add'
+    try {
+        const result = remove
+            ? await untagDatasetMembers(props.datasetId, tag.id, filters.value)
+            : await tagDatasetMembers(props.datasetId, tag.id, filters.value)
+        showToast(batchOutcome(result, remove), 'success')
+        // Not busy any more before the dialog closes, or its hide would be cancelled.
+        batchBusy.value = null
+        batchOpen.value = false
+        await load()
+    } catch (err) {
+        const fallback = remove
+            ? t('The tag could not be removed from the recordings.', SCOPE)
+            : t('The recordings could not be tagged.', SCOPE)
+        showToast(errorDetail(err, fallback), 'danger')
+    } finally {
+        batchBusy.value = null
+    }
+}
+
+function addBatch () {
+    return runBatch(false)
+}
+
+function removeBatch () {
+    return runBatch(true)
+}
+
 /** The deployment's registered vocabularies, read once; the drawer names the ones a recording has no codes from. */
 const vocabularies = ref<Vocabulary[]>([])
 
@@ -382,7 +588,20 @@ function standardLabel (group: CodeSummary) {
             :subject-fields="subjectFields"
             @change="onFilter"
         ></DatasetBrowserFilters>
-        <p v-if="summary && (!loading || rows.length)" class="dataset-browser__summary" role="status">{{ summary }}</p>
+        <div class="dataset-browser__toolbar">
+            <p v-if="!loading || rows.length" class="dataset-browser__summary" role="status">{{ summary }}</p>
+            <wa-button v-if="canManage"
+                appearance="plain"
+                class="dataset-browser__batch"
+                :disabled="loading || !total"
+                size="s"
+                variant="brand"
+                @click="openBatch"
+            >
+                <wa-icon name="tag" slot="start"></wa-icon>
+                {{ t('Tag recordings…', SCOPE) }}
+            </wa-button>
+        </div>
         <DataTable v-if="!error"
             :columns="columns"
             :current-key="current?.hash ?? null"
@@ -478,8 +697,19 @@ function standardLabel (group: CodeSummary) {
 
             <section class="dataset-browser__section">
                 <h3 class="dataset-browser__heading">{{ t('Tags', SCOPE) }}</h3>
-                <p v-if="!tags.length" class="dataset-browser__quiet">{{ t('No tags.', SCOPE) }}</p>
-                <div v-else class="dataset-browser__tags">
+                <TagPicker v-if="canManage"
+                    :can-create="canCreateTags"
+                    :disabled="savingTags || !tagsLoaded"
+                    :label="t('Add a tag', SCOPE)"
+                    :selected="tags"
+                    @add="addTag"
+                    @remove="removeTag"
+                ></TagPicker>
+                <p v-if="canManage && tagsFailed" class="dataset-browser__quiet">
+                    {{ t('Not every tag could be loaded, so the tags cannot be changed here.', SCOPE) }}
+                </p>
+                <p v-else-if="!canManage && !tags.length" class="dataset-browser__quiet">{{ t('No tags.', SCOPE) }}</p>
+                <div v-else-if="!canManage" class="dataset-browser__tags">
                     <wa-tag v-for="tag in tags" :key="tag.id"
                         size="s"
                         :variant="tag.curated ? 'brand' : 'neutral'"
@@ -528,6 +758,58 @@ function standardLabel (group: CodeSummary) {
             </wa-button>
         </template>
     </RecordingDetailsDrawer>
+
+    <wa-dialog
+        class="dataset-browser__dialog"
+        :label="t('Tag recordings', SCOPE)"
+        :open="batchOpen"
+        @wa-hide.self="closeBatch"
+    >
+        <div class="dataset-browser__section">
+            <p class="dataset-browser__dialog-text">{{ batchScope }}</p>
+            <p class="dataset-browser__quiet">{{ t('Recordings you cannot change are skipped.', SCOPE) }}</p>
+            <wa-callout v-if="batchTooMany" size="s" variant="warning">
+                {{ t('More than {count} recordings match. Narrow the filters first.', SCOPE, {
+                    count: MAX_BATCH_TAGGED.toLocaleString(),
+                }) }}
+            </wa-callout>
+            <TagPicker
+                :can-create="canCreateTags"
+                :disabled="!!batchBusy"
+                :label="t('Tag', SCOPE)"
+                :selected="batchSelected"
+                @add="chooseBatchTag"
+                @remove="clearBatchTag"
+            ></TagPicker>
+        </div>
+        <div slot="footer" class="form-actions">
+            <wa-button
+                appearance="plain"
+                :disabled="!!batchBusy"
+                @click="closeBatch"
+            >
+                {{ t('Cancel', SCOPE) }}
+            </wa-button>
+            <wa-button
+                appearance="plain"
+                :disabled="!batchTag || batchTooMany || batchBusy === 'add'"
+                :loading="batchBusy === 'remove'"
+                variant="danger"
+                @click="removeBatch"
+            >
+                {{ t('Remove tag', SCOPE) }}
+            </wa-button>
+            <wa-button
+                appearance="filled-outlined"
+                :disabled="!batchTag || batchTooMany || batchBusy === 'remove'"
+                :loading="batchBusy === 'add'"
+                variant="brand"
+                @click="addBatch"
+            >
+                {{ t('Add tag', SCOPE) }}
+            </wa-button>
+        </div>
+    </wa-dialog>
 </template>
 
 <style scoped>
@@ -537,9 +819,29 @@ function standardLabel (group: CodeSummary) {
     gap: var(--wa-space-m);
 }
 
+.dataset-browser__toolbar {
+    align-items: center;
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--wa-space-s);
+    justify-content: space-between;
+}
+
 .dataset-browser__summary {
     color: var(--wa-color-text-quiet);
     font-size: var(--wa-font-size-s);
+    margin: 0;
+}
+
+.dataset-browser__batch {
+    margin-inline-start: auto;
+}
+
+.dataset-browser__dialog {
+    --width: 32rem;
+}
+
+.dataset-browser__dialog-text {
     margin: 0;
 }
 

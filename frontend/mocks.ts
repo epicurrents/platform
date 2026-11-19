@@ -78,6 +78,12 @@
  *   GET    /api/v1/library/catalogue/                 (every gated dataset with members, as released)
  *   PATCH  /api/v1/library/datasets/{id}/recordings/{hash}/subject/
  *   GET    /api/v1/library/recording-tags/
+ *   GET    /api/v1/library/tags/                      (a flat set: no tag has a parent)
+ *   POST   /api/v1/library/tags/
+ *   POST   /api/v1/library/tags/{id}/items/           (recordings only, by hash)
+ *   DELETE /api/v1/library/tags/{id}/items/
+ *   POST   /api/v1/library/datasets/{id}/tags/{tagId}/
+ *   DELETE /api/v1/library/datasets/{id}/tags/{tagId}/
  *   DELETE /api/v1/library/datasets/{id}/items/{itemId}/
  *   GET    /api/v1/library/datasets/{id}/pool/        (never a pool: no ingest profiles)
  *   GET    /api/v1/library/datasets/{id}/access/
@@ -292,6 +298,10 @@ interface MockState {
     datasetAccess: MockAccess[]
     /** Subject values per dataset member, keyed `<dataset id>:<recording hash>`. */
     datasetSubjects: Record<string, Record<string, string | number>>
+    /** The tags a caller has created, after the seeded ones. */
+    tags: MockTag[]
+    /** The tag ids on a recording once a write has changed them, by hash; the rest keep their seeded set. */
+    recordingTagIds: Record<string, number[]>
     seq: {
         rec: number
         coll: number
@@ -327,7 +337,13 @@ const MOCK_SUBJECT_FIELDS: {
 ]
 
 /** Tags the mock hands out, a recording carrying a deterministic subset of them. */
-const MOCK_TAGS = [
+interface MockTag {
+    id: number
+    name: string
+    curated: boolean
+}
+
+const MOCK_TAGS: MockTag[] = [
     { id: 1, name: 'Teaching', curated: true },
     { id: 2, name: 'Artefacts', curated: true },
     { id: 3, name: 'Interesting', curated: false },
@@ -935,6 +951,8 @@ function buildSeed(): MockState {
             `${item._parent_id}:${item.object_id}`,
             { age_years: Number(((parseInt(item.object_id.slice(0, 4), 16) % 1600) / 100).toFixed(2)) },
         ])),
+        tags: MOCK_TAGS.map(tag => ({ ...tag })),
+        recordingTagIds: {},
         seq: { rec: 17, coll: 3, ds: 3, item: 4, access: 2, account: 7, group: 3 },
         snapshots: [
             {
@@ -1330,13 +1348,96 @@ function lastSuperuserRefusal(account: MockAccount, nextActive: boolean, nextSup
 }
 
 /**
- * The mock tags on a recording: a subset picked by the hash's digits, curated first, then by name.
+ * The mock tags on a recording, curated first, then by name: the ones written for it, or until a write a subset of
+ * the seeded tags picked by the hash's digits.
  * @param hash - The recording's hash.
  */
 function mockTagsOf(hash: string) {
-    return MOCK_TAGS
-        .filter((_, index) => parseInt(hash[index] ?? '0', 16) % 2 === 1)
-        .sort((a, b) => Number(b.curated) - Number(a.curated) || a.name.localeCompare(b.name))
+    const written = _state.recordingTagIds[hash]
+    const tags = written
+        ? _state.tags.filter(tag => written.includes(tag.id))
+        : MOCK_TAGS.filter((_, index) => parseInt(hash[index] ?? '0', 16) % 2 === 1)
+    return [...tags].sort((a, b) => Number(b.curated) - Number(a.curated) || a.name.localeCompare(b.name))
+}
+
+/**
+ * Set whether a recording carries a tag, and say whether that changed anything.
+ * @param hash - The recording's hash.
+ * @param tagId - The tag.
+ * @param present - Whether the recording should carry it.
+ */
+function setMockTag(hash: string, tagId: number, present: boolean): boolean {
+    const ids = mockTagsOf(hash).map(tag => tag.id)
+    if (ids.includes(tagId) === present) {
+        return false
+    }
+    _state.recordingTagIds[hash] = present ? [...ids, tagId] : ids.filter(id => id !== tagId)
+    return true
+}
+
+/** A mock tag as `TagOut`; the mock caller authored every tag. */
+function tagOut(tag: MockTag) {
+    return {
+        ...tag,
+        description: '',
+        parent_id: null,
+        author_id: MOCK_USER_ID,
+        created_at: '2026-01-01T00:00:00Z',
+        modified_at: '2026-01-01T00:00:00Z',
+    }
+}
+
+/**
+ * A browser query over a mock dataset: the fields shown, the members, and whether a member passes the query's
+ * filters, leaving out the dimension named by `skip` as a facet count does. The browse and batch-tag routes share it,
+ * so a batch writes the members the page lists.
+ * @param dsId - The dataset.
+ * @param query - The request's query parameters.
+ */
+function mockBrowseQuery(dsId: number, query: URLSearchParams) {
+    const gated = !!_state.datasets.find(ds => ds.id === dsId)?.release_gated
+    const fields = gated ? MOCK_SUBJECT_FIELDS.filter(f => f.displayed) : MOCK_SUBJECT_FIELDS
+    const subjectOf = (r: MockRecording) => _state.datasetSubjects[`${dsId}:${r.hash}`] ?? {}
+    const modalityFilter = query.getAll('modality')
+    const subjectFilter = fields
+        .filter(f => f.type !== 'number')
+        .map(f => [f.key, query.getAll(`subject.${f.key}`)] as const)
+        .filter(([, values]) => values.length)
+    const bound = (name: string) => {
+        const raw = query.get(name)
+        return raw === null || raw === '' ? null : Number(raw)
+    }
+    const rangeFilter = fields
+        .filter(f => f.type === 'number')
+        .map(f => [f.key, bound(`subject.${f.key}.min`), bound(`subject.${f.key}.max`)] as const)
+        .filter(([, low, high]) => low !== null || high !== null)
+    const tagFilter = query.getAll('tag').map(Number)
+    const passes = (r: MockRecording, skip?: string) => {
+        if (skip !== 'modality' && modalityFilter.length && !modalityFilter.includes(r.modality)) {
+            return false
+        }
+        for (const [key, values] of subjectFilter) {
+            if (skip !== `subject.${key}` && !values.includes(String(subjectOf(r)[key] ?? ''))) {
+                return false
+            }
+        }
+        for (const [key, low, high] of rangeFilter) {
+            const value = subjectOf(r)[key]
+            if (skip === `subject.${key}`) {
+                continue
+            }
+            if (typeof value !== 'number' || (low !== null && value < low) || (high !== null && value > high)) {
+                return false
+            }
+        }
+        const tagIds = new Set(mockTagsOf(r.hash).map(tag => tag.id))
+        return skip === 'tag' || tagFilter.every(id => tagIds.has(id))
+    }
+    const all = _state.datasetItems
+        .filter(i => i._parent_id === dsId && i.content_type_id === RECORDING_CT_ID)
+        .map(i => findRecording(i.object_id))
+        .filter((r): r is MockRecording => !!r)
+    return { fields, subjectOf, tagFilter, passes, all }
 }
 
 /** Strip internal _parent_id before sending an item to the client. */
@@ -2768,48 +2869,7 @@ export async function handleMock(
             const sortParam = query.get('sort') ?? 'name'
             const descending = sortParam.startsWith('-')
             const sortKey = sortParam.replace(/^-/, '')
-            const gated = !!_state.datasets.find(ds => ds.id === dsId)?.release_gated
-            const fields = gated ? MOCK_SUBJECT_FIELDS.filter(f => f.displayed) : MOCK_SUBJECT_FIELDS
-            const subjectOf = (r: MockRecording) => _state.datasetSubjects[`${dsId}:${r.hash}`] ?? {}
-            const modalityFilter = query.getAll('modality')
-            const subjectFilter = fields
-                .filter(f => f.type !== 'number')
-                .map(f => [f.key, query.getAll(`subject.${f.key}`)] as const)
-                .filter(([, values]) => values.length)
-            const bound = (name: string) => {
-                const raw = query.get(name)
-                return raw === null || raw === '' ? null : Number(raw)
-            }
-            const rangeFilter = fields
-                .filter(f => f.type === 'number')
-                .map(f => [f.key, bound(`subject.${f.key}.min`), bound(`subject.${f.key}.max`)] as const)
-                .filter(([, low, high]) => low !== null || high !== null)
-            const tagFilter = query.getAll('tag').map(Number)
-            const passes = (r: MockRecording, skip?: string) => {
-                if (skip !== 'modality' && modalityFilter.length && !modalityFilter.includes(r.modality)) {
-                    return false
-                }
-                for (const [key, values] of subjectFilter) {
-                    if (skip !== `subject.${key}` && !values.includes(String(subjectOf(r)[key] ?? ''))) {
-                        return false
-                    }
-                }
-                for (const [key, low, high] of rangeFilter) {
-                    const value = subjectOf(r)[key]
-                    if (skip === `subject.${key}`) {
-                        continue
-                    }
-                    if (typeof value !== 'number' || (low !== null && value < low) || (high !== null && value > high)) {
-                        return false
-                    }
-                }
-                const tagIds = new Set(mockTagsOf(r.hash).map(tag => tag.id))
-                return skip === 'tag' || tagFilter.every(id => tagIds.has(id))
-            }
-            const all = _state.datasetItems
-                .filter(i => i._parent_id === dsId && i.content_type_id === RECORDING_CT_ID)
-                .map(i => findRecording(i.object_id))
-                .filter((r): r is MockRecording => !!r)
+            const { fields, subjectOf, tagFilter, passes, all } = mockBrowseQuery(dsId, query)
             type ValueOf = (r: MockRecording) => string | number | undefined
             const tally = (values: string[], skip: string, valueOf: ValueOf) =>
                 values.map(value => ({
@@ -2833,7 +2893,7 @@ export async function handleMock(
                         count: found.length,
                     }]
                 })),
-                tags: MOCK_TAGS.map(tag => ({
+                tags: _state.tags.map(tag => ({
                     ...tag,
                     count: all.filter(r => passes(r) && mockTagsOf(r.hash).some(t => t.id === tag.id)).length,
                 })).filter(tag => tag.count !== 0 || tagFilter.includes(tag.id)),
@@ -2932,6 +2992,87 @@ export async function handleMock(
             .filter(row => row.tags.length)
             .sort((a, b) => a.hash.localeCompare(b.hash))
         return send(res, 200, answer)
+    }
+
+    // GET /api/v1/library/tags/ — no mock tag has a parent, so every tag is a root and a parent has no children
+    if (path === '/api/v1/library/tags/' && method === 'GET') {
+        const query = new URL(req.url ?? path, 'http://mock').searchParams
+        const search = (query.get('q') ?? '').trim().toLowerCase()
+        const limit = Number(query.get('limit') ?? 50)
+        const tags = query.get('parent_id')
+            ? []
+            : _state.tags
+                .filter(tag => !search || tag.name.toLowerCase().includes(search))
+                .sort((a, b) => a.name.localeCompare(b.name))
+        return send(res, 200, tags.slice(0, limit).map(tagOut))
+    }
+
+    // POST /api/v1/library/tags/ — the mock caller is staff, so every tag it creates is curated
+    if (path === '/api/v1/library/tags/' && method === 'POST') {
+        const body = await readBody(req)
+        const name = String(body.name ?? '').trim()
+        if (!name) {
+            return send(res, 422, { detail: 'A tag needs a name.' })
+        }
+        const tag = { id: Math.max(0, ..._state.tags.map(other => other.id)) + 1, name, curated: true }
+        _state.tags.push(tag)
+        return send(res, 201, { ...tagOut(tag), warnings: [] })
+    }
+
+    // POST and DELETE /api/v1/library/tags/{id}/items/ — a recording named by its hash
+    {
+        const m = path.match(/^\/api\/v1\/library\/tags\/(\d+)\/items\/$/)
+        if (m && (method === 'POST' || method === 'DELETE')) {
+            const tag = _state.tags.find(other => other.id === Number(m[1]))
+            if (!tag) {
+                return send(res, 404, { detail: 'Tag not found' })
+            }
+            const query = new URL(req.url ?? path, 'http://mock').searchParams
+            const objectId = method === 'POST'
+                ? String((await readBody(req)).object_id ?? '')
+                : query.get('object_id') ?? ''
+            const recording = findRecording(objectId)
+            if (!recording) {
+                return send(res, 404, { detail: 'Object not found' })
+            }
+            if (method === 'DELETE') {
+                return setMockTag(recording.hash, tag.id, false)
+                    ? send(res, 200, { status: 'ok' })
+                    : send(res, 404, { detail: 'Tagged item not found' })
+            }
+            if (!setMockTag(recording.hash, tag.id, true)) {
+                return send(res, 409, { detail: 'This object already has this tag' })
+            }
+            return send(res, 201, {
+                id: null,
+                tag_id: tag.id,
+                content_type_id: RECORDING_CT_ID,
+                object_id: null,
+                object_hash: recording.hash,
+                tagged_at: new Date().toISOString(),
+            })
+        }
+    }
+
+    // POST and DELETE /api/v1/library/datasets/{id}/tags/{tagId}/ — the mock caller may change every member
+    {
+        const m = path.match(/^\/api\/v1\/library\/datasets\/(\d+)\/tags\/(\d+)\/$/)
+        if (m && (method === 'POST' || method === 'DELETE')) {
+            const tag = _state.tags.find(other => other.id === Number(m[2]))
+            if (!tag) {
+                return send(res, 404, { detail: 'Tag not found' })
+            }
+            const query = new URL(req.url ?? path, 'http://mock').searchParams
+            const { passes, all } = mockBrowseQuery(Number(m[1]), query)
+            const members = all.filter(r => passes(r))
+            const changed = members.filter(r => setMockTag(r.hash, tag.id, method === 'POST')).length
+            return send(res, 200, {
+                matched: members.length,
+                changed,
+                unchanged: members.length - changed,
+                skipped: 0,
+            })
+        }
     }
 
     // GET /api/v1/library/datasets/{id}/pool/ — the mock has no ingest profiles, so no dataset is a pool

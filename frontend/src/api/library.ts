@@ -620,22 +620,12 @@ export interface RecordingTags {
 }
 
 /**
- * One page of a dataset's recordings for the browser.
- * @param datasetId - The dataset's object hash or primary key.
- * @param params - `sort` is a key from the server's allowlist, or `subject.<key>`, prefixed with `-` for descending.
- * @param filters - Sent as repeated `modality`, `subject.<key>` and `tag` parameters, and a range as `subject.<key>.min` and `subject.<key>.max`.
+ * A browser query's filters as query parameters: repeated `modality`, `subject.<key>` and `tag` parameters, and a
+ * range as `subject.<key>.min` and `subject.<key>.max`.
+ * @param query - The parameters to append to.
+ * @param filters - The filters; none appends nothing.
  */
-export async function browseDataset(
-    datasetId: number | string,
-    params: { sort?: string; limit?: number; offset?: number },
-    filters?: DatasetBrowseFilters,
-): Promise<DatasetBrowsePage> {
-    const query = new URLSearchParams()
-    for (const [name, value] of Object.entries(params)) {
-        if (value !== undefined) {
-            query.append(name, String(value))
-        }
-    }
+function appendFilters (query: URLSearchParams, filters?: DatasetBrowseFilters) {
     for (const modality of filters?.modality ?? []) {
         query.append('modality', modality)
     }
@@ -655,6 +645,26 @@ export async function browseDataset(
     for (const tag of filters?.tags ?? []) {
         query.append('tag', String(tag))
     }
+}
+
+/**
+ * One page of a dataset's recordings for the browser.
+ * @param datasetId - The dataset's object hash or primary key.
+ * @param params - `sort` is a key from the server's allowlist, or `subject.<key>`, prefixed with `-` for descending.
+ * @param filters - Sent as repeated `modality`, `subject.<key>` and `tag` parameters, and a range as `subject.<key>.min` and `subject.<key>.max`.
+ */
+export async function browseDataset(
+    datasetId: number | string,
+    params: { sort?: string; limit?: number; offset?: number },
+    filters?: DatasetBrowseFilters,
+): Promise<DatasetBrowsePage> {
+    const query = new URLSearchParams()
+    for (const [name, value] of Object.entries(params)) {
+        if (value !== undefined) {
+            query.append(name, String(value))
+        }
+    }
+    appendFilters(query, filters)
     const response = await http.get<DatasetBrowsePage>(`/api/v1/library/datasets/${datasetId}/browse/`, {
         params: query,
     })
@@ -718,4 +728,150 @@ export async function updateDatasetMemberSubject(
         { values },
     )
     return response.data.values
+}
+
+// ---------------------------------------------------------------------------
+// Tags
+// ---------------------------------------------------------------------------
+
+/**
+ * A tag within the caller's reach. `curated` tags were created by staff and are listed to everyone; any other is
+ * listed to its author and to those who can read an object it is on.
+ */
+export interface Tag {
+    id: number
+    name: string
+    description: string
+    parent_id: number | null
+    author_id: number
+    curated: boolean
+    created_at: string
+    modified_at: string
+}
+
+/** A tag create or update response, with warnings for a name or description that looks like an identifier. */
+export interface TagWrite extends Tag {
+    warnings: NameWarning[]
+}
+
+/**
+ * A tag on one object. `id` and `object_id` are null for a pooled recording listed to anyone but a manager of its
+ * pool; `object_hash` names a recording or a media file to whoever is listed it.
+ */
+export interface TaggedItem {
+    id: number | null
+    tag_id: number
+    content_type_id: number
+    object_id: string | null
+    object_hash: string | null
+    tagged_at: string
+}
+
+/**
+ * The outcome of tagging or untagging the members a browser query matches: of the `matched` members, `changed`
+ * were tagged or untagged, `unchanged` already were, and `skipped` the caller may not tag or untag.
+ */
+export interface DatasetTagBatch {
+    matched: number
+    changed: number
+    unchanged: number
+    skipped: number
+}
+
+/**
+ * The tags within the caller's reach, by name: the roots, the children of `parentId`, or with `q` the tags whose
+ * name contains it at every level of the tree.
+ * @param params - `q` is matched case-insensitively and narrowed to the children of `parentId` when both are given; the server caps `limit` at 200.
+ */
+export async function listTags(
+    params: { q?: string; parentId?: number; limit?: number; offset?: number } = {},
+): Promise<Tag[]> {
+    const response = await http.get<Tag[]>('/api/v1/library/tags/', {
+        params: {
+            q: params.q || undefined,
+            parent_id: params.parentId,
+            limit: params.limit,
+            offset: params.offset,
+        },
+    })
+    return response.data
+}
+
+/**
+ * Create a tag; staff only unless the deployment opens creation to everyone. A tag created by staff is curated.
+ * @param payload - `parent_id` must be a tag within the caller's reach.
+ */
+export async function createTag(
+    payload: { name: string; description?: string; parent_id?: number | null },
+): Promise<TagWrite> {
+    const response = await http.post<TagWrite>('/api/v1/library/tags/', payload)
+    return response.data
+}
+
+/**
+ * Tag one object; the caller must be able to write it. A second tagging of the same object is a 409.
+ * @param tagId - A tag within the caller's reach.
+ * @param contentTypeId - The object's content type, from `getRecordingContentTypeId` or `getMediaContentTypeId`.
+ * @param objectId - A recording's or media file's hash, or another object's primary key.
+ */
+export async function tagObject(tagId: number, contentTypeId: number, objectId: string): Promise<TaggedItem> {
+    const response = await http.post<TaggedItem>(`/api/v1/library/tags/${tagId}/items/`, {
+        content_type_id: contentTypeId,
+        object_id: objectId,
+    })
+    return response.data
+}
+
+/**
+ * Remove a tag from one object; the caller must be able to write it or have authored the tag.
+ * @param tagId - A tag within the caller's reach.
+ * @param contentTypeId - The object's content type.
+ * @param objectId - A recording's or media file's hash, or another object's primary key.
+ */
+export async function untagObject(tagId: number, contentTypeId: number, objectId: string): Promise<void> {
+    await http.delete(`/api/v1/library/tags/${tagId}/items/`, {
+        params: { content_type_id: contentTypeId, object_id: objectId },
+    })
+}
+
+/**
+ * Tag every recording of a dataset that a browser query matches; a member the caller may not write is skipped and
+ * counted. The server refuses a query matching more than 5,000 recordings.
+ * @param datasetId - The dataset's object hash or primary key.
+ * @param tagId - A tag within the caller's reach.
+ * @param filters - The browser's filters; none tags every member the caller can read.
+ */
+export async function tagDatasetMembers(
+    datasetId: number | string,
+    tagId: number,
+    filters?: DatasetBrowseFilters,
+): Promise<DatasetTagBatch> {
+    const query = new URLSearchParams()
+    appendFilters(query, filters)
+    const response = await http.post<DatasetTagBatch>(
+        `/api/v1/library/datasets/${datasetId}/tags/${tagId}/`,
+        null,
+        { params: query },
+    )
+    return response.data
+}
+
+/**
+ * Remove a tag from every recording of a dataset that a browser query matches; a member is untagged where the
+ * caller may write it or authored the tag, and skipped otherwise.
+ * @param datasetId - The dataset's object hash or primary key.
+ * @param tagId - A tag within the caller's reach.
+ * @param filters - The browser's filters; none untags every member the caller can read.
+ */
+export async function untagDatasetMembers(
+    datasetId: number | string,
+    tagId: number,
+    filters?: DatasetBrowseFilters,
+): Promise<DatasetTagBatch> {
+    const query = new URLSearchParams()
+    appendFilters(query, filters)
+    const response = await http.delete<DatasetTagBatch>(`/api/v1/library/datasets/${datasetId}/tags/${tagId}/`, {
+        params: query,
+    })
+    return response.data
 }

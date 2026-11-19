@@ -156,7 +156,7 @@ Same CRUD + items shape as Collections at `/datasets/`, plus the access surface 
 
 | Method | Path | Notes |
 |---|---|---|
-| `GET` | `/tags/` | List the tags within the caller's reach. Filter by `parent_id`; a parent outside the caller's reach is 404. |
+| `GET` | `/tags/` | List the tags within the caller's reach. Filter by `parent_id`; a parent outside the caller's reach is 404. `q` matches names at every level, or under `parent_id`; the audit row records that a search ran, never its text. |
 | `POST` | `/tags/` | Create. Staff only by default (403 otherwise); optional `parent_id`, which must be within reach. Returns `warnings` for a name or description that looks like an identifier. |
 | `GET` | `/tags/{id}/` | Detail. 404 outside the caller's reach, the same answer as for a missing tag. |
 | `PATCH` | `/tags/{id}/` | Update. Requires tag authorship; a new parent must be within reach. Returns `warnings`. |
