@@ -9,7 +9,15 @@
 import { describe, expect, it } from 'vitest'
 import type { MediaFileDetail } from '#api/media'
 import type { Recording } from '#api/recordings'
-import { describeMedia, describeRecording, eagerStudyLoadLimit, recordingProperties } from './datasetStudies'
+import type { DatasetBrowseRow } from '#api/library'
+import {
+    describeMedia,
+    describeRecording,
+    eagerStudyLoadLimit,
+    listedFromBrowseRow,
+    listedFromRecording,
+    recordingProperties,
+} from './datasetStudies'
 import type { EpicurrentsApp } from '@epicurrents/core/dist/types'
 
 const recording = (overrides: Partial<Recording> = {}): Recording => ({
@@ -49,30 +57,62 @@ const recording = (overrides: Partial<Recording> = {}): Recording => ({
 
 describe('recording properties', () => {
     it('lists the duration and the signal channels without the annotation channel', () => {
-        expect(recordingProperties(recording())).toEqual([['duration', 600], ['signals', 2]])
+        expect(recordingProperties(listedFromRecording(recording()))).toEqual([['duration', 600], ['signals', 2]])
     })
     it('leaves the channel count out when the descriptors are absent', () => {
         const meta = { ...recording().meta!, signals: undefined }
-        expect(recordingProperties(recording({ meta }))).toEqual([['duration', 600]])
+        expect(recordingProperties(listedFromRecording(recording({ meta })))).toEqual([['duration', 600]])
     })
     it('holds none before processing has written the metadata', () => {
-        expect(recordingProperties(recording({ meta: null }))).toBeNull()
+        expect(recordingProperties(listedFromRecording(recording({ meta: null })))).toBeNull()
+    })
+})
+
+describe('a browser row as listed', () => {
+    const row = (overrides: Partial<DatasetBrowseRow> = {}): DatasetBrowseRow => ({
+        channel_count: 19,
+        channel_layout: null,
+        created_at: '2026-11-01T00:00:00Z',
+        deidentification_version: 5,
+        display_name: 'subject-007.edf',
+        duration: 900,
+        file_extension: '.edf',
+        hash: 'b'.repeat(32),
+        modality: 'eeg',
+        public_source: '',
+        sampling_rate_max: 256,
+        sampling_rate_min: 256,
+        subject: {},
+        tag_count: 0,
+        tags: [],
+        ...overrides,
+    })
+    it('lists the same properties as the detail, from the ingest metadata the row carries', () => {
+        expect(recordingProperties(listedFromBrowseRow(row()))).toEqual([['duration', 900], ['signals', 19]])
+        expect(recordingProperties(listedFromBrowseRow(row({ channel_count: null })))).toEqual([['duration', 900]])
+        expect(recordingProperties(listedFromBrowseRow(row({ duration: null, channel_count: null })))).toBeNull()
+    })
+    it('names it by the grantee-visible name and loads it by its hash', () => {
+        const description = describeRecording(listedFromBrowseRow(row()))
+        expect(description.name).toBe('subject-007')
+        expect(description.loader).toBe('eeg/edf-file')
+        expect(new URL(description.source).pathname).toBe(`/recordings/api/v1/${'b'.repeat(32)}/file`)
     })
 })
 
 describe('describing a recording', () => {
     it('names the importer by modality and a lower-case extension', () => {
-        expect(describeRecording(recording()).loader).toBe('eeg/edf-file')
+        expect(describeRecording(listedFromRecording(recording())).loader).toBe('eeg/edf-file')
     })
     it('lists it under its name without the extension', () => {
-        expect(describeRecording(recording()).name).toBe('upload-20261119T082015Z')
+        expect(describeRecording(listedFromRecording(recording())).name).toBe('upload-20261119T082015Z')
     })
     it('loads the default version from an absolute URL, with the share token when given', () => {
-        const source = new URL(describeRecording(recording(), 'token-1').source)
+        const source = new URL(describeRecording(listedFromRecording(recording()), 'token-1').source)
         expect(source.pathname).toBe(`/recordings/api/v1/${'a'.repeat(32)}/file`)
         expect(source.searchParams.get('version')).toBe('default')
         expect(source.searchParams.get('share_token')).toBe('token-1')
-        expect(new URL(describeRecording(recording()).source).searchParams.has('share_token')).toBe(false)
+        expect(new URL(describeRecording(listedFromRecording(recording())).source).searchParams.has('share_token')).toBe(false)
     })
 })
 

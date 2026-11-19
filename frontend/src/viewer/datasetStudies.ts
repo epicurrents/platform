@@ -6,14 +6,63 @@
  * its header to list it, its duration and channel count, which the platform parsed at ingest and serves as trusted
  * metadata; listing from it costs no fetch and no reader. An item without such metadata is listed by name, and the
  * caller loads up to `app.eagerStudyLoadLimit` of those straight away so they list with their properties.
+ *
+ * A recording is listed from a `ListedRecording`, which a dataset's browser row and a recording's detail both give, so
+ * a dataset of any size is listed from its browser pages rather than one detail request per member.
  */
 
+import type { DatasetBrowseRow } from '#api/library'
 import type { MediaFileDetail } from '#api/media'
 import { recordingName, type Recording } from '#api/recordings'
 import type { DataResource, EpicurrentsApp } from '@epicurrents/core/dist/types'
 
 /** A property a study is listed with: its duration in seconds, or its number of signal channels. */
 export type ListedProperty = [string, number]
+
+/** What a recording is listed in the viewer by. */
+export interface ListedRecording {
+    /** The recording's hash, which names it in the recording routes. */
+    hash: string
+    /** The name to list it under, with its file extension. */
+    name: string
+    modality: string
+    file_extension: string
+    /** Duration in seconds, null until processing has written the metadata. */
+    duration: number | null
+    /** Signal channels, the annotation channel of an EDF+ file not among them; null when the platform holds none. */
+    channel_count: number | null
+}
+
+/**
+ * A recording's detail as the viewer lists it, under the name the caller is shown.
+ * @param recording - The recording's detail.
+ */
+export function listedFromRecording(recording: Recording): ListedRecording {
+    const signals = recording.meta?.signals
+    return {
+        channel_count: signals?.length ? signals.filter(signal => !signal.is_annotation_channel).length : null,
+        duration: recording.meta?.duration ?? null,
+        file_extension: recording.file_extension,
+        hash: recording.hash,
+        modality: recording.modality,
+        name: recordingName(recording),
+    }
+}
+
+/**
+ * A dataset browser row as the viewer lists it, under the grantee-visible name the browser shows every reader.
+ * @param row - A row of the dataset browser.
+ */
+export function listedFromBrowseRow(row: DatasetBrowseRow): ListedRecording {
+    return {
+        channel_count: row.channel_count,
+        duration: row.duration,
+        file_extension: row.file_extension,
+        hash: row.hash,
+        modality: row.modality,
+        name: row.display_name,
+    }
+}
 
 /**
  * The part of the viewer's deferred-study API the platform calls. The application the platform runs is the viewer
@@ -78,15 +127,15 @@ export function importerForMedia(media: MediaFileDetail): string | null {
  * The properties a recording is listed with, from the metadata the platform recorded at ingest: its duration and the
  * number of signal channels, the annotation channel of an EDF+ file not among them, as the viewer counts them once the
  * recording loads. Null until processing has written the metadata.
+ * @param recording - The recording as listed.
  */
-export function recordingProperties(recording: Recording): ListedProperty[] | null {
-    const meta = recording.meta
-    if (!meta) {
+export function recordingProperties(recording: ListedRecording): ListedProperty[] | null {
+    if (recording.duration === null) {
         return null
     }
-    const properties: ListedProperty[] = [['duration', meta.duration]]
-    if (meta.signals?.length) {
-        properties.push(['signals', meta.signals.filter(signal => !signal.is_annotation_channel).length])
+    const properties: ListedProperty[] = [['duration', recording.duration]]
+    if (recording.channel_count !== null) {
+        properties.push(['signals', recording.channel_count])
     }
     return properties
 }
@@ -95,10 +144,10 @@ export function recordingProperties(recording: Recording): ListedProperty[] | nu
  * Describe a recording for the viewer. The URL is absolute because the reader fetches ranges from a worker, which has
  * no document base URL to resolve a relative one against. It names the default version, the one the recording's
  * reconstruction stages built and the stored file when there is none.
- * @param recording - The recording.
+ * @param recording - The recording as listed.
  * @param shareToken - Share token the dataset was opened with, if any.
  */
-export function describeRecording(recording: Recording, shareToken?: string): StudyDescription {
+export function describeRecording(recording: ListedRecording, shareToken?: string): StudyDescription {
     const query = new URLSearchParams({ version: 'default' })
     if (shareToken) {
         query.set('share_token', shareToken)
@@ -109,7 +158,7 @@ export function describeRecording(recording: Recording, shareToken?: string): St
     const extension = recording.file_extension.replace(/^\./, '').toLowerCase()
     return {
         loader: `${recording.modality}/${extension}-file`,
-        name: recordingName(recording).replace(/\.[^.]+$/, ''),
+        name: recording.name.replace(/\.[^.]+$/, ''),
         properties: recordingProperties(recording),
         source: new URL(relativePath, import.meta.url).toString(),
     }

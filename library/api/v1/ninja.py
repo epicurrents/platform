@@ -220,7 +220,8 @@ class DatasetBrowseRowOut(Schema):
 
     The ingest metadata a reader chooses recordings by, nothing author-private and no sequential id:
     ``hash`` names the recording. ``display_name`` is the grantee-visible name for every caller, the
-    author included, so the table reads the same to everyone it is shared with. ``created_at`` is the
+    author included, so the table reads the same to everyone it is shared with. ``file_extension`` is the
+    stored file's, as ``RecordingOut`` serves it, which with ``modality`` names the viewer importer that opens it. ``created_at`` is the
     date the recording surfaces serve this caller: exact for its author and superusers, otherwise a
     released gated member's release month or the first of its upload month. The metadata columns are
     null until ingest has written them. ``channel_count`` and the sampling rates count signal channels
@@ -233,6 +234,7 @@ class DatasetBrowseRowOut(Schema):
     hash: str
     display_name: str
     modality: str
+    file_extension: str
     public_source: str
     created_at: datetime
     duration: float | None
@@ -2625,6 +2627,7 @@ def browse_dataset(
             "hash": rec.stored_name.split(".", 1)[0],
             "display_name": _resolve_display_name(rec),
             "modality": rec.modality,
+            "file_extension": rec.file_extension,
             "public_source": rec.public_source,
             "created_at": _visible_created_at(rec, exact=rec.pk in exact_pks, release_month=months.get(str(rec.pk))),
             "duration": rec.duration,

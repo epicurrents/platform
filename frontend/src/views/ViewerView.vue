@@ -9,7 +9,7 @@ import {
     browseFiltersFromQuery,
     getDataset,
     listAllDatasetItems,
-    listMatchingRecordingHashes,
+    listMatchingRecordings,
     type DatasetBrowseFilters,
 } from '#api/library'
 import { getMediaDetail, listMediaFiles, type MediaFileDetail, type MediaFileSummary } from '#api/media'
@@ -29,9 +29,17 @@ import { plugin as pluginsPlugin } from '#plugins/active'
 import { mergeSetup } from '#plugins/base'
 import { waitForEventBus } from '#projects/eventBus'
 import { getViewerConfig } from '#api/viewerConfig'
-import { applyViewerSettingsOverrides, VIEWER_USER_SETTINGS_PATH } from '#lib/viewerConfig'
+import { applyViewerSettingsOverrides, VIEWER_USER_SETTINGS_PATH, type ViewerSettingsOverrides } from '#lib/viewerConfig'
 import { leadFieldProvider } from '#viewer/leadFields'
-import { describeMedia, describeRecording, eagerStudyLoadLimit, type DeferredStudyApp } from '#viewer/datasetStudies'
+import {
+    describeMedia,
+    describeRecording,
+    eagerStudyLoadLimit,
+    listedFromBrowseRow,
+    listedFromRecording,
+    type DeferredStudyApp,
+    type ListedRecording,
+} from '#viewer/datasetStudies'
 import { createUploadTarget } from '#lib/exportTargets'
 
 // The overlay panel comes from the active project if it defines one, otherwise
@@ -45,15 +53,18 @@ interface DatasetBundle {
     items: BundleItem[]
     /** Load every item when the viewer opens, rather than each when it is opened. */
     preload: boolean
+    /** The dataset's own viewer-config overrides, for a bundle that is a dataset. */
+    viewerConfig?: ViewerSettingsOverrides
 }
 
 /**
- * Per-item payload after the platform-side fetch. Discriminated so the
- * mount loop can pick the right importer + URL without re-querying the
- * list endpoint's metadata.
+ * Per-item payload after the platform-side fetch. Discriminated so the mount loop can pick the right importer + URL
+ * without re-querying the list endpoint's metadata. A recording is listed from what its dataset's browser rows give;
+ * its detail, which carries the interruption table, is read when it is loaded, unless the link named it and it was
+ * read up front.
  */
 type BundleItem =
-    | { kind: 'recording'; recording: Recording }
+    | { kind: 'recording'; listed: ListedRecording; recording: Recording | null }
     | { kind: 'media'; media: MediaFileDetail }
 
 /**
@@ -84,15 +95,30 @@ function seedTrustedInterruptions(resource: DataResource, recording: Recording):
 
 /**
  * Finish a study once the viewer has loaded it, whether up front or when it was opened: seed a recording's trusted
- * interruption table and attach its videos. Runs before the loaded resource is activated, which is when the activation
- * flow delivers the interruption table to the reader.
+ * interruption table, from its detail, and attach its videos. Runs before the loaded resource is activated, which is
+ * when the activation flow delivers the interruption table to the reader. A detail that cannot be read leaves the
+ * viewer to discover the gaps itself.
+ * @param resource - The loaded resource.
+ * @param item - The item it was listed from.
+ * @param shareToken - Share token the item's dataset was opened with, if any.
  */
-async function studyLoaded(resource: DataResource, item: BundleItem): Promise<void> {
+async function studyLoaded(resource: DataResource, item: BundleItem, shareToken: string | undefined): Promise<void> {
     if (item.kind !== 'recording') {
         return
     }
-    seedTrustedInterruptions(resource, item.recording)
-    await attachRecordingVideos(resource, item.recording.hash)
+    const hash = item.listed.hash
+    const [recording] = await Promise.all([
+        item.recording
+            ? Promise.resolve(item.recording)
+            : getRecordingDetail(hash, shareToken).catch((e: unknown) => {
+                console.warn(`[Epicurrents] Could not read the interruption table of ${hash}.`, e)
+                return null
+            }),
+        attachRecordingVideos(resource, hash),
+    ])
+    if (recording) {
+        seedTrustedInterruptions(resource, recording)
+    }
 }
 
 /**
@@ -213,6 +239,11 @@ const datasetSort = computed(() => (route.query.sort as string | undefined)?.tri
 const bundles = ref<DatasetBundle[]>([])
 const loading = ref(true)
 const error = ref<string | null>(null)
+/**
+ * What the viewer is doing between the items being read and the first of them opening: listing the items, then
+ * loading those it loads up front. Null once the first item is opened.
+ */
+const openingStatus = ref<string | null>(null)
 
 /** Total items across all bundles — used for empty-state detection. */
 const totalItems = computed(
@@ -231,8 +262,11 @@ const emptyMode = computed(() =>
 )
 
 /**
- * A dataset's members as a bundle the viewer lists, each resolved to its detail row. With a browser query, only the
- * recordings the dataset browser lists under it, in its order; without one, every member in the dataset's order.
+ * A dataset's members as a bundle the viewer lists. Recordings are listed from the dataset browser's rows, a page of
+ * 200 at a time, so the size of the dataset sets the number of pages rather than of requests; a media member is read
+ * for its detail. With a browser query, only the recordings the browser lists under it, in its order; without one,
+ * every member in the dataset's order. A member the browser does not list to the caller, one they cannot read, is
+ * left out.
  * @param id - The dataset's object hash or primary key.
  * @param token - Share token the dataset is read with, if any.
  * @param filters - The browser filters the link carries, or null.
@@ -245,42 +279,46 @@ async function loadDatasetBundle(
     sort: string | null = null,
 ): Promise<DatasetBundle> {
     const browsed = filters !== null || sort !== null
-    const [dataset, allItems, listed] = await Promise.all([
+    // The browser lists recordings only, so a browsed link opens no media and needs no member listing.
+    const [dataset, rows, allItems] = await Promise.all([
         getDataset(id, token),
-        listAllDatasetItems(id, token),
-        browsed ? listMatchingRecordingHashes(id, filters, sort ?? 'name', token) : Promise.resolve(null),
+        listMatchingRecordings(id, filters, sort ?? 'name', token),
+        browsed ? Promise.resolve(null) : listAllDatasetItems(id, token),
     ])
-    // The browser lists recordings only, so a browsed link opens no media.
-    const byHash = new Map(
-        allItems.filter(item => item.object_type === 'recording' && item.object_hash).map(item => [item.object_hash, item]),
-    )
-    const items = listed
-        ? listed.map(hash => byHash.get(hash)).filter((item): item is NonNullable<typeof item> => !!item)
-        : allItems
-    // Preserve dataset order; resolve each item to its detail row (or null
-    // when the item type / state is not viewable). Unsupported media files
-    // are dropped here so the mount loop never tries to load them.
-    const bundleItems = (await Promise.all(
-        items.map(async (item): Promise<BundleItem | null> => {
-            if (!item.object_hash) {
-                return null
-            }
-            if (item.object_type === 'recording') {
-                const rec = await getRecordingDetail(item.object_hash, token)
-                return { kind: 'recording', recording: rec }
-            }
-            if (item.object_type === 'mediafile') {
-                if (item.is_supported === false) {
-                    console.warn(`[Epicurrents] Skipping unsupported media ${item.object_hash}`)
+    const listedByHash = new Map(rows.map(row => [row.hash, listedFromBrowseRow(row)]))
+    const recordingItem = (hash: string): BundleItem | null => {
+        const listed = listedByHash.get(hash)
+        return listed ? { kind: 'recording', listed, recording: null } : null
+    }
+    // Preserve dataset order. Unsupported media files are dropped here so the mount loop never tries to load them.
+    const bundleItems = allItems === null
+        ? rows.map(row => recordingItem(row.hash)).filter((i): i is BundleItem => i !== null)
+        : (await Promise.all(
+            allItems.map(async (item): Promise<BundleItem | null> => {
+                if (!item.object_hash) {
                     return null
                 }
-                const media = await getMediaDetail(item.object_hash)
-                return { kind: 'media', media }
-            }
-            return null
-        }),
-    )).filter((i): i is BundleItem => i !== null)
-    return { name: dataset.name, shareToken: token, items: bundleItems, preload: dataset.preload_members ?? false }
+                if (item.object_type === 'recording') {
+                    return recordingItem(item.object_hash)
+                }
+                if (item.object_type === 'mediafile') {
+                    if (item.is_supported === false) {
+                        console.warn(`[Epicurrents] Skipping unsupported media ${item.object_hash}`)
+                        return null
+                    }
+                    const media = await getMediaDetail(item.object_hash)
+                    return { kind: 'media', media }
+                }
+                return null
+            }),
+        )).filter((i): i is BundleItem => i !== null)
+    return {
+        items: bundleItems,
+        name: dataset.name,
+        preload: dataset.preload_members ?? false,
+        shareToken: token,
+        viewerConfig: dataset.viewer_config,
+    }
 }
 
 function cancelLeave () {
@@ -352,10 +390,10 @@ onMounted(async () => {
             // recordings (`?files=`) and media (`?media=`) in the order they
             // were declared in the URL.
             const recordingItems = await Promise.all(
-                hashes.value.map(async h => ({
-                    kind: 'recording' as const,
-                    recording: await getRecordingDetail(h, shareToken.value),
-                })),
+                hashes.value.map(async h => {
+                    const recording = await getRecordingDetail(h, shareToken.value)
+                    return { kind: 'recording' as const, listed: listedFromRecording(recording), recording }
+                }),
             )
             const mediaItems = await Promise.all(
                 mediaHashes.value.map(async h => ({
@@ -385,6 +423,9 @@ onMounted(async () => {
         }
         return
     }
+    if (totalItems.value > 1) {
+        openingStatus.value = t('Opening {count} items…', SCOPE, { count: totalItems.value })
+    }
 
     // Poll until the Epicurrents global is available, then mount.
     let retries = 0
@@ -394,6 +435,8 @@ onMounted(async () => {
                 retries++
                 console.debug(`Waiting for Epicurrents to be available (retry ${retries})...`)
                 setTimeout(awaitApp, 1000)
+            } else {
+                openingStatus.value = null
             }
             return
         }
@@ -455,6 +498,7 @@ onMounted(async () => {
             epic = await Epicurrents.createEpicurrentsApp(setup)
             if (!epic) {
                 console.error('Failed to initialize Epicurrents app.')
+                openingStatus.value = null
                 return
             }
             if (totalItems.value === 1) {
@@ -475,12 +519,7 @@ onMounted(async () => {
                 // A dataset opened via ?dataset=<id> layers its own overrides on
                 // top of the deployment config (most specific wins).
                 if (datasetId.value !== null) {
-                    try {
-                        const ds = await getDataset(datasetId.value, shareToken.value)
-                        overrides = { ...overrides, ...ds.viewer_config }
-                    } catch (err) {
-                        console.warn('[viewer-config] could not load dataset overrides:', err)
-                    }
+                    overrides = { ...overrides, ...bundles.value[0]?.viewerConfig }
                 }
                 applyViewerSettingsOverrides(epic, overrides)
             } catch (err) {
@@ -561,7 +600,7 @@ onMounted(async () => {
                 viewerDatasets.push(viewerDataset)
                 for (const item of bundle.items) {
                     const description = item.kind === 'recording'
-                        ? describeRecording(item.recording, bundle.shareToken)
+                        ? describeRecording(item.listed, bundle.shareToken)
                         : describeMedia(item.media)
                     if (!description) {
                         const media = (item as { media: MediaFileDetail }).media
@@ -571,13 +610,13 @@ onMounted(async () => {
                     const listing = app.addDeferredStudy({
                         loader: description.loader,
                         name: description.name,
-                        onLoaded: (resource) => studyLoaded(resource, item),
+                        onLoaded: (resource) => studyLoaded(resource, item, bundle.shareToken),
                         options: { isValidated: true, name: description.name },
                         properties: description.properties ?? undefined,
                         source: description.source,
                     }, { dataset: viewerDataset })
                     if (!listing) {
-                        const hash = item.kind === 'recording' ? item.recording.hash : item.media.content_hash
+                        const hash = item.kind === 'recording' ? item.listed.hash : item.media.content_hash
                         console.error(`[Epicurrents] Could not list the item ${hash}.`)
                         continue
                     }
@@ -592,7 +631,13 @@ onMounted(async () => {
                 )
             }
             const loadedStudies: DataResource[] = []
-            for (const listing of eager.slice(0, eagerLimit)) {
+            const eagerLoads = eager.slice(0, eagerLimit)
+            for (const [index, listing] of eagerLoads.entries()) {
+                if (eagerLoads.length > 1) {
+                    openingStatus.value = t(
+                        'Loading {done} of {count} items…', SCOPE, { done: index + 1, count: eagerLoads.length },
+                    )
+                }
                 const loaded = await app.openDeferredResource(listing)
                 if (loaded) {
                     loadedStudies.push(loaded)
@@ -604,7 +649,10 @@ onMounted(async () => {
             if (first) {
                 window.setTimeout(() => {
                     app.interface?.openResource(first)
+                    openingStatus.value = null
                 }, 250)
+            } else {
+                openingStatus.value = null
             }
             // Notify the active project and enabled plugins of the studies loaded up front: every member of a dataset
             // flagged to preload, within the eager load limit, and none of a dataset listed from metadata.
@@ -630,6 +678,10 @@ onMounted(async () => {
                 :data-file-hashes="hashes.join(',')"
                 id="epicurrents-viewer"
             ></div>
+            <div v-if="openingStatus" class="viewer-opening" role="status">
+                <wa-spinner></wa-spinner>
+                <span>{{ openingStatus }}</span>
+            </div>
             <!-- Project- or plugin-provided overlay panel (e.g. a teaching project's session panel). -->
             <component v-if="viewerPanel"
                 :datasetId="datasetId"
@@ -682,6 +734,26 @@ onMounted(async () => {
 .error {
     align-self: center;
     margin: 3rem 1rem;
+}
+
+/* Over the viewer while it lists and loads a set, and never in the way of it: the viewer's own interface is live
+   underneath, and the status goes once the first item opens. */
+.viewer-opening {
+    align-items: center;
+    background: var(--wa-color-surface-raised);
+    border: var(--wa-border-width-s) solid var(--wa-color-surface-border);
+    border-radius: var(--wa-border-radius-m);
+    box-shadow: var(--wa-shadow-m);
+    color: var(--wa-color-text-normal);
+    display: flex;
+    gap: var(--wa-space-s);
+    left: 50%;
+    padding: var(--wa-space-s) var(--wa-space-m);
+    pointer-events: none;
+    position: absolute;
+    top: 40%;
+    transform: translateX(-50%);
+    z-index: 10;
 }
 
 .viewer-container {

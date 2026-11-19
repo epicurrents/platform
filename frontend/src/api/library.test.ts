@@ -25,7 +25,7 @@ import {
     listAllCollectionItems,
     listAllCollections,
     listAllDatasetItems,
-    listMatchingRecordingHashes,
+    listMatchingRecordings,
     listRecordingTags,
     listTags,
     setPublicListing,
@@ -300,16 +300,27 @@ describe('browser query in a link', () => {
 
     it('reads every page under the sort, in the order the server lists them', async () => {
         const rows = (from: number, count: number) => Array.from({ length: count }, (_, i) => ({ hash: `h${from + i}` }))
-        mockGet
-            .mockResolvedValueOnce({ data: { count: 203, items: rows(0, 200) } })
-            .mockResolvedValueOnce({ data: { count: 203, items: rows(200, 3) } })
-        const hashes = await listMatchingRecordingHashes('abc', null, '-duration', 'tok')
-        expect(hashes).toHaveLength(203)
-        expect(hashes[0]).toBe('h0')
-        expect(hashes[202]).toBe('h202')
-        const second = mockGet.mock.calls[1][1]?.params as URLSearchParams
-        expect(second.get('sort')).toBe('-duration')
-        expect(second.get('offset')).toBe('200')
-        expect(second.get('share_token')).toBe('tok')
+        const pages: Record<string, unknown> = {
+            0: { count: 403, items: rows(0, 200) },
+            200: { count: 403, items: rows(200, 200) },
+            400: { count: 403, items: rows(400, 3) },
+        }
+        mockGet.mockImplementation((_url: string, config?: { params?: URLSearchParams }) => {
+            return Promise.resolve({ data: pages[config?.params?.get('offset') ?? ''] })
+        })
+        const listed = await listMatchingRecordings('abc', null, '-duration', 'tok')
+        expect(listed.map(row => row.hash)).toEqual(Array.from({ length: 403 }, (_, i) => `h${i}`))
+        expect(mockGet).toHaveBeenCalledTimes(3)
+        for (const [, config] of mockGet.mock.calls) {
+            const params = config?.params as URLSearchParams
+            expect(params.get('sort')).toBe('-duration')
+            expect(params.get('share_token')).toBe('tok')
+        }
+    })
+
+    it('reads one page when the first holds every match', async () => {
+        mockGet.mockResolvedValueOnce({ data: { count: 2, items: [{ hash: 'h0' }, { hash: 'h1' }] } })
+        expect((await listMatchingRecordings('abc', null, 'name')).map(row => row.hash)).toEqual(['h0', 'h1'])
+        expect(mockGet).toHaveBeenCalledTimes(1)
     })
 })

@@ -133,6 +133,7 @@ BROWSE_ROW_KEYS = {
     "hash",
     "display_name",
     "modality",
+    "file_extension",
     "public_source",
     "created_at",
     "duration",

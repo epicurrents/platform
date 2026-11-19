@@ -308,7 +308,7 @@ One thing to settle either way: a reader worker's `setup-cache` answers the shar
 
 A dataset now lists its recordings and loads each when it is opened ([frontend/README.md → Opening a dataset in the viewer](frontend/README.md#opening-a-dataset-in-the-viewer)), which keeps a thousand-recording dataset from crashing the tab on open. Three pieces are left:
 
-- **Startup still asks for every item's detail.** `loadDatasetBundle` in [ViewerView.vue](frontend/src/views/ViewerView.vue) fires one `getRecordingDetail` per member at once, a thousand requests for a thousand recordings, to read the metadata the listing is built from. A batch endpoint returning the listing fields for a dataset's members would make it one.
+- **The navigator renders every listed study.** A dataset is listed from the browser's pages and the viewer's controls bar checks its position once per batch, which brought a thousand-recording dataset from about twelve seconds to under three; what is left is a main-thread task of most of a second while the navigator renders a thousand rows, which the opening status covers. Rendering only the rows in view would remove it, in the interface's navigator.
 - **Opened recordings are never released.** Stepping through a few hundred recordings in one tab still exhausts it; the viewer side is in the core ROADMAP ("Release the readers of opened recordings").
 - **The SPA declares the deferred-study API itself.** `DeferredStudyApp` in [datasetStudies.ts](frontend/src/viewer/datasetStudies.ts) stands in for declarations the `@epicurrents/core` dev dependency gains with its next minor; move the dependency and delete it.
 

@@ -574,6 +574,7 @@ export interface DatasetBrowseRow {
     hash: string
     display_name: string
     modality: string
+    file_extension: string
     public_source: string
     created_at: string
     duration: number | null
@@ -769,28 +770,30 @@ export function browseFiltersFromQuery (query: Record<string, unknown>): Dataset
 }
 
 /**
- * The hashes of every recording of the dataset the filters match, in the browser's order under *sort*, read a page
- * of 200 at a time.
+ * Every recording of the dataset the filters match, as the browser lists it, in its order under *sort*. Read a page
+ * of 200 at a time: the first page gives the count, and the rest are read together.
  * @param datasetId - The dataset's object hash or primary key.
  * @param filters - The browser filters, or null for every recording.
  * @param sort - A browser sort key, `-` prefixed for descending.
  * @param shareToken - Share token the dataset is read with, if any.
  */
-export async function listMatchingRecordingHashes (
+export async function listMatchingRecordings (
     datasetId: number | string,
     filters: DatasetBrowseFilters | null,
     sort: string,
     shareToken?: string,
-): Promise<string[]> {
+): Promise<DatasetBrowseRow[]> {
     const limit = 200
-    const hashes: string[] = []
-    for (let offset = 0; ; offset += limit) {
-        const page = await browseDataset(datasetId, { sort, limit, offset }, filters ?? undefined, shareToken)
-        hashes.push(...page.items.map(row => row.hash))
-        if (page.items.length < limit || hashes.length >= page.count) {
-            return hashes
+    const read = (offset: number) => browseDataset(datasetId, { sort, limit, offset }, filters ?? undefined, shareToken)
+    const first = await read(0)
+    const offsets: number[] = []
+    if (first.items.length === limit) {
+        for (let offset = limit; offset < first.count; offset += limit) {
+            offsets.push(offset)
         }
     }
+    const rest = await Promise.all(offsets.map(read))
+    return [first, ...rest].flatMap(page => page.items)
 }
 
 /**

@@ -73,6 +73,7 @@ class TestColumns:
         _add(dataset, recording)
         (row,) = _browse(_client(user), dataset).json()["items"]
         assert row["modality"] == "eeg"
+        assert row["file_extension"] == ".edf"
         assert row["public_source"] == "https://example.org/ds"
         assert row["duration"] == 12.5
         assert row["channel_count"] == 3, "the annotation channel is not a signal channel"

@@ -3071,6 +3071,7 @@ export async function handleMock(
                     hash: r.hash,
                     display_name: resolvedDisplayName(r),
                     modality: r.modality,
+                    file_extension: r.file_extension,
                     public_source: r.public_source ?? '',
                     created_at: r.created_at,
                     duration: r.meta?.duration ?? null,
