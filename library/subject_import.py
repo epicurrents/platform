@@ -9,7 +9,8 @@ stored as the number it reads as. Every column the mapping does not name is drop
 not cover, or that is not a finite number for a number field, is counted and never stored.
 
 Rows are paired with recordings by the original's file name, which reaches the platform only in the
-author-private ``Recording.original_name``. The import reads it to match and stores nothing of it, and nothing it
+author-private ``Recording.original_name``, or by the file's bytes, through the server-only ``Recording.file_hash``,
+when the deployment discards names. The import reads either to match and stores nothing of it, and nothing it
 reports names a recording, a file or a value: the run is described by counts and by the table's line numbers.
 Pairing by position is not offered, because one file missing from the import would shift every later row onto the
 wrong recording with nothing to show it.
@@ -32,9 +33,15 @@ where ``age_years`` is a number field.
 
 ``match.on`` is ``name`` (the cell's file name equals the recording's), ``stem`` (the same, ignoring the
 extension, for a file a converter renamed) or ``prefix`` (the recording's file name starts with the cell followed
-by a character that is not a letter or a digit, so ``sub-1`` does not match ``sub-10_task-rest_eeg.edf``). A band
-is half-open, ``from`` inclusive and ``below`` exclusive, either end optional, and bands may not overlap. ``values``
-is consulted before ``bands``. A cell that is empty or ``n/a`` is *missing*, not unmapped.
+by a character that is not a letter or a digit, so ``sub-1`` does not match ``sub-10_task-rest_eeg.edf``) or
+``content`` (the cell names a file under a source folder the caller gives, whose SHA-256 equals the recording's
+``file_hash``). ``content`` is the mode for a deployment running ``RECORDINGS_DISCARD_ORIGINAL_NAME``, where no name
+was kept to match; it pairs a native EDF or BDF file only, since a converted file's digest is of the EDF the
+converter wrote. Rows naming byte-identical files that would write the same values share one outcome, and a
+recording whose bytes another member shares takes those values with it. ``files_not_read`` counts the rows whose cell
+is empty or names no readable file in the folder, which tells an operator's mistake from a file whose bytes match no
+recording. A band is half-open, ``from`` inclusive and ``below`` exclusive, either end optional, and bands may not
+overlap. ``values`` is consulted before ``bands``. A cell that is empty or ``n/a`` is *missing*, not unmapped.
 
 The rules of ``library.subjects`` hold: the values are checked against the schema under the dataset's row lock,
 a released member of a release-gated dataset keeps its values, and the audit trail withholds them. A submission
@@ -45,15 +52,19 @@ file name.
 from __future__ import annotations
 
 import csv
+import hashlib
 import math
+import os
 from collections import Counter
 from dataclasses import dataclass, field
 from itertools import pairwise
 from pathlib import Path, PurePosixPath
 from typing import Any
 
-MATCH_MODES = ("name", "stem", "prefix")
+MATCH_MODES = ("name", "stem", "prefix", "content")
 _MISSING = {"", "n/a", "na"}
+# What a missing cell writes in ``_outcome``: a tuple, which no choice and no number can equal.
+_WRITES_NOTHING = ("missing",)
 
 
 class ImportRefused(Exception):
@@ -119,6 +130,7 @@ class ImportPlan:
     members_released: int = 0
     members_not_controlled: int = 0
     members_changed: int = 0
+    files_not_read: int = 0
     mapped: Counter = field(default_factory=Counter)
     unmapped: Counter = field(default_factory=Counter)
     missing: Counter = field(default_factory=Counter)
@@ -139,6 +151,7 @@ class ImportPlan:
             "members_released": self.members_released,
             "members_not_controlled": self.members_not_controlled,
             "members_changed": self.members_changed,
+            "files_not_read": self.files_not_read,
             "fields": {
                 key: {"mapped": self.mapped[key], "unmapped": self.unmapped[key], "missing": self.missing[key]}
                 for key in keys
@@ -250,6 +263,38 @@ def load_mapping(raw: Any, schema: list[dict], columns: list[str]) -> Mapping:
     return Mapping(match_column=match["column"], match_on=match_on, fields=fields)
 
 
+def hash_files(rows: list[tuple[int, dict[str, str]]], column: str, root: Path) -> dict[int, str | None]:
+    """The SHA-256 of the file each row's *column* names under *root*, by line.
+
+    ``None`` for a cell that is empty, names a path outside *root* as written (an absolute path or a ``..`` escape),
+    or names nothing that can be read as a regular file, so such a row is unmatched rather than read from elsewhere.
+    Containment is checked on the path as written and links are followed after it, because the escape the check
+    exists for comes from the table, and a DataLad or git-annex tree keeps every file behind a link into its annex.
+    A read error is a ``None`` too, so the run reports the row instead of a traceback naming the file.
+    """
+    root = root.resolve()
+    digests: dict[int, str | None] = {}
+    for line, row in rows:
+        cell = row[column].replace("\\", "/")
+        digests[line] = None
+        if not cell:
+            continue
+        path = Path(os.path.normpath(root / cell))
+        if not path.is_relative_to(root):
+            continue
+        try:
+            if not path.is_file():
+                continue
+            hasher = hashlib.sha256()
+            with path.open("rb") as fh:
+                for chunk in iter(lambda: fh.read(1 << 20), b""):
+                    hasher.update(chunk)
+        except (OSError, ValueError):
+            continue
+        digests[line] = hasher.hexdigest()
+    return digests
+
+
 def _stem(name: str) -> str:
     """*name* without its extension; a suffix that does not start with a letter (``sub-1.2``) is not one."""
     path = Path(name)
@@ -269,14 +314,27 @@ def _matches(original_name: str, cell: str, match_on: str) -> bool:
     return bool(wanted) and name == wanted
 
 
+def _outcome(mapping: Mapping, row: dict[str, str]) -> tuple:
+    """What *row* would write for each mapped field, so ``30`` and ``30.0``, or ``n/a`` and an empty cell, agree."""
+    return tuple(
+        _WRITES_NOTHING if row[field_map.column].lower() in _MISSING else field_map.choice_for(row[field_map.column])
+        for field_map in mapping.fields
+    )
+
+
 def plan_import(
-    dataset: Any, schema: list[dict], mapping: Mapping, rows: list[tuple[int, dict[str, str]]]
+    dataset: Any,
+    schema: list[dict],
+    mapping: Mapping,
+    rows: list[tuple[int, dict[str, str]]],
+    digests: dict[int, str | None] | None = None,
 ) -> ImportPlan:
     """Pair the table's rows with the dataset's recording members and work out each member's new values.
 
     A member matched by more than one row is matched by none, and every row that matched it is reported as
     ambiguous: two rows disagreeing about one recording is not a choice the import makes. A row matching several
-    members is fine under ``prefix``, a participant with several recordings, and ambiguous otherwise.
+    members is fine under ``prefix``, a participant with several recordings, and under ``content``, recordings with
+    the same bytes; it is ambiguous otherwise. ``content`` needs *digests*, from ``hash_files``.
     """
     from django.contrib.contenttypes.models import ContentType
 
@@ -292,7 +350,12 @@ def plan_import(
     )
     # Only the dataset author's own recordings: another author's original name is theirs, and pairing it with a
     # row of the table would tell the dataset's author which subject their recording is.
-    names = dict(live.filter(author_id=dataset.author_id).values_list("pk", "original_name"))
+    by_content = mapping.match_on == "content"
+    if by_content and digests is None:
+        raise ImportRefused("Matching on content needs the files the table names.")
+    names = dict(
+        live.filter(author_id=dataset.author_id).values_list("pk", "file_hash" if by_content else "original_name")
+    )
     plan.members_not_controlled = live.exclude(author_id=dataset.author_id).count()
     members = [
         (item, names[int(item.object_id)])
@@ -301,25 +364,51 @@ def plan_import(
     ]
     plan.members = len(members)
 
+    # Rows naming byte-identical files that would write the same values follow the first of them.
+    duplicate_of: dict[int, int] = {}
+    if by_content:
+        plan.files_not_read = sum(1 for line, _row in rows if digests.get(line) is None)
+        groups: dict[tuple, list[int]] = {}
+        for line, row in rows:
+            if digests.get(line):
+                groups.setdefault((digests[line], _outcome(mapping, row)), []).append(line)
+        duplicate_of = {line: lines[0] for lines in groups.values() for line in lines[1:]}
+
     hits: dict[int, list[int]] = {}
     row_members: dict[int, list] = {}
     for line, row in rows:
-        cell = row[mapping.match_column]
-        matched = [
-            item for item, original_name in members if original_name and _matches(original_name, cell, mapping.match_on)
-        ]
+        if line in duplicate_of:
+            continue
+        if by_content:
+            digest = digests.get(line)
+            matched = [item for item, file_hash in members if digest and file_hash == digest]
+        else:
+            cell = row[mapping.match_column]
+            matched = [
+                item
+                for item, original_name in members
+                if original_name and _matches(original_name, cell, mapping.match_on)
+            ]
         row_members[line] = matched
         for item in matched:
             hits.setdefault(item.pk, []).append(line)
 
     ambiguous = {line for lines in hits.values() if len(lines) > 1 for line in lines}
-    if mapping.match_on != "prefix":
+    if mapping.match_on not in ("prefix", "content"):
         ambiguous |= {line for line, matched in row_members.items() if len(matched) > 1}
     current = dict(
         DatasetItemSubject.objects.filter(item__in=[item for item, _ in members]).values_list("item_id", "values")
     )
 
     for line, row in rows:
+        if line in duplicate_of:
+            if duplicate_of[line] in ambiguous:
+                plan.ambiguous_lines.append(line)
+            elif row_members[duplicate_of[line]]:
+                plan.matched_rows += 1
+            else:
+                plan.unmatched_lines.append(line)
+            continue
         matched = row_members[line]
         if line in ambiguous:
             plan.ambiguous_lines.append(line)

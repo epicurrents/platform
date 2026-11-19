@@ -1,12 +1,14 @@
 """The subject-table import: the mapping's validation, how a cell maps, how rows pair with recordings, and the command.
 
-Covers the refusals of a mapping, values before bands and the half-open bands, the three match modes, ambiguous
-and unmatched rows, released members left alone, a pool refused, and what the run leaves behind: values written
-and withheld from the trail, an activity row carrying counts only, and output naming no file and no value.
+Covers the refusals of a mapping, values before bands and the half-open bands, the four match modes, ambiguous
+and unmatched rows, byte-identical files under content matching, released members left alone, a pool refused, and
+what the run leaves behind: values written and withheld from the trail, an activity row carrying counts only, and
+output naming no file and no value.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 from io import StringIO
@@ -321,3 +323,188 @@ class TestCommand:
         table, mapping = _files(tmp_path, [[SUBJECT, "30", "F", DROPPED, "extra"]])
         with pytest.raises(CommandError, match="more cells"):
             _run(dataset, table, mapping)
+
+
+CONTENT = {"match": {"column": "participant_id", "on": "content"}, "fields": MAPPING["fields"]}
+
+
+def _source(tmp_path, files):
+    """A source folder holding *files*, a mapping of name to bytes, and the digest of each."""
+    root = tmp_path / "source"
+    root.mkdir()
+    for name, data in files.items():
+        (root / name).write_bytes(data)
+    return root, {name: hashlib.sha256(data).hexdigest() for name, data in files.items()}
+
+
+def _discarded(author, index, file_hash):
+    return _named(author, index, f"upload-20260101T00000{index}Z.edf", file_hash=file_hash)
+
+
+class TestContentMatching:
+    def test_rows_pair_with_recordings_by_the_bytes_of_the_file_they_name(self, user, tmp_path):
+        root, digests = _source(tmp_path, {"A1.edf": b"alpha", "B2.edf": b"beta"})
+        dataset, items = _dataset(user, _discarded(user, 0, digests["A1.edf"]), _discarded(user, 1, digests["B2.edf"]))
+        table, mapping = _files(tmp_path, [["A1.edf", "89+", "F", ""], ["B2.edf", "30", "M", ""]], mapping=CONTENT)
+        output = _run(dataset, table, mapping, "--files", str(root))
+        assert _values(items[0]) == {"age": MARKER, "sex": "female"}
+        assert _values(items[1]) == {"age": "18-64", "sex": "male"}
+        for secret in ("A1.edf", digests["A1.edf"], str(root)):
+            assert secret not in output
+        recorded = json.dumps(Activity.objects.get(verb="library.dataset.subject.import").metadata)
+        assert digests["A1.edf"] not in recorded and str(root) not in recorded
+
+    def test_identical_files_given_the_same_cells_are_one_row(self, user, tmp_path):
+        root, digests = _source(tmp_path, {"A1.edf": b"twin", "B2.edf": b"twin"})
+        dataset, items = _dataset(user, _discarded(user, 0, digests["A1.edf"]), _discarded(user, 1, digests["B2.edf"]))
+        table, mapping = _files(tmp_path, [["A1.edf", "30", "M", "x"], ["B2.edf", "30", "M", "y"]], mapping=CONTENT)
+        report = json.loads(_run(dataset, table, mapping, "--files", str(root), "--format", "json"))
+        assert report["matched_rows"] == 2 and report["ambiguous_rows"] == 0
+        assert report["members_matched"] == 2 and report["fields"]["sex"]["mapped"] == 2
+        assert _values(items[0]) == _values(items[1]) == {"age": "18-64", "sex": "male"}
+
+    def test_identical_files_given_different_cells_are_ambiguous(self, user, tmp_path):
+        root, digests = _source(tmp_path, {"A1.edf": b"twin", "B2.edf": b"twin", "C3.edf": b"twin"})
+        dataset, items = _dataset(user, _discarded(user, 0, digests["A1.edf"]), _discarded(user, 1, digests["B2.edf"]))
+        rows = [["A1.edf", "30", "M", ""], ["B2.edf", "10", "F", ""], ["C3.edf", "10", "F", ""]]
+        table, mapping = _files(tmp_path, rows, mapping=CONTENT)
+        report = json.loads(_run(dataset, table, mapping, "--files", str(root), "--format", "json"))
+        assert report["ambiguous_lines"] == [2, 3, 4]
+        assert _values(items[0]) is None and _values(items[1]) is None
+
+    @pytest.mark.parametrize("cell", ["../outside.edf", "missing.edf", ""])
+    def test_a_cell_naming_no_file_in_the_folder_is_unmatched(self, user, tmp_path, cell):
+        root, _digests = _source(tmp_path, {"A1.edf": b"alpha"})
+        (tmp_path / "outside.edf").write_bytes(b"outside")
+        dataset, items = _dataset(user, _discarded(user, 0, hashlib.sha256(b"outside").hexdigest()))
+        table, mapping = _files(tmp_path, [[cell, "30", "M", ""]], mapping=CONTENT)
+        report = json.loads(_run(dataset, table, mapping, "--files", str(root), "--format", "json"))
+        assert report["unmatched_lines"] == [2]
+        assert _values(items[0]) is None
+
+    def test_an_absolute_path_is_not_read(self, user, tmp_path):
+        root, _digests = _source(tmp_path, {"A1.edf": b"alpha"})
+        outside = tmp_path / "outside.edf"
+        outside.write_bytes(b"outside")
+        dataset, items = _dataset(user, _discarded(user, 0, hashlib.sha256(b"outside").hexdigest()))
+        table, mapping = _files(tmp_path, [[str(outside), "30", "M", ""]], mapping=CONTENT)
+        report = json.loads(_run(dataset, table, mapping, "--files", str(root), "--format", "json"))
+        assert report["unmatched_lines"] == [2]
+        assert _values(items[0]) is None
+
+    def test_another_authors_recording_is_not_paired_by_content(self, user, make_user, tmp_path):
+        root, digests = _source(tmp_path, {"A1.edf": b"alpha"})
+        dataset, items = _dataset(user, _discarded(make_user(), 0, digests["A1.edf"]))
+        table, mapping = _files(tmp_path, [["A1.edf", "30", "M", ""]], mapping=CONTENT)
+        report = json.loads(_run(dataset, table, mapping, "--files", str(root), "--format", "json"))
+        assert report["members_not_controlled"] == 1 and report["unmatched_rows"] == 1
+        assert _values(items[0]) is None
+
+    def test_content_matching_needs_the_folder(self, user, tmp_path):
+        dataset, _items = _dataset(user, _discarded(user, 0, "0" * 64))
+        table, mapping = _files(tmp_path, [["A1.edf", "30", "M", ""]], mapping=CONTENT)
+        with pytest.raises(CommandError, match="needs --files"):
+            _run(dataset, table, mapping)
+        with pytest.raises(CommandError, match="not a folder"):
+            _run(dataset, table, mapping, "--files", str(tmp_path / "nowhere"))
+
+    def test_the_folder_is_refused_for_a_name_match(self, user, tmp_path):
+        dataset, _items = _dataset(user, _named(user, 0, f"{SUBJECT}_task-rest_eeg.edf"))
+        table, mapping = _files(tmp_path, [[SUBJECT, "30", "F", ""]])
+        with pytest.raises(CommandError, match="only when"):
+            _run(dataset, table, mapping, "--files", str(tmp_path))
+
+    def test_one_row_reaches_every_member_with_the_same_bytes(self, user, tmp_path):
+        root, digests = _source(tmp_path, {"A1.edf": b"twin"})
+        dataset, items = _dataset(user, _discarded(user, 0, digests["A1.edf"]), _discarded(user, 1, digests["A1.edf"]))
+        table, mapping = _files(tmp_path, [["A1.edf", "30", "M", ""]], mapping=CONTENT)
+        report = json.loads(_run(dataset, table, mapping, "--files", str(root), "--format", "json"))
+        assert report["matched_rows"] == 1 and report["members_matched"] == 2
+        assert _values(items[0]) == _values(items[1]) == {"age": "18-64", "sex": "male"}
+
+    def test_identical_files_writing_the_same_values_agree_whatever_the_spelling(self, user, tmp_path):
+        root, digests = _source(tmp_path, {"A1.edf": b"twin", "B2.edf": b"twin"})
+        dataset, items = _dataset(user, _discarded(user, 0, digests["A1.edf"]), _discarded(user, 1, digests["B2.edf"]))
+        table, mapping = _files(tmp_path, [["A1.edf", "30", "n/a", ""], ["B2.edf", "30.0", "", ""]], mapping=CONTENT)
+        report = json.loads(_run(dataset, table, mapping, "--files", str(root), "--format", "json"))
+        assert report["ambiguous_rows"] == 0
+        assert _values(items[0]) == _values(items[1]) == {"age": "18-64"}
+
+    def test_a_duplicate_of_an_unmatched_row_is_unmatched(self, user, tmp_path):
+        root, _digests = _source(tmp_path, {"A1.edf": b"twin", "B2.edf": b"twin"})
+        dataset, _items = _dataset(user, _discarded(user, 0, "0" * 64))
+        table, mapping = _files(tmp_path, [["A1.edf", "30", "M", ""], ["B2.edf", "30", "M", ""]], mapping=CONTENT)
+        report = json.loads(_run(dataset, table, mapping, "--files", str(root), "--format", "json"))
+        assert report["unmatched_lines"] == [2, 3] and report["files_not_read"] == 0
+
+    def test_a_link_in_the_folder_is_followed_wherever_it_points(self, user, tmp_path):
+        root, _digests = _source(tmp_path, {})
+        annex = tmp_path / "annex"
+        annex.mkdir()
+        (annex / "object").write_bytes(b"annexed")
+        (root / "A1.edf").symlink_to(annex / "object")
+        dataset, items = _dataset(user, _discarded(user, 0, hashlib.sha256(b"annexed").hexdigest()))
+        table, mapping = _files(tmp_path, [["A1.edf", "30", "M", ""]], mapping=CONTENT)
+        _run(dataset, table, mapping, "--files", str(root))
+        assert _values(items[0]) == {"age": "18-64", "sex": "male"}
+
+    def test_a_backslash_separator_reads_as_a_folder(self, user, tmp_path):
+        root, _digests = _source(tmp_path, {})
+        (root / "sub-1").mkdir()
+        (root / "sub-1" / "A1.edf").write_bytes(b"nested")
+        dataset, items = _dataset(user, _discarded(user, 0, hashlib.sha256(b"nested").hexdigest()))
+        table, mapping = _files(tmp_path, [["sub-1\\A1.edf", "30", "M", ""]], mapping=CONTENT)
+        _run(dataset, table, mapping, "--files", str(root))
+        assert _values(items[0]) == {"age": "18-64", "sex": "male"}
+
+    @pytest.mark.parametrize("cell", ["sub-1", "A1.edf", "bad\x00name.edf"])
+    def test_a_cell_naming_nothing_readable_is_counted_and_unmatched(self, user, tmp_path, cell):
+        root, digests = _source(tmp_path, {"A1.edf": b"alpha"})
+        (root / "sub-1").mkdir()
+        (root / "A1.edf").chmod(0)
+        dataset, _items = _dataset(user, _discarded(user, 0, digests["A1.edf"]))
+        table, mapping = _files(tmp_path, [[cell, "30", "M", ""]], mapping=CONTENT)
+        try:
+            output = _run(dataset, table, mapping, "--files", str(root), "--format", "json")
+        finally:
+            (root / "A1.edf").chmod(0o600)
+        report = json.loads(output)
+        if cell == "A1.edf" and report["matched_rows"] == 1:
+            pytest.skip("running with privileges that read a file with no permissions")
+        assert report["unmatched_lines"] == [2] and report["files_not_read"] == 1
+        assert str(root) not in output
+
+    def test_a_released_member_keeps_its_values_under_content_matching(self, user, tmp_path):
+        root, digests = _source(tmp_path, {"A1.edf": b"alpha", "B2.edf": b"beta"})
+        released = _discarded(user, 0, digests["A1.edf"])
+        unreleased = _discarded(user, 1, digests["B2.edf"])
+        dataset, items = _gated_dataset(user, released, unreleased)
+        DatasetMeta.objects.create(dataset=dataset, subject_schema=[AGE, SEX])
+        _release(dataset, items[0])
+        table, mapping = _files(tmp_path, [["A1.edf", "30", "F", ""], ["B2.edf", "30", "F", ""]], mapping=CONTENT)
+        report = json.loads(_run(dataset, table, mapping, "--files", str(root), "--format", "json"))
+        assert report["members_released"] == 1
+        assert _values(items[0]) is None and _values(items[1]) == {"age": "18-64", "sex": "female"}
+
+    def test_a_dry_run_reports_what_the_run_writes(self, user, tmp_path):
+        root, digests = _source(tmp_path, {"A1.edf": b"alpha"})
+        dataset, items = _dataset(user, _discarded(user, 0, digests["A1.edf"]))
+        table, mapping = _files(tmp_path, [["A1.edf", "30", "M", ""], ["gone.edf", "30", "M", ""]], mapping=CONTENT)
+        dry = json.loads(_run(dataset, table, mapping, "--files", str(root), "--dry-run", "--format", "json"))
+        assert _values(items[0]) is None
+        real = json.loads(_run(dataset, table, mapping, "--files", str(root), "--format", "json"))
+        assert {**dry, "dry_run": False} == real
+        assert real["members_changed"] == 1 and real["files_not_read"] == 1
+
+    def test_a_missing_cell_disagrees_with_a_choice_spelled_missing(self, user, tmp_path):
+        status = {"key": "status", "label": "Status", "choices": ["missing", "present"]}
+        root, digests = _source(tmp_path, {"A1.edf": b"twin", "B2.edf": b"twin"})
+        recordings = (_discarded(user, 0, digests["A1.edf"]), _discarded(user, 1, digests["B2.edf"]))
+        dataset, items = _dataset(user, *recordings, schema=(status,))
+        mapping = {**CONTENT, "fields": {"status": {"column": "sex", "values": {"unknown": "missing"}}}}
+        table, mapping_path = _files(
+            tmp_path, [["A1.edf", "", "n/a", ""], ["B2.edf", "", "unknown", ""]], mapping=mapping
+        )
+        report = json.loads(_run(dataset, table, mapping_path, "--files", str(root), "--format", "json"))
+        assert report["ambiguous_lines"] == [2, 3]
+        assert _values(items[0]) is None and _values(items[1]) is None

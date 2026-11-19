@@ -1,7 +1,8 @@
 """Import a published dataset's subject table onto a dataset's subject fields, through a mapping file.
 
-The table's rows are paired with the dataset author's own recordings by the original file name, and each declared
-field is read through the mapping (``library.subject_import`` has the format). Columns the mapping does not name are
+The table's rows are paired with the dataset author's own recordings by the original file name, or with
+``"on": "content"`` by the bytes of the file each row names under ``--files``, and each declared field is read
+through the mapping (``library.subject_import`` has the format). Columns the mapping does not name are
 dropped, and cells it does not cover are counted, never stored. Output is counts and the table's line numbers for
 rows that matched nothing or matched ambiguously; it never names a recording, a file or a value.
 
@@ -13,6 +14,7 @@ Usage::
 
     python manage.py import_subject_table <dataset-hash> participants.tsv --mapping mapping.json --dry-run
     python manage.py import_subject_table <dataset-hash> participants.tsv --mapping mapping.json
+    python manage.py import_subject_table <dataset-hash> subjects.csv --mapping mapping.json --files /data/source
 """
 
 from __future__ import annotations
@@ -28,7 +30,7 @@ from activity.system_activity import with_system_activity
 from library.models import Dataset
 from library.pools import is_pool
 from library.release import resolve_dataset
-from library.subject_import import ImportRefused, apply_plan, load_mapping, plan_import, read_table
+from library.subject_import import ImportRefused, apply_plan, hash_files, load_mapping, plan_import, read_table
 from library.subjects import schema_of
 
 
@@ -41,6 +43,10 @@ class Command(BaseCommand):
         parser.add_argument("dataset", help="Dataset hash or primary key")
         parser.add_argument("table", help="The subject table, CSV or (.tsv, .tab) tab-separated, UTF-8")
         parser.add_argument("--mapping", required=True, help="The JSON mapping file")
+        parser.add_argument(
+            "--files",
+            help='The folder the table\'s file names are read under; required by, and only for, "on": "content"',
+        )
         parser.add_argument("--dry-run", action="store_true", help="Report what would be written and write nothing")
         parser.add_argument("--format", choices=("text", "json"), default="text")
 
@@ -67,7 +73,9 @@ class Command(BaseCommand):
 
         # Checked before the audited scope opens, so a refused mapping leaves no activity row; checked again under
         # the lock in case the schema changed in between.
-        plan = self._plan(dataset, raw_mapping, header, rows)
+        mapping = self._mapping(dataset, raw_mapping, header)
+        digests = self._digests(mapping, rows, options["files"])
+        plan = self._plan(dataset, raw_mapping, header, rows, digests)
         if options["dry_run"]:
             self._emit(dataset, plan.report(), options["format"], dry_run=True)
             return
@@ -80,7 +88,7 @@ class Command(BaseCommand):
         ):
             # Under the schema write's lock, so the values are checked against the schema they are stored under.
             locked = Dataset.objects.select_for_update().get(pk=dataset.pk)
-            plan = self._plan(locked, raw_mapping, header, rows)
+            plan = self._plan(locked, raw_mapping, header, rows, digests)
             apply_plan(plan)
             if activity is not None:
                 activity.metadata = plan.audit_metadata()
@@ -88,15 +96,32 @@ class Command(BaseCommand):
         self._emit(dataset, plan.report(), options["format"], dry_run=False)
 
     @staticmethod
-    def _plan(dataset, raw_mapping, header, rows):
+    def _mapping(dataset, raw_mapping, header):
         schema = schema_of(dataset)
         if not schema:
             raise CommandError(f"Dataset {dataset.object_hash} declares no subject fields")
         try:
-            mapping = load_mapping(raw_mapping, schema, header)
+            return load_mapping(raw_mapping, schema, header)
         except ImportRefused as exc:
             raise CommandError(str(exc)) from exc
-        return plan_import(dataset, schema, mapping, rows)
+
+    @staticmethod
+    def _digests(mapping, rows, files):
+        """The digest of each file the table names, read once and outside the lock; ``None`` unless on content."""
+        if mapping.match_on != "content":
+            if files is not None:
+                raise CommandError('--files is read only when the mapping matches "on": "content"')
+            return None
+        if files is None:
+            raise CommandError('A mapping matching "on": "content" needs --files')
+        root = Path(files)
+        if not root.is_dir():
+            raise CommandError("--files is not a folder")
+        return hash_files(rows, mapping.match_column, root)
+
+    def _plan(self, dataset, raw_mapping, header, rows, digests):
+        mapping = self._mapping(dataset, raw_mapping, header)
+        return plan_import(dataset, schema_of(dataset), mapping, rows, digests)
 
     def _emit(self, dataset, report: dict, fmt: str, *, dry_run: bool) -> None:
         if fmt == "json":
@@ -115,6 +140,8 @@ class Command(BaseCommand):
             f"  members matched: {report['members_matched']}, of which released and left as they are: "
             f"{report['members_released']}"
         )
+        if report["files_not_read"]:
+            self.stdout.write(f"  rows naming no readable file under --files, or none: {report['files_not_read']}")
         if report["members_not_controlled"]:
             self.stdout.write(f"  recording members by another author, not paired: {report['members_not_controlled']}")
         for key, counts in report["fields"].items():
