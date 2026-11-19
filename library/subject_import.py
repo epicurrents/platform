@@ -2,10 +2,11 @@
 
 A published dataset ships its subject facts as a table, one row per file or per participant (a BIDS
 ``participants.tsv`` is the common case). The table's columns hold what the original's authors recorded, exact
-ages and local codes among them, which the platform's subject schema does not admit. A *mapping file* says how
+ages and local codes among them, which a field of choices does not admit. A *mapping file* says how
 each declared field is read from the table: which column, and how a cell becomes one of the field's choices,
-through a table of values, a list of numeric bands, or both. Every column the mapping does not name is dropped,
-and a cell the mapping does not cover is counted and never stored.
+through a table of values, a list of numeric bands, or both. A number field names its column alone, and a cell is
+stored as the number it reads as. Every column the mapping does not name is dropped, and a cell the mapping does
+not cover, or that is not a finite number for a number field, is counted and never stored.
 
 Rows are paired with recordings by the original's file name, which reaches the platform only in the
 author-private ``Recording.original_name``. The import reads it to match and stores nothing of it, and nothing it
@@ -22,9 +23,12 @@ The mapping file is JSON::
                                            {"from": 18, "below": 65, "choice": "18-64"},
                                            {"from": 65, "choice": "65+"}],
                 "values": {"89+": "65+"}},
-        "sex": {"column": "sex", "values": {"F": "female", "M": "male"}}
+        "sex": {"column": "sex", "values": {"F": "female", "M": "male"}},
+        "age_years": {"column": "age"}
       }
     }
+
+where ``age_years`` is a number field.
 
 ``match.on`` is ``name`` (the cell's file name equals the recording's), ``stem`` (the same, ignoring the
 extension, for a file a converter renamed) or ``prefix`` (the recording's file name starts with the cell followed
@@ -64,9 +68,19 @@ class FieldMap:
     column: str
     values: dict[str, str]
     bands: list[tuple[float, float, str]]
+    number: bool = False
 
-    def choice_for(self, cell: str) -> str | None:
-        """The choice *cell* maps to, or ``None`` when the mapping does not cover it."""
+    def choice_for(self, cell: str) -> str | float | None:
+        """The choice *cell* maps to, or for a number field the number it reads as; ``None`` when the mapping does not
+        cover it."""
+        if self.number:
+            from library.subjects import is_number
+
+            try:
+                value = float(cell)
+            except ValueError:
+                return None
+            return value if is_number(value) else None
         if cell in self.values:
             return self.values[cell]
         if not self.bands:
@@ -184,7 +198,10 @@ def load_mapping(raw: Any, schema: list[dict], columns: list[str]) -> Mapping:
         raise ImportRefused(f"match.on must be one of {', '.join(MATCH_MODES)}.")
     if match["column"] not in columns:
         raise ImportRefused("The table has no column named by match.column.")
-    choices = {entry["key"]: entry["choices"] for entry in schema}
+    from library.subjects import is_number_field
+
+    choices = {entry["key"]: entry.get("choices", []) for entry in schema}
+    numbers = {entry["key"] for entry in schema if is_number_field(entry)}
     if not isinstance(raw["fields"], dict) or not raw["fields"]:
         raise ImportRefused("fields must be a non-empty object of subject field keys.")
     fields = []
@@ -193,6 +210,13 @@ def load_mapping(raw: Any, schema: list[dict], columns: list[str]) -> Mapping:
             raise ImportRefused(f"The dataset declares no subject field {key}.")
         if not isinstance(spec, dict) or not isinstance(spec.get("column"), str):
             raise ImportRefused(f"The mapping of {key} must be an object naming a column.")
+        if key in numbers:
+            if set(spec) != {"column"}:
+                raise ImportRefused(f"{key} is a number field; its mapping names a column and nothing else.")
+            if spec["column"] not in columns:
+                raise ImportRefused(f"The table has no column named by the mapping of {key}.")
+            fields.append(FieldMap(key=key, column=spec["column"], values={}, bands=[], number=True))
+            continue
         if set(spec) - {"column", "values", "bands"} or not ({"values", "bands"} & set(spec)):
             raise ImportRefused(f"The mapping of {key} takes a column and values, bands or both.")
         if spec["column"] not in columns:

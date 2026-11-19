@@ -26,12 +26,13 @@ import {
     type DatasetBrowseRow,
     type DatasetFacets,
     type SubjectField,
+    type SubjectValue,
     type TagChip,
 } from '#api/library'
 import { getRecordingCodes, listVocabularies, type CodeSummary, type Vocabulary } from '#api/annotations'
 import { getRecordingDetail, type Recording } from '#api/recordings'
 import { errorDetail } from '#lib/http'
-import { formatDuration, formatMonth, formatSamplingRate } from '#lib/format'
+import { formatDuration, formatMonth, formatSamplingRate, formatSubjectValue } from '#lib/format'
 import { showToast } from '#lib/toast'
 import DataTable, { type DataTableColumn } from '#components/DataTable.vue'
 import DatasetBrowserFilters from '#components/DatasetBrowserFilters.vue'
@@ -54,8 +55,8 @@ const router = useRouter()
 
 const rows = ref<DatasetBrowseRow[]>([])
 const subjectFields = ref<SubjectField[]>([])
-const facets = ref<DatasetFacets>({ modality: [], subject: {}, tags: [] })
-const filters = ref<DatasetBrowseFilters>({ modality: [], subject: {}, tags: [] })
+const facets = ref<DatasetFacets>({ modality: [], subject: {}, ranges: {}, tags: [] })
+const filters = ref<DatasetBrowseFilters>({ modality: [], subject: {}, ranges: {}, tags: [] })
 const total = ref(0)
 const page = ref(1)
 const sort = ref('name')
@@ -123,8 +124,11 @@ function onFilter (next: DatasetBrowseFilters) {
 }
 
 const filtered = computed(() => {
-    const { modality, subject, tags } = filters.value
-    return modality.length > 0 || tags.length > 0 || Object.values(subject).some(values => values.length > 0)
+    const { modality, subject, ranges, tags } = filters.value
+    return modality.length > 0
+        || tags.length > 0
+        || Object.values(subject).some(values => values.length > 0)
+        || Object.keys(ranges).length > 0
 })
 
 /** The line above the table: how many recordings match; empty when too few match to say, which the table says. */
@@ -178,8 +182,9 @@ const columns = computed<DataTableColumn<DatasetBrowseRow>[]>(() => [
     ...subjectFields.value.map(field => ({
         key: `${SUBJECT_PREFIX}${field.key}`,
         label: field.label,
+        numeric: field.type === 'number',
         sortable: true,
-        format: (row: DatasetBrowseRow) => row.subject[field.key] ?? '',
+        format: (row: DatasetBrowseRow) => formatSubjectValue(row.subject[field.key]),
     })),
     { key: 'date', label: t('Date', SCOPE), sortable: true, format: row => formatMonth(row.created_at) },
     { key: 'tags', label: t('Tags', SCOPE) },
@@ -204,6 +209,7 @@ const detail = ref<Recording | null>(null)
 const tags = ref<TagChip[]>([])
 const codes = ref<CodeSummary[] | null>(null)
 const codesError = ref(false)
+// Each field's value as the form holds it: a choice, or a number field's value as typed; empty for none.
 const subjectDraft = reactive<Record<string, string>>({})
 const savingSubject = ref(false)
 
@@ -217,8 +223,31 @@ function resetSubjectDraft (row: DatasetBrowseRow) {
         delete subjectDraft[key]
     }
     for (const field of subjectFields.value) {
-        subjectDraft[field.key] = row.subject[field.key] ?? ''
+        subjectDraft[field.key] = draftOf(row, field)
     }
+}
+
+/**
+ * A row's value for a field as the form holds it.
+ * @param row - A browser row.
+ * @param field - One of the shown subject fields.
+ */
+function draftOf (row: DatasetBrowseRow, field: SubjectField) {
+    const value = row.subject[field.key]
+    return value === undefined ? '' : String(value)
+}
+
+/**
+ * The value a field's draft is sent as: null for an empty draft, a number for a number field, NaN for a number field
+ * whose draft is not one.
+ * @param field - One of the shown subject fields.
+ */
+function draftValue (field: SubjectField): SubjectValue | null {
+    const draft = subjectDraft[field.key].trim()
+    if (draft === '') {
+        return null
+    }
+    return field.type === 'number' ? Number(draft) : draft
 }
 
 async function openDetails (row: DatasetBrowseRow) {
@@ -275,19 +304,24 @@ function openInViewer () {
 /** Whether the draft differs from the values the row was opened with. */
 const subjectChanged = computed(() => {
     const row = current.value
-    return !!row && subjectFields.value.some(field => (row.subject[field.key] ?? '') !== subjectDraft[field.key])
+    return !!row && subjectFields.value.some(field => draftOf(row, field) !== subjectDraft[field.key].trim())
 })
+
+/** Whether a number field's draft is not a number, which the form refuses before it is sent. */
+const subjectInvalid = computed(() => subjectFields.value.some(field => {
+    const value = draftValue(field)
+    return typeof value === 'number' && !Number.isFinite(value)
+}))
 
 async function saveSubject () {
     const row = current.value
-    if (!row || !subjectChanged.value) {
+    if (!row || !subjectChanged.value || subjectInvalid.value) {
         return
     }
-    const changes: Record<string, string | null> = {}
+    const changes: Record<string, SubjectValue | null> = {}
     for (const field of subjectFields.value) {
-        const next = subjectDraft[field.key]
-        if ((row.subject[field.key] ?? '') !== next) {
-            changes[field.key] = next || null
+        if (draftOf(row, field) !== subjectDraft[field.key].trim()) {
+            changes[field.key] = draftValue(field)
         }
     }
     savingSubject.value = true
@@ -391,17 +425,28 @@ function standardLabel (group: CodeSummary) {
             <section v-if="subjectFields.length" class="dataset-browser__section">
                 <h3 class="dataset-browser__heading">{{ t('Subject', SCOPE) }}</h3>
                 <div v-if="canManage" class="dataset-browser__subject-form">
-                    <wa-select v-for="field in subjectFields" :key="field.key"
-                        :disabled="savingSubject"
-                        :label="field.label"
-                        size="s"
-                        v-wa="[subjectDraft, field.key]"
-                    >
-                        <wa-option value="">{{ t('Not set', SCOPE) }}</wa-option>
-                        <wa-option v-for="choice in field.choices" :key="choice" :value="choice">
-                            {{ choice }}
-                        </wa-option>
-                    </wa-select>
+                    <template v-for="field in subjectFields" :key="field.key">
+                        <wa-input v-if="field.type === 'number'"
+                            :disabled="savingSubject"
+                            inputmode="decimal"
+                            :label="field.label"
+                            :placeholder="t('Not set', SCOPE)"
+                            size="s"
+                            type="number"
+                            v-wa="[subjectDraft, field.key]"
+                        ></wa-input>
+                        <wa-select v-else
+                            :disabled="savingSubject"
+                            :label="field.label"
+                            size="s"
+                            v-wa="[subjectDraft, field.key]"
+                        >
+                            <wa-option value="">{{ t('Not set', SCOPE) }}</wa-option>
+                            <wa-option v-for="choice in field.choices" :key="choice" :value="choice">
+                                {{ choice }}
+                            </wa-option>
+                        </wa-select>
+                    </template>
                     <div class="form-actions">
                         <wa-button
                             appearance="plain"
@@ -413,7 +458,7 @@ function standardLabel (group: CodeSummary) {
                         </wa-button>
                         <wa-button
                             appearance="filled-outlined"
-                            :disabled="!subjectChanged"
+                            :disabled="!subjectChanged || subjectInvalid"
                             :loading="savingSubject"
                             size="s"
                             variant="brand"

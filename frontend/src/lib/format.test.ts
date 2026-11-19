@@ -4,7 +4,7 @@
  * @package    epicurrents-platform
  */
 import { describe, expect, it } from 'vitest'
-import { formatDuration, formatMonth, formatSamplingRate, formatSize } from './format'
+import { formatDuration, formatMonth, formatSamplingRate, formatSize, formatSubjectValue } from './format'
 
 describe('formatDuration', () => {
     it('uses the two largest units that apply', () => {
@@ -44,5 +44,14 @@ describe('formatMonth', () => {
             month: 'short', timeZone: 'UTC', year: 'numeric',
         })
         expect(formatMonth('2026-11-01T00:00:00Z')).toBe(november)
+    })
+})
+
+describe('formatSubjectValue', () => {
+    it('shows a choice as it is and a number to two decimals at most', () => {
+        expect(formatSubjectValue('65+')).toBe('65+')
+        expect(formatSubjectValue(1.487123288)).toBe('1.49')
+        expect(formatSubjectValue(12)).toBe('12')
+        expect(formatSubjectValue(undefined)).toBe('')
     })
 })

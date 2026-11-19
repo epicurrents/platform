@@ -61,8 +61,9 @@ def _with_schema(dataset, *fields):
 
 
 def _out(*fields):
-    """*fields* as ``SubjectFieldOut`` serves them, with ``displayed`` false where the field does not set it."""
-    return [{"displayed": False, **field} for field in fields]
+    """*fields* as ``SubjectFieldOut`` serves them, with the type and ``displayed`` filled in where the field does not
+    set them."""
+    return [{"type": "choice", "choices": [], "displayed": False, **field} for field in fields]
 
 
 def _set(item, **values):
@@ -354,9 +355,9 @@ class TestDisplayedFields:
     def test_a_reader_is_shown_the_displayed_fields_and_their_values_only(self, user, released):
         dataset, _item, reader = released
         schema = _client(reader).get(f"{DATASETS}/{dataset.object_hash}/subject-schema/").json()
-        assert schema == {"fields": [AGE_SHOWN]}
+        assert schema == {"fields": _out(AGE_SHOWN)}
         body = _client(reader).get(f"{DATASETS}/{dataset.object_hash}/browse/").json()
-        assert body["subject_fields"] == [AGE_SHOWN]
+        assert body["subject_fields"] == _out(AGE_SHOWN)
         assert body["items"][0]["subject"] == {"age": "65+"}
         assert _client(reader).get(f"{DATASETS}/{dataset.object_hash}/browse/?sort=subject.age").status_code == 200
         assert _client(reader).get(f"{DATASETS}/{dataset.object_hash}/browse/?sort=subject.sex").status_code == 400

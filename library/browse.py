@@ -7,10 +7,12 @@ The order is an allowlist. None of its keys is an arrival order: the date key so
 reader is shown, a released member's release month or the first of its upload month in UTC, and every key
 breaks ties by name and then by the random stored name, never by a sequential id. Each subject field the
 caller is shown adds a key, ``subject.<key>``, which sorts by the field's declared choice order, so age
-bands sort as declared rather than as strings.
+bands sort as declared rather than as strings, and a number field by its value.
 
 Filters narrow the rows by modality, by the subject fields the caller is shown and by tag, and facets count the
-members under each value (:func:`facet_counts`). A filter on a field the caller is not shown is refused, since its
+members under each value (:func:`facet_counts`). A number field filters by a range instead, ``subject.<key>.min``
+and ``subject.<key>.max``, both inclusive and either optional, and its facet is the lowest and highest value
+under the other filters. A filter on a field the caller is not shown is refused, since its
 counts would describe the hidden values. Every count is a sum over rows the caller can page through.
 
 A member the caller cannot read is left out of the rows and the counts (:func:`readable_ids`), which is decided once
@@ -122,9 +124,14 @@ def browse_rows(member_ids, *, sort: str, descending: bool, dataset=None, schema
         )
     )
     if sort.startswith(SUBJECT_SORT_PREFIX):
+        from library.subjects import is_number_field
+
         field = next(f for f in schema if f["key"] == sort[len(SUBJECT_SORT_PREFIX) :])
         qs = qs.annotate(subject_value=_subject_value(dataset, recording_ct, field["key"]))
-        qs = qs.annotate(subject_order=_choice_index(field))
+        if is_number_field(field):
+            qs = qs.annotate(subject_order=Cast(F("subject_value"), FloatField()))
+        else:
+            qs = qs.annotate(subject_order=_choice_index(field))
         column = F("subject_order")
     else:
         column = {
@@ -164,47 +171,70 @@ def member_recording_ids(members) -> list[int]:
 
 #: The most tags a tag facet lists, by count; the selected tags are listed besides.
 FACET_TAGS = 30
+RANGE_BOUNDS = ("min", "max")
 
 
 @dataclasses.dataclass
 class Filters:
-    """The values a browser page is narrowed to: any of the modalities, any of the choices of each subject field, and
-    every one of the tags."""
+    """The values a browser page is narrowed to: any of the modalities, any of the choices of each subject field, a
+    range of each number field, and every one of the tags. A range is ``(low, high)``, inclusive, ``None`` at an
+    open end."""
 
     modality: frozenset[str] = frozenset()
     subject: dict[str, frozenset[str]] = dataclasses.field(default_factory=dict)
+    ranges: dict[str, tuple[float | None, float | None]] = dataclasses.field(default_factory=dict)
     tags: frozenset[int] = frozenset()
 
     @property
     def active(self) -> bool:
         """Whether any filter is set."""
-        return bool(self.modality or self.subject or self.tags)
+        return bool(self.modality or self.subject or self.ranges or self.tags)
 
     @property
     def fields(self) -> list[str]:
         """The filtered dimensions, by name: ``modality``, ``subject.<key>`` and ``tag``."""
         names = ["modality"] if self.modality else []
-        names += [f"{SUBJECT_SORT_PREFIX}{key}" for key in sorted(self.subject)]
+        names += [f"{SUBJECT_SORT_PREFIX}{key}" for key in sorted({*self.subject, *self.ranges})]
         return [*names, "tag"] if self.tags else names
 
 
 def parse_filters(params, schema, *, tags_allowed: bool) -> Filters:
     """Read the filters from the query *params*; ``ValueError`` naming the parameter for one not allowed.
 
-    ``modality`` and ``tag`` may repeat; ``subject.<key>`` repeats per choice, for each field of *schema*, the schema
-    the caller is shown, and only with one of the field's choices. *tags_allowed* is false for a caller without an
-    account, who is served no tags.
+    ``modality`` and ``tag`` may repeat; ``subject.<key>`` repeats per choice, for each field of choices of *schema*,
+    the schema the caller is shown, and only with one of the field's choices. A number field of *schema* takes
+    ``subject.<key>.min`` and ``subject.<key>.max`` instead, once each, a finite number; an empty one is open.
+    *tags_allowed* is false for a caller without an account, who is served no tags.
     """
-    choices = {item["key"]: set(item["choices"]) for item in schema}
+    from library.subjects import is_number, is_number_field
+
+    choices = {item["key"]: set(item["choices"]) for item in schema if not is_number_field(item)}
+    numbers = {item["key"] for item in schema if is_number_field(item)}
     subject: dict[str, frozenset[str]] = {}
+    bounds: dict[str, dict[str, float]] = {}
     for name in params:
         if not name.startswith(SUBJECT_SORT_PREFIX):
             continue
         key = name[len(SUBJECT_SORT_PREFIX) :]
+        key, _, bound = key.rpartition(".") if "." in key else (key, "", "")
+        if bound:
+            raw = [value.strip() for value in params.getlist(name) if value.strip()]
+            if key not in numbers or bound not in RANGE_BOUNDS or len(raw) > 1:
+                raise ValueError(name)
+            if raw:
+                try:
+                    number = float(raw[0])
+                except ValueError as exc:
+                    raise ValueError(name) from exc
+                if not is_number(number):
+                    raise ValueError(name)
+                bounds.setdefault(key, {})[bound] = number
+            continue
         values = {value for value in params.getlist(name) if value}
         if key not in choices or not values <= choices[key]:
             raise ValueError(name)
         subject[key] = frozenset(values)
+    ranges = {key: (found.get("min"), found.get("max")) for key, found in bounds.items()}
     raw_tags = [value for value in params.getlist("tag") if value]
     if raw_tags and not tags_allowed:
         raise ValueError("tag")
@@ -213,7 +243,7 @@ def parse_filters(params, schema, *, tags_allowed: bool) -> Filters:
     except ValueError as exc:
         raise ValueError("tag") from exc
     modality = frozenset(value.strip().lower() for value in params.getlist("modality") if value.strip())
-    return Filters(modality=modality, subject=subject, tags=tags)
+    return Filters(modality=modality, subject=subject, ranges=ranges, tags=tags)
 
 
 @dataclasses.dataclass
@@ -221,7 +251,7 @@ class MemberFacts:
     """What the filters and facets read of one recording member."""
 
     modality: str
-    subject: dict[str, str]
+    subject: dict[str, Any]
     tags: frozenset[int]
 
 
@@ -294,7 +324,19 @@ def _matches(facts: MemberFacts, filters: Filters, *, skip: str | None = None) -
     for key, values in filters.subject.items():
         if skip != f"{SUBJECT_SORT_PREFIX}{key}" and facts.subject.get(key) not in values:
             return False
+    for key, (low, high) in filters.ranges.items():
+        if skip != f"{SUBJECT_SORT_PREFIX}{key}" and not _in_range(facts.subject.get(key), low, high):
+            return False
     return skip == "tag" or filters.tags <= facts.tags
+
+
+def _in_range(value: Any, low: float | None, high: float | None) -> bool:
+    """Whether *value* is a number within ``[low, high]``; a member without a number is outside every range."""
+    from library.subjects import is_number
+
+    if not is_number(value):
+        return False
+    return (low is None or value >= low) and (high is None or value <= high)
 
 
 def matching_ids(facts: dict[int, MemberFacts], filters: Filters) -> list[int]:
@@ -308,9 +350,12 @@ def facet_counts(facts: dict[int, MemberFacts], filters: Filters, schema, *, tag
     A modality or subject value is counted under every filter but its own dimension's, so the other values of a
     filtered dimension stay countable; a tag is counted under every filter, since tags combine with *and*. Modality
     values are those present; a subject field lists each declared choice; tags are the :data:`FACET_TAGS` most
-    frequent among the matching members, then by name, and the selected ones the caller can see on a member.
-    *tag_rows* maps a tag id to its ``Tag``, as :func:`member_facts` gives them.
+    frequent among the matching members, then by name, and the selected ones the caller can see on a member. A
+    number field's facet is the lowest and highest value, and how many members carry one, under every filter but its
+    own range. *tag_rows* maps a tag id to its ``Tag``, as :func:`member_facts` gives them.
     """
+    from library.subjects import is_number, is_number_field
+
     modality = {}
     for member in facts.values():
         if member.modality and _matches(member, filters, skip="modality"):
@@ -318,8 +363,21 @@ def facet_counts(facts: dict[int, MemberFacts], filters: Filters, schema, *, tag
     for value in filters.modality:
         modality.setdefault(value, 0)
     subject = {}
+    ranges = {}
     for item in schema:
         skip = f"{SUBJECT_SORT_PREFIX}{item['key']}"
+        if is_number_field(item):
+            found = [
+                member.subject[item["key"]]
+                for member in facts.values()
+                if is_number(member.subject.get(item["key"])) and _matches(member, filters, skip=skip)
+            ]
+            ranges[item["key"]] = {
+                "min": min(found) if found else None,
+                "max": max(found) if found else None,
+                "count": len(found),
+            }
+            continue
         counts = dict.fromkeys(item["choices"], 0)
         for member in facts.values():
             value = member.subject.get(item["key"])
@@ -339,6 +397,7 @@ def facet_counts(facts: dict[int, MemberFacts], filters: Filters, schema, *, tag
     return {
         "modality": [{"value": value, "count": count} for value, count in sorted(modality.items())],
         "subject": subject,
+        "ranges": ranges,
         "tags": [
             {
                 "id": tag_id,

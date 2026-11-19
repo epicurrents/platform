@@ -73,8 +73,8 @@
  *   GET    /api/v1/library/datasets/{id}/items/
  *   POST   /api/v1/library/datasets/{id}/items/
  *   GET    /api/v1/library/datasets/{id}/folders/     (no dataset has folders)
- *   GET    /api/v1/library/datasets/{id}/browse/      (every dataset declares the same two subject fields; a gated
- *                                                       one answers as to a reader: displayed fields, k = 3)
+ *   GET    /api/v1/library/datasets/{id}/browse/      (every dataset declares the same three subject fields, one a
+ *                                                       number; a gated one answers as to a reader: displayed fields)
  *   GET    /api/v1/library/catalogue/                 (every gated dataset with members, as released)
  *   PATCH  /api/v1/library/datasets/{id}/recordings/{hash}/subject/
  *   GET    /api/v1/library/recording-tags/
@@ -291,7 +291,7 @@ interface MockState {
     datasetItems: MockItem[]
     datasetAccess: MockAccess[]
     /** Subject values per dataset member, keyed `<dataset id>:<recording hash>`. */
-    datasetSubjects: Record<string, Record<string, string>>
+    datasetSubjects: Record<string, Record<string, string | number>>
     seq: {
         rec: number
         coll: number
@@ -308,9 +308,22 @@ interface MockState {
 const RECORDING_CT_ID = 42
 
 /** The subject schema every mock dataset declares, so the browser's subject columns and the drawer's form show. */
-const MOCK_SUBJECT_FIELDS = [
-    { key: 'age_band', label: 'Age band', choices: ['0-17', '18-39', '40-64', '65+'], displayed: true },
-    { key: 'indication', label: 'Indication', choices: ['Epilepsy', 'Sleep', 'Other'], displayed: false },
+const MOCK_SUBJECT_FIELDS: {
+    key: string
+    label: string
+    type: 'choice' | 'number'
+    choices: string[]
+    displayed: boolean
+}[] = [
+    { key: 'age_band', label: 'Age band', type: 'choice', choices: ['0-17', '18-39', '40-64', '65+'], displayed: true },
+    {
+        key: 'indication',
+        label: 'Indication',
+        type: 'choice',
+        choices: ['Epilepsy', 'Sleep', 'Other'],
+        displayed: false,
+    },
+    { key: 'age_years', label: 'Age (years)', type: 'number', choices: [], displayed: false },
 ]
 
 /** Tags the mock hands out, a recording carrying a deterministic subset of them. */
@@ -917,7 +930,11 @@ function buildSeed(): MockState {
         datasets,
         datasetItems,
         datasetAccess,
-        datasetSubjects: {},
+        // A deterministic age per seeded member, so the number field's column, sort and range filter have values.
+        datasetSubjects: Object.fromEntries(datasetItems.map(item => [
+            `${item._parent_id}:${item.object_id}`,
+            { age_years: Number(((parseInt(item.object_id.slice(0, 4), 16) % 1600) / 100).toFixed(2)) },
+        ])),
         seq: { rec: 17, coll: 3, ds: 3, item: 4, access: 2, account: 7, group: 3 },
         snapshots: [
             {
@@ -2756,15 +2773,33 @@ export async function handleMock(
             const subjectOf = (r: MockRecording) => _state.datasetSubjects[`${dsId}:${r.hash}`] ?? {}
             const modalityFilter = query.getAll('modality')
             const subjectFilter = fields
+                .filter(f => f.type !== 'number')
                 .map(f => [f.key, query.getAll(`subject.${f.key}`)] as const)
                 .filter(([, values]) => values.length)
+            const bound = (name: string) => {
+                const raw = query.get(name)
+                return raw === null || raw === '' ? null : Number(raw)
+            }
+            const rangeFilter = fields
+                .filter(f => f.type === 'number')
+                .map(f => [f.key, bound(`subject.${f.key}.min`), bound(`subject.${f.key}.max`)] as const)
+                .filter(([, low, high]) => low !== null || high !== null)
             const tagFilter = query.getAll('tag').map(Number)
             const passes = (r: MockRecording, skip?: string) => {
                 if (skip !== 'modality' && modalityFilter.length && !modalityFilter.includes(r.modality)) {
                     return false
                 }
                 for (const [key, values] of subjectFilter) {
-                    if (skip !== `subject.${key}` && !values.includes(subjectOf(r)[key] ?? '')) {
+                    if (skip !== `subject.${key}` && !values.includes(String(subjectOf(r)[key] ?? ''))) {
+                        return false
+                    }
+                }
+                for (const [key, low, high] of rangeFilter) {
+                    const value = subjectOf(r)[key]
+                    if (skip === `subject.${key}`) {
+                        continue
+                    }
+                    if (typeof value !== 'number' || (low !== null && value < low) || (high !== null && value > high)) {
                         return false
                     }
                 }
@@ -2775,17 +2810,29 @@ export async function handleMock(
                 .filter(i => i._parent_id === dsId && i.content_type_id === RECORDING_CT_ID)
                 .map(i => findRecording(i.object_id))
                 .filter((r): r is MockRecording => !!r)
-            const tally = (values: string[], skip: string, valueOf: (r: MockRecording) => string | undefined) =>
+            type ValueOf = (r: MockRecording) => string | number | undefined
+            const tally = (values: string[], skip: string, valueOf: ValueOf) =>
                 values.map(value => ({
                     value,
                     count: all.filter(r => valueOf(r) === value && passes(r, skip)).length,
                 }))
             const facets = {
                 modality: tally([...new Set(all.map(r => r.modality))].sort(), 'modality', r => r.modality),
-                subject: Object.fromEntries(fields.map(f => [
+                subject: Object.fromEntries(fields.filter(f => f.type !== 'number').map(f => [
                     f.key,
                     tally(f.choices, `subject.${f.key}`, r => subjectOf(r)[f.key]),
                 ])),
+                ranges: Object.fromEntries(fields.filter(f => f.type === 'number').map(f => {
+                    const found = all
+                        .filter(r => passes(r, `subject.${f.key}`))
+                        .map(r => subjectOf(r)[f.key])
+                        .filter((value): value is number => typeof value === 'number')
+                    return [f.key, {
+                        min: found.length ? Math.min(...found) : null,
+                        max: found.length ? Math.max(...found) : null,
+                        count: found.length,
+                    }]
+                })),
                 tags: MOCK_TAGS.map(tag => ({
                     ...tag,
                     count: all.filter(r => passes(r) && mockTagsOf(r.hash).some(t => t.id === tag.id)).length,
@@ -2793,9 +2840,14 @@ export async function handleMock(
             }
             const members = all.filter(r => passes(r))
             const count = members.length
-            const sortValue = (r: MockRecording): string | number => {
+            const sortValue = (r: MockRecording): string | number | null => {
                 if (sortKey.startsWith('subject.')) {
-                    return _state.datasetSubjects[`${dsId}:${r.hash}`]?.[sortKey.slice('subject.'.length)] ?? ''
+                    const field = fields.find(f => f.key === sortKey.slice('subject.'.length))
+                    const value = subjectOf(r)[field?.key ?? '']
+                    if (field?.type === 'number') {
+                        return typeof value === 'number' ? value : null
+                    }
+                    return field && typeof value === 'string' ? field.choices.indexOf(value) : null
                 }
                 switch (sortKey) {
                     case 'modality': return r.modality
@@ -2809,6 +2861,10 @@ export async function handleMock(
             members.sort((a, b) => {
                 const left = sortValue(a)
                 const right = sortValue(b)
+                // A member without a value sorts last in either direction, as the server orders it.
+                if (left === null || right === null) {
+                    return (left === null ? 1 : 0) - (right === null ? 1 : 0) || a.hash.localeCompare(b.hash)
+                }
                 const order = left < right ? -1 : left > right ? 1 : 0
                 return (descending ? -order : order) || a.hash.localeCompare(b.hash)
             })
@@ -2844,14 +2900,19 @@ export async function handleMock(
             const key = `${m[1]}:${m[2]}`
             const body = await readBody(req)
             const values = { ...(_state.datasetSubjects[key] ?? {}) }
-            for (const [field, value] of Object.entries((body.values ?? {}) as Record<string, string | null>)) {
+            const changes = (body.values ?? {}) as Record<string, string | number | null>
+            for (const [field, value] of Object.entries(changes)) {
                 const declared = MOCK_SUBJECT_FIELDS.find(f => f.key === field)
                 if (!declared) {
                     return send(res, 400, { detail: `The dataset declares no subject field ${field}.` })
                 }
                 if (value === null) {
                     delete values[field]
-                } else if (!declared.choices.includes(value)) {
+                } else if (declared.type === 'number' && (typeof value !== 'number' || !Number.isFinite(value))) {
+                    return send(res, 400, { detail: `The value for ${field} must be a finite number.` })
+                } else if (
+                    declared.type !== 'number' && (typeof value !== 'string' || !declared.choices.includes(value))
+                ) {
                     return send(res, 400, { detail: `The value for ${field} is not one of its choices.` })
                 } else {
                     values[field] = value

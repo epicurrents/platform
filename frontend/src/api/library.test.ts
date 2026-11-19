@@ -80,6 +80,7 @@ describe('browseDataset', () => {
         await browseDataset('abc', { sort: '-name', limit: 50, offset: 0 }, {
             modality: ['eeg', 'ecg'],
             subject: { age_band: ['0-17', '65+'], indication: [] },
+            ranges: {},
             tags: [3, 7],
         })
         const params = mockGet.mock.calls[0][1]?.params as URLSearchParams
@@ -90,6 +91,21 @@ describe('browseDataset', () => {
         expect(params.getAll('subject.age_band')).toEqual(['0-17', '65+'])
         expect(params.has('subject.indication')).toBe(false)
         expect(params.getAll('tag')).toEqual(['3', '7'])
+    })
+
+    it('sends each end of a range that is set, and an open end not at all', async () => {
+        mockGet.mockResolvedValueOnce({ data: {} })
+        await browseDataset('abc', { sort: 'name' }, {
+            modality: [],
+            subject: {},
+            ranges: { age_years: { min: 0.5 }, weight: { min: 2, max: 10.25 } },
+            tags: [],
+        })
+        const params = mockGet.mock.calls[0][1]?.params as URLSearchParams
+        expect(params.get('subject.age_years.min')).toBe('0.5')
+        expect(params.has('subject.age_years.max')).toBe(false)
+        expect(params.get('subject.weight.min')).toBe('2')
+        expect(params.get('subject.weight.max')).toBe('10.25')
     })
 
     it('sends no filter parameters without filters', async () => {

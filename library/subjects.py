@@ -1,12 +1,12 @@
 """Subject fields: the schema a dataset declares for its members, and the values each member carries.
 
 A dataset's *subject schema* (``DatasetMeta.subject_schema``) is an ordered list of fields, each a key, a label and
-a fixed list of choices. There is no free-text field and no exact number: an age is declared as bands, a diagnosis
-as categories, so a value names a category rather than describing a person, the line the annotation-text rule
-draws for a code's value. A member's *values* (``DatasetItemSubject.values``) map a schema key to one of its
-choices. They are set by the dataset's managers, and in a submission pool they also arrive with each submission,
-in its sidecar's ``subject_fields`` key, which the submission gate checks against the schema
-(``recordings.submissions.validate_subject_fields``).
+either a fixed list of choices or the type ``number``. There is no free-text field: an age is declared as bands or
+as a number, a diagnosis as categories, so a value names a category or a quantity rather than describing a person,
+the line the annotation-text rule draws for a code's value. A member's *values* (``DatasetItemSubject.values``) map
+a schema key to one of its choices, or to a finite number for a number field. They are set by the dataset's
+managers, and in a submission pool they also arrive with each submission, in its sidecar's ``subject_fields`` key,
+which the submission gate checks against the schema (``recordings.submissions.validate_subject_fields``).
 
 The rules, each enforced here and called by the endpoints in ``library.api.v1.ninja``:
 
@@ -25,6 +25,10 @@ The rules, each enforced here and called by the endpoints in ``library.api.v1.ni
   released members were sized on the displayed fields alone, and their values are fixed, so the others could never
   be cleared first.
 * Elsewhere ``displayed`` has no effect: a dataset's readers are shown every field it declares.
+* A number field is declared only on a dataset that is not release-gated, not a pool and has had no release, and
+  such a dataset cannot be gated or made a pool while it declares one (:func:`number_field_refusal`). A number is
+  never displayed: on a gated dataset each value would be a class of its own. The field exists for a dataset
+  re-released from a published one whose publishers already settled how fine its values are.
 
 Nothing here judges whether a schema is too fine-grained. Outside a release-gated dataset no class is sized at all,
 and inside one only the displayed fields are, so whether the fields a dataset declares could together identify a
@@ -33,6 +37,7 @@ subject is a judgement made before the dataset is put on the platform, not one t
 
 from __future__ import annotations
 
+import math
 import re
 from collections import Counter
 from dataclasses import dataclass
@@ -42,9 +47,13 @@ MAX_FIELDS = 24
 MAX_CHOICES = 64
 MAX_LABEL_LENGTH = 80
 MAX_CHOICE_LENGTH = 64
+#: The largest magnitude a number value may have, so a value stays exact in every JSON reader and in a float column.
+MAX_NUMBER = 1e15
+NUMBER = "number"
 _KEY_RE = re.compile(r"^[a-z][a-z0-9_]{0,39}$")
 _FIELD_KEYS = {"key", "label", "choices"}
 _OPTIONAL_FIELD_KEYS = {"displayed"}
+_NUMBER_FIELD_KEYS = {"key", "label", "type"}
 
 
 @dataclass
@@ -67,13 +76,29 @@ def _text(value: Any, what: str, limit: int) -> str:
     return value
 
 
+def is_number_field(field: dict) -> bool:
+    """Whether *field* is a number field rather than a field of choices."""
+    return field.get("type") == NUMBER
+
+
+def is_number(value: Any) -> bool:
+    """Whether *value* is a number a number field stores: finite, within :data:`MAX_NUMBER`, and not a boolean."""
+    return (
+        not isinstance(value, bool)
+        and isinstance(value, (int, float))
+        and math.isfinite(value)
+        and abs(value) <= MAX_NUMBER
+    )
+
+
 def validate_schema(raw: Any) -> list[dict]:
     """The normalised form of a submitted schema, or :class:`SubjectError` (400) naming the first fault.
 
     Strings are stripped. Keys are lower-case identifiers, unique within the schema; choices are unique within
-    their field. A field carries ``key``, ``label`` and ``choices`` and may carry ``displayed``, a boolean, so a
-    misspelt attribute is refused rather than dropped. ``displayed`` is stored only when it is true, so a field
-    without it and the same field with ``displayed: false`` compare equal.
+    their field. A field of choices carries ``key``, ``label`` and ``choices`` and may carry ``displayed``, a
+    boolean; a number field carries exactly ``key``, ``label`` and ``type: "number"``. A misspelt attribute is
+    refused rather than dropped. ``displayed`` is stored only when it is true, so a field without it and the same
+    field with ``displayed: false`` compare equal.
     """
     if not isinstance(raw, list):
         raise SubjectError(400, "The subject schema must be a list of fields.")
@@ -82,7 +107,12 @@ def validate_schema(raw: Any) -> list[dict]:
     fields: list[dict] = []
     seen_keys: set[str] = set()
     for index, field in enumerate(raw):
-        if not isinstance(field, dict) or not _FIELD_KEYS <= set(field) <= _FIELD_KEYS | _OPTIONAL_FIELD_KEYS:
+        number = isinstance(field, dict) and "type" in field
+        if number and (field["type"] != NUMBER or set(field) != _NUMBER_FIELD_KEYS):
+            raise SubjectError(400, f"Field {index} with a type must be a number field with only key, label and type.")
+        if not number and (
+            not isinstance(field, dict) or not _FIELD_KEYS <= set(field) <= _FIELD_KEYS | _OPTIONAL_FIELD_KEYS
+        ):
             raise SubjectError(
                 400, f"Field {index} must have the attributes key, label and choices, and may have displayed."
             )
@@ -95,6 +125,9 @@ def validate_schema(raw: Any) -> list[dict]:
             raise SubjectError(400, f"The key {key} is declared twice.")
         seen_keys.add(key)
         label = _text(field["label"], f"The label of {key}", MAX_LABEL_LENGTH)
+        if number:
+            fields.append({"key": key, "label": label, "type": NUMBER})
+            continue
         choices = field["choices"]
         if not isinstance(choices, list) or not choices:
             raise SubjectError(400, f"The choices of {key} must be a non-empty list.")
@@ -122,9 +155,32 @@ def schema_warnings(schema: list[dict]) -> list[dict[str, str]]:
     rows: list[dict[str, str]] = []
     for field in schema:
         rows.extend(name_warnings(**{f"{field['key']}.label": field["label"]}))
-        for choice in field["choices"]:
+        for choice in field.get("choices", ()):
             rows.extend(name_warnings(**{f"{field['key']}.choices": choice}))
     return rows
+
+
+def number_field_refusal(dataset: Any, schema: list[dict]) -> str | None:
+    """Why *schema*, declaring a number field, may not be *dataset*'s, or None when it may (always None without one).
+
+    A number field is refused on a release-gated dataset, a pool and a dataset that has had a release, where the
+    fields a reader is shown are part of the class a release is sized on.
+    """
+    from library.pools import is_pool
+
+    if not any(is_number_field(field) for field in schema):
+        return None
+    if is_pool(dataset) or hides_undisplayed(dataset):
+        return "A number field is declared only on a dataset that is not release-gated, not a pool and has no release."
+    return None
+
+
+def gating_refusal(dataset: Any) -> str | None:
+    """Why *dataset*'s subject schema keeps it from being release-gated or made a pool, or None when it does not: a
+    number field, which :func:`number_field_refusal` admits only on a dataset that is neither."""
+    if any(is_number_field(field) for field in schema_of(dataset)):
+        return "A dataset with a number subject field cannot be release-gated or a pool; declare it as bands first."
+    return None
 
 
 def schema_of(dataset: Any) -> list[dict]:
@@ -146,8 +202,9 @@ def values_in_use(dataset: Any) -> Counter:
 
 
 def ensure_schema_change_allowed(dataset: Any, schema: list[dict]) -> None:
-    """Refuse a schema change to a filling pool, one that drops a field or choice a member still carries, or one that
-    changes which fields a dataset with a release displays.
+    """Refuse a schema change to a filling pool, one that drops a field or choice a member still carries, one that
+    changes which fields a dataset with a release displays, or a number field where :func:`number_field_refusal`
+    refuses one.
 
     The dataset row must already be locked by the caller, so a submission cannot fill the pool in between.
     """
@@ -156,6 +213,9 @@ def ensure_schema_change_allowed(dataset: Any, schema: list[dict]) -> None:
     current = schema_of(dataset)
     if schema == current:
         return
+    refusal = number_field_refusal(dataset, schema)
+    if refusal:
+        raise SubjectError(409, refusal)
     if is_pool(dataset) and is_filling(dataset):
         raise SubjectError(
             409, "The subject schema of a filling pool cannot change: its members were checked against it."
@@ -177,28 +237,45 @@ def ensure_schema_change_allowed(dataset: Any, schema: list[dict]) -> None:
             raise SubjectError(
                 409, "The displayed fields of a dataset with a release are fixed: its classes were sized on them."
             )
-    declared = {(field["key"], choice) for field in schema for choice in field["choices"]}
-    dropped = sorted(pair for pair in values_in_use(dataset) if pair not in declared)
+    fields = {field["key"]: field for field in schema}
+    dropped = sorted(
+        ((key, value) for key, value in values_in_use(dataset) if not _accepts(fields.get(key), value)),
+        key=lambda pair: (pair[0], str(pair[1])),
+    )
     if dropped:
-        key, choice = dropped[0]
-        raise SubjectError(409, f"The choice {choice!r} of {key} is in use; clear it from the members first.")
+        key, value = dropped[0]
+        if isinstance(value, str):
+            raise SubjectError(409, f"The choice {value!r} of {key} is in use; clear it from the members first.")
+        raise SubjectError(409, f"{key} holds numbers on some members; clear them first.")
+
+
+def _accepts(field: dict | None, value: Any) -> bool:
+    """Whether *field* admits *value*: a number for a number field, one of its choices otherwise."""
+    if field is None:
+        return False
+    if is_number_field(field):
+        return is_number(value)
+    return isinstance(value, str) and value in field["choices"]
 
 
 def apply_values(schema: list[dict], current: dict, changes: Any) -> dict:
-    """*current* with *changes* merged in: a key set to a choice of its field, or cleared with ``null``.
+    """*current* with *changes* merged in: a key set to a choice of its field or a number for a number field, or
+    cleared with ``null``.
 
-    :class:`SubjectError` (400) for a key the schema does not declare or a value that is not one of its choices.
+    :class:`SubjectError` (400) for a key the schema does not declare or a value its field does not admit.
     """
     if not isinstance(changes, dict):
         raise SubjectError(400, "Values must be an object of field keys.")
-    choices = {field["key"]: field["choices"] for field in schema}
+    fields = {field["key"]: field for field in schema}
     merged = dict(current or {})
     for key, value in changes.items():
-        if key not in choices:
+        if key not in fields:
             raise SubjectError(400, f"The dataset declares no subject field {key}.")
         if value is None:
             merged.pop(key, None)
-        elif not isinstance(value, str) or value not in choices[key]:
+        elif not _accepts(fields[key], value):
+            if is_number_field(fields[key]):
+                raise SubjectError(400, f"The value for {key} must be a finite number.")
             raise SubjectError(400, f"The value for {key} is not one of its choices.")
         else:
             merged[key] = value

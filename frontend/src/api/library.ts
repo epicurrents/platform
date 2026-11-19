@@ -515,15 +515,20 @@ export interface TagChip {
 }
 
 /**
- * One field of a dataset's subject schema. `displayed` marks a field a reader who does not manage a release-gated
- * dataset, or one that has had a release, is shown; elsewhere it has no effect.
+ * One field of a dataset's subject schema: a field of `choices`, or a `number` field, which has none and holds a
+ * number per member. `displayed` marks a field a reader who does not manage a release-gated dataset, or one that has
+ * had a release, is shown; elsewhere it has no effect. A number field is never displayed.
  */
 export interface SubjectField {
     key: string
     label: string
+    type: 'choice' | 'number'
     choices: string[]
     displayed: boolean
 }
+
+/** A member's value for a subject field: one of its choices, or a number for a number field. */
+export type SubjectValue = string | number
 
 /**
  * One recording of a dataset as the browser shows it. `created_at` is the date the caller is served: exact for the
@@ -543,7 +548,7 @@ export interface DatasetBrowseRow {
     sampling_rate_min: number | null
     channel_layout: string | null
     deidentification_version: number | null
-    subject: Record<string, string>
+    subject: Record<string, SubjectValue>
     tags: TagChip[]
     tag_count: number
 }
@@ -559,20 +564,41 @@ export interface TagFacet extends TagChip {
     count: number
 }
 
-/** The browser's facets: the modalities present, each shown subject field's choices by key, and the tags. */
-export interface DatasetFacets {
-    modality: FacetValue[]
-    subject: Record<string, FacetValue[]>
-    tags: TagFacet[]
+/**
+ * A number field's facet: the lowest and highest value among the members that would match under the other filters,
+ * and how many of them carry a value. `min` and `max` are null when none does.
+ */
+export interface RangeFacet {
+    min: number | null
+    max: number | null
+    count: number
 }
 
 /**
- * What a browser page is narrowed to: any of the modalities, any of the choices of each subject field, and every one
- * of the tags.
+ * The browser's facets: the modalities present, each shown subject field's choices by key, each shown number field's
+ * range by key, and the tags.
+ */
+export interface DatasetFacets {
+    modality: FacetValue[]
+    subject: Record<string, FacetValue[]>
+    ranges: Record<string, RangeFacet>
+    tags: TagFacet[]
+}
+
+/** A number field's range filter, both ends inclusive; a missing end is open. */
+export interface SubjectRange {
+    min?: number
+    max?: number
+}
+
+/**
+ * What a browser page is narrowed to: any of the modalities, any of the choices of each subject field, a range of
+ * each number field, and every one of the tags.
  */
 export interface DatasetBrowseFilters {
     modality: string[]
     subject: Record<string, string[]>
+    ranges: Record<string, SubjectRange>
     tags: number[]
 }
 
@@ -597,7 +623,7 @@ export interface RecordingTags {
  * One page of a dataset's recordings for the browser.
  * @param datasetId - The dataset's object hash or primary key.
  * @param params - `sort` is a key from the server's allowlist, or `subject.<key>`, prefixed with `-` for descending.
- * @param filters - Sent as repeated `modality`, `subject.<key>` and `tag` parameters.
+ * @param filters - Sent as repeated `modality`, `subject.<key>` and `tag` parameters, and a range as `subject.<key>.min` and `subject.<key>.max`.
  */
 export async function browseDataset(
     datasetId: number | string,
@@ -616,6 +642,14 @@ export async function browseDataset(
     for (const [key, values] of Object.entries(filters?.subject ?? {})) {
         for (const value of values) {
             query.append(`subject.${key}`, value)
+        }
+    }
+    for (const [key, range] of Object.entries(filters?.ranges ?? {})) {
+        if (range.min !== undefined) {
+            query.append(`subject.${key}.min`, String(range.min))
+        }
+        if (range.max !== undefined) {
+            query.append(`subject.${key}.max`, String(range.max))
         }
     }
     for (const tag of filters?.tags ?? []) {
@@ -672,14 +706,14 @@ export async function listRecordingTags(hashes: string[]): Promise<RecordingTags
  * kept.
  * @param datasetId - The dataset's object hash or primary key.
  * @param hash - The member recording's hash.
- * @param values - Each value one of its field's choices, or null.
+ * @param values - Each value one of its field's choices, a number for a number field, or null.
  */
 export async function updateDatasetMemberSubject(
     datasetId: number | string,
     hash: string,
-    values: Record<string, string | null>,
-): Promise<Record<string, string>> {
-    const response = await http.patch<{ values: Record<string, string> }>(
+    values: Record<string, SubjectValue | null>,
+): Promise<Record<string, SubjectValue>> {
+    const response = await http.patch<{ values: Record<string, SubjectValue> }>(
         `/api/v1/library/datasets/${datasetId}/recordings/${hash}/subject/`,
         { values },
     )

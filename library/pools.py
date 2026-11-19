@@ -124,6 +124,11 @@ def configure_pool(dataset: Any, profile_key: str) -> Group:
         raise PoolError(409, "The dataset is already a submission pool.")
     if has_members(dataset) or is_filling(dataset):
         raise PoolError(409, "A submission pool is configured on an empty dataset only.")
+    from library.subjects import gating_refusal
+
+    refusal = gating_refusal(dataset)
+    if refusal:
+        raise PoolError(409, refusal)
     profile = _registered_profile(profile_key)
     group = Group.objects.create(name=_group_name(dataset))
     dataset.submission_profile = profile.key

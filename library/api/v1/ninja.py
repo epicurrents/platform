@@ -49,6 +49,7 @@ Tags
 import hashlib
 import json
 from datetime import date, datetime
+from typing import Literal
 
 from django.conf import settings
 from django.contrib.auth import get_user_model
@@ -224,18 +225,19 @@ class DatasetBrowseRowOut(Schema):
     sampling_rate_min: float | None
     channel_layout: str | None
     deidentification_version: int | None
-    subject: dict[str, str]
+    subject: dict[str, str | float]
     tags: list[TagChipOut]
     tag_count: int
 
 
 class SubjectFieldOut(Schema):
-    """One field of a dataset's subject schema: its key, its label, its choices in declared order, and whether a
-    reader who does not manage a release-gated dataset is shown it."""
+    """One field of a dataset's subject schema: its key, its label, its type, its choices in declared order (none for
+    a number field), and whether a reader who does not manage a release-gated dataset is shown it."""
 
     key: str
     label: str
-    choices: list[str]
+    type: Literal["choice", "number"] = "choice"
+    choices: list[str] = []
     displayed: bool = False
 
 
@@ -255,11 +257,22 @@ class TagFacetOut(Schema):
     count: int
 
 
+class RangeFacetOut(Schema):
+    """A shown number field's facet: the lowest and highest value among the members that would match, and how many
+    of them carry a value; ``min`` and ``max`` are null when none does."""
+
+    min: float | None
+    max: float | None
+    count: int
+
+
 class DatasetFacetsOut(Schema):
-    """The browser's facets: the modalities present, each shown subject field's choices by key, and the tags."""
+    """The browser's facets: the modalities present, each shown subject field's choices by key, each shown number
+    field's range by key, and the tags."""
 
     modality: list[FacetValueOut]
     subject: dict[str, list[FacetValueOut]]
+    ranges: dict[str, RangeFacetOut]
     tags: list[TagFacetOut]
 
 
@@ -291,7 +304,8 @@ class SubjectSchemaWriteOut(SubjectSchemaOut):
 
 
 class MemberSubjectIn(Schema):
-    """Subject values to set on a member, each a choice of its field, or ``null`` to clear it; other keys are kept."""
+    """Subject values to set on a member, each a choice of its field or a number for a number field, or ``null`` to
+    clear it; other keys are kept."""
 
     values: dict
 
@@ -299,7 +313,7 @@ class MemberSubjectIn(Schema):
 class MemberSubjectOut(Schema):
     """A member's subject values after the write."""
 
-    values: dict[str, str]
+    values: dict[str, str | float]
 
 
 class CollectionItemOut(Schema):
@@ -1712,7 +1726,9 @@ def update_dataset(request, dataset_id: str, payload: CollectionPatchIn):
                 raise HttpError(403, "Only the dataset's author or a superuser may change release gating")
             _pool_rule(pools.ensure_gate_unchanged, dataset, payload.release_gated)
             if payload.release_gated:
-                refusal = gate_refusal(dataset)
+                from library.subjects import gating_refusal
+
+                refusal = gate_refusal(dataset) or gating_refusal(dataset)
                 if refusal:
                     raise HttpError(409, refusal)
             dataset.release_gated = payload.release_gated
@@ -2212,8 +2228,10 @@ def browse_dataset(
     The same access and the same members as the item listing, recordings only. Sort keys are an
     allowlist (``library.browse.SORT_KEYS``, and ``subject.<key>`` for each subject field shown), and
     none of them orders by arrival. ``modality``, ``subject.<key>`` and ``tag`` (a tag id) filter the rows and may
-    repeat: any of a dimension's values, every one of the tags. The facets count each value under the other filters
-    (``library.browse.facet_counts``). A member the caller cannot read is in neither the rows nor the counts.
+    repeat: any of a dimension's values, every one of the tags. A number field filters by ``subject.<key>.min`` and
+    ``subject.<key>.max`` instead. The facets count each value under the other filters, and give a number field's
+    lowest and highest value (``library.browse.facet_counts``). A member the caller cannot read is in neither the
+    rows nor the counts.
     """
     from epicurrents.permissions import can_read_object
     from library.browse import (
@@ -2369,7 +2387,7 @@ def update_dataset_subject_schema(request, dataset_id: str, payload: SubjectSche
             target=dataset,
             metadata={
                 "field_count": len(schema),
-                "choice_count": sum(len(field["choices"]) for field in schema),
+                "choice_count": sum(len(field.get("choices", ())) for field in schema),
             },
         )
     return {"fields": schema, "warnings": subjects.schema_warnings(schema)}

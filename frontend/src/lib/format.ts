@@ -57,3 +57,14 @@ export function formatMonth (iso: string): string {
     }
     return parsed.toLocaleDateString(undefined, { year: 'numeric', month: 'short', timeZone: 'UTC' })
 }
+
+/**
+ * A subject value as the browser shows it: a choice as it is, a number to two decimals at most, e.g. "1.49".
+ * @param value - The member's value for a field, or undefined when it has none.
+ */
+export function formatSubjectValue (value: string | number | undefined): string {
+    if (value === undefined) {
+        return ''
+    }
+    return typeof value === 'number' ? Number(value.toFixed(2)).toString() : value
+}
