@@ -174,6 +174,8 @@ interface MockGroup {
     deleted_at: string | null
     /** Datasets only. */
     release_gated?: boolean
+    /** Datasets only. */
+    preload_members?: boolean
 }
 
 /**
@@ -2801,8 +2803,20 @@ export async function handleMock(
                 // Every mock recording is the mock user's own, so the server's 409 for members authored by someone
                 // other than the dataset's author never arises here.
                 if (typeof body.release_gated === 'boolean') ds.release_gated = body.release_gated
+                if (typeof body.preload_members === 'boolean') {
+                    const members = _state.datasetItems.filter(i => i._parent_id === id).length
+                    if (body.preload_members && members > 50) {
+                        return send(res, 409, { detail: 'A dataset of more than 50 members cannot preload them.' })
+                    }
+                    ds.preload_members = body.preload_members
+                }
                 ds.modified_at = new Date().toISOString()
-                return send(res, 200, { ...ds, release_gated: ds.release_gated ?? false, warnings: [] })
+                return send(res, 200, {
+                    ...ds,
+                    preload_members: ds.preload_members ?? false,
+                    release_gated: ds.release_gated ?? false,
+                    warnings: [],
+                })
             }
             if (method === 'DELETE') {
                 ds.deleted_at = new Date().toISOString()

@@ -8,6 +8,14 @@ export interface RecordingMeta {
     data_record_duration: number
     signal_count: number
     discontinuous: boolean
+    /** Per-channel descriptors, in stored order; the annotation channel of an EDF+ file is among them. */
+    signals?: SignalInfo[]
+}
+
+/** The parts of a channel descriptor the frontend reads. */
+export interface SignalInfo {
+    label: string
+    is_annotation_channel: boolean
 }
 
 export interface AnnotationRef {

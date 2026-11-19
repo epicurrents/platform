@@ -138,6 +138,9 @@ class CollectionPatchIn(Schema):
     # superuser may change it; turning it off publishes every unreleased member.
     # A submission pool's gate is its configuration's (library/pools.py).
     release_gated: bool | None = None
+    # Datasets only — load every member in the viewer when the dataset is opened. Refused above
+    # LIBRARY_DATASET_PRELOAD_LIMIT members.
+    preload_members: bool | None = None
 
 
 class CollectionOut(Schema):
@@ -161,6 +164,8 @@ class CollectionOut(Schema):
     license_url: str | None = None
     # Datasets only — members are hidden until a release run publishes them.
     release_gated: bool = False
+    # Datasets only — the viewer loads every member when the dataset is opened.
+    preload_members: bool = False
 
 
 class CollectionWriteOut(CollectionOut):
@@ -1770,6 +1775,7 @@ def _dataset_out(dataset: Dataset) -> dict:
         "license_spdx": meta.license_spdx if meta else None,
         "license_url": meta.license_url if meta else None,
         "release_gated": dataset.release_gated,
+        "preload_members": dataset.preload_members,
     }
 
 
@@ -1851,6 +1857,12 @@ def update_dataset(request, dataset_id: str, payload: CollectionPatchIn):
                     raise HttpError(409, refusal)
             dataset.release_gated = payload.release_gated
             fields_updated.append("release_gated")
+        if payload.preload_members is not None and payload.preload_members != dataset.preload_members:
+            limit = settings.LIBRARY_DATASET_PRELOAD_LIMIT
+            if payload.preload_members and dataset.items.count() > limit:
+                raise HttpError(409, f"A dataset of more than {limit} members cannot preload them.")
+            dataset.preload_members = payload.preload_members
+            fields_updated.append("preload_members")
 
         meta_updates: dict[str, str] = {}
         if payload.license_spdx is not None:
@@ -1860,7 +1872,11 @@ def update_dataset(request, dataset_id: str, payload: CollectionPatchIn):
             meta_updates["license_url"] = payload.license_url
             fields_updated.append("license_url")
 
-        dataset_fields = [f for f in fields_updated if f in ("name", "description", "viewer_config", "release_gated")]
+        dataset_fields = [
+            f
+            for f in fields_updated
+            if f in ("name", "description", "viewer_config", "release_gated", "preload_members")
+        ]
         dataset.save(update_fields=[*dataset_fields, "modified_at"])
         if meta_updates:
             DatasetMeta.objects.update_or_create(dataset=dataset, defaults=meta_updates)

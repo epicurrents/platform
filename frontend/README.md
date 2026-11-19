@@ -154,6 +154,20 @@ Then choose variants in templates with the `library` attribute:
 This is backwards-compatible: existing icons that omit `library` continue to
 resolve through the default icon library.
 
+## Opening a dataset in the viewer
+
+[ViewerView.vue](src/views/ViewerView.vue) lists every item of the datasets it opens before loading any of them. Each item becomes a deferred study in the viewer, a listing with the importer and URL to load it from, built by [datasetStudies.ts](src/viewer/datasetStudies.ts), and the viewer loads it when it is opened. A loaded recording holds a reader, and with shared memory a worker, for as long as the tab lives, so loading every item up front is what crashed the tab at a few hundred recordings.
+
+A recording that has finished processing is listed with its duration and channel count from the metadata the platform recorded at ingest, so listing it costs no fetch. The viewer only displays those values; opening the recording still reads its header. Three kinds of item are loaded up front instead, as many as the viewer's `app.eagerStudyLoadLimit` allows (default 50, the rest listed):
+
+- every member of a dataset flagged `preload_members` ([library/README.md](../library/README.md));
+- every item of a `?files=` or `?media=` link, which names a selection the user made;
+- an item the platform holds no metadata for, a media file or a recording still processing, which would otherwise be listed by name alone.
+
+A project's `onStudiesReady` receives only the studies loaded up front, so a workflow that needs every member loaded flags its dataset rather than loading the rest itself. Every project gets this same rule: whether everything loads depends on the dataset, never on which project is active. Edu flags its session datasets when a session is created.
+
+The deferred-study API comes from the viewer edition built from source. The `@epicurrents/core` dev dependency the SPA takes its types from predates it, so `DeferredStudyApp` in [datasetStudies.ts](src/viewer/datasetStudies.ts) declares the part the SPA calls until that dependency moves to a release carrying it.
+
 ## Leaving the viewer
 
 Leaving the page ends the review session: what is open in the viewer closes, the position the user navigated to is lost, and any annotation edits go with it. None of it is recoverable — a recording opened from the platform can be reloaded, but relocating it and navigating back is the expensive part, and a file the user opened from their own disk cannot be reopened without them picking it again. So the viewer asks whenever anything is open, not only when annotations have been edited, and a viewer tab with a recording in it prompts on the way out by design. With nothing open, leaving is unremarkable and nothing is asked.

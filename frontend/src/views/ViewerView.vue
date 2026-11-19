@@ -4,7 +4,7 @@ import { onBeforeRouteLeave, useRoute } from 'vue-router'
 import { t } from '#i18n'
 import { showToast } from '#lib/toast'
 import { useAuthStore } from '#stores/auth'
-import { getRecordingDetail, recordingName } from '#api/recordings'
+import { getRecordingDetail } from '#api/recordings'
 import { getDataset, listAllDatasetItems } from '#api/library'
 import { getMediaDetail, listMediaFiles, type MediaFileDetail, type MediaFileSummary } from '#api/media'
 import type {
@@ -12,6 +12,7 @@ import type {
     DataResource,
     EpicurrentsApp,
     EpicurrentsGlobal,
+    MediaDataset,
     VideoAttachment,
 } from '@epicurrents/core/dist/types'
 // viewer/interface has no compiled .d.ts output; declare only what we need here.
@@ -24,6 +25,7 @@ import { waitForEventBus } from '#projects/eventBus'
 import { getViewerConfig } from '#api/viewerConfig'
 import { applyViewerSettingsOverrides, VIEWER_USER_SETTINGS_PATH } from '#lib/viewerConfig'
 import { leadFieldProvider } from '#viewer/leadFields'
+import { describeMedia, describeRecording, eagerStudyLoadLimit, type DeferredStudyApp } from '#viewer/datasetStudies'
 import { createUploadTarget } from '#lib/exportTargets'
 
 // The overlay panel comes from the active project if it defines one, otherwise
@@ -35,6 +37,8 @@ interface DatasetBundle {
     name: string
     shareToken: string | undefined
     items: BundleItem[]
+    /** Load every item when the viewer opens, rather than each when it is opened. */
+    preload: boolean
 }
 
 /**
@@ -45,27 +49,6 @@ interface DatasetBundle {
 type BundleItem =
     | { kind: 'recording'; recording: Recording }
     | { kind: 'media'; media: MediaFileDetail }
-
-/** Media types the viewer renders with the browser's own element, each through its `media/<type>-url` importer. */
-const NATIVE_MEDIA_TYPES = new Set(['audio', 'image', 'video'])
-
-/**
- * Map a media file to the viewer importer that opens it: a native media type by its type, which hands the URL to
- * the browser's own element, and a document by its extension. The platform always loads media by URL (the bytes live
- * behind /media/api/v1/<hash>/file), so this dispatches to the ``-url`` importer rather than the ``-file`` one,
- * which expects a File object from a picker and misreads a URL string as an asset-relative filename
- * (``/assets/undefined`` requests against the SPA host). Returns null for a format the viewer cannot open; the caller
- * skips the item rather than failing the whole dataset load.
- */
-function importerForMedia(media: MediaFileDetail): string | null {
-    if (NATIVE_MEDIA_TYPES.has(media.media_type)) {
-        return `media/${media.media_type}-url`
-    }
-    const ext = (media.file_extension || '').toLowerCase()
-    if (ext === '.pdf') return 'doc/pdf-url'
-    if (ext === '.md') return 'doc/htm-url'
-    return null
-}
 
 /**
  * Seed the viewer resource with the platform's complete interruption table from the recording
@@ -91,6 +74,19 @@ function seedTrustedInterruptions(resource: DataResource, recording: Recording):
     target.setTrustedInterruptions(
         new Map(recording.interruptions.map((intr) => [intr.start, intr.duration]))
     )
+}
+
+/**
+ * Finish a study once the viewer has loaded it, whether up front or when it was opened: seed a recording's trusted
+ * interruption table and attach its videos. Runs before the loaded resource is activated, which is when the activation
+ * flow delivers the interruption table to the reader.
+ */
+async function studyLoaded(resource: DataResource, item: BundleItem): Promise<void> {
+    if (item.kind !== 'recording') {
+        return
+    }
+    seedTrustedInterruptions(resource, item.recording)
+    await attachRecordingVideos(resource, item.recording.hash)
 }
 
 /**
@@ -247,7 +243,7 @@ async function loadDatasetBundle(id: number | string, token: string | undefined)
             return null
         }),
     )).filter((i): i is BundleItem => i !== null)
-    return { name: dataset.name, shareToken: token, items: bundleItems }
+    return { name: dataset.name, shareToken: token, items: bundleItems, preload: dataset.preload_members ?? false }
 }
 
 function cancelLeave () {
@@ -328,10 +324,12 @@ onMounted(async () => {
                     media: await getMediaDetail(h),
                 })),
             )
+            // A link naming its items is a selection the user made, so every item loads up front.
             bundles.value = [{
                 name: 'Dataset',
                 shareToken: shareToken.value,
                 items: [...recordingItems, ...mediaItems],
+                preload: true,
             }]
         }
         // No ref params (emptyMode): leave bundles empty and fall through to
@@ -504,101 +502,73 @@ onMounted(async () => {
                 }
                 const first = ds.resources?.values().next().value?.resource
                 if (first && epic) {
-                    // Runtime exposes setActiveResource at runtime but the
-                    // RuntimeState interface does not surface it; narrow cast.
-                    ;(epic.runtime as unknown as {
-                        setActiveResource: (r: DataResource) => void
-                    }).setActiveResource(first)
+                    // Through the interface, which loads a listed study before activating it.
+                    epic.interface?.openResource(first)
                 }
             })
 
-            let firstRec = null as DataResource | null
-            const loadedStudies: DataResource[] = []
+            // Every item is listed first and loads when it is opened, so a large dataset costs no fetch and no reader
+            // per member. A dataset flagged to preload, and an item the platform holds no metadata to list, are loaded
+            // up front instead, as many as the viewer's eager load limit allows.
+            const app = epic as DeferredStudyApp
+            const eagerLimit = eagerStudyLoadLimit(app)
+            const eager: DataResource[] = []
+            const viewerDatasets: MediaDataset[] = []
             for (const [bundleIdx, bundle] of bundles.value.entries()) {
                 // Only the first dataset is marked active; later ones must not
                 // override the active selection or the UI ends up in an
                 // inconsistent state on mount.
-                const viewerDataset = epic?.createDataset(bundle.name, bundleIdx === 0)
+                const viewerDataset = app.createDataset(bundle.name, bundleIdx === 0)
+                viewerDatasets.push(viewerDataset)
                 for (const item of bundle.items) {
-                    try {
-                        let importerName: string | null = null
-                        let downloadUrl = ''
-                        let displayName = ''
-
-                        if (item.kind === 'recording') {
-                            const rec = item.recording
-                            // Build an absolute URL — Workers (used for Range fetches on the SAB path) have no
-                            // document.baseURI, so a relative path throws "Failed to parse URL" inside the
-                            // EDF reader worker. Main-thread fetches would resolve it; resolve here so both
-                            // paths see the same string.
-                            // The default version is the one the recording's reconstruction stages built, and the
-                            // stored file when it has none; until the viewer compares versions itself, it opens that.
-                            const query = new URLSearchParams({ version: 'default' })
-                            if (bundle.shareToken) {
-                                query.set('share_token', bundle.shareToken)
-                            }
-                            const relativePath = `/recordings/api/v1/${rec.hash}/file?${query.toString()}`
-                            downloadUrl = new URL(relativePath, import.meta.url).toString()
-                            displayName = recordingName(rec).replace(/\.[^.]+$/, '')
-                            // Lower-case the extension before lookup — loader names are registered as
-                            // ``eeg/edf-file`` etc., and a recording uploaded with ``.EDF`` (whose
-                            // ``file_extension`` was previously stored verbatim) would otherwise produce
-                            // ``eeg/EDF-file`` and fail to resolve. Defensive even after the upload-side
-                            // fix lands, since existing rows may still carry an uppercase extension.
-                            const normalizedExt = rec.file_extension.replace(/^\./, '').toLowerCase()
-                            importerName = `${rec.modality}/${normalizedExt}-file`
-                        } else {
-                            const media = item.media
-                            importerName = importerForMedia(media)
-                            if (!importerName) {
-                                console.warn(`[Epicurrents] No importer registered for media ${media.file_extension}; skipping ${media.content_hash}`)
-                                continue
-                            }
-                            // Media download endpoint is session-authenticated — the
-                            // browser sends cookies on the worker fetch. Share-token
-                            // access for media is a phase-4 follow-up; until then
-                            // unauthenticated dataset shares won't render media items.
-                            //
-                            // The relative path is bound to a local before the
-                            // ``new URL(...)`` call because Vite's minifier mis-handles
-                            // an inline template literal here and emits
-                            // ``new URL(Object.assign({})[`/media/...`], ...)``,
-                            // which evaluates to ``new URL(undefined, ...)`` and
-                            // resolves to ``/assets/undefined``. Recording's branch
-                            // sidesteps it by binding ``relativePath`` first; we
-                            // match that shape for the same reason.
-                            const mediaRelativePath = `/media/api/v1/${media.content_hash}/file`
-                            downloadUrl = new URL(mediaRelativePath, import.meta.url).toString()
-                            displayName = media.display_name
-                        }
-                        const study = await epic?.loadStudy(
-                            importerName,
-                            downloadUrl,
-                            { dataset: viewerDataset, name: displayName, isValidated: true },
-                        )
-                        if (study) {
-                            loadedStudies.push(study)
-                            if (!firstRec) firstRec = study
-                            if (item.kind === 'recording') {
-                                seedTrustedInterruptions(study, item.recording)
-                                await attachRecordingVideos(study, item.recording.hash)
-                            }
-                        }
-                        console.debug(`[Epicurrents] Study ${study!.name} successfully loaded.`)
-                    } catch (e) {
+                    const description = item.kind === 'recording'
+                        ? describeRecording(item.recording, bundle.shareToken)
+                        : describeMedia(item.media)
+                    if (!description) {
+                        const media = (item as { media: MediaFileDetail }).media
+                        console.warn(`[Epicurrents] No importer registered for media ${media.file_extension}; skipping ${media.content_hash}`)
+                        continue
+                    }
+                    const listing = app.addDeferredStudy({
+                        loader: description.loader,
+                        name: description.name,
+                        onLoaded: (resource) => studyLoaded(resource, item),
+                        options: { isValidated: true, name: description.name },
+                        properties: description.properties ?? undefined,
+                        source: description.source,
+                    }, { dataset: viewerDataset })
+                    if (!listing) {
                         const hash = item.kind === 'recording' ? item.recording.hash : item.media.content_hash
-                        console.error(`[Epicurrents] Failed to load study from hash ${hash}.`)
-                        console.error(e)
+                        console.error(`[Epicurrents] Could not list the item ${hash}.`)
+                        continue
+                    }
+                    if (bundle.preload || !description.properties) {
+                        eager.push(listing)
                     }
                 }
             }
-            if (firstRec) {
-                // Open the first recording in the viewer. The rest will be available in the dataset sidebar.
+            if (eager.length > eagerLimit) {
+                console.warn(
+                    `[Epicurrents] Loading ${eagerLimit} of ${eager.length} items up front; the rest load when opened.`
+                )
+            }
+            const loadedStudies: DataResource[] = []
+            for (const listing of eager.slice(0, eagerLimit)) {
+                const loaded = await app.openDeferredResource(listing)
+                if (loaded) {
+                    loadedStudies.push(loaded)
+                }
+            }
+            // Open the first item that did not fail to load, loading it if it is still a listing. The rest stay in the
+            // dataset sidebar.
+            const first = viewerDatasets[0]?.resources.find(ctx => ctx.resource.state !== 'error')?.resource
+            if (first) {
                 window.setTimeout(() => {
-                    epic?.interface?.openResource(firstRec)
+                    app.interface?.openResource(first)
                 }, 250)
             }
-            // Notify the active project and enabled plugins that all studies are loaded and the first is open.
+            // Notify the active project and enabled plugins of the studies loaded up front: every member of a dataset
+            // flagged to preload, within the eager load limit, and none of a dataset listed from metadata.
             await plugin.onStudiesReady?.(epic, loadedStudies)
             await pluginsPlugin.onStudiesReady?.(epic, loadedStudies)
         })

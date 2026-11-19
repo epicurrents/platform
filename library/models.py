@@ -217,6 +217,13 @@ class Dataset(models.Model):
             "and serve the release month in place of the upload time."
         ),
     )
+    # Whether the viewer loads every member when the dataset is opened, rather than listing them and loading each
+    # when it is opened. For a dataset whose workflow spans its members, such as a teaching session's recordings.
+    # Turning it on is refused above LIBRARY_DATASET_PRELOAD_LIMIT members, since every loaded member holds a reader.
+    preload_members = models.BooleanField(
+        default=False,
+        help_text="Load every member in the viewer when the dataset is opened, instead of each when it is opened.",
+    )
     # A submission pool is a release-gated dataset with a registered ingest
     # profile: members of its dedicated group submit prepared recordings through
     # the validating submission path (``recordings.submissions``). The rules on

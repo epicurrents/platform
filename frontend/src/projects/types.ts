@@ -142,14 +142,20 @@ export interface ViewerPlugin {
     onAppReady?: (epic: EpicurrentsApp, bus: EventTarget) => void | Promise<void>
 
     /**
-     * Called after all studies have been loaded and the first one has been
-     * opened in the viewer.  Use this hook for post-load actions such as
-     * registering event listeners, triggering annotation fetches, or
-     * adjusting the dataset displayed in the sidebar.
+     * Called once the viewer has listed every item and loaded the ones it
+     * loads up front, as the first item is being opened. Use this hook for
+     * post-load actions such as registering event listeners, triggering
+     * annotation fetches, or adjusting the dataset displayed in the sidebar.
+     *
+     * Only the studies loaded up front are passed: every member of a dataset
+     * flagged `preload_members` and every item of a `?files=` link, within the
+     * viewer's eager load limit, and otherwise only the items the platform
+     * holds no metadata to list. The rest are listed and load when opened, so
+     * a workflow spanning a dataset's members needs the dataset flagged.
      *
      * @param epic - The Epicurrents application instance.
-     * @param studies - All successfully loaded `DataResource` objects, in
-     *   the same order as the recordings passed to the viewer.
+     * @param studies - The studies loaded up front, in the order they were
+     *   passed to the viewer.
      */
     onStudiesReady?: (epic: EpicurrentsApp, studies: DataResource[]) => void | Promise<void>
 

@@ -833,6 +833,10 @@ TEXT_HYGIENE_PATTERNS: dict[str, str] = {}
 # deployment decision rather than whatever each user types; a deployment that
 # wants user-defined tags turns this off and gets the reach-scoped listing.
 LIBRARY_TAG_CREATION_REQUIRES_STAFF = env_bool("LIBRARY_TAG_CREATION_REQUIRES_STAFF", default=True)
+# Most members a dataset may have when its preload flag is turned on. The viewer holds a reader, and with shared
+# memory a worker, for every loaded recording, and a browser tab gives out somewhere in the hundreds; the viewer's own
+# eagerStudyLoadLimit (also 50) caps what it loads regardless, so a deployment raising this raises that too.
+LIBRARY_DATASET_PRELOAD_LIMIT = config("LIBRARY_DATASET_PRELOAD_LIMIT", default=50, cast=int)
 # A deployment whose datasets are release-gated (a multi-centre pool released to readers by
 # release runs) keeps no copy of a submission its contributor does not also hold, so the
 # originals volume is refused at boot while this is on (library/checks.py). Set by the project.

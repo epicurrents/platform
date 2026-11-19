@@ -655,7 +655,7 @@ async function submitMoveItem() {
 const showEdit = ref(false)
 const editLoading = ref(false)
 const editError = ref<string | null>(null)
-const input = reactive({ editName: '', editDescription: '', editReleaseGated: false })
+const input = reactive({ editName: '', editDescription: '', editPreloadMembers: false, editReleaseGated: false })
 
 function openEdit() {
     if (!dataset.value) {
@@ -663,6 +663,7 @@ function openEdit() {
     }
     input.editName = dataset.value.name
     input.editDescription = dataset.value.description
+    input.editPreloadMembers = dataset.value.preload_members ?? false
     input.editReleaseGated = dataset.value.release_gated ?? false
     editError.value = null
     showEdit.value = true
@@ -684,6 +685,11 @@ async function submitEdit() {
             name: input.editName.trim(),
             description: input.editDescription.trim(),
         }
+        // Sent only when changed: a dataset that grew past the limit after preloading was turned on must still save
+        // its name.
+        if (input.editPreloadMembers !== (dataset.value?.preload_members ?? false)) {
+            payload.preload_members = input.editPreloadMembers
+        }
         const wasGated = dataset.value?.release_gated ?? false
         if (canEditConfig.value && !isPool.value) {
             payload.release_gated = input.editReleaseGated
@@ -696,7 +702,8 @@ async function submitEdit() {
             await reloadAfterGateChange()
         }
     } catch (err) {
-        // A 409 names why the gate cannot change, e.g. members not authored by the dataset's author.
+        // A 409 names why the change is refused: members not authored by the dataset's author for the gate, or too
+        // many members to preload.
         editError.value = errorDetail(err, t('Failed to update dataset.', SCOPE))
     } finally {
         editLoading.value = false
@@ -1253,6 +1260,16 @@ const assessFn = (right: AccessRight, payload: AssessmentPayload) =>
                 size="s"
                 v-wa="[input, 'editDescription']"
             ></wa-textarea>
+            <wa-switch
+                :disabled="editLoading"
+                size="s"
+                v-wa="[input, 'editPreloadMembers']"
+            >
+                {{ t('Load all members when opened', SCOPE) }}
+            </wa-switch>
+            <p class="dataset-view__hint">
+                {{ t('The viewer loads every member as the dataset opens, for a dataset whose work spans its members, such as a teaching session. Otherwise it lists them and loads each when it is opened. Refused for a dataset larger than the deployment allows.', SCOPE) }}
+            </p>
             <template v-if="canEditConfig && !isPool">
                 <wa-switch
                     :disabled="editLoading"
