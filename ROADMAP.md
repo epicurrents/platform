@@ -320,7 +320,7 @@ Related, and visible in the same list: a recording uploaded with `RECORDINGS_DIS
 The [public listing](library/README.md#public-listing) lists a dataset through one of its share tokens only when every member is a recording carrying `public_source`, and it was built to see whether that condition holds up in use. Open questions:
 
 - **The condition itself.** It refuses a dataset with a single unsourced recording, and any media member, and drops a listed dataset off the listing the moment one is added. If that proves too strict in practice, the alternative considered was leaving the judgement to the author, as for subject fields; it would need its own row in the [assessment log](docs/anonymisation-compliance.md#assessment-log), since the ¶ 26 argument would no longer carry it.
-- **Finding the listing.** Nothing links to `/public-datasets` yet: not the login page, the nav or the catalogue. The login page could link to it when the listing answers, which costs one anonymous request per visit.
+- **Finding the listing.** A signed-in reader finds it in the catalogue, which lists the public datasets beside the released ones. Nothing links to `/public-datasets` for a visitor without an account; the login page could link to it when the listing answers, which costs one anonymous request per visit.
 - **Several tokens.** A dataset is listed through one token. Rotating a listed token means listing the new one and revoking the old, which works but is two steps.
 
 ## 🟢 Viewer — defer resource open until activation setup completes (replace the re-dispatch band-aid)
