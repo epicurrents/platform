@@ -3,12 +3,12 @@
  * A dataset's recordings to browse, read-only: the dataset's name, description and licence above the dataset
  * browser, with no management controls. The page a shared link opens, so it reads the dataset with the `?token=`
  * share token when one is given and needs no account then; a signed-in reader without a token reads it as
- * themselves. "Open in viewer" opens the whole dataset with the same token.
+ * themselves. The browser's own button opens what it matches in the viewer, with the same token.
  *
  * @package    epicurrents-platform
  */
 import { computed, onMounted, ref } from 'vue'
-import { useRoute, useRouter } from 'vue-router'
+import { useRoute } from 'vue-router'
 import { t } from '#i18n'
 import { getDataset, type Collection } from '#api/library'
 import { errorDetail } from '#lib/http'
@@ -19,7 +19,6 @@ import { useAuthStore } from '#stores/auth'
 const SCOPE = 'DatasetBrowseView'
 
 const route = useRoute()
-const router = useRouter()
 const authStore = useAuthStore()
 
 const datasetId = computed(() => String(route.params.id))
@@ -41,15 +40,6 @@ onMounted(async () => {
         loading.value = false
     }
 })
-
-function openInViewer () {
-    const query: Record<string, string> = { dataset: dataset.value?.object_hash ?? datasetId.value }
-    if (shareToken.value) {
-        query.token = shareToken.value
-    }
-    const { href } = router.resolve({ name: 'viewer', query })
-    window.open(href, '_blank')
-}
 </script>
 
 <template>
@@ -61,14 +51,6 @@ function openInViewer () {
         <template v-else-if="dataset">
             <header class="page-header">
                 <h1>{{ dataset.name }}</h1>
-                <wa-button
-                    appearance="filled-outlined"
-                    variant="brand"
-                    @click="openInViewer"
-                >
-                    <wa-icon name="arrow-up-right-from-square" slot="start"></wa-icon>
-                    {{ t('Open in viewer', SCOPE) }}
-                </wa-button>
             </header>
             <p v-if="dataset.description" class="dataset-browse__description">{{ dataset.description }}</p>
             <p v-if="dataset.license_spdx" class="dataset-browse__licence">
