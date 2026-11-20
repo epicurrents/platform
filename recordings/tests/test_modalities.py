@@ -29,7 +29,7 @@ from recordings.testing import make_edf_bytes
 from recordings.tests.test_edf_processor import _make_edfplus_file
 
 UPLOAD_URL = "/recordings/api/v1/upload"
-HASH = "c" * 32
+HASH = "C" * 32
 
 
 def _continuous():

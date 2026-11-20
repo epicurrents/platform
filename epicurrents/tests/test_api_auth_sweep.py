@@ -27,6 +27,7 @@ ANONYMOUS_ALLOWLIST = {
     ("annotations.api.v1.ninja", "healthcheck"): "unauthenticated liveness probe",
     ("epicurrents.api.v1.ninja", "healthcheck"): "unauthenticated liveness probe",
     ("epicurrents.api.v1.ninja", "readiness"): "unauthenticated readiness probe for orchestration",
+    ("library.api.v1.ninja", "list_public_datasets"): "the public dataset listing, 404 unless the deployment serves it",
     ("maintenance.api.v1.ninja", "get_lock"): "maintenance flag probe the signed-out SPA polls for the release",
     ("notifications.api.v1.ninja", "vapid_public_key"): "the VAPID public key is public by definition",
     ("user.api.v1.ninja", "agreement_endpoint"): "the user agreement is read before an account accepts it, or exists",
