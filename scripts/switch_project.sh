@@ -14,7 +14,13 @@
 set -euo pipefail
 
 NEW_PROJECT="${1:-}"
-if [[ -z "$NEW_PROJECT" ]]; then
+# An option is never a project name. Taken as one, `--help` would archive the
+# active project's tables and stop the stack before failing on the name.
+if [[ "$NEW_PROJECT" == "-h" || "$NEW_PROJECT" == "--help" ]]; then
+    echo "Usage: $0 <new-project-name>"
+    exit 0
+fi
+if [[ -z "$NEW_PROJECT" || "$NEW_PROJECT" == -* ]]; then
     echo "Usage: $0 <new-project-name>" >&2
     exit 1
 fi

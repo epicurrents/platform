@@ -2,7 +2,8 @@
 
 Starting from no active project (a blank or absent ``EPICURRENTS_PROJECT``) skips the deactivation and still writes
 both env files; a named current project is deactivated first; a missing key or frontend env file is added rather than
-left unedited; switching to the active project does nothing. See ``conftest.py`` for the fakebin pattern.
+left unedited; switching to the active project does nothing; an option, ``--help`` included, is never taken as a
+project name. See ``conftest.py`` for the fakebin pattern.
 """
 
 from scripts.tests.conftest import run_script
@@ -63,4 +64,19 @@ class TestSwitchProject:
         (tmp_path / "frontend").mkdir()
         result = _run(fakebin, tmp_path)
         assert result.returncode == 1
+        assert not fakebin.calls()
+
+    def test_help_prints_usage_and_touches_nothing(self, fakebin, tmp_path):
+        _make_repo(tmp_path, env="EPICURRENTS_PROJECT=example\n")
+        result = _run(fakebin, tmp_path, project="--help")
+        assert result.returncode == 0, result.stderr
+        assert "Usage:" in result.stdout
+        assert not fakebin.calls()
+        assert (tmp_path / ".env").read_text() == "EPICURRENTS_PROJECT=example\n"
+
+    def test_an_option_is_never_taken_as_a_project(self, fakebin, tmp_path):
+        _make_repo(tmp_path, env="EPICURRENTS_PROJECT=example\n")
+        result = _run(fakebin, tmp_path, project="--dry-run")
+        assert result.returncode == 1
+        assert "Usage:" in result.stderr
         assert not fakebin.calls()
