@@ -8,6 +8,8 @@ Entries are written for the person deciding whether to upgrade, so the ones that
 
 ## [Unreleased]
 
+## [0.2.1] — 2026-11-20
+
 ### Changed
 
 - **The viewer lists a dataset's members and loads each when it is opened.** Opening a dataset, a `?files=` link or a session link used to load every item before anything showed; a dataset's recordings are now listed from the metadata recorded at ingest and loaded on opening, so a large dataset opens. This needs a viewer edition built from core 2.3.0 or later: with an older edition nothing opens from any of these links. A project plugin's `onStudiesReady` now receives only the studies loaded up front, so a workflow that spans a dataset's members either flags the dataset `preload_members` or returns `preload` on the entries of its `resolveSessionDatasets`, which holds for that session link alone. Both load at most the viewer's `app.eagerStudyLoadLimit` items, 50 by default. [frontend/README.md](frontend/README.md#opening-a-dataset-in-the-viewer).
@@ -411,7 +413,9 @@ Started at 0.x rather than 1.0.0 deliberately. The code is not early — it is f
 - `recordings.processors.edf._build_header` is now `build_header`. It was private with sixteen call sites across the federation middleware, the FUSE filesystem and a project. Its de-identifying counterpart `_build_clean_header` stays private on purpose: its blanking values are a PHI contract, not parameters.
 - `pandas` and `PyWavelets` left the platform's dependency closure for the one project that used them. A deployment needing them gets them from that project.
 
-[Unreleased]: https://github.com/epicurrents/platform/compare/v0.1.3...HEAD
+[Unreleased]: https://github.com/epicurrents/platform/compare/v0.2.1...HEAD
+[0.2.1]: https://github.com/epicurrents/platform/compare/v0.2.0...v0.2.1
+[0.2.0]: https://github.com/epicurrents/platform/compare/v0.1.3...v0.2.0
 [0.1.3]: https://github.com/epicurrents/platform/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/epicurrents/platform/compare/v0.1.0...v0.1.2
 [0.1.0]: https://github.com/epicurrents/platform/releases/tag/v0.1.0
