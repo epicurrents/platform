@@ -23,7 +23,7 @@ export type ListedProperty = [string, number]
 export interface ListedRecording {
     /** The recording's hash, which names it in the recording routes. */
     hash: string
-    /** The name to list it under, with its file extension. */
+    /** The name to list it under, which may end with its file extension. */
     name: string
     modality: string
     file_extension: string
@@ -147,6 +147,18 @@ export function recordingProperties(recording: ListedRecording): ListedProperty[
  * @param recording - The recording as listed.
  * @param shareToken - Share token the dataset was opened with, if any.
  */
+/**
+ * The recording's name without its file extension. Only that extension is taken off: a browser row's name is the
+ * label its author gave it, which carries none and may hold a dot of its own.
+ */
+function nameWithoutExtension (recording: ListedRecording) {
+    const extension = recording.file_extension.toLowerCase()
+    if (extension && recording.name.toLowerCase().endsWith(extension)) {
+        return recording.name.slice(0, -extension.length)
+    }
+    return recording.name
+}
+
 export function describeRecording(recording: ListedRecording, shareToken?: string): StudyDescription {
     const query = new URLSearchParams({ version: 'default' })
     if (shareToken) {
@@ -158,7 +170,7 @@ export function describeRecording(recording: ListedRecording, shareToken?: strin
     const extension = recording.file_extension.replace(/^\./, '').toLowerCase()
     return {
         loader: `${recording.modality}/${extension}-file`,
-        name: recording.name.replace(/\.[^.]+$/, ''),
+        name: nameWithoutExtension(recording),
         properties: recordingProperties(recording),
         source: new URL(relativePath, import.meta.url).toString(),
     }

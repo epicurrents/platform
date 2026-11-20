@@ -242,6 +242,8 @@ const tagsLoaded = ref(false)
 const tagsFailed = ref(false)
 const codes = ref<CodeSummary[] | null>(null)
 const codesError = ref(false)
+/** Whether the open recording's codes are not served to this reader, which leaves the section out. */
+const codesUnavailable = ref(false)
 // Each field's value as the form holds it: a choice, or a number field's value as typed; empty for none.
 const subjectDraft = reactive<Record<string, string>>({})
 const savingSubject = ref(false)
@@ -302,6 +304,7 @@ async function openDetails (row: DatasetBrowseRow) {
     tagsFailed.value = false
     codes.value = null
     codesError.value = false
+    codesUnavailable.value = false
     resetSubjectDraft(row)
     getRecordingDetail(hash, props.shareToken).then(rec => {
         if (stillShowing(hash)) {
@@ -322,14 +325,18 @@ async function openDetails (row: DatasetBrowseRow) {
         }
     }).catch(() => {
         if (stillShowing(hash)) {
-            codesError.value = true
+            // The codes are read with the session alone, so a signed-in reader whose access is the link's token is
+            // refused them; that is nothing to report, and the section is left out as it is without an account.
+            codesError.value = !props.shareToken
+            codesUnavailable.value = !!props.shareToken
         }
     })
     if (row.tag_count > row.tags.length) {
         try {
             const [answer] = await listRecordingTags([hash])
-            if (stillShowing(hash)) {
-                tags.value = answer?.tags ?? []
+            // A recording the session does not read is left out of the answer, and the row's first tags stay shown.
+            if (stillShowing(hash) && answer) {
+                tags.value = answer.tags
                 tagsLoaded.value = true
             }
         } catch {
@@ -777,7 +784,7 @@ function standardLabel (group: CodeSummary) {
                 </div>
             </section>
 
-            <section v-if="!tokenOnly" class="dataset-browser__section">
+            <section v-if="!tokenOnly && !codesUnavailable" class="dataset-browser__section">
                 <h3 class="dataset-browser__heading">{{ t('Codes', SCOPE) }}</h3>
                 <p v-if="codesError" class="dataset-browser__quiet">{{ t('The codes could not be loaded.', SCOPE) }}</p>
                 <wa-spinner v-else-if="codes === null"></wa-spinner>

@@ -92,6 +92,10 @@ describe('a browser row as listed', () => {
         expect(recordingProperties(listedFromBrowseRow(row({ channel_count: null })))).toEqual([['duration', 900]])
         expect(recordingProperties(listedFromBrowseRow(row({ duration: null, channel_count: null })))).toBeNull()
     })
+    it('keeps a dot that is part of the name', () => {
+        expect(describeRecording(listedFromBrowseRow(row({ display_name: 'Sleep v1.5' }))).name).toBe('Sleep v1.5')
+        expect(describeRecording(listedFromBrowseRow(row({ display_name: 'Sleep v1.5.EDF' }))).name).toBe('Sleep v1.5')
+    })
     it('names it by the grantee-visible name and loads it by its hash', () => {
         const description = describeRecording(listedFromBrowseRow(row()))
         expect(description.name).toBe('subject-007')

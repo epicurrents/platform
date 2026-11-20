@@ -15,7 +15,8 @@ export interface Collection {
     name: string
     description: string
     parent_id: number | null
-    author_id: number
+    /** Null for a dataset read through a share token without an account. */
+    author_id: number | null
     created_at: string
     modified_at: string
     deleted_at: string | null
@@ -771,12 +772,17 @@ export function browseFiltersFromQuery (query: Record<string, unknown>): Dataset
 
 /**
  * Every recording of the dataset the filters match, as the browser lists it, in its order under *sort*. Read a page
- * of 200 at a time: the first page gives the count, and the rest are read together.
+ * of 200 at a time: the first page gives the count, and the rest are read a few together, since the server works out
+ * the whole query for each page and a large dataset read all at once would run into its request limit. The pages are
+ * not one snapshot, so a recording that moved between them is kept once.
  * @param datasetId - The dataset's object hash or primary key.
  * @param filters - The browser filters, or null for every recording.
  * @param sort - A browser sort key, `-` prefixed for descending.
  * @param shareToken - Share token the dataset is read with, if any.
  */
+/** The most browser pages {@link listMatchingRecordings} reads at once. */
+const MATCHING_PAGES_TOGETHER = 4
+
 export async function listMatchingRecordings (
     datasetId: number | string,
     filters: DatasetBrowseFilters | null,
@@ -792,8 +798,18 @@ export async function listMatchingRecordings (
             offsets.push(offset)
         }
     }
-    const rest = await Promise.all(offsets.map(read))
-    return [first, ...rest].flatMap(page => page.items)
+    const pages = [first]
+    for (let next = 0; next < offsets.length; next += MATCHING_PAGES_TOGETHER) {
+        pages.push(...await Promise.all(offsets.slice(next, next + MATCHING_PAGES_TOGETHER).map(read)))
+    }
+    const seen = new Set<string>()
+    return pages.flatMap(page => page.items).filter(row => {
+        if (seen.has(row.hash)) {
+            return false
+        }
+        seen.add(row.hash)
+        return true
+    })
 }
 
 /**

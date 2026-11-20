@@ -318,6 +318,25 @@ describe('browser query in a link', () => {
         }
     })
 
+    it('reads the later pages a few at a time and keeps a recording that moved between them once', async () => {
+        let open = 0
+        let most = 0
+        mockGet.mockImplementation(async (_url: string, config?: { params?: URLSearchParams }) => {
+            const offset = Number(config?.params?.get('offset'))
+            open += 1
+            most = Math.max(most, open)
+            await new Promise(resolve => setTimeout(resolve, 0))
+            open -= 1
+            // Every page repeats the first row of the one before it, as a member moving down between reads would.
+            const items = Array.from({ length: 200 }, (_, i) => ({ hash: `h${Math.max(offset + i - 1, 0)}` }))
+            return { data: { count: 2000, items } }
+        })
+        const listed = await listMatchingRecordings('abc', null, 'name')
+        expect(mockGet).toHaveBeenCalledTimes(10)
+        expect(most).toBeLessThanOrEqual(4)
+        expect(new Set(listed.map(row => row.hash)).size).toBe(listed.length)
+    })
+
     it('reads one page when the first holds every match', async () => {
         mockGet.mockResolvedValueOnce({ data: { count: 2, items: [{ hash: 'h0' }, { hash: 'h1' }] } })
         expect((await listMatchingRecordings('abc', null, 'name')).map(row => row.hash)).toEqual(['h0', 'h1'])
