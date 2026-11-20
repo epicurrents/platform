@@ -67,7 +67,7 @@ class TestTagByHash:
     def test_a_media_file_is_tagged_by_its_content_hash(self, user):
         from media.models import MediaFile
 
-        media = baker.make(MediaFile, author=user, content_hash="AB" * 32, file_size=1)
+        media = baker.make(MediaFile, author=user, content_hash="AB" * 16, file_size=1)
         tag = baker.make(Tag, author=user)
         ct = ContentType.objects.get_for_model(MediaFile, for_concrete_model=False)
         response = _client(user).post(
