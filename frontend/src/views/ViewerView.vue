@@ -377,9 +377,11 @@ onMounted(async () => {
                 error.value = t('This session has no datasets.', SCOPE)
                 return
             }
-            bundles.value = await Promise.all(
-                sessionDatasets.map(d => loadDatasetBundle(d.id, d.share_token)),
-            )
+            bundles.value = await Promise.all(sessionDatasets.map(async d => {
+                const bundle = await loadDatasetBundle(d.id, d.share_token)
+                // The session may ask for its datasets' members up front without the datasets being flagged.
+                return { ...bundle, preload: bundle.preload || d.preload === true }
+            }))
         } else if (datasetId.value !== null) {
             // Single-dataset mode.
             bundles.value = [

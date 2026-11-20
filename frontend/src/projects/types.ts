@@ -148,10 +148,11 @@ export interface ViewerPlugin {
      * annotation fetches, or adjusting the dataset displayed in the sidebar.
      *
      * Only the studies loaded up front are passed: every member of a dataset
-     * flagged `preload_members` and every item of a `?files=` link, within the
+     * flagged `preload_members` or named with `preload` by
+     * `resolveSessionDatasets`, and every item of a `?files=` link, within the
      * viewer's eager load limit, and otherwise only the items the platform
      * holds no metadata to list. The rest are listed and load when opened, so
-     * a workflow spanning a dataset's members needs the dataset flagged.
+     * a workflow spanning a dataset's members needs one of the two.
      *
      * @param epic - The Epicurrents application instance.
      * @param studies - The studies loaded up front, in the order they were
@@ -181,10 +182,14 @@ export interface ViewerPlugin {
 /**
  * One dataset behind a session token, as `resolveSessionDatasets` returns it.
  * `shareToken` is per dataset rather than per session, so each is loaded under
- * its own grant.
+ * its own grant. `preload` loads the dataset's members up front for this
+ * session, as the dataset's own `preload_members` flag does for every reader;
+ * a project whose session workflow spans the members sets it here rather than
+ * on a dataset the session only reads.
  */
 export interface SessionDatasetRef {
     id: number
     name: string
+    preload?: boolean
     share_token: string
 }
