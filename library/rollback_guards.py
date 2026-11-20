@@ -9,6 +9,8 @@ restoring what those paths would refuse:
 - a dataset rollback that changes the pool configuration or the gate (``submission_profile``,
   ``submission_group``, ``submissions_open``, ``release_gated``), and the rollback of a pool's
   creation, which would trash it past ``ensure_deletable``;
+- a dataset rollback that changes its public listing (``public_listing``), which only the author or
+  a superuser decides and a write grantee's rollback would otherwise restore after it was cleared;
 - any rollback of a release run, a run's sign-off or a curator's approval: each is a record of
   something that happened, and restoring or removing one rewrites what a release relied on;
 - a membership rollback in a release-gated dataset or a pool, or one that moves a member's release
@@ -46,7 +48,9 @@ def _restored_state(change) -> dict | None:
 
 
 def dataset_guard(change, existing_obj: Any) -> str | None:
-    """Refuse a dataset rollback that would change the pool configuration or the gate, or trash a pool."""
+    """Refuse a dataset rollback that would change the pool configuration, the gate or the public listing, or trash
+    a pool.
+    """
     from library.pools import is_pool
 
     state = _restored_state(change)
@@ -59,6 +63,9 @@ def dataset_guard(change, existing_obj: Any) -> str | None:
         restored = state.get(field, current)
         if (restored or _POOL_DEFAULTS[field]) != (current or _POOL_DEFAULTS[field]):
             return "A rollback cannot change a dataset's submission pool or release gating."
+    current_listing = getattr(existing_obj, "public_listing_id", None)
+    if state.get("public_listing_id", current_listing) != current_listing:
+        return "A rollback cannot change a dataset's public listing; its author lists or unlists it."
     return None
 
 

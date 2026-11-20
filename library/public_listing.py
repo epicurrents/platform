@@ -8,8 +8,9 @@ What may be listed is narrower than what may be shared by link, because the list
 platform's own authority rather than the sharer passing it on. A listing republishes data its publisher already
 releases openly: the dataset is ungated, the token's grant is de-identifying, and every member is a recording that
 carries ``Recording.public_source``. The rules are applied when a token is listed and again on every read of the
-listing, so a member added without a source, a token that expires or a rollback that restores an old value takes the
-dataset off the listing until it qualifies again, without anyone having to notice.
+listing, so a member added without a source or a token that expires takes the dataset off the listing until it
+qualifies again, without anyone having to notice. The re-check tests what is listed and not who decided it, so the
+dataset's rollback guard in ``library.rollback_guards`` refuses a rollback that would change the listing.
 """
 
 from django.conf import settings

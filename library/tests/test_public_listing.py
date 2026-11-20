@@ -14,6 +14,7 @@ from django.test import Client, override_settings
 from django.utils import timezone
 from model_bakery import baker
 
+from activity.audit import rollback_change, rollback_refusal
 from activity.models import Activity, ObjectChangeLog
 from epicurrents.models import AccessRight
 from library.models import Dataset, DatasetItem
@@ -258,6 +259,69 @@ class TestAuthority:
     def test_a_superuser_may_list(self, superuser_client, dataset):
         c, _admin = superuser_client
         assert _put(c, dataset, _token(dataset)).status_code == 200
+
+
+def _latest_change(dataset):
+    content_type = ContentType.objects.get_for_model(Dataset)
+    return ObjectChangeLog.objects.filter(content_type=content_type, object_id=str(dataset.pk)).latest("pk")
+
+
+class TestRollback:
+    """The rollback API restores a recorded state past the endpoints, so the listing has a rollback guard."""
+
+    def _unlisted(self, client, dataset):
+        """List and unlist *dataset*; the change that cleared the listing."""
+        right = _token(dataset)
+        assert _put(client, dataset, right).status_code == 200
+        assert client.delete(f"{DATASETS_URL}{dataset.object_hash}/public-listing/").status_code == 200
+        return right, _latest_change(dataset)
+
+    def test_a_write_grantee_cannot_relist_by_rolling_back_the_unlisting(self, auth_client, dataset, make_user):
+        c, _user = auth_client
+        _right, cleared = self._unlisted(c, dataset)
+        grantee = make_user()
+        AccessRight.objects.create(
+            content_type=ContentType.objects.get_for_model(Dataset, for_concrete_model=False),
+            object_id=str(dataset.pk),
+            access_giver=dataset.author,
+            access_target=grantee,
+            can_read=True,
+            can_write=True,
+        )
+        assert cleared.before_state["public_listing_id"] is not None
+        with pytest.raises(ValueError, match="public listing"):
+            rollback_change(user=grantee, change_id=cleared.pk)
+        dataset.refresh_from_db()
+        assert dataset.public_listing_id is None
+        assert _listed_hashes() == []
+
+    def test_nor_the_author(self, auth_client, dataset):
+        c, user = auth_client
+        _right, cleared = self._unlisted(c, dataset)
+        with pytest.raises(ValueError, match="public listing"):
+            rollback_change(user=user, change_id=cleared.pk)
+
+    def test_a_state_listed_through_a_revoked_token_is_refused_not_restored(self, auth_client, dataset):
+        c, user = auth_client
+        right, cleared = self._unlisted(c, dataset)
+        right.delete()
+        assert rollback_refusal(cleared) is not None
+        with pytest.raises(ValueError, match="public listing"):
+            rollback_change(user=user, change_id=cleared.pk)
+
+    def test_a_rename_that_leaves_the_listing_alone_still_rolls_back(self, auth_client, dataset):
+        c, user = auth_client
+        assert _put(c, dataset, _token(dataset)).status_code == 200
+        resp = c.patch(
+            f"{DATASETS_URL}{dataset.object_hash}/", json.dumps({"name": "renamed"}), content_type="application/json"
+        )
+        assert resp.status_code == 200, resp.content
+        rename = _latest_change(dataset)
+        assert rollback_refusal(rename) is None
+        rollback_change(user=user, change_id=rename.pk)
+        dataset.refresh_from_db()
+        assert dataset.name == "published-eeg"
+        assert _listed_hashes() == [dataset.object_hash]
 
 
 class TestAudit:
