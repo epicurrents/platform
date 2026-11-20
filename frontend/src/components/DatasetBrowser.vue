@@ -23,6 +23,7 @@
  */
 import { computed, onMounted, reactive, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
+import type WaInput from '@awesome.me/webawesome/dist/components/input/input.js'
 import { t } from '#i18n'
 import {
     browseDataset,
@@ -280,6 +281,16 @@ function draftValue (field: SubjectField): SubjectValue | null {
         return null
     }
     return field.type === 'number' ? Number(draft) : draft
+}
+
+/**
+ * Take a number field's draft as typed. The input is bound by hand because `v-wa` writes a number input back as a
+ * number, NaN when empty, and the draft is compared and sent as the string the field holds.
+ * @param key - The number field's key.
+ * @param event - The input's input event.
+ */
+function onNumberDraft (key: string, event: Event) {
+    subjectDraft[key] = String((event.target as WaInput).value ?? '')
 }
 
 async function openDetails (row: DatasetBrowseRow) {
@@ -698,7 +709,8 @@ function standardLabel (group: CodeSummary) {
                             :placeholder="t('Not set', SCOPE)"
                             size="s"
                             type="number"
-                            v-wa="[subjectDraft, field.key]"
+                            :value="subjectDraft[field.key]"
+                            @input="onNumberDraft(field.key, $event)"
                         ></wa-input>
                         <wa-select v-else
                             :disabled="savingSubject"
