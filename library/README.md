@@ -2,7 +2,7 @@
 
 Three organisational primitives for arbitrary platform objects: **Collections** (folder-like trees), **Datasets** (flat sets that propagate read access to their members), and **Tags** (a hierarchical label taxonomy). All three associate to objects through generic `content_type` + `object_id` membership rows, so any Django model is fair game — today the primary item type is `Recording`, but Datasets, Collections, and Tags can hold each other or any future model without schema changes.
 
-Two read-permission extensions are registered here that the rest of the platform consumes implicitly: a `can_read` `AccessRight` on a Dataset propagates to every contained item; a `can_read` `AccessRight` on a Collection propagates to its immediate child items (capped by what the collection author can read).
+One read-permission extension is registered here that the rest of the platform consumes implicitly, locally and for federated peers: a `can_read` `AccessRight` on a Dataset propagates to every contained item. Collections are author-private and no `AccessRight` may target one, so a collection grants nothing.
 
 ## How the three differ
 
