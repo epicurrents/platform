@@ -186,6 +186,29 @@ class TestRefusals:
         assert resp.status_code == 409
         assert "other_members" in _codes(c.get(f"{DATASETS_URL}{dataset.object_hash}/public-listing/"))
 
+    def test_a_recording_with_attached_media_is_refused_and_unlists(self, auth_client, dataset, user):
+        from media.models import MediaFile
+        from recordings.models import Recording
+
+        c, _user = auth_client
+        assert _put(c, dataset, _token(dataset)).status_code == 200
+        assert _listed_hashes() == [dataset.object_hash]
+        recording = Recording.objects.filter(author=user).first()
+        baker.make(
+            MediaFile,
+            author=user,
+            content_hash="AB" * 16,
+            file_size=1,
+            attachment_content_type=ContentType.objects.get_for_model(Recording, for_concrete_model=False),
+            attachment_object_id=str(recording.pk),
+        )
+        # The token would read the attachment through the recording, as stored.
+        assert _listed_hashes() == []
+        resp = c.get(f"{DATASETS_URL}{dataset.object_hash}/public-listing/")
+        assert {"code": "attached_media", "count": 1} in [
+            {"code": problem["code"], "count": problem["count"]} for problem in resp.json()["problems"]
+        ]
+
     def test_an_empty_dataset_is_refused(self, auth_client, user):
         c, _user = auth_client
         empty = Dataset.objects.create(author=user, name="empty")
@@ -259,6 +282,63 @@ class TestAuthority:
     def test_a_superuser_may_list(self, superuser_client, dataset):
         c, _admin = superuser_client
         assert _put(c, dataset, _token(dataset)).status_code == 200
+
+
+class TestTokenReach:
+    """A listed token's reader is anyone, so what it reads beyond the listing entry names no account and no day."""
+
+    def test_the_dataset_is_read_without_its_author_or_its_exact_times(self, auth_client, dataset):
+        c, user = auth_client
+        _put(c, dataset, _token(dataset))
+        body = Client().get(f"{DATASETS_URL}{dataset.object_hash}/?share_token={TOKEN}").json()
+        assert body["author_id"] is None
+        for key in ("created_at", "modified_at"):
+            assert body[key].startswith(timezone.now().strftime("%Y-%m-01T00:00:00")), body[key]
+        signed_in = c.get(f"{DATASETS_URL}{dataset.object_hash}/").json()
+        assert signed_in["author_id"] == user.pk
+        assert not signed_in["created_at"].startswith(timezone.now().strftime("%Y-%m-01T00:00:00.000"))
+
+    def test_the_members_are_listed_without_keys_or_the_day_they_were_added(self, auth_client, dataset):
+        c, _user = auth_client
+        _put(c, dataset, _token(dataset))
+        rows = Client().get(f"{DATASETS_URL}{dataset.object_hash}/items/?share_token={TOKEN}").json()
+        assert len(rows) == 2
+        for row in rows:
+            assert row["id"] is None and row["object_id"] is None
+            assert row["object_hash"]
+            assert row["added_at"].startswith(timezone.now().strftime("%Y-%m-01T00:00:00")), row["added_at"]
+        own = c.get(f"{DATASETS_URL}{dataset.object_hash}/items/").json()
+        assert all(row["id"] is not None and row["object_id"] is not None for row in own)
+
+    def test_folders_and_snapshots_follow_the_dataset(self, auth_client, dataset, user):
+        from library.models import DatasetFolder
+
+        c, _user = auth_client
+        _put(c, dataset, _token(dataset))
+        DatasetFolder.objects.create(dataset=dataset, name="folder")
+        created = c.post(
+            f"{DATASETS_URL}{dataset.object_hash}/snapshots/",
+            json.dumps({"label": "v1"}),
+            content_type="application/json",
+        )
+        assert created.status_code == 201, created.content
+        month = timezone.now().strftime("%Y-%m-01T00:00:00")
+        anyone = Client()
+        (folder,) = anyone.get(f"{DATASETS_URL}{dataset.object_hash}/folders/?share_token={TOKEN}").json()
+        assert folder["created_at"].startswith(month) and folder["modified_at"].startswith(month)
+        (snapshot,) = anyone.get(f"{DATASETS_URL}{dataset.object_hash}/snapshots/?share_token={TOKEN}").json()
+        assert snapshot["author_id"] is None and snapshot["created_at"].startswith(month)
+        detail = anyone.get(f"{DATASETS_URL}snapshots/{snapshot['object_hash']}/?share_token={TOKEN}").json()
+        assert detail["author_id"] is None and detail["created_at"].startswith(month)
+        assert c.get(f"{DATASETS_URL}{dataset.object_hash}/snapshots/").json()[0]["author_id"] == user.pk
+
+    def test_a_signed_in_reader_holding_the_token_keeps_the_keys(self, auth_client, dataset, make_user):
+        c, _user = auth_client
+        _put(c, dataset, _token(dataset))
+        reader = Client()
+        reader.force_login(make_user())
+        body = reader.get(f"{DATASETS_URL}{dataset.object_hash}/?share_token={TOKEN}").json()
+        assert body["author_id"] == dataset.author_id
 
 
 def _latest_change(dataset):

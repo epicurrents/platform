@@ -192,6 +192,20 @@ class TestUnreachableTagsAreNotFound:
         assert resp.status_code == 404
         assert not TaggedItem.objects.filter(tag=world["alice_root"]).exists()
 
+    def test_untagging_by_item_id_under_an_unreachable_tag(self, world):
+        item = TaggedItem.objects.get(tag=world["alice_child"])
+        client = _client_for(world["carol"])
+        # The same answer for an item that exists and one that does not, so neither id space is walked.
+        assert client.delete(f"{TAGS}{world['alice_child'].pk}/items/{item.pk}/").status_code == 404
+        assert client.delete(f"{TAGS}{world['alice_child'].pk}/items/{item.pk + 1000}/").status_code == 404
+        assert TaggedItem.objects.filter(pk=item.pk).exists()
+
+    def test_the_author_still_untags_by_item_id(self, world):
+        item = TaggedItem.objects.get(tag=world["alice_child"])
+        resp = _client_for(world["alice"]).delete(f"{TAGS}{world['alice_child'].pk}/items/{item.pk}/")
+        assert resp.status_code == 200
+        assert not TaggedItem.objects.filter(pk=item.pk).exists()
+
     def test_applying_a_reachable_tag_still_works(self, world):
         own = _recording(world["carol"])
         resp = _post(

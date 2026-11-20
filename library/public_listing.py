@@ -31,6 +31,7 @@ PROBLEMS = {
     "no_recordings": "The dataset holds no recordings.",
     "other_members": "Only recordings can be listed; the dataset holds other members.",
     "unsourced_recordings": "Every recording must name the published dataset it was taken from.",
+    "attached_media": "A recording with attached media cannot be listed; the token would read the media as stored.",
 }
 
 
@@ -86,6 +87,17 @@ def listing_problems(dataset: Dataset, right) -> list[dict]:
     unsourced = recordings.filter(public_source="").count()
     if unsourced:
         add("unsourced_recordings", unsourced)
+    # Media attached to a recording is read by whoever reads the recording (``media.permissions``), as stored: no
+    # de-identifying pass exists for a video or a document, and none carries a published source.
+    from media.models import MediaFile
+
+    attached = MediaFile.objects.filter(
+        attachment_content_type=recording_ct,
+        attachment_object_id__in=[str(pk) for pk in recordings.values_list("pk", flat=True)],
+        deleted_at__isnull=True,
+    ).count()
+    if attached:
+        add("attached_media", attached)
     return problems
 
 

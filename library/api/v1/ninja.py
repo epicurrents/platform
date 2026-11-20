@@ -55,7 +55,7 @@ Tags
 
 import hashlib
 import json
-from datetime import date, datetime
+from datetime import UTC, date, datetime
 from typing import Literal
 
 from django.conf import settings
@@ -88,6 +88,7 @@ from library.models import (
     DatasetSnapshot,
     Tag,
     TaggedItem,
+    month_start,
 )
 from library.permissions import (
     ensure_can_read_collection,
@@ -154,7 +155,8 @@ class CollectionOut(Schema):
     name: str
     description: str
     parent_id: int | None
-    author_id: int
+    # Null for a dataset read through a share token without an account, whose reader may be anyone.
+    author_id: int | None
     created_at: datetime
     modified_at: datetime
     deleted_at: datetime | None = None
@@ -537,14 +539,12 @@ def _resolve_media_object_id(object_id: str) -> str:
     """
     from media.models import MediaFile
 
-    # Integer-PK shortcut: trust the value but verify the row exists.
-    try:
-        int(object_id)
+    # Integer-PK shortcut: verify the row exists, and answer the key as the database spells it, so one object has
+    # one identifier in every row that names it.
+    if object_id.isascii() and object_id.isdigit():
         if not MediaFile.objects.filter(pk=object_id, deleted_at__isnull=True).exists():
             raise HttpError(404, "Media file not found")
-        return object_id
-    except ValueError:
-        pass
+        return str(int(object_id))
 
     # Treat as a content_hash (case-insensitive hex).
     normalized = object_id.strip().upper()
@@ -568,14 +568,12 @@ def _resolve_recording_object_id(object_id: str) -> str:
     """
     from recordings.models import Recording
 
-    # If the value is an integer, validate the recording exists.
-    try:
-        int(object_id)
+    # If the value is an integer, validate the recording exists, and answer the key as the database spells it, so
+    # one recording has one identifier in every row that names it.
+    if object_id.isascii() and object_id.isdigit():
         if not Recording.objects.filter(pk=object_id, deleted_at__isnull=True).exists():
             raise HttpError(404, "Recording not found")
-        return object_id
-    except ValueError:
-        pass
+        return str(int(object_id))
 
     # Treat as 32-character hex hash.
     normalized = object_id.strip().upper()
@@ -1938,7 +1936,18 @@ def _collection_write_out(collection: Collection, warnings: list[dict]) -> dict:
     }
 
 
-def _dataset_out(dataset: Dataset) -> dict:
+def _to_month(moment: datetime | None) -> datetime | None:
+    """*moment* truncated to the first of its month in UTC, as a recording's upload time is served to a reader."""
+    if moment is None:
+        return None
+    return month_start(moment.astimezone(UTC))
+
+
+def _dataset_out(dataset: Dataset, *, account: bool = True) -> dict:
+    """Serialise *dataset*. A caller without an account, reading through a share token alone, is not told who
+    wrote the dataset and gets its two times to the month: a token may be on the public listing, where its reader
+    is anyone.
+    """
     try:
         meta = dataset.meta
     except DatasetMeta.DoesNotExist:
@@ -1948,9 +1957,9 @@ def _dataset_out(dataset: Dataset) -> dict:
         "name": dataset.name,
         "description": dataset.description,
         "parent_id": None,
-        "author_id": dataset.author_id,
-        "created_at": dataset.created_at,
-        "modified_at": dataset.modified_at,
+        "author_id": dataset.author_id if account else None,
+        "created_at": dataset.created_at if account else _to_month(dataset.created_at),
+        "modified_at": dataset.modified_at if account else _to_month(dataset.modified_at),
         "deleted_at": dataset.deleted_at,
         "viewer_config": dataset.viewer_config,
         "object_hash": dataset.object_hash,
@@ -1986,7 +1995,7 @@ def get_dataset(request, dataset_id: str, share_token: str | None = None):
         target=dataset,
         metadata={"share_token_used": bool((share_token or "").strip())},
     )
-    return _dataset_out(dataset)
+    return _dataset_out(dataset, account=user is not None)
 
 
 @api.patch("/datasets/{dataset_id}/", response=CollectionWriteOut)
@@ -2523,7 +2532,13 @@ def list_dataset_items(
                 # The time a member was added is its ingest time; a reader gets
                 # the release month here as everywhere else.
                 row["added_at"] = row["release_month"]
-    _null_sequential_ids(rows, user, all_rows=not manager)
+    elif user is None:
+        # A member is often added as it is uploaded, so the exact time would undo the month a recording's upload
+        # time is served to. A token's reader may be anyone, where a grantee is someone the sharer chose.
+        for row in rows:
+            row["added_at"] = _to_month(row["added_at"])
+    # Without an account the keys go too: a recording is named by its hash to every reader.
+    _null_sequential_ids(rows, user, all_rows=not manager or user is None)
     return rows
 
 
@@ -3039,6 +3054,11 @@ def list_dataset_folders(request, dataset_id: str, share_token: str | None = Non
             "share_token_used": bool((share_token or "").strip()),
         },
     )
+    if user is None:
+        # Without an account the times go to the month, as the dataset's own do.
+        for folder in folders:
+            folder.created_at = _to_month(folder.created_at)
+            folder.modified_at = _to_month(folder.modified_at)
     return folders
 
 
@@ -3197,7 +3217,8 @@ class DatasetSnapshotOut(Schema):
     object_hash: str
     dataset_id: int
     dataset_object_hash: str
-    author_id: int
+    # Null for a snapshot read through a share token without an account, as a dataset's author is.
+    author_id: int | None
     label: str
     manifest_hash: str
     member_count: int
@@ -3258,16 +3279,17 @@ def _manifest_hash(manifest: list[dict]) -> str:
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
-def _snapshot_out(snapshot: DatasetSnapshot, *, include_manifest: bool = False) -> dict:
+def _snapshot_out(snapshot: DatasetSnapshot, *, include_manifest: bool = False, account: bool = True) -> dict:
+    """Serialise *snapshot*; a caller without an account is served it as ``_dataset_out`` serves the dataset."""
     return {
         "object_hash": snapshot.object_hash,
         "dataset_id": snapshot.dataset_id,
         "dataset_object_hash": snapshot.dataset.object_hash,
-        "author_id": snapshot.author_id,
+        "author_id": snapshot.author_id if account else None,
         "label": snapshot.label,
         "manifest_hash": snapshot.manifest_hash,
         "member_count": len(snapshot.manifest),
-        "created_at": snapshot.created_at,
+        "created_at": snapshot.created_at if account else _to_month(snapshot.created_at),
         "manifest": snapshot.manifest if include_manifest else None,
     }
 
@@ -3329,7 +3351,7 @@ def list_dataset_snapshots(request, dataset_id: str, share_token: str | None = N
             "share_token_used": bool((share_token or "").strip()),
         },
     )
-    return [_snapshot_out(snapshot) for snapshot in snapshots]
+    return [_snapshot_out(snapshot, account=user is not None) for snapshot in snapshots]
 
 
 @api.get("/datasets/snapshots/{snapshot_hash}/", response=DatasetSnapshotOut)
@@ -3358,7 +3380,7 @@ def get_dataset_snapshot(request, snapshot_hash: str, share_token: str | None = 
         target=snapshot,
         metadata={"share_token_used": bool((share_token or "").strip())},
     )
-    return _snapshot_out(snapshot, include_manifest=True)
+    return _snapshot_out(snapshot, include_manifest=True, account=user is not None)
 
 
 # ---------------------------------------------------------------------------
@@ -3919,7 +3941,7 @@ def untag_item(request, tag_id: int, item_id: int):
     tag's author (or a superuser).
     """
     user = _require_auth(request)
-    tag = _get_tag(tag_id)
+    tag = _get_tag(tag_id, user=user)
 
     item = TaggedItem.objects.filter(pk=item_id, tag=tag).first()
     if item is None:
@@ -3949,13 +3971,18 @@ def _batch_tag(request, user, dataset_id: str, tag_id: int, *, remove: bool) -> 
     Every row is written one by one inside one transaction, so each lands in the audit trail.
     """
     from epicurrents.permissions import can_read_object, can_write_object
-    from library.browse import matching_ids
+    from library.browse import SUBJECT_SORT_PREFIX, matching_ids
     from recordings.models import Recording
 
     dataset = _get_active_dataset(dataset_id)
     if not (user.is_superuser or dataset.author_id == user.pk or can_read_object(user=user, obj=dataset)):
         raise HttpError(403, "You do not have permission to view this dataset")
     tag = _get_tag(tag_id, user=user)
+    # A browser read ignores a parameter that is not a filter; here a misspelt one would widen a write to every
+    # member, so it is refused.
+    for name in request.GET:
+        if name not in ("modality", "tag") and not name.startswith(SUBJECT_SORT_PREFIX):
+            raise HttpError(400, f"Unknown filter: {name}")
     _schema, filters, facts, _tag_rows = _browse_facts(request, dataset, user, None)
     member_ids = matching_ids(facts, filters)
     if len(member_ids) > MAX_BATCH_TAGGED:

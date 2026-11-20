@@ -76,7 +76,7 @@ class TestValues:
         assert response.status_code == 200, response.content
         assert response.json()["values"] == {"age": 1.487123288, "sex": "female"}
 
-    @pytest.mark.parametrize("value", ["1.5", True, [1], {"v": 1}, 1e16])
+    @pytest.mark.parametrize("value", ["1.5", True, [1], {"v": 1}, 1e16, 10**400])
     def test_anything_but_a_finite_number_is_refused(self, user, value):
         dataset = _dataset(user)
         recording = _recording(user, 0)

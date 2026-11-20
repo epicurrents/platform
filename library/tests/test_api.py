@@ -2048,7 +2048,7 @@ class TestUntagItem:
         resp = c.delete(_tag_url(tag.pk, f"items/{item.pk}/"))
         assert resp.status_code == 200
 
-    def test_unrelated_user_gets_403(self, auth_client, make_user):
+    def test_unrelated_user_does_not_find_the_tag(self, auth_client, make_user):
         c, user = auth_client
         owner = make_user(username="owner")
         tag_author = make_user(username="tagauthor")
@@ -2056,9 +2056,26 @@ class TestUntagItem:
         tag = baker.make(Tag, author=tag_author, name="TheirTag")
         ct = ContentType.objects.get_for_model(rec, for_concrete_model=False)
         item = TaggedItem.objects.create(tag=tag, content_type=ct, object_id=str(rec.pk))
-        # user is neither the tag author nor the recording owner
+        # user is neither the tag author nor the recording owner, and reads nothing the tag is on
+        resp = c.delete(_tag_url(tag.pk, f"items/{item.pk}/"))
+        assert resp.status_code == 404
+        assert TaggedItem.objects.filter(pk=item.pk).exists()
+
+    def test_reader_of_the_object_gets_403(self, auth_client, make_user):
+        c, user = auth_client
+        owner = make_user(username="owner")
+        tag_author = make_user(username="tagauthor")
+        rec = _make_recording(owner)
+        tag = baker.make(Tag, author=tag_author, name="TheirTag")
+        ct = ContentType.objects.get_for_model(rec, for_concrete_model=False)
+        item = TaggedItem.objects.create(tag=tag, content_type=ct, object_id=str(rec.pk))
+        AccessRight.objects.create(
+            content_type=ct, object_id=str(rec.pk), access_giver=owner, access_target=user, can_read=True
+        )
+        # Reading the recording puts the tag within reach; untagging still takes write access or authorship.
         resp = c.delete(_tag_url(tag.pk, f"items/{item.pk}/"))
         assert resp.status_code == 403
+        assert TaggedItem.objects.filter(pk=item.pk).exists()
 
     def test_missing_item_returns_404(self, auth_client):
         c, user = auth_client

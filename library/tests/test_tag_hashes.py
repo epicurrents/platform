@@ -79,6 +79,20 @@ class TestTagByHash:
         assert response.json()["object_hash"] == media.content_hash
         assert TaggedItem.objects.get(tag=tag).object_id == str(media.pk)
 
+    @pytest.mark.parametrize("spelling", ["0{pk}", "+{pk}", " {pk}", "{pk}_0"])
+    def test_a_key_spelt_another_way_names_no_second_tagging(self, user, spelling):
+        recording = _recording(user, 0)
+        tag = baker.make(Tag, author=user)
+        client = _client(user)
+        assert _tag_by_hash(client, tag, recording).status_code == 201
+        response = client.post(
+            f"{TAGS}/{tag.pk}/items/",
+            {"content_type_id": _recording_ct().pk, "object_id": spelling.format(pk=recording.pk)},
+            content_type="application/json",
+        )
+        assert response.status_code in (400, 404, 409), response.content
+        assert list(TaggedItem.objects.filter(tag=tag).values_list("object_id", flat=True)) == [str(recording.pk)]
+
     def test_the_hash_and_the_key_name_the_same_tagging(self, user):
         recording = _recording(user, 0)
         tag = baker.make(Tag, author=user)
@@ -212,6 +226,14 @@ class TestBatchTag:
         response = _batch(_client(user), dataset, tag, "?subject.sex=female")
         assert response.json() == {"matched": 2, "changed": 1, "unchanged": 0, "skipped": 1}
         assert _tagged(tag) == {recordings[0].pk}
+
+    @pytest.mark.parametrize("query", ["?modalty=eeg", "?subjects.sex=female", "?sort=name"])
+    def test_a_parameter_that_is_not_a_filter_is_refused_and_tags_nothing(self, user, members, query):
+        # Read as no filter, a misspelt one would tag every member.
+        dataset, _recordings, tag = members
+        response = _batch(_client(user), dataset, tag, query)
+        assert response.status_code == 400, response.content
+        assert _tagged(tag) == set()
 
     def test_a_second_run_changes_nothing(self, user, members):
         dataset, _recordings, tag = members

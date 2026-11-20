@@ -86,8 +86,9 @@ def is_number(value: Any) -> bool:
     return (
         not isinstance(value, bool)
         and isinstance(value, (int, float))
-        and math.isfinite(value)
+        # The bound first: an integer beyond a float's range is within no bound, and has no finiteness to ask about.
         and abs(value) <= MAX_NUMBER
+        and math.isfinite(value)
     )
 
 
