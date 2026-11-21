@@ -10,6 +10,8 @@ import { joinAssessmentReference, splitAssessmentReference, type AssessmentKind 
 
 const SCOPE = 'AccessRightsPanel'
 
+type GrantMode = 'user' | 'group' | 'token'
+
 const props = defineProps<{
     accessRights: AccessRight[]
     grantFn: (payload: GrantAccessPayload) => Promise<AccessRight>
@@ -22,6 +24,8 @@ const props = defineProps<{
     tokenLinks?: (right: AccessRight) => { label: string, url: string }[]
     /** The grant the object is listed publicly through, marked on its row. */
     listedRightId?: number | null
+    /** The target kinds the grant dialog offers, in tab order; all three when omitted. One mode hides the tabs. */
+    modes?: GrantMode[]
 }>()
 
 const emit = defineEmits<{
@@ -31,7 +35,8 @@ const emit = defineEmits<{
 // ── Dialog state ──────────────────────────────────────────────────────────────
 
 const showGrantAccess = ref(false)
-const grantMode = ref<'user' | 'group' | 'token'>('user')
+const enabledModes = computed<GrantMode[]>(() => props.modes?.length ? props.modes : ['user', 'group', 'token'])
+const grantMode = ref<GrantMode>('user')
 const grantPerms = reactive({ canRead: true, canWrite: false, canShare: false })
 const grantLoading = ref(false)
 const grantError = ref<string | null>(null)
@@ -108,7 +113,7 @@ const showOriginalDataInfo = ref(false)
 // ── Open / close ──────────────────────────────────────────────────────────────
 
 function openGrantAccess() {
-    grantMode.value = 'user'
+    grantMode.value = enabledModes.value[0]
     grantPerms.canRead = true
     grantPerms.canWrite = false
     grantPerms.canShare = false
@@ -545,8 +550,8 @@ function userDisplayName(user: UserSearchResult): string {
             <wa-callout v-if="grantError" variant="danger">{{ grantError }}</wa-callout>
 
             <!-- Mode tabs -->
-            <div class="mode-tabs" role="tablist">
-                <button
+            <div v-if="enabledModes.length > 1" class="mode-tabs" role="tablist">
+                <button v-if="enabledModes.includes('user')"
                     class="mode-tab"
                     :class="{ active: grantMode === 'user' }"
                     role="tab"
@@ -556,7 +561,7 @@ function userDisplayName(user: UserSearchResult): string {
                     <wa-icon name="user"></wa-icon>
                     {{ t('User', SCOPE) }}
                 </button>
-                <button
+                <button v-if="enabledModes.includes('group')"
                     class="mode-tab"
                     :class="{ active: grantMode === 'group' }"
                     role="tab"
@@ -566,7 +571,7 @@ function userDisplayName(user: UserSearchResult): string {
                     <wa-icon name="users"></wa-icon>
                     {{ t('Group', SCOPE) }}
                 </button>
-                <button
+                <button v-if="enabledModes.includes('token')"
                     class="mode-tab"
                     :class="{ active: grantMode === 'token' }"
                     role="tab"
