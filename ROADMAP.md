@@ -353,6 +353,8 @@ Once the deferral lands, remove the `prepare()` re-dispatch + its `Log.debug` in
 
 Rare in practice — it only triggers when an item is auto-opened at the same moment it is loaded (the first item in a dataset on page load), and even then only under specific timing; the interim fix recovers within ~1 s. Hence 🟢. But the band-aid (the double-fired event) should not outlive a proper deferral.
 
+**Planned as part of the core load-in-place lifecycle (2026-11-21).** "Load a study in place, not through a placeholder" in the core ROADMAP lists studies as their real resource with no worker, and finishes the setup on the same object at first activation. The interface shows one loading state and mounts the modality viewer only once the resource is ready, which is the deferral described above, and the `prepare()` re-dispatch goes with it. On the platform side, consuming that release removes [attachmentParents.ts](frontend/src/viewer/attachmentParents.ts) and the `DeferredStudyApp` declarations. Attachments also become child resources of their recording instead of dataset members listed after it, which the nested navigator in the interface ROADMAP lists under their parent.
+
 ---
 
 ## 🟡 Additional getting-started scenarios
