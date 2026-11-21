@@ -337,6 +337,10 @@ Collections and Tags are identified by **integer PK** in URLs (`/collections/42/
 
 Items inside collections, datasets and tags are named by the contained object's opaque identifier, a recording's hash or a media file's `content_hash`, on every add, listing and untag path; the object's primary key stays accepted for internal callers and for types without a hash.
 
+## Member types
+
+The library knows recordings and media files by name, and any other model can be a member by its primary key, listed with no type and no hash unless it is registered. A plugin registers its model in [item_types.py](item_types.py) with `register_item_type(ItemType(...))`: the `object_type` it is listed as, its hash field and spelling, its grantee-visible label, its live rows, whether its serving endpoints take a share token, and `withheld_under_middleware`, the queryset form of the model's terms refusal. The library then resolves the hash on an item write (the primary key stays accepted), lists the member by type, hash and label, drops rows that are not live, and leaves out, before a page is sliced, a type that serves no share token for a token caller and the members a de-identifying reader is refused. A registered type is refused in a release-gated dataset, and gating a dataset holding one is refused, unless it declares `release_gateable`: the gate hides an unreleased member through a read-visibility gate its model registers, and a registered type has none. The dicom plugin registers `dicomstudy`; tests in [plugins/dicom/tests/test_dataset_members.py](../plugins/dicom/tests/test_dataset_members.py).
+
 ## Settings consumed
 
 | Variable | Default | Notes |
@@ -353,7 +357,7 @@ The app also consumes the cross-app `AccessRight` model from `epicurrents`.
 
 | Hook | How |
 |---|---|
-| Make a project model a collection / dataset / tag target | Nothing required — the generic-FK membership rows accept any Django model. Add an instance via `POST /collections/{id}/items/` with the model's `content_type` and `object_id`. |
+| Make a project model a collection / dataset / tag target | The generic-FK membership rows accept any Django model by its primary key. Register it as a [member type](#member-types) so it is added by its hash and listed by type, hash and label, and so the release gate refuses it. |
 | Register an additional read-permission rule | `register_read_permission_extension(callable)` from your project's `apps.py::ready()`. Your extension is consulted alongside the two library extensions. See [epicurrents/README.md](../epicurrents/README.md#permission-extensions). |
 | Decide what a release run publishes | `register_release_selector(fn)` from your project's `apps.py::ready()`; see [release gating](#release-gating). The platform applies the monthly cadence and hands the selector the eligible members. |
 | Add project-specific tag namespacing | The platform has no namespace mechanism for tags today — tag names are a flat global string. If a project needs namespaces, the cleanest path is a prefix convention (`epicurrents.<project>.<concept>`, mirroring the `Code.standard` pattern) enforced at the project's API layer. |

@@ -13,7 +13,7 @@
 
 import type { DatasetBrowseRow } from '#api/library'
 import type { MediaFileDetail } from '#api/media'
-import { recordingName, type Recording } from '#api/recordings'
+import { recordingName, type Recording, type RecordingAttachment } from '#api/recordings'
 import type { DataResource, EpicurrentsApp } from '@epicurrents/core/dist/types'
 
 /** A property a study is listed with: its duration in seconds, or its number of signal channels. */
@@ -113,7 +113,7 @@ const NATIVE_MEDIA_TYPES = new Set(['audio', 'image', 'video'])
  * (``/assets/undefined`` requests against the SPA host). Returns null for a format the viewer cannot open; the caller
  * skips the item rather than failing the whole dataset load.
  */
-export function importerForMedia(media: MediaFileDetail): string | null {
+export function importerForMedia(media: Pick<MediaFileDetail, 'file_extension' | 'media_type'>): string | null {
     if (NATIVE_MEDIA_TYPES.has(media.media_type)) {
         return `media/${media.media_type}-url`
     }
@@ -195,5 +195,37 @@ export function describeMedia(media: MediaFileDetail): StudyDescription | null {
         name: media.display_name,
         properties: null,
         source: new URL(relativePath, import.meta.url).toString(),
+    }
+}
+
+/**
+ * Describe a media file attached to a recording, or answer null for one listed some other way: an attachment of
+ * another type, a format the live allowlist no longer admits, or a video, which plays on its recording's timeline
+ * rather than as an item of its own. The address carries the share token the recording was read with, which the
+ * media file endpoint accepts.
+ * @param attachment - The attachment as the attachments listing gives it.
+ * @param shareToken - Share token the recording was read with, if any.
+ */
+export function describeMediaAttachment(attachment: RecordingAttachment, shareToken?: string): StudyDescription | null {
+    const details = attachment.details
+    if (attachment.type !== 'mediafile' || details.is_supported === false || details.media_type === 'video') {
+        return null
+    }
+    const loader = importerForMedia({
+        file_extension: String(details.file_extension ?? ''),
+        media_type: String(details.media_type ?? ''),
+    })
+    if (!loader) {
+        return null
+    }
+    const source = new URL(`/media/api/v1/${attachment.hash}/file`, window.location.origin)
+    if (shareToken) {
+        source.searchParams.set('share_token', shareToken)
+    }
+    return {
+        loader,
+        name: attachment.name,
+        properties: null,
+        source: source.toString(),
     }
 }

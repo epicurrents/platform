@@ -1,6 +1,9 @@
 import type { Component } from 'vue'
-import type { RouteLocationRaw, RouteRecordRaw } from 'vue-router'
+import type { LocationQuery, RouteLocationRaw, RouteRecordRaw } from 'vue-router'
 import type { DataResource, EpicurrentsApp } from '@epicurrents/core/dist/types'
+import type { DatasetItem } from '#api/library'
+import type { RecordingAttachment } from '#api/recordings'
+import type { StudyDescription } from '#viewer/datasetStudies'
 
 export interface ProjectNavLink {
     /** Stable identifier used as a Vue key and for debugging. */
@@ -177,6 +180,47 @@ export interface ViewerPlugin {
      *   its own right, so the call is unauthenticated.
      */
     resolveSessionDatasets?: (sessionToken: string) => Promise<SessionDatasetRef[]>
+
+    /**
+     * Sources of viewer items of a type this plugin owns, which the viewer lists beside recordings and media.
+     *
+     * The viewer page knows recordings and media files only; a plugin that stores something the viewer can open
+     * describes its items here, as the importer, name and URL the viewer lists them by, so the page needs no change
+     * for a new type. Every source of every plugin and of the project is consulted.
+     */
+    viewerItems?: ViewerItemSource[]
+}
+
+/**
+ * One kind of item a plugin lists in the viewer. Each answer is the `StudyDescription` the viewer lists an item by,
+ * so the viewer never learns what the item is.
+ */
+export interface ViewerItemSource {
+    /**
+     * Query parameters of a viewer URL that name this source's items, as `files` names recordings. A URL carrying one
+     * opens the viewer on the items it names rather than blank.
+     */
+    params: string[]
+    /**
+     * The items the viewer URL's query names, in the order it names them; empty when it names none. A rejection means
+     * an item could not be found or read, and the viewer reports it as it does for a recording.
+     * @param query - The viewer route's query.
+     */
+    fromQuery: (query: LocationQuery) => Promise<StudyDescription[]>
+    /**
+     * Describe an attachment of a type this source owns, which the viewer lists after the recording it is attached
+     * to; null for any other type, or for one of its own it cannot open.
+     * @param attachment - The attachment as the recording attachments listing gives it.
+     * @param shareToken - Share token the recording was read with, if any.
+     */
+    describeAttachment?: (attachment: RecordingAttachment, shareToken?: string) => StudyDescription | null
+    /**
+     * Describe a dataset member of a type this source owns, as the dataset item listing gives it (`object_type`,
+     * `object_hash`, `object_name`); null for any other type, or for one of its own it cannot open.
+     * @param item - The member as the dataset item listing gives it.
+     * @param shareToken - Share token the dataset was opened with, if any.
+     */
+    describeDatasetItem?: (item: DatasetItem, shareToken?: string) => StudyDescription | null
 }
 
 /**

@@ -14,14 +14,48 @@
  *   /plugin/dicom/ohif/viewer/dicomjson?url=<ohif-json endpoint>. It accepts any origin in `?url=` when OHIF has no
  *   authentication of its own, which is the case here; the platform's `connect-src 'self'` is what refuses a link
  *   pointing it elsewhere.
+ *
+ * The viewer edition's radiology view frames a study's page. Framed, the header's return arrow (which leads to OHIF's
+ * own study list) is turned off with the list, and the logo is replaced by a Back button that asks the radiology view
+ * to take a step back from the study, to the recording it is attached to or to the dataset, by posting
+ * `{ type: 'epicurrents:radiology:return' }` to the parent window at this origin. Standalone, the viewer keeps its
+ * list and its logo.
+ *
+ * OHIF's investigational-use notice is not shown in the frame: the study endpoints serve signed-in users only, and the
+ * platform viewer around the frame spares a signed-in user its own disclaimer. Standalone, the notice is shown once
+ * and stays hidden for 30 days after it is confirmed, rather than on every new tab, which is OHIF's default.
  */
+const framed = window.parent !== window;
+
 window.config = {
   name: 'epicurrents',
   routerBasename: '/plugin/dicom/ohif',
   extensions: [],
   modes: [],
   customizationService: {},
-  showStudyList: true,
+  showStudyList: !framed,
+  whiteLabeling: framed
+    ? {
+        createLogoComponentFn: React =>
+          React.createElement(
+            'button',
+            {
+              type: 'button',
+              className: 'text-primary flex items-center gap-1 px-2 text-base hover:opacity-80',
+              title: 'Back',
+              onClick: event => {
+                event.stopPropagation();
+                window.parent.postMessage(
+                  { type: 'epicurrents:radiology:return' },
+                  window.location.origin
+                );
+              },
+            },
+            '\u2039 Back'
+          ),
+      }
+    : undefined,
+  investigationalUseDialog: framed ? { option: 'never' } : { option: 'configure', days: 30 },
   maxNumberOfWebWorkers: 3,
   // Warns when the page is not cross-origin isolated, which is the visible sign of a missing
   // ENABLE_CROSS_ORIGIN_ISOLATION (see the plugin README).

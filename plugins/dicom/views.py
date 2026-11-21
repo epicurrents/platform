@@ -20,6 +20,12 @@ therefore carries the platform policy with ``'unsafe-eval'`` added to
 the SPA and the API keep the strict one. The relaxation is scoped to the whole
 OHIF mount rather than the worker because the worker is an unnamed numbered
 chunk whose name changes with every build.
+
+The viewer edition's radiology view frames this mount, so its responses also
+allow framing by the platform's own pages: ``frame-ancestors 'self'`` in place
+of whatever the platform policy names, and ``X-Frame-Options: SAMEORIGIN``,
+which ``XFrameOptionsMiddleware`` leaves standing because the header is already
+set. Every other response keeps ``frame-ancestors 'none'`` and ``DENY``.
 """
 
 import mimetypes
@@ -65,6 +71,15 @@ def _extend(directives: list[str], name: str, source: str) -> None:
     directives.append(f"{name} {' '.join(default.split()[1:])} {source}")
 
 
+def _replace(directives: list[str], name: str, value: str) -> None:
+    """Set directive *name* to *value*, replacing the policy's own sources for it."""
+    for i, directive in enumerate(directives):
+        if directive.split()[0] == name:
+            directives[i] = f"{name} {value}"
+            return
+    directives.append(f"{name} {value}")
+
+
 def _ohif_csp() -> tuple[str, str] | None:
     """Return the (header, value) pair for OHIF responses, or None when CSP is off."""
     policy = (getattr(settings, "CONTENT_SECURITY_POLICY", "") or "").strip()
@@ -72,6 +87,7 @@ def _ohif_csp() -> tuple[str, str] | None:
         return None
     directives = [d.strip() for d in policy.split(";") if d.strip()]
     _extend(directives, "script-src", "'unsafe-eval'")
+    _replace(directives, "frame-ancestors", "'self'")
     if demo_data_enabled():
         _extend(directives, "connect-src", DEMO_ORIGIN)
     report_only = bool(getattr(settings, "CSP_REPORT_ONLY", True))
@@ -80,9 +96,11 @@ def _ohif_csp() -> tuple[str, str] | None:
 
 
 def _with_csp(response):
+    """Give an OHIF response the mount's policy: eval for the codec worker, framing by the platform's own pages."""
     csp = _ohif_csp()
     if csp:
         response[csp[0]] = csp[1]
+    response["X-Frame-Options"] = "SAMEORIGIN"
     return response
 
 

@@ -127,6 +127,8 @@ slot into `_ATTACHMENT_TARGETS` in [api/v1/ninja.py](api/v1/ninja.py) with
 a `resolve_for_attach(user, public_id)` callback and a
 `public_id(target)` reader.
 
+Attached media is listed with every other attachment of a recording by the recordings app's attachments listing: [apps.py](apps.py) registers the `mediafile` type with [epicurrents/attachments.py](../epicurrents/README.md#attachments), described by [attachments.py](attachments.py), with `platform_pass` `none` since the platform applies nothing to media content.
+
 ### Timeline position
 
 `time_offset` (seconds, nullable) is where the media sits on the attached
@@ -286,6 +288,7 @@ media items alongside recordings in three URL modes:
   shape as `?files=<hash>` for recordings).
 - `?files=<hash>` and `?media=<hash>` can be combined on the same URL
   to load a mixed bundle in declared order.
+- A recording's attached media other than video is listed after the recording, from the attachments listing; attached video keeps playing on the recording's timeline.
 
 The viewer edition registers the importers the dispatcher names, and the platform does not re-register them: PdfImporter mutates a static worker URL on construction. ViewerView loads every media item by URL. A `video`, `audio` or `image` item goes to `media/<type>-url`, the native media module's loader, which reads nothing and hands the URL to the browser's element; a document goes by extension, `.md` to `doc/htm-url` and `.pdf` to `doc/pdf-url`. An item the dispatcher has no importer for is skipped with a console warning, and one whose extension has left the allowlist arrives as `is_supported: false` and is never loaded.
 

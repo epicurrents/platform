@@ -57,6 +57,7 @@ export function mergeSetup<T extends object> (target: T, ...sources: object[]): 
  *   overrides an earlier one on a conflicting value.
  * - `onAppReady` / `onStudiesReady` — chained: every plugin's hook runs, in
  *   order, each awaited before the next.
+ * - `viewerItems` — concatenated in plugin order.
  *
  * @param plugins - Enabled plugins, in `VITE_PLUGINS` order.
  * @returns One `ViewerPlugin` combining all contributions.
@@ -115,5 +116,6 @@ export function mergePlugins(plugins: ViewerPlugin[]): ViewerPlugin {
                 await p.onStudiesReady?.(epic, studies)
             }
         },
+        viewerItems: plugins.flatMap(p => p.viewerItems ?? []),
     }
 }

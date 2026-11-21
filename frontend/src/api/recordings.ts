@@ -108,6 +108,47 @@ export async function getRecordingDetail(hash: string, shareToken?: string): Pro
     return response.data
 }
 
+/**
+ * One object attached to a recording: a media file, or a type a plugin registers such as a DICOM study.
+ * @remarks
+ * An attachment's content is its submitter's to answer for. `platform_pass` records the pass the platform applied to
+ * the stored content (`none`, or `dicom-header`), never an assurance a reader can rely on, so no surface may present
+ * an attachment as de-identified by the platform.
+ */
+export interface RecordingAttachment {
+    /** Hash of the recording it is attached to. */
+    parent: string
+    /** Registered attachment type: `mediafile`, or a plugin's. */
+    type: string
+    /** The attachment's own public hash. */
+    hash: string
+    /** Grantee-visible name. */
+    name: string
+    platform_pass: string
+    /** What a client needs to open it, per type. */
+    details: Record<string, string | number | boolean | null>
+}
+
+/** Most recordings one attachments request may name. */
+export const ATTACHMENT_LISTING_LIMIT = 200
+
+/**
+ * The attachments the caller may read on the named recordings, one request per `ATTACHMENT_LISTING_LIMIT` hashes.
+ * @param hashes - Recording hashes, in the order items should come back.
+ * @param shareToken - Share token the recordings are read with, if any.
+ */
+export async function listRecordingAttachments(hashes: string[], shareToken?: string): Promise<RecordingAttachment[]> {
+    const pages: string[][] = []
+    for (let i = 0; i < hashes.length; i += ATTACHMENT_LISTING_LIMIT) {
+        pages.push(hashes.slice(i, i + ATTACHMENT_LISTING_LIMIT))
+    }
+    const responses = await Promise.all(pages.map(page => http.get<RecordingAttachment[]>(
+        '/recordings/api/v1/attachments/',
+        { params: { recordings: page.join(','), ...(shareToken ? { share_token: shareToken } : {}) } },
+    )))
+    return responses.flatMap(response => response.data)
+}
+
 export async function getRecordingStatus(hash: string): Promise<RecordingStatus> {
     const response = await http.get<RecordingStatus>(`/recordings/api/v1/status/${hash}`)
     return response.data

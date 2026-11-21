@@ -587,12 +587,25 @@ def _resolve_recording_object_id(object_id: str) -> str:
 
 
 def _resolve_item_object_id(ct: ContentType, object_id: str) -> str:
-    """The primary key string an item payload's *object_id* names: a recording's or a media file's hash resolved,
-    any other type's taken as given."""
+    """The primary key string an item payload's *object_id* names: a recording's, a media file's or a registered
+    type's hash resolved (``library.item_types``), any other type's taken as given."""
+    from library.item_types import item_type_for, resolve_hash
+
     if ct.app_label == "recordings" and ct.model == "recording":
         return _resolve_recording_object_id(object_id)
     if ct.app_label == "media" and ct.model == "mediafile":
         return _resolve_media_object_id(object_id)
+    item_type = item_type_for(ct)
+    if item_type is not None:
+        # The primary key stays accepted for internal callers, as for the two types above.
+        if object_id.isascii() and object_id.isdigit():
+            if not item_type.live(item_type.model.objects.filter(pk=object_id)).exists():
+                raise HttpError(404, "Object not found")
+            return str(int(object_id))
+        resolved = resolve_hash(item_type, object_id)
+        if resolved is None:
+            raise HttpError(404, "Object not found")
+        return resolved
     return object_id
 
 
@@ -633,6 +646,14 @@ def _object_hashes(rows: list[dict]) -> dict[tuple[int, str], str]:
         media_pks = {pk for pk in media_pks if pk and pk.isdigit()}
         for pk, content_hash in MediaFile.objects.filter(pk__in=media_pks).values_list("pk", "content_hash"):
             found[(media_ct.pk, str(pk))] = content_hash
+    from library.item_types import registered_item_types
+
+    for item_type in registered_item_types():
+        type_ct = item_type.content_type
+        type_pks = {row["object_id"] for row in rows if row["content_type_id"] == type_ct.pk}
+        type_pks = {pk for pk in type_pks if pk and pk.isdigit()}
+        for pk, public in item_type.model.objects.filter(pk__in=type_pks).values_list("pk", item_type.hash_field):
+            found[(type_ct.pk, str(pk))] = public
     return found
 
 
@@ -731,6 +752,21 @@ def _enrich_collection_items(items: list, user) -> list[dict]:
                 "is_supported": _is_supported(m),
             }
 
+    from library.item_types import registered_item_types
+
+    # Registered types, by content type id: each live member's (name, hash), and the type's listed name.
+    registered: dict[int, tuple[str, dict[str, tuple[str, str]]]] = {}
+    for item_type in registered_item_types():
+        type_ct = item_type.content_type
+        pks = {item.object_id for item in items if item.content_type_id == type_ct.id}
+        if not pks:
+            continue
+        members = item_type.live(item_type.model.objects.filter(pk__in=pks))
+        registered[type_ct.id] = (
+            item_type.object_type,
+            {str(obj.pk): (item_type.display_name(obj), getattr(obj, item_type.hash_field)) for obj in members},
+        )
+
     result = []
     for item in items:
         base = {
@@ -761,6 +797,14 @@ def _enrich_collection_items(items: list, user) -> list[dict]:
                 continue
             base.update(entry)
             base["object_type"] = "mediafile"
+        elif item.content_type_id in registered:
+            object_type, members = registered[item.content_type_id]
+            entry = members.get(item.object_id)
+            if entry is None:
+                # Not live (trashed or gone) — dropped, as a trashed media file is.
+                continue
+            base["object_name"], base["object_hash"] = entry
+            base["object_type"] = object_type
         result.append(base)
     return result
 
@@ -768,8 +812,8 @@ def _enrich_collection_items(items: list, user) -> list[dict]:
 def _listable_items(qs):
     """Narrow a ``CollectionItem`` or ``DatasetItem`` queryset to the rows ``_enrich_collection_items`` serves.
 
-    Leaves out the items whose recording is trashed, FAILED or gone, and whose media file is trashed or gone, which
-    the enrichment would drop. Applied before a page is sliced, so a page comes back short only at the end of the
+    Leaves out the items whose recording is trashed, FAILED or gone, whose media file is trashed or gone, and whose
+    registered member type (``library.item_types``) does not count the member live, which the enrichment would drop. Applied before a page is sliced, so a page comes back short only at the end of the
     listing: a client reading pages until a short one reads every row, and its next offset is the rows it holds.
     """
     from django.db.models import CharField, Q
@@ -785,11 +829,17 @@ def _listable_items(qs):
         .values("key")
     )
     live_media = MediaFile.objects.filter(deleted_at__isnull=True).annotate(key=Cast("pk", CharField())).values("key")
+    from library.item_types import registered_item_types
+
     recording_ct = ContentType.objects.get_for_model(Recording, for_concrete_model=False)
     media_ct = ContentType.objects.get_for_model(MediaFile, for_concrete_model=False)
-    return qs.exclude(Q(content_type=recording_ct) & ~Q(object_id__in=live_recordings)).exclude(
+    qs = qs.exclude(Q(content_type=recording_ct) & ~Q(object_id__in=live_recordings)).exclude(
         Q(content_type=media_ct) & ~Q(object_id__in=live_media)
     )
+    for item_type in registered_item_types():
+        live = item_type.live(item_type.model.objects.all()).annotate(key=Cast("pk", CharField())).values("key")
+        qs = qs.exclude(Q(content_type=item_type.content_type) & ~Q(object_id__in=live))
+    return qs
 
 
 # ---------------------------------------------------------------------------
@@ -2501,8 +2551,10 @@ def list_dataset_items(
         or can_read_object(user=user, obj=dataset, share_token=share_token)
     ):
         raise HttpError(403, "You do not have permission to view this dataset")
+    from library.item_types import without_unservable_members
+
     qs, manager = _visible_members(dataset, user, share_token)
-    qs = _listable_items(qs)
+    qs = without_unservable_members(_listable_items(qs), dataset, user, share_token)
     if dataset.release_gated:
         # A gated dataset orders by name: added_at is the arrival order the release month hides.
         qs = qs.select_related("release").annotate(sort_name=member_name_subquery()).order_by("sort_name", "object_id")

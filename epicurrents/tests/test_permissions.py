@@ -934,3 +934,97 @@ class TestRecordingVisibilityGate:
             {"target_content_type_id": ct.pk, "target_object_id": str(recording.pk)},
         )
         assert response.status_code == 404
+
+
+@pytest.fixture
+def refusal_registry():
+    """Snapshot and restore the module-global terms-refusal registry."""
+    from epicurrents import permissions
+
+    saved = {label: list(rules) for label, rules in permissions._TERMS_REFUSALS.items()}
+    yield permissions._TERMS_REFUSALS
+    permissions._TERMS_REFUSALS.clear()
+    permissions._TERMS_REFUSALS.update(saved)
+
+
+@pytest.mark.django_db
+class TestTermsRefusal:
+    """A model's terms refusal denies a grant carrying apply_middleware, however the grant is reached.
+
+    Tested on Dataset with a rule refusing every object, so the mechanics are seen apart from any real model.
+    """
+
+    @staticmethod
+    def _refuse_all(obj):
+        return True
+
+    def _dataset(self, author):
+        from library.models import Dataset
+
+        return Dataset.objects.create(author=author, name="refused")
+
+    @pytest.mark.parametrize(("apply_middleware", "readable"), [(True, False), (False, True)])
+    def test_direct_row_is_refused_only_under_de_identifying_terms(
+        self, user, make_user, refusal_registry, apply_middleware, readable
+    ):
+        from epicurrents.permissions import register_terms_refusal
+
+        reader = make_user()
+        dataset = self._dataset(user)
+        _make_access_right(dataset, user, target=reader, can_read=True, apply_middleware=apply_middleware)
+        register_terms_refusal("library.dataset", self._refuse_all)
+        assert can_read_object(reader, dataset) is readable
+
+    def test_extension_grant_is_refused_under_de_identifying_terms(self, user, make_user, refusal_registry):
+        from epicurrents import permissions
+        from epicurrents.permissions import register_terms_refusal
+
+        reader = make_user()
+        dataset = self._dataset(user)
+
+        def grant_with_terms(user, obj, share_token=None):
+            return ReadAccessTerms(granted=obj == dataset, apply_middleware=True)
+
+        permissions._READ_PERMISSION_EXTENSIONS.append(grant_with_terms)
+        try:
+            assert can_read_object(reader, dataset) is True
+            register_terms_refusal("library.dataset", self._refuse_all)
+            assert can_read_object(reader, dataset) is False
+        finally:
+            permissions._READ_PERMISSION_EXTENSIONS.remove(grant_with_terms)
+
+    def test_author_and_superuser_are_exempt(self, user, make_superuser, refusal_registry):
+        from epicurrents.permissions import register_terms_refusal
+
+        dataset = self._dataset(user)
+        # The author's own row, written with apply_middleware at its default, which has no effect for the author.
+        _make_access_right(dataset, user, target=user, can_read=True)
+        register_terms_refusal("library.dataset", self._refuse_all)
+        assert can_read_object(user, dataset) is True
+        assert can_read_object(make_superuser(), dataset) is True
+
+    def test_a_rule_answering_false_leaves_the_grant(self, user, make_user, refusal_registry):
+        from epicurrents.permissions import register_terms_refusal
+
+        reader = make_user()
+        dataset = self._dataset(user)
+        _make_access_right(dataset, user, target=reader, can_read=True, apply_middleware=True)
+        register_terms_refusal("library.dataset", lambda obj: False)
+        terms = get_read_access_result(reader, dataset)
+        assert terms.granted is True and terms.apply_middleware is True
+
+    def test_a_rule_for_another_model_is_not_consulted(self, user, make_user, refusal_registry):
+        from epicurrents.permissions import register_terms_refusal
+
+        reader = make_user()
+        dataset = self._dataset(user)
+        _make_access_right(dataset, user, target=reader, can_read=True, apply_middleware=True)
+        register_terms_refusal("library.collection", self._refuse_all)
+        assert can_read_object(reader, dataset) is True
+
+    def test_registration_is_idempotent(self, refusal_registry):
+        from epicurrents.permissions import _TERMS_REFUSALS, register_terms_refusal
+
+        register_terms_refusal("library.dataset", self._refuse_all)
+        register_terms_refusal("library.dataset", self._refuse_all)
+        assert _TERMS_REFUSALS["library.dataset"].count(self._refuse_all) == 1

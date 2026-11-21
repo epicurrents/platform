@@ -266,7 +266,8 @@ def gate_refusal(dataset: Dataset) -> str | None:
     """Why the gate may not be turned on for *dataset*, or None when it may.
 
     Every recording and media member must be the dataset author's own, or a pooled recording of
-    a pool: a gate on anyone else's member would hide it from its own readers.
+    a pool: a gate on anyone else's member would hide it from its own readers. A member of a registered
+    type that declares no gate of its own refuses the gate outright.
     """
     from recordings.models import Recording
 
@@ -282,6 +283,30 @@ def gate_refusal(dataset: Dataset) -> str | None:
         for author_id in _author_ids(ct, ids).values():
             if not controls_membership(dataset, author_id, system_id):
                 return "Only a dataset whose members are all its author's own can be release-gated."
+    from library.item_types import registered_item_types
+
+    for item_type in registered_item_types():
+        if (
+            not item_type.release_gateable
+            and DatasetItem.objects.filter(dataset=dataset, content_type=item_type.content_type).exists()
+        ):
+            return f"A dataset holding a {item_type.object_type} member cannot be release-gated."
+    return None
+
+
+def _ungateable_refusal(obj: Any) -> str | None:
+    """Why *obj* may not be a member of any release-gated dataset, or None.
+
+    The gate hides an unreleased member through the read-visibility gate its model registers; a registered member
+    type that declares none (``library.item_types``) would be readable before its release, so it is refused.
+    """
+    from library.item_types import item_type_for
+
+    if obj is None:
+        return None
+    item_type = item_type_for(ContentType.objects.get_for_model(obj, for_concrete_model=False))
+    if item_type is not None and not item_type.release_gateable:
+        return f"A release-gated dataset cannot hold a {item_type.object_type} member."
     return None
 
 
@@ -289,10 +314,14 @@ def membership_refusal(dataset: Dataset, obj: Any) -> str | None:
     """Why *obj* may not be added to the gated *dataset*, or None when it may (always None for an ungated one).
 
     A gated dataset takes only its author's own objects, whoever adds them, superusers included:
-    what the gate hides must be the gating party's to hide.
+    what the gate hides must be the gating party's to hide. It takes no member of a registered type
+    that declares no gate of its own, which nothing would hide before its release.
     """
     if not dataset.release_gated:
         return None
+    refusal = _ungateable_refusal(obj)
+    if refusal:
+        return refusal
     author_id = getattr(obj, "author_id", None)
     if author_id is None or author_id != dataset.author_id:
         return "A release-gated dataset takes only its author's own objects."

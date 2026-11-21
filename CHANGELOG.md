@@ -8,6 +8,16 @@ Entries are written for the person deciding whether to upgrade, so the ones that
 
 ## [Unreleased]
 
+### Changed
+
+- **A recording's attachments are listed in the viewer after it.** Attached documents, images and audio, and a plugin's attachable types, now appear in the viewer's dataset after the recording they are attached to, from a new attachments listing (`GET /recordings/api/v1/attachments/`); attached video still plays on the recording's timeline. A plugin with an attachable model registers it with `register_attachment_type`, and one with a dataset-member model with `register_item_type`, so neither is listed by its primary key. [recordings/README.md](recordings/README.md#attachments), [library/README.md](library/README.md#member-types).
+- **A grant carrying `apply_middleware` now conveys nothing of an object its model declares it cannot honour.** `register_terms_refusal` in `epicurrents.permissions` is applied to every local read, direct and inherited, the object's author excepted; the dicom plugin declares a study stored without its header pass, which a de-identifying dataset grant used to serve raw. [epicurrents/README.md](epicurrents/README.md#permissions).
+- **dicom: "View" opens the platform's viewer, which frames OHIF in its radiology view.** This needs a viewer edition carrying the interface's `rad` module; with an edition that predates it, nothing opens from a `?dicom=` link, the study list's View button, an attached study or a study in a dataset. Studies can be dataset members, never of a release-gated dataset. [plugins/dicom/README.md](plugins/dicom/README.md#embedded-view).
+
+### Fixed
+
+- **A guest opening a share link in the viewer is shown the viewer's disclaimer again.** The signed-in viewer marked the disclaimer accepted for every caller, share-token guests included; it now does so for signed-in users only.
+
 ## [0.2.1] — 2026-11-20
 
 ### Changed

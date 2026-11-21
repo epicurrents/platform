@@ -8,10 +8,11 @@
 
 import { describe, expect, it } from 'vitest'
 import type { MediaFileDetail } from '#api/media'
-import type { Recording } from '#api/recordings'
+import type { Recording, RecordingAttachment } from '#api/recordings'
 import type { DatasetBrowseRow } from '#api/library'
 import {
     describeMedia,
+    describeMediaAttachment,
     describeRecording,
     eagerStudyLoadLimit,
     listedFromBrowseRow,
@@ -149,5 +150,34 @@ describe('the eager load limit', () => {
     })
     it('falls back to the default where the setting is absent', () => {
         expect(eagerStudyLoadLimit(app({}))).toBe(50)
+    })
+})
+
+describe('describeMediaAttachment', () => {
+    const attachment = (details: RecordingAttachment['details'], type = 'mediafile'): RecordingAttachment => ({
+        details,
+        hash: 'abc',
+        name: 'Report',
+        parent: 'P',
+        platform_pass: 'none',
+        type,
+    })
+
+    it('opens a document through its importer at its file, carrying the share token', () => {
+        const described = describeMediaAttachment(
+            attachment({ file_extension: '.pdf', is_supported: true, media_type: 'document' }), 'tok',
+        )
+        expect(described?.loader).toBe('doc/pdf-url')
+        expect(described?.name).toBe('Report')
+        const source = new URL(described!.source)
+        expect(source.pathname).toBe('/media/api/v1/abc/file')
+        expect(source.searchParams.get('share_token')).toBe('tok')
+    })
+
+    it('leaves a video to its recording, and skips an unsupported file or another type', () => {
+        expect(describeMediaAttachment(attachment({ media_type: 'video', file_extension: '.mp4' }))).toBeNull()
+        expect(describeMediaAttachment(attachment({ media_type: 'document', file_extension: '.pdf',
+            is_supported: false }))).toBeNull()
+        expect(describeMediaAttachment(attachment({}, 'dicomstudy'))).toBeNull()
     })
 })

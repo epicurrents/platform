@@ -105,11 +105,42 @@ class TestOhifContentSecurityPolicy:
     def test_policy_without_script_src_derives_it_from_default_src(self, client, ohif_dist, settings):
         settings.CONTENT_SECURITY_POLICY = "default-src 'self'"
         policy = client.get(f"{VIEWER_URL}viewer")["Content-Security-Policy"]
-        assert policy == "default-src 'self'; script-src 'self' 'unsafe-eval'"
+        assert policy == "default-src 'self'; script-src 'self' 'unsafe-eval'; frame-ancestors 'self'"
 
     def test_no_policy_configured_adds_none(self, client, ohif_dist, settings):
         settings.CONTENT_SECURITY_POLICY = ""
         assert "Content-Security-Policy" not in client.get(f"{VIEWER_URL}viewer")
+
+
+@pytest.mark.django_db
+class TestOhifFraming:
+    """The radiology view frames the OHIF mount; only the platform's own pages may, and only that mount."""
+
+    @pytest.fixture(autouse=True)
+    def enforced_policy(self, settings):
+        settings.CONTENT_SECURITY_POLICY = f"{STRICT}; frame-ancestors 'none'"
+        settings.CSP_REPORT_ONLY = False
+
+    @pytest.mark.parametrize("subpath", ["", "viewer/dicomjson", "app.bundle.abc.js"])
+    def test_ohif_responses_allow_same_origin_framing(self, client, ohif_dist, subpath):
+        response = client.get(f"{VIEWER_URL}{subpath}")
+        directives = dict(d.strip().split(" ", 1) for d in response["Content-Security-Policy"].split(";"))
+        assert directives["frame-ancestors"] == "'self'"
+        assert response["X-Frame-Options"] == "SAMEORIGIN"
+
+    def test_platform_responses_still_refuse_framing(self, client, ohif_dist):
+        response = client.get("/api/v1/")
+        assert "frame-ancestors 'none'" in response["Content-Security-Policy"]
+        assert response["X-Frame-Options"] == "DENY"
+
+    def test_policy_without_frame_ancestors_gains_the_same_origin_one(self, client, ohif_dist, settings):
+        settings.CONTENT_SECURITY_POLICY = STRICT
+        policy = client.get(f"{VIEWER_URL}viewer")["Content-Security-Policy"]
+        assert policy.endswith("; frame-ancestors 'self'")
+
+    def test_no_policy_configured_still_sets_same_origin_framing(self, client, ohif_dist, settings):
+        settings.CONTENT_SECURITY_POLICY = ""
+        assert client.get(f"{VIEWER_URL}viewer")["X-Frame-Options"] == "SAMEORIGIN"
 
 
 @pytest.mark.django_db

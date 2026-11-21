@@ -29,6 +29,11 @@ surface an object its model's gate hides. Recordings register a gate
 that hides FAILED recordings from everyone but the author and hides
 trashed recordings from every caller.
 
+Below them sits a narrower restrictive rule, terms refusals registered via
+:func:`register_terms_refusal`: once a grant is found, an object its model
+declares unable to honour ``apply_middleware`` is denied to a caller whose
+terms carry it. The dicom plugin declares a study stored without its pass.
+
 The README (``epicurrents/README.md`` → *Permissions*) is the long-form
 description of grants, resolution order, and the ``apply_middleware``
 metadata flag; this docstring just sets the orientation for code readers.
@@ -82,6 +87,12 @@ _FEDERATED_READ_EXTENSIONS: list = []
 # object must be treated as invisible to that caller. Register from
 # app.ready() via register_read_visibility_gate() to avoid circular imports.
 _READ_VISIBILITY_GATES: dict = {}
+
+# Registry of terms refusals, keyed by model label ("app.model"). Each rule
+# receives the object and returns True when it cannot be served under terms
+# carrying apply_middleware. Register from app.ready() via
+# register_terms_refusal().
+_TERMS_REFUSALS: dict = {}
 
 
 @dataclass
@@ -137,6 +148,38 @@ def _hidden_by_visibility_gate(user: Any, obj: Any, share_token: str | None = No
         if gate(user=user, obj=obj, share_token=share_token):
             return True
     return False
+
+
+def register_terms_refusal(model_label: str, refuses) -> None:
+    """Register a rule refusing objects of one model to a caller whose read terms carry ``apply_middleware``.
+
+    Signature: ``refuses(obj) -> bool`` — return True when *obj* holds what the
+    de-identifying pipeline exists to withhold and no pipeline applies to it,
+    so a de-identifying grant on it, direct or inherited, must convey nothing.
+    The dicom plugin registers a study stored without its header pass.
+    Consulted by :func:`get_read_access_result` once a grant has been found;
+    the object's author is exempt, as ``apply_middleware`` has no effect for
+    the author, and superusers never reach it. Local resolution only: the
+    federated resolvers do not consult it, so a model that registers one must
+    not be served to peers. Idempotent.
+    """
+    rules = _TERMS_REFUSALS.setdefault(model_label.lower(), [])
+    if refuses not in rules:
+        rules.append(refuses)
+
+
+def _refused_under_terms(user: Any, obj: Any, terms: ReadAccessTerms) -> ReadAccessTerms:
+    """Return *terms*, or a denial when a registered terms refusal applies to them."""
+    if not (terms.granted and terms.apply_middleware):
+        return terms
+    rules = _TERMS_REFUSALS.get(getattr(getattr(obj, "_meta", None), "label_lower", None), ())
+    if not rules:
+        return terms
+    if user is not None and getattr(user, "is_authenticated", False) and getattr(obj, "author_id", None) == user.pk:
+        return terms
+    if any(rule(obj) for rule in rules):
+        return ReadAccessTerms(granted=False)
+    return terms
 
 
 def register_read_permission_extension(checker) -> None:
@@ -313,6 +356,10 @@ def get_read_access_result(user: Any, obj: Any, share_token: str | None = None) 
     4. Registered extension checkers (e.g. Dataset membership).
        Extensions are only consulted when no direct ``AccessRight`` matched;
        they always yield default metadata (``apply_middleware=False``).
+    5. Terms refusals registered for the object's model
+       (:func:`register_terms_refusal`), applied to the grant 3 or 4 found:
+       an object that cannot honour ``apply_middleware`` is denied to a caller
+       whose terms carry it, the object's author excepted.
     """
 
     if user and getattr(user, "is_superuser", False):
@@ -374,7 +421,9 @@ def get_read_access_result(user: Any, obj: Any, share_token: str | None = None) 
                 .first()
             )
             if right is not None:
-                return ReadAccessTerms(granted=True, apply_middleware=right.apply_middleware)
+                return _refused_under_terms(
+                    user, obj, ReadAccessTerms(granted=True, apply_middleware=right.apply_middleware)
+                )
 
     # Extension fallback — only reached when no direct AccessRight matched.
     # Extensions may return either a plain bool or a ReadAccessTerms.  A bool True
@@ -385,7 +434,7 @@ def get_read_access_result(user: Any, obj: Any, share_token: str | None = None) 
         result = checker(user=user, obj=obj, share_token=share_token)
         if isinstance(result, ReadAccessTerms):
             if result.granted:
-                return result
+                return _refused_under_terms(user, obj, result)
         elif result:
             return ReadAccessTerms(granted=True)
 

@@ -4,6 +4,7 @@
             <h1>{{ t('DICOM Studies', SCOPE) }}</h1>
             <wa-button
                 appearance="filled-outlined"
+                size="s"
                 variant="brand"
                 @click="openUploadDialog"
             >
@@ -59,6 +60,9 @@
                         >
                             {{ t('View', SCOPE) }}
                         </wa-button>
+                        <wa-button appearance="plain" size="s" @click="openAddToDataset(study)">
+                            {{ t('Add to dataset', SCOPE) }}
+                        </wa-button>
                         <wa-button v-if="study.can_share"
                             appearance="plain"
                             size="s"
@@ -91,9 +95,9 @@
                     {{
                         t(
                             '{count} image(s) may show identifying text in the picture itself: ultrasound images, '
-                                + 'secondary captures and images marked as carrying burned-in annotation. The '
-                                + 'platform removes identifying details from the file header, but it cannot see '
-                                + 'text in the image.',
+                                + 'secondary captures and images marked as carrying burned-in annotation. What the '
+                                + 'images show is your responsibility: the platform clears identifying header fields '
+                                + 'as a safeguard, but it cannot see text in an image.',
                             SCOPE,
                             { count: heldForReview.length }
                         )
@@ -110,6 +114,16 @@
             </div>
             <template v-else>
                 <p>{{ t('Select one or more DICOM files (.dcm) or folders to upload.', SCOPE) }}</p>
+                <p class="dialog-note">
+                    {{
+                        t(
+                            'You are responsible for what the files contain. De-identify studies in the software '
+                                + 'that exports them; the platform also clears identifying header fields, as a '
+                                + 'safeguard rather than a guarantee.',
+                            SCOPE
+                        )
+                    }}
+                </p>
                 <input
                     accept=".dcm,application/dicom"
                     class="file-input"
@@ -171,6 +185,57 @@
             ></AccessRightsPanel>
         </wa-dialog>
 
+        <!-- Add to dataset dialog -->
+        <wa-dialog
+            :label="t('Add to dataset', SCOPE)"
+            :open="!!studyToAdd"
+            @wa-after-hide.self="closeAddToDataset"
+        >
+            <div v-if="datasetsLoading" class="loading-state">
+                <wa-spinner></wa-spinner>
+                {{ t('Loading datasets…', SCOPE) }}
+            </div>
+            <template v-else>
+                <p v-if="!datasetChoices.length">
+                    {{ t('You have no dataset this study can be added to.', SCOPE) }}
+                </p>
+                <wa-select v-else
+                    :disabled="addingToDataset"
+                    :label="t('Dataset', SCOPE)"
+                    :placeholder="t('Choose a dataset', SCOPE)"
+                    size="s"
+                    v-wa="[addForm, 'datasetHash']"
+                >
+                    <wa-option v-for="dataset in datasetChoices" :key="dataset.object_hash!" :value="dataset.object_hash!">
+                        {{ dataset.name }}
+                    </wa-option>
+                </wa-select>
+                <p class="dialog-note">
+                    {{
+                        t(
+                            'Everyone the dataset is shared with can read the study. Release-gated datasets cannot '
+                                + 'hold studies.',
+                            SCOPE
+                        )
+                    }}
+                </p>
+            </template>
+            <div class="dialog-footer" slot="footer">
+                <wa-button appearance="plain" @click="closeAddToDataset">
+                    {{ t('Cancel', SCOPE) }}
+                </wa-button>
+                <wa-button
+                    appearance="filled-outlined"
+                    :disabled="!addForm.datasetHash || addingToDataset"
+                    :loading="addingToDataset"
+                    variant="brand"
+                    @click="addToDataset"
+                >
+                    {{ t('Add', SCOPE) }}
+                </wa-button>
+            </div>
+        </wa-dialog>
+
         <!-- Delete confirmation dialog -->
         <wa-dialog
             :label="t('Delete Study', SCOPE)"
@@ -204,15 +269,18 @@
 
 <script setup lang="ts">
 import { onMounted, reactive, ref } from 'vue'
+import { useRouter } from 'vue-router'
 import { useAuthStore } from '#stores/auth'
 import { showToast } from '#lib/toast'
 import { t } from '#i18n'
 import AccessRightsPanel from '#components/AccessRightsPanel.vue'
-import type { AccessRight, GrantAccessPayload } from '#api/library'
+import { addDatasetItem, listAllDatasets, type AccessRight, type Collection, type GrantAccessPayload } from '#api/library'
 import type { DicomStudyOut, DicomUploadOut } from './api'
 import { BURNED_IN_CONFIRMATION_REQUIRED, dicomApi } from './api'
 
 const SCOPE = 'DicomStudiesView'
+
+const router = useRouter()
 
 const authStore = useAuthStore()
 
@@ -228,6 +296,11 @@ const reviewForm = reactive({ confirmed: false })
 const fileInputRef = ref<HTMLInputElement | null>(null)
 const studyToDelete = ref<DicomStudyOut | null>(null)
 const studyToShare = ref<DicomStudyOut | null>(null)
+const studyToAdd = ref<DicomStudyOut | null>(null)
+const datasetChoices = ref<Collection[]>([])
+const datasetsLoading = ref(false)
+const addingToDataset = ref(false)
+const addForm = reactive({ datasetHash: '' })
 const accessRights = ref<AccessRight[]>([])
 const accessLoading = ref(false)
 
@@ -263,8 +336,8 @@ function formatDate(dateStr: string): string {
 }
 
 function openInViewer(studyHash: string) {
-    const viewerUrl = dicomApi.ohifViewerUrl(studyHash)
-    window.open(viewerUrl, '_blank')
+    const { href } = router.resolve({ name: 'viewer', query: { dicom: studyHash } })
+    window.open(href, '_blank')
 }
 
 function openUploadDialog() {
@@ -376,17 +449,62 @@ async function openShareDialog(study: DicomStudyOut) {
 function shareNotice(study: DicomStudyOut): string {
     if (study.deidentification_version === null) {
         return t(
-            'This study is stored as uploaded: its files and patient details are not de-identified, and everyone '
-                + 'you share it with receives them as they are.',
+            'The platform applied no header safeguard to this study: everyone you share it with receives the '
+                + 'files as they were uploaded, patient details included.',
             SCOPE
         )
     }
     return t(
-        'Patient details were removed from this study\'s files when they were uploaded. The platform does not check '
-            + 'the images themselves for text; for ultrasound and similar images, the uploader confirmed they show '
-            + 'none.',
+        'The platform cleared identifying header fields when this study was uploaded, as a safeguard. What the study '
+            + 'contains remains the uploader\'s responsibility: the platform does not check the images for text, and '
+            + 'for ultrasound and similar images the uploader confirmed they show none.',
         SCOPE
     )
+}
+
+async function openAddToDataset(study: DicomStudyOut) {
+    studyToAdd.value = study
+    addForm.datasetHash = ''
+    datasetsLoading.value = true
+    try {
+        // A release-gated dataset takes no study, so it is not offered.
+        datasetChoices.value = (await listAllDatasets()).filter(d => !d.release_gated && d.object_hash)
+    } catch {
+        showToast(t('Failed to load datasets.', SCOPE), 'danger')
+        studyToAdd.value = null
+    } finally {
+        datasetsLoading.value = false
+    }
+}
+
+function closeAddToDataset() {
+    studyToAdd.value = null
+}
+
+async function addToDataset() {
+    const study = studyToAdd.value
+    if (!study || !addForm.datasetHash) {
+        return
+    }
+    addingToDataset.value = true
+    try {
+        const contentTypeId = await dicomApi.studyContentTypeId()
+        await addDatasetItem(addForm.datasetHash, { content_type_id: contentTypeId, object_id: study.hash })
+        showToast(t('Study added to the dataset.', SCOPE), 'neutral')
+        studyToAdd.value = null
+    } catch (e) {
+        const status = (e as { response?: { status?: number } }).response?.status
+        showToast(
+            status === 409
+                ? t('The study is already in that dataset, or the dataset cannot hold it.', SCOPE)
+                : status === 403
+                    ? t('You cannot add items to that dataset.', SCOPE)
+                    : t('The study could not be added to the dataset.', SCOPE),
+            'danger',
+        )
+    } finally {
+        addingToDataset.value = false
+    }
 }
 
 function closeShareDialog() {
@@ -428,6 +546,11 @@ async function deleteStudy() {
 <style scoped>
 .share-dialog {
     --width: min(44rem, 95vw);
+}
+
+.dialog-note {
+    color: var(--wa-color-text-quiet);
+    font-size: var(--wa-font-size-s);
 }
 
 .dicom-studies-view {

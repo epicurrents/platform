@@ -4,7 +4,7 @@ import { onBeforeRouteLeave, useRoute } from 'vue-router'
 import { t } from '#i18n'
 import { showToast } from '#lib/toast'
 import { useAuthStore } from '#stores/auth'
-import { getRecordingDetail } from '#api/recordings'
+import { getRecordingDetail, listRecordingAttachments } from '#api/recordings'
 import {
     browseFiltersFromQuery,
     getDataset,
@@ -23,28 +23,34 @@ import type {
 } from '@epicurrents/core/dist/types'
 // viewer/interface has no compiled .d.ts output; declare only what we need here.
 type InterfaceSettings = { app: { disclaimerAccepted: number } }
-import type { Recording } from '#api/recordings'
+import type { Recording, RecordingAttachment } from '#api/recordings'
+import type { ViewerItemSource } from '#projects/types'
 import { plugin } from '#projects/active'
 import { plugin as pluginsPlugin } from '#plugins/active'
 import { mergeSetup } from '#plugins/base'
 import { waitForEventBus } from '#projects/eventBus'
 import { getViewerConfig } from '#api/viewerConfig'
 import { applyViewerSettingsOverrides, VIEWER_USER_SETTINGS_PATH, type ViewerSettingsOverrides } from '#lib/viewerConfig'
+import { AttachmentParents } from '#viewer/attachmentParents'
 import { leadFieldProvider } from '#viewer/leadFields'
 import {
     describeMedia,
+    describeMediaAttachment,
     describeRecording,
     eagerStudyLoadLimit,
     listedFromBrowseRow,
     listedFromRecording,
     type DeferredStudyApp,
     type ListedRecording,
+    type StudyDescription,
 } from '#viewer/datasetStudies'
 import { createUploadTarget } from '#lib/exportTargets'
 
 // The overlay panel comes from the active project if it defines one, otherwise
 // from the first enabled plugin that does. A page hosts a single overlay.
 const viewerPanel = plugin.viewerPanel ?? pluginsPlugin.viewerPanel
+/** Every plugin's sources of viewer items, then the project's. */
+const viewerItemSources = [...(pluginsPlugin.viewerItems ?? []), ...(plugin.viewerItems ?? [])]
 
 /** One viewer-side dataset to create plus the items to load into it. */
 interface DatasetBundle {
@@ -66,6 +72,59 @@ interface DatasetBundle {
 type BundleItem =
     | { kind: 'recording'; listed: ListedRecording; recording: Recording | null }
     | { kind: 'media'; media: MediaFileDetail }
+    | { kind: 'described'; description: StudyDescription; parent?: string }
+
+/**
+ * List what is attached to the bundle's recordings after each of them, one request per page of recordings. Videos are
+ * left out, since they play on their recording's timeline; so is a media file the bundle already holds as an item of
+ * its own or a plugin's item the bundle already lists, and an attachment no media importer or viewer item source
+ * describes. Each listed attachment carries its
+ * parent's hash, for a navigator that lists it under the recording. Listing nothing when the request fails leaves the
+ * recordings themselves to open.
+ * @param items - The bundle's items, in order.
+ * @param shareToken - Share token the bundle is read with, if any.
+ * @param sources - The viewer item sources that may describe a plugin's attachment.
+ */
+async function withAttachments(
+    items: BundleItem[],
+    shareToken: string | undefined,
+    sources: ViewerItemSource[],
+): Promise<BundleItem[]> {
+    const hashes = items.flatMap(item => item.kind === 'recording' ? [item.listed.hash.toUpperCase()] : [])
+    if (!hashes.length) {
+        return items
+    }
+    let attachments: RecordingAttachment[]
+    try {
+        attachments = await listRecordingAttachments(hashes, shareToken)
+    } catch (e) {
+        console.warn('[Epicurrents] Could not list the attachments of the recordings.', e)
+        return items
+    }
+    // What the bundle already lists as an item of its own: a media member by its hash, and anything a plugin
+    // described by the address it loads from, so a study that is both a member and attached is listed once.
+    const held = new Set(items.flatMap(item => item.kind === 'media' ? [item.media.content_hash] : []))
+    const heldSources = new Set(items.flatMap(item => item.kind === 'described' ? [item.description.source] : []))
+    const byParent = new Map<string, BundleItem[]>()
+    for (const attachment of attachments) {
+        if (held.has(attachment.hash)) {
+            continue
+        }
+        const description = describeMediaAttachment(attachment, shareToken)
+            ?? sources.map(source => source.describeAttachment?.(attachment, shareToken) ?? null).find(d => d)
+            ?? null
+        if (!description || heldSources.has(description.source)) {
+            continue
+        }
+        const parent = attachment.parent.toUpperCase()
+        const listed = byParent.get(parent) ?? []
+        listed.push({ kind: 'described', description, parent })
+        byParent.set(parent, listed)
+    }
+    return items.flatMap(item => item.kind === 'recording'
+        ? [item, ...(byParent.get(item.listed.hash.toUpperCase()) ?? [])]
+        : [item])
+}
 
 /**
  * Seed the viewer resource with the platform's complete interruption table from the recording
@@ -91,6 +150,20 @@ function seedTrustedInterruptions(resource: DataResource, recording: Recording):
     target.setTrustedInterruptions(
         new Map(recording.interruptions.map((intr) => [intr.start, intr.duration]))
     )
+}
+
+/**
+ * Keep the link between an attached item and its recording current as either of them loads.
+ * @param parents - The bundle's attachment links.
+ * @param resource - The loaded resource.
+ * @param item - The bundle item it was loaded from.
+ */
+function itemLoaded(parents: AttachmentParents, resource: DataResource, item: BundleItem) {
+    if (item.kind === 'recording') {
+        parents.recordingHeld(item.listed.hash, resource)
+    } else if (item.kind === 'described' && item.parent) {
+        parents.childLoaded(item.parent, resource)
+    }
 }
 
 /**
@@ -250,15 +323,21 @@ const totalItems = computed(
     () => bundles.value.reduce((n, b) => n + b.items.length, 0),
 )
 
+/** True when the URL names an item of a type a plugin lists, through one of its sources' parameters. */
+const pluginItemsNamed = computed(() =>
+    viewerItemSources.some(source => source.params.some(param => !!route.query[param])),
+)
+
 /**
- * No reference params at all (`files` / `media` / `dataset` / `session`): open
+ * No reference params at all (`files` / `media` / `dataset` / `session`, nor a plugin's): open
  * the viewer blank so its own load UI is available, instead of erroring.
  */
 const emptyMode = computed(() =>
     !sessionToken.value
     && datasetId.value === null
     && !hashes.value.length
-    && !mediaHashes.value.length,
+    && !mediaHashes.value.length
+    && !pluginItemsNamed.value,
 )
 
 /**
@@ -309,11 +388,15 @@ async function loadDatasetBundle(
                     const media = await getMediaDetail(item.object_hash)
                     return { kind: 'media', media }
                 }
-                return null
+                // A type a plugin owns is described by the plugin's source; one nobody describes is left out.
+                const description = viewerItemSources
+                    .map(source => source.describeDatasetItem?.(item, token) ?? null)
+                    .find(d => d) ?? null
+                return description ? { kind: 'described', description } : null
             }),
         )).filter((i): i is BundleItem => i !== null)
     return {
-        items: bundleItems,
+        items: await withAttachments(bundleItems, token, viewerItemSources),
         name: dataset.name,
         preload: dataset.preload_members ?? false,
         shareToken: token,
@@ -387,10 +470,10 @@ onMounted(async () => {
             bundles.value = [
                 await loadDatasetBundle(datasetId.value, shareToken.value, datasetFilters.value, datasetSort.value),
             ]
-        } else if (hashes.value.length || mediaHashes.value.length) {
+        } else if (hashes.value.length || mediaHashes.value.length || pluginItemsNamed.value) {
             // Individual items mode — one unauthenticated bundle that mixes
-            // recordings (`?files=`) and media (`?media=`) in the order they
-            // were declared in the URL.
+            // recordings (`?files=`), media (`?media=`) and the items a plugin's
+            // parameters name, each kind in the order it was declared in the URL.
             const recordingItems = await Promise.all(
                 hashes.value.map(async h => {
                     const recording = await getRecordingDetail(h, shareToken.value)
@@ -403,11 +486,16 @@ onMounted(async () => {
                     media: await getMediaDetail(h),
                 })),
             )
+            const pluginItems = (await Promise.all(viewerItemSources.map(source => source.fromQuery(route.query))))
+                .flat()
+                .map(description => ({ kind: 'described' as const, description }))
             // A link naming its items is a selection the user made, so every item loads up front.
             bundles.value = [{
                 name: 'Dataset',
                 shareToken: shareToken.value,
-                items: [...recordingItems, ...mediaItems],
+                items: await withAttachments(
+                    [...recordingItems, ...mediaItems, ...pluginItems], shareToken.value, viewerItemSources,
+                ),
                 preload: true,
             }]
         }
@@ -507,9 +595,12 @@ onMounted(async () => {
                 // Hide the dataset navigator sidebar when only one item is loaded, to maximize screen space.
                 ;(epic.runtime.APP as any).uiComponentVisible.navigator = false
             }
-            // TODO: A temporary fix to avoid the disclaimer; this needs a user setting in the future.
-            const interfaceSettings = epic.runtime.INTERFACE as InterfaceSettings
-            interfaceSettings.app.disclaimerAccepted = 1
+            // A signed-in user is spared the viewer's disclaimer; a guest reading through a share token is shown it.
+            // TODO: The signed-in case needs a user setting in the future.
+            if (auth.isAuthenticated) {
+                const interfaceSettings = epic.runtime.INTERFACE as InterfaceSettings
+                interfaceSettings.app.disclaimerAccepted = 1
+            }
             // Apply the deployment's viewer-config overrides (project seed merged
             // with the editable database overrides) before the project hook and
             // before any study loads, so per-recording reads like the default
@@ -591,6 +682,7 @@ onMounted(async () => {
             // per member. A dataset flagged to preload, and an item the platform holds no metadata to list, are loaded
             // up front instead, as many as the viewer's eager load limit allows.
             const app = epic as DeferredStudyApp
+            const parents = new AttachmentParents()
             const eagerLimit = eagerStudyLoadLimit(app)
             const eager: DataResource[] = []
             const viewerDatasets: MediaDataset[] = []
@@ -603,7 +695,9 @@ onMounted(async () => {
                 for (const item of bundle.items) {
                     const description = item.kind === 'recording'
                         ? describeRecording(item.listed, bundle.shareToken)
-                        : describeMedia(item.media)
+                        : item.kind === 'media'
+                            ? describeMedia(item.media)
+                            : item.description
                     if (!description) {
                         const media = (item as { media: MediaFileDetail }).media
                         console.warn(`[Epicurrents] No importer registered for media ${media.file_extension}; skipping ${media.content_hash}`)
@@ -612,15 +706,23 @@ onMounted(async () => {
                     const listing = app.addDeferredStudy({
                         loader: description.loader,
                         name: description.name,
-                        onLoaded: (resource) => studyLoaded(resource, item, bundle.shareToken),
+                        onLoaded: (resource) => {
+                            itemLoaded(parents, resource, item)
+                            return studyLoaded(resource, item, bundle.shareToken)
+                        },
                         options: { isValidated: true, name: description.name },
                         properties: description.properties ?? undefined,
                         source: description.source,
                     }, { dataset: viewerDataset })
                     if (!listing) {
-                        const hash = item.kind === 'recording' ? item.listed.hash : item.media.content_hash
+                        const hash = item.kind === 'recording'
+                            ? item.listed.hash
+                            : item.kind === 'media' ? item.media.content_hash : item.description.name
                         console.error(`[Epicurrents] Could not list the item ${hash}.`)
                         continue
+                    }
+                    if (item.kind === 'recording') {
+                        parents.recordingHeld(item.listed.hash, listing)
                     }
                     if (bundle.preload || !description.properties) {
                         eager.push(listing)

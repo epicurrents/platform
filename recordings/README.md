@@ -497,6 +497,7 @@ Mounted at `/recordings/api/v1/`. Full request/response detail in [api/v1/ninja.
 |---|---|---|
 | `POST` | `/upload` | Multipart upload. Returns 202 immediately with the staging metadata and `warnings` for a `display_name` that looks like an identifier; poll `/status/{hash}` for processing progress. An optional `hypnogram` file part carries a study's scored stages, see [Modality](#modality). `public_source` records the published dataset the data was taken from, 400 when it is neither a DOI nor a URL. |
 | `GET` | `/status/{hash}` | Current processing status of a recording. |
+| `GET` | `/attachments/` | What is attached to each of up to 200 named recordings; see [Attachments](#attachments). |
 | `GET` | `/` | List visible recordings for the caller, paginated by `limit`/`offset`. Filterable by `status`, `trash`, and `uncollected` (only recordings in no collection — the library root). |
 | `GET` | `/{hash}` | Full recording metadata including `RecordingMeta` and per-channel `SignalInfo`. `created_at` is month-truncated for every reader but the author and superusers; `file_hash` is not part of any response. |
 | `GET` | `/{hash}/slice` | Metadata scoped to a time window, with annotations clamped to the slice. |
@@ -575,6 +576,10 @@ Recordings with `status=FAILED` are visible only to the author and to superusers
 Enforcement is two-layer. The read-visibility gate `recording_hidden_from_reader` in [permissions.py](permissions.py), registered with the permission resolver from `RecordingsConfig.ready()`, denies `can_read_object` itself for FAILED (non-author) and trashed recordings — so surfaces outside this app that resolve recordings generically (the annotations API, extension grants) hide them without knowing the rule. `_failed_hidden_for_caller(recording, user, fed)` in [api/v1/ninja.py](api/v1/ninja.py) is the endpoint-side layer: every recording surface checks it *before* its read-permission check, so a grantee with a valid `AccessRight` on a FAILED recording sees 404 rather than the resolver's 403 — indistinguishable from absence, because the data they would receive is meaningless and the failure detail is author-private.
 
 Defense in depth on the serve path: when a recording is somehow READY but `RecordingMeta` is missing (a race window or pathological state), the serve helper refuses raw bytes to `apply_middleware=True` callers and returns 403 with `{"code": "recording_unprocessed", "detail": "..."}` rather than leaking the unrewritten header.
+
+## Attachments
+
+`GET /recordings/api/v1/attachments/?recordings=<hash>,…` lists what is attached to up to 200 recordings in one request, one dataset browser page, through the registry in [epicurrents/attachments.py](../epicurrents/README.md#attachments). Session or share-token callers; a recording the caller cannot read or that is hidden from them (`_hidden_for_caller`) contributes nothing, and is not told apart from one with nothing attached. Each item names its `parent` recording by hash, its `type`, its own `hash` and grantee-visible `name`, `platform_pass` and a per-type `details` map; items come in the named order, by name within a recording. The audit row carries counts. The viewer lists every attachment but videos after its recording, which keep playing on the recording's timeline; tests in [tests/test_attachments_listing.py](tests/test_attachments_listing.py).
 
 ## Submissions
 

@@ -44,4 +44,10 @@ describe('mergePlugins', () => {
         expect(merged.extraSetup).toEqual({ modules: { eeg: { a: 1, b: 2 } } })
         expect(mergePlugins([{}]).extraSetup).toBeUndefined()
     })
+    it('concatenates the viewer item sources of every plugin, in plugin order', () => {
+        const first = { params: ['a'], fromQuery: async () => [] }
+        const second = { params: ['b'], fromQuery: async () => [] }
+        const merged = mergePlugins([{ viewerItems: [first] }, {}, { viewerItems: [second] }])
+        expect(merged.viewerItems).toEqual([first, second])
+    })
 })

@@ -1,8 +1,8 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { http } from '#lib/http'
-import { uploadRecording } from './recordings'
+import { ATTACHMENT_LISTING_LIMIT, listRecordingAttachments, uploadRecording } from './recordings'
 
-vi.mock('#lib/http', () => ({ http: { post: vi.fn() } }))
+vi.mock('#lib/http', () => ({ http: { get: vi.fn(), post: vi.fn() } }))
 
 const mockPost = vi.mocked(http.post)
 const file = new File(['a'], 'a.edf')
@@ -46,5 +46,28 @@ describe('uploadRecording', () => {
         await uploadRecording(file)
         expect(request().params).toEqual({})
         expect([...request().body.keys()]).toEqual(['file'])
+    })
+})
+
+describe('listRecordingAttachments', () => {
+    const mockGet = vi.mocked(http.get)
+
+    beforeEach(() => {
+        vi.clearAllMocks()
+        mockGet.mockImplementation((_url, config) => Promise.resolve({
+            data: [{ parent: String(config?.params?.recordings).split(',')[0] }],
+        }))
+    })
+
+    it('names the recordings a page at a time and joins the pages in order', async () => {
+        const hashes = Array.from({ length: ATTACHMENT_LISTING_LIMIT + 1 }, (_, i) => `H${i}`)
+        const items = await listRecordingAttachments(hashes)
+        expect(mockGet).toHaveBeenCalledTimes(2)
+        expect(items.map(item => item.parent)).toEqual(['H0', `H${ATTACHMENT_LISTING_LIMIT}`])
+    })
+
+    it('passes the share token when there is one', async () => {
+        await listRecordingAttachments(['A'], 'tok')
+        expect(mockGet.mock.calls[0][1]?.params).toEqual({ recordings: 'A', share_token: 'tok' })
     })
 })

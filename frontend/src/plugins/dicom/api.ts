@@ -82,7 +82,28 @@ const BASE = '/plugin/dicom/api/v1/dicom'
  */
 export const BURNED_IN_CONFIRMATION_REQUIRED = 'burned_in_confirmation_required'
 
+let studyContentTypeId: number | null = null
+
 export const dicomApi = {
+    /**
+     * The content type a study is added to a dataset by, through the library's generic items endpoint. Cached for the
+     * page's lifetime.
+     */
+    async studyContentTypeId(): Promise<number> {
+        if (studyContentTypeId !== null) {
+            return studyContentTypeId
+        }
+        const response = await http.get<{ id: number, natural_key: string }[]>('/annotations/api/v1/content-types', {
+            params: { app_label: 'dicom', model: 'dicomstudy' },
+        })
+        const found = response.data.find(type => type.natural_key === 'dicom.dicomstudy')
+        if (!found) {
+            throw new Error('dicom.DicomStudy content type not found on this server')
+        }
+        studyContentTypeId = found.id
+        return found.id
+    },
+
     listStudies(): Promise<DicomStudyOut[]> {
         return http.get<DicomStudyOut[]>(`${BASE}/studies/`).then(r => r.data)
     },
@@ -101,7 +122,7 @@ export const dicomApi = {
     },
 
     /**
-     * Grant a user an access right on a study. Only user targets are accepted for now. A study is de-identified, or
+     * Grant a user an access right on a study. Only user targets are accepted for now. A study's header pass runs, or
      * not, when it is stored, and every grantee receives the stored files, so the payload's `apply_middleware` is
      * ignored.
      * @param hash - The study's `hash` from the study listing.

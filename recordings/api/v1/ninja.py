@@ -2089,6 +2089,81 @@ def list_recordings(
     ]
 
 
+#: Most recordings one attachment listing names, a page of the dataset browser.
+ATTACHMENT_LISTING_LIMIT = 200
+
+
+class AttachmentOut(Schema):
+    """One object attached to a recording, as ``epicurrents.attachments`` lists it.
+
+    ``parent`` is the recording's hash and ``hash`` the attachment's own public identifier. ``platform_pass`` names
+    the pass the platform applied to the stored content (``none``, or ``dicom-header`` for a study whose header the
+    dicom plugin cleaned): a record of what was done, never an assurance, since an attachment's content is its
+    submitter's to answer for. ``details`` is what a client needs to open the item, per type.
+    """
+
+    parent: str
+    type: str
+    hash: str
+    name: str
+    platform_pass: str
+    details: dict[str, str | int | float | bool | None]
+
+
+@api.get("/attachments/", response=list[AttachmentOut])
+def list_attachments(request, recordings: str, share_token: str | None = None):
+    """List what is attached to each named recording, for every recording and attachment the caller may read.
+
+    *recordings* is a comma-separated list of up to ``ATTACHMENT_LISTING_LIMIT`` recording hashes, one dataset browser
+    page, so a client lists a page's attachments in one request. A recording the caller may not read, or that is
+    hidden from them, contributes nothing and is not told apart from one that does not exist or has nothing attached.
+    Each attachment is decided by its own type's read rule; see ``epicurrents.attachments``.
+    """
+    from django.db.models.functions import Left
+
+    from epicurrents.attachments import attachments_of
+
+    user = getattr(request, "user", None)
+    if not (user and getattr(user, "is_authenticated", False)):
+        user = None
+        if not (share_token or "").strip():
+            raise HttpError(401, "Authentication credentials were not provided")
+
+    hashes = [h.strip().upper() for h in recordings.split(",") if h.strip()]
+    if not hashes:
+        raise HttpError(400, "Name at least one recording.")
+    if len(hashes) > ATTACHMENT_LISTING_LIMIT:
+        raise HttpError(400, f"Name at most {ATTACHMENT_LISTING_LIMIT} recordings.")
+    if any(len(h) != 32 or not h.isalnum() for h in hashes):
+        raise HttpError(400, "Invalid recording hash. Use 32 alphanumeric characters.")
+
+    found = {
+        r.prefix: r
+        for r in Recording.objects.filter(deleted_at__isnull=True)
+        .annotate(prefix=Left("stored_name", 32))
+        .filter(prefix__in=set(hashes))
+        .order_by("created_at")
+    }
+    readable = [
+        (h, found[h])
+        for h in dict.fromkeys(hashes)
+        if h in found
+        and not _hidden_for_caller(found[h], user, None, share_token)
+        and can_read_object(user=user, obj=found[h], share_token=share_token)
+    ]
+    items = attachments_of(readable, user, share_token=share_token)
+    log_activity(
+        verb="recordings.attachments.list",
+        metadata={
+            "recordings_named": len(hashes),
+            "recordings_readable": len(readable),
+            "attachment_count": len(items),
+            "share_token_used": bool((share_token or "").strip()),
+        },
+    )
+    return items
+
+
 @api.get("/{hash}/slice", response=RecordingSliceOut)
 def recording_detail_slice(
     request,

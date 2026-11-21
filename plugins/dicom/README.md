@@ -1,6 +1,6 @@
 # dicom
 
-DICOM file management and OHIF viewer integration for the Epicurrents platform. Lets users upload DICOM studies (CT, MRI, PET, etc.), parses and indexes them synchronously at upload, and opens them in the [OHIF Viewer](https://ohif.org) — a full-featured, open-source medical image viewer.
+DICOM file management and OHIF viewer integration for the Epicurrents platform. Lets users upload DICOM studies (CT, MRI, PET, ultrasound, etc.), parses and indexes them synchronously at upload, and opens them in the [OHIF Viewer](https://ohif.org) — a full-featured, open-source medical image viewer — both standalone and framed inside the signed-in viewer's radiology view, beside the recordings they belong with ([Embedded view](#embedded-view)).
 
 This plugin is the successor to the PHP `OhifController` that ran inside Nextcloud. The architecture is similar — parse tags, generate DICOMweb JSON, serve the stored files — but the implementation is native to the Epicurrents platform (Django, pydicom, the platform's permission system).
 
@@ -109,7 +109,9 @@ The upload endpoint stages each file (hashing as it streams), prepares it, persi
 
 ## De-identification
 
-On by default (`DICOM_DEIDENTIFY_ON_INGEST`). The stored file is the de-identified one, so the study list, the study detail, the OHIF JSON, DICOMweb, WADO-URI, sharing and attachment inheritance serve it without knowing about the pass. The output is pseudonymised personal data, never anonymous: the pixels are untouched, and the deployment holds the key that ties each replaced UID to its source ([docs/anonymisation-compliance.md](../../docs/anonymisation-compliance.md)). Decisions and phases are in [dicom-deidentification-plan.md](../../docs/engineering-notes/dicom-deidentification-plan.md).
+A study is an attachment in the platform's sense: what it contains, header and pixels alike, is its submitter's responsibility, and it should arrive de-identified, preferably by the clinical software that produces the export, which knows the source system's fields. The pass below is defence in depth, not a promise of de-identification. It is recorded as what was done (`deidentification_version`, and `platform_pass` in the attachments listing) and is never presented as something a reader can rely on; the Upload and Share dialogs say so.
+
+On by default (`DICOM_DEIDENTIFY_ON_INGEST`). The stored file is the rewritten one, so the study list, the study detail, the OHIF JSON, DICOMweb, WADO-URI, sharing and attachment inheritance serve it without knowing about the pass. Whatever the pass removes, the output is pseudonymised personal data, never anonymous: the pixels are untouched, and the deployment holds the key that ties each replaced UID to its source ([docs/anonymisation-compliance.md](../../docs/anonymisation-compliance.md)). Decisions and phases are in [dicom-deidentification-plan.md](../../docs/engineering-notes/dicom-deidentification-plan.md).
 
 [deidentify.py](deidentify.py) applies the PS3.15 Annex E basic profile from the table dicom-anonymizer ships for the standard's 2026c edition, with actions of its own: the library applies its table to the top level only, writes `ANONYMIZED` as its dummy, and draws UIDs at random per process, which would split a study uploaded in several requests into several studies. The pass, wherever an attribute appears, nested sequences included:
 
@@ -201,7 +203,7 @@ There is no trash listing / restore endpoint yet; until the retention window clo
 python manage.py index_dicom /path/to/archive/ --user admin [--dry-run] [--resume] [--confirm-burned-in]
 ```
 
-Bulk-imports an existing DICOM directory tree through the same [ingest.py](ingest.py) logic as the upload endpoint: each candidate file is prepared, written de-identified to `DICOM_UPLOAD_PATH` (the archive is only read), and persisted as a `ready` instance. `--resume` skips files whose as-archived SHA-256 already appears on one of the owning user's instances as `source_hash`, so a crashed run can be restarted without duplicates. Images that need a [burned-in text](#burned-in-text) check are held back and counted until the run carries `--confirm-burned-in`. The whole run opens a `with_system_activity("dicom.import", interface=command)` scope, so every row lands in the audit trail.
+Bulk-imports an existing DICOM directory tree through the same [ingest.py](ingest.py) logic as the upload endpoint: each candidate file is prepared, rewritten through the header pass to `DICOM_UPLOAD_PATH` (the archive is only read), and persisted as a `ready` instance. `--resume` skips files whose as-archived SHA-256 already appears on one of the owning user's instances as `source_hash`, so a crashed run can be restarted without duplicates. Images that need a [burned-in text](#burned-in-text) check are held back and counted until the run carries `--confirm-burned-in`. The whole run opens a `with_system_activity("dicom.import", interface=command)` scope, so every row lands in the audit trail.
 
 ## Settings / env vars
 
@@ -225,13 +227,16 @@ Bulk-imports an existing DICOM directory tree through the same [ingest.py](inges
 - Its author (who receives a full self-`AccessRight` at study creation, mirroring recordings).
 - Superusers.
 - Any user with an active `AccessRight` row (`can_read=True`) pointing at the study — created through the access endpoints, which the Share dialog on the study list drives.
-- Anyone who can read the study's *attached parent* (typically the recording acquired in the same session), through the `can_read_via_attachment` extension in [permissions.py](permissions.py). Attachment-inherited studies do not appear in the flat study list; they surface through their parent. A caller who reads the parent under `apply_middleware` gets nothing from a study stored as uploaded, which would otherwise hand them in full the patient details their grant withholds; a de-identified study is readable as usual.
+- Anyone who can read the study's *attached parent* (typically the recording acquired in the same session), through the `can_read_via_attachment` extension in [permissions.py](permissions.py). Attachment-inherited studies do not appear in the flat study list; they surface through their parent, and through the [attachments listing](../../recordings/README.md#attachments).
+- Anyone who can read a dataset holding the study, through the library's dataset extension. A study is a dataset, collection and tag member by its hash through the [item-type registry](../../library/README.md#member-types), never in a release-gated dataset, since the gate has no way to hide a study before its release; "Add to dataset" on the study list adds one.
+
+**A study stored without the header pass is given to nobody who reads it under `apply_middleware`**, however the grant is reached: a dataset, an attachment or a direct row. The plugin registers that as a terms refusal (`register_terms_refusal` in [epicurrents/permissions.py](../../epicurrents/permissions.py)), so every surface that resolves a study inherits it; the study's own author is exempt, and a dataset listing leaves such a study out before it pages (`withheld_under_middleware` on the item type), which [tests/test_dataset_members.py](tests/test_dataset_members.py) pins to the refusal. No DICOM path de-identifies per grant, so this is the one thing a de-identifying grant changes for a study: what the platform knows to be raw is withheld rather than served.
 
 Write access (trash, future patch) requires authorship, superuser status, or a `can_write` grant; sharing requires authorship, superuser status, or a `can_share` grant. Series and instances are not independently shareable; access is always inherited from the study. Trashed studies are hidden from every surface — including attachment inheritance — and direct hash lookups return 404 rather than 403, so access denials are indistinguishable from missing studies.
 
 **Granting** follows the dataset rules through `epicurrents.granting`, so a study and a dataset are shared alike: managing access needs authorship, superuser status or a `can_share` grant; a delegated grant confers only what its holder has; a target that already holds a right answers 409; and the author's own row is revocable only by the author or a superuser. The study list carries `can_share` per study, and the Share dialog in [DicomStudiesView.vue](../../frontend/src/plugins/dicom/DicomStudiesView.vue) is the shared `AccessRightsPanel` with only the user mode offered.
 
-Two deliberate limits. Only user targets are accepted: group grants are wanted but not built, and neither the study list nor the [DICOMweb](#dicomweb) search would honour one yet, since both read direct user rows only. Enabling them means accepting `access_target_group_id` here, offering the panel's group mode, and widening `listed_studies` in [dicomweb.py](dicomweb.py) to the caller's groups. And no grant carries `apply_middleware`: a study is de-identified once, when it is stored, not per grant, so every row is written with it off rather than claiming a per-recipient sanitisation that does not happen. The dialog's notice follows the study's `deidentification_version`: it says what was removed, and that the images themselves were checked by the uploader where a check applied, or that the study is stored as uploaded.
+Two deliberate limits. Only user targets are accepted: group grants are wanted but not built, and neither the study list nor the [DICOMweb](#dicomweb) search would honour one yet, since both read direct user rows only. Enabling them means accepting `access_target_group_id` here, offering the panel's group mode, and widening `listed_studies` in [dicomweb.py](dicomweb.py) to the caller's groups. And no grant carries `apply_middleware`: a study is de-identified once, when it is stored, not per grant, so every row is written with it off rather than claiming a per-recipient sanitisation that does not happen. The dialog's notice follows the study's `deidentification_version`: it says the platform cleared header fields as a safeguard, that the content stays the uploader's responsibility and that the images were checked by the uploader where a check applied, or that no safeguard was applied and recipients get the files as uploaded.
 
 Studies readable only through an attachment stay out of both study lists by design; they are reached through their parent recording.
 
@@ -244,7 +249,16 @@ The OHIF viewer is mounted at `/plugin/dicom/ohif/` via [public_urls.py](public_
 /plugin/dicom/ohif/viewer/dicomjson?url=<encoded-ohif-json-url>       dicomjson
 ```
 
-The bare `/plugin/dicom/ohif/` is OHIF's study list, filled by the `platform` source's [DICOMweb](#dicomweb) search, and opening a row uses the first form. The Vue study list opens a study in a new tab with the second form, which names the exact copy by its hash rather than resolving a UID. `/plugin/dicom/` redirects to the Vue study list. Any sub-path without a file extension falls back to `index.html` for OHIF's client-side routing, and a missing file with one answers 404 rather than the HTML document.
+The bare `/plugin/dicom/ohif/` is OHIF's study list, filled by the `platform` source's [DICOMweb](#dicomweb) search, and opening a row uses the first form. The second form names the exact copy by its hash rather than resolving a UID; it is the address the [embedded view](#embedded-view) frames, and "View" on the Vue study list opens the signed-in viewer on it in a new tab. `/plugin/dicom/` redirects to the Vue study list. Any sub-path without a file extension falls back to `index.html` for OHIF's client-side routing, and a missing file with one answers 404 rather than the HTML document.
+
+## Embedded view
+
+The signed-in viewer opens a study in its radiology view, which frames the study's OHIF page in a same-origin iframe rather than loading OHIF into the viewer's own document. OHIF's main bundle compiles code with `new Function`, which the SPA's `script-src` refuses, and it brings a global stylesheet, a router that reads the page URL, document-wide hotkeys and no teardown API; in the frame all of that stays in OHIF's document under the mount's own policy. The viewer edition knows nothing of DICOM: its `rad` module takes a study by the address of a page that renders it, through the `rad/viewer-url` importer, and that address is the `dicomjson` form above. Plan and decisions in [dicom-embedded-view-plan.md](../../docs/engineering-notes/dicom-embedded-view-plan.md).
+
+- **Framing.** Every response of the OHIF mount carries `frame-ancestors 'self'` in place of the platform's `'none'`, and `X-Frame-Options: SAMEORIGIN` ([views.py](views.py)); no other response changes. The frame shares the session cookie and the cross-origin isolation headers, so the codecs keep `SharedArrayBuffer`.
+- **Framed mode.** [ohif-app-config.js](ohif-app-config.js) checks `window.parent !== window`. Framed, OHIF's study list and the header's return arrow are off, and the logo is replaced by a Back button that posts `{ type: 'epicurrents:radiology:return' }` to the parent at this origin; the radiology view answers it with the nearest step of its trail, the recording the study is attached to or else the dataset. OHIF's investigational-use notice is off in the frame, since the study endpoints serve only signed-in users and the platform viewer spares those its own disclaimer. Standalone, the viewer keeps its list and its logo, and the notice stays hidden for 30 days once confirmed.
+- **How a study reaches the viewer.** Three routes, each through the plugin's `viewerItems` source in [viewerItems.ts](../../frontend/src/plugins/dicom/viewerItems.ts): `?dicom=<hash>[,…]` on the viewer URL; a study attached to a listed recording, from the [attachments listing](../../recordings/README.md#attachments), listed after its recording; and a study in a dataset, from the dataset item listing. None is listed to a reader holding only a share token, since the study endpoints authenticate by session only.
+- **Layout and theme.** The radiology view hides the dataset navigator, since OHIF has a study panel of its own and needs the width, and shows the footer's dataset › study trail, whose dataset step brings the navigator back. The view is dark and the others light; the switch crossfades through the View Transitions API ([interface README](../../frontend/viewer/interface/README.md)).
 
 ## DICOMweb
 
@@ -282,7 +296,7 @@ Reverse proxies (nginx, Caddy, …) in front of Django must pass these headers t
 
 The image loader's codec worker compiles code with `new Function`, which the platform's `script-src` refuses, so under the production policy every compressed study (JPEG 2000 and the other WASM codecs) fails to decode while uncompressed ones render. [views.py](views.py) therefore sends the platform policy with `'unsafe-eval'` added to `script-src` on every response it serves, in the same enforce or report-only mode as the platform's. The security middleware sets its own policy with `setdefault`, so the SPA and the API keep the strict one.
 
-The relaxation covers the whole OHIF mount rather than the worker alone because the worker is an unnamed numbered chunk whose name changes with every build. `script-src` already carries `'unsafe-inline'`, so the OHIF page loses little it had.
+The relaxation covers the whole OHIF mount rather than the worker alone because the worker is an unnamed numbered chunk whose name changes with every build. `script-src` already carries `'unsafe-inline'`, so the OHIF page loses little it had. The same responses replace `frame-ancestors` with `'self'` for the [embedded view](#embedded-view). The whole path, the framed viewer included, was driven in Chrome under the enforced production policy with no violation reported.
 
 `dicomjson` fetches whatever `url` names: OHIF restricts the origin only when it has authentication of its own, which it does not here. The platform's `connect-src 'self'` is what refuses a crafted link pointing the viewer at another origin's metadata or pixels, so a deployment that widens `connect-src` widens what such a link can load.
 
@@ -324,6 +338,8 @@ A † marks a verb emitted from a Celery task or management command rather than 
 - **Changing `DICOM_UID_KEY`**: every UID is keyed on it, so a study uploaded before the change and again after becomes two studies. Keep the key with the rest of `.env`.
 - **Re-uploading a downloaded file**: a file fetched from the platform already carries replaced UIDs, which the pass replaces again, so it arrives as a new study rather than joining the one it came from.
 - **Dummied dates**: every stored date is `19850101`, so QIDO date filters and the study list's date column say nothing about when a study was acquired. A deliberate result of [de-identification](#de-identification), not a fault.
+- **Attaching after upload**: a study is attached to a recording only by the upload's `attached_to_type` / `attached_to_id`; there is no endpoint to attach, move or detach one later.
+- **Keyboard inside the frame**: the viewer's shortcuts do not reach a focused OHIF frame. That is the isolation working; click outside the frame to use them.
 - **Duplicate uploads**: Re-uploading an instance that is already `ready` in the same study is rejected per file (DICOM identity semantics — same SOP UID means same object; replacing bytes under an already-served instance would be a silent mutation). Re-uploading a `pending`/`failed` instance replaces it.
 
 ## Troubleshooting
@@ -356,6 +372,10 @@ The OHIF JSON is missing or misstating the windowing or rescale tags — see [OH
 ### 🟡 Redact burned-in text
 
 The [burned-in text](#burned-in-text) gate rests on the uploader's confirmation. An optional Celery stage running `presidio-image-redactor` on the same modalities would check the pixels on the platform and could replace or supplement it; the attested instances are findable by `pixel_review`. Too heavy for the synchronous upload path ([dicom-deidentification-tools.md](../../docs/engineering-notes/dicom-deidentification-tools.md)).
+
+### 🟢 Attach after upload
+
+A study can be attached to a recording only at upload. An endpoint to attach, move or detach one, mirroring the media app's `PATCH attached_to`, would let a study uploaded first be paired with its recording later.
 
 ### 🟢 Safe private attributes
 
