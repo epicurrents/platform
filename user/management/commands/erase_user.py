@@ -194,17 +194,21 @@ class Command(BaseCommand):
         )
 
     def _preserved_stored_names(self, user) -> list:
-        """Stored names of owned recordings when originals preservation is on.
+        """Stored names of owned recordings, and plugin originals directories, when preservation is on.
 
         Returns an empty list when ``RECORDINGS_PRESERVE_MODE`` is ``"off"``.
         The names key the operator's out-of-band reconciliation of the
-        write-only originals volume; the platform itself never reads it.
+        write-only originals volume; the platform itself never reads it. A
+        plugin's entries are ``plugins/<plugin>/<key>`` paths, from
+        ``recordings.preservation.register_plugin_originals``.
         """
         from django.conf import settings
 
+        from recordings.preservation import plugin_original_paths
+
         if getattr(settings, "RECORDINGS_PRESERVE_MODE", "off") == "off":
             return []
-        return list(user.recordings.values_list("stored_name", flat=True))
+        return list(user.recordings.values_list("stored_name", flat=True)) + plugin_original_paths(user)
 
     def _unlink_owned_files(self, user):
         """Unlink recording and media files before the cascade removes the rows.

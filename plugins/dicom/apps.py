@@ -29,6 +29,7 @@ class DicomConfig(PluginConfig):
     def ready(self):
         """Wire the plugin's extension points.
 
+        - The ``DICOM_UID_KEY`` system check (``checks.py``).
         - File-unlink ``pre_delete`` receiver, so every hard-delete path
           (purge, study delete, account-erasure cascade) cleans the
           filesystem.
@@ -37,9 +38,11 @@ class DicomConfig(PluginConfig):
         - Audit masking for patient demographics: the patient is not a
           platform ``User``, so the subject-erasure registry cannot key on
           them — write-time masking is the only lever that keeps their
-          identity out of the permanent audit trail. The live ``DicomStudy``
-          row keeps plaintext for the viewer.
+          identity out of the permanent audit trail, whether or not the
+          study was de-identified at ingest. The as-uploaded digest is
+          withheld outright.
         """
+        import plugins.dicom.checks
         import plugins.dicom.signals  # noqa: F401
         from activity.audit import register_masked_fields
         from epicurrents.permissions import register_read_permission_extension
@@ -59,6 +62,18 @@ class DicomConfig(PluginConfig):
             },
         )
 
+        # The as-uploaded digest links a stored file to the original held by
+        # whoever acquired it; a masking digest of it could be recomputed from
+        # that original, so it is withheld.
+        register_masked_fields("dicom.dicominstance", {"source_hash"}, withhold=True)
+
+        # Account erasure lists a DICOM author's preserved originals for the
+        # operator. Only a rewritten file was preserved; a file the pass refused
+        # has no row, and its manifest names the author_id instead.
+        from recordings.preservation import register_plugin_originals
+
+        register_plugin_originals("dicom", _preserved_original_keys)
+
         # Subject-access export. AGENTS.md's rule says projects *and plugins*
         # register their own; the plugin half was missed when the rule landed, and
         # manage.py check refuses to boot a dicom deployment until it is here.
@@ -70,3 +85,13 @@ class DicomConfig(PluginConfig):
             fields=("created_at",),
             title="DICOM studies you imported",
         )
+
+
+def _preserved_original_keys(user) -> list[str]:
+    """The originals-volume directory keys of *user*'s rewritten DICOM files: each stored name's prefix."""
+    from plugins.dicom.models import DicomInstance
+
+    names = DicomInstance.objects.filter(
+        series__study__author=user, deidentification_version__isnull=False
+    ).values_list("stored_name", flat=True)
+    return [name.split(".", 1)[0] for name in names]

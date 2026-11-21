@@ -11,9 +11,9 @@
             </wa-button>
         </header>
 
-        <wa-alert v-if="error" open variant="danger">
+        <wa-callout v-if="error" variant="danger">
             {{ error }}
-        </wa-alert>
+        </wa-callout>
 
         <div v-if="loading" class="loading-state">
             <wa-spinner></wa-spinner>
@@ -86,27 +86,60 @@
             :open="showUploadDialog"
             @wa-after-hide="closeUploadDialog"
         >
-            <p>{{ t('Select one or more DICOM files (.dcm) or folders to upload.', SCOPE) }}</p>
-            <input
-                accept=".dcm,application/dicom"
-                class="file-input"
-                multiple
-                ref="fileInputRef"
-                type="file"
-                @change="onFilesSelected"
-            />
-            <wa-button appearance="plain" @click="chooseFiles">
-                {{ t('Choose files', SCOPE) }}
-            </wa-button>
-            <span v-if="selectedFiles.length" class="file-count">
-                {{ t('{count} file(s) selected', SCOPE, { count: selectedFiles.length }) }}
-            </span>
+            <div v-if="heldForReview.length" class="review-step">
+                <wa-callout variant="warning">
+                    {{
+                        t(
+                            '{count} image(s) may show identifying text in the picture itself: ultrasound images, '
+                                + 'secondary captures and images marked as carrying burned-in annotation. The '
+                                + 'platform removes identifying details from the file header, but it cannot see '
+                                + 'text in the image.',
+                            SCOPE,
+                            { count: heldForReview.length }
+                        )
+                    }}
+                </wa-callout>
+                <wa-checkbox v-wa="[reviewForm, 'confirmed']">
+                    {{
+                        t(
+                            'I have checked these images and they show no names, IDs, dates or other identifying text.',
+                            SCOPE
+                        )
+                    }}
+                </wa-checkbox>
+            </div>
+            <template v-else>
+                <p>{{ t('Select one or more DICOM files (.dcm) or folders to upload.', SCOPE) }}</p>
+                <input
+                    accept=".dcm,application/dicom"
+                    class="file-input"
+                    multiple
+                    ref="fileInputRef"
+                    type="file"
+                    @change="onFilesSelected"
+                />
+                <wa-button appearance="plain" @click="chooseFiles">
+                    {{ t('Choose files', SCOPE) }}
+                </wa-button>
+                <span v-if="selectedFiles.length" class="file-count">
+                    {{ t('{count} file(s) selected', SCOPE, { count: selectedFiles.length }) }}
+                </span>
+            </template>
 
             <div class="dialog-footer" slot="footer">
                 <wa-button appearance="plain" @click="closeUploadDialog">
                     {{ t('Cancel', SCOPE) }}
                 </wa-button>
-                <wa-button
+                <wa-button v-if="heldForReview.length"
+                    appearance="filled-outlined"
+                    variant="brand"
+                    :disabled="!reviewForm.confirmed || uploading"
+                    @click="uploadReviewed"
+                >
+                    <wa-spinner v-if="uploading" slot="prefix"></wa-spinner>
+                    {{ uploading ? t('Uploading…', SCOPE) : t('Upload checked images', SCOPE) }}
+                </wa-button>
+                <wa-button v-else
                     appearance="filled-outlined"
                     variant="brand"
                     :disabled="selectedFiles.length === 0 || uploading"
@@ -132,7 +165,7 @@
             <AccessRightsPanel v-else-if="studyToShare"
                 v-model:accessRights="accessRights"
                 :grantFn="grantFn"
-                :infoMessage="t('Shared studies are served as uploaded: the files and their patient details are not de-identified.', SCOPE)"
+                :infoMessage="shareNotice(studyToShare)"
                 :modes="['user']"
                 :revokeFn="revokeFn"
             ></AccessRightsPanel>
@@ -170,14 +203,14 @@
 </template>
 
 <script setup lang="ts">
-import { onMounted, ref } from 'vue'
+import { onMounted, reactive, ref } from 'vue'
 import { useAuthStore } from '#stores/auth'
 import { showToast } from '#lib/toast'
 import { t } from '#i18n'
 import AccessRightsPanel from '#components/AccessRightsPanel.vue'
 import type { AccessRight, GrantAccessPayload } from '#api/library'
-import type { DicomStudyOut } from './api'
-import { dicomApi } from './api'
+import type { DicomStudyOut, DicomUploadOut } from './api'
+import { BURNED_IN_CONFIRMATION_REQUIRED, dicomApi } from './api'
 
 const SCOPE = 'DicomStudiesView'
 
@@ -189,6 +222,9 @@ const error = ref('')
 const showUploadDialog = ref(false)
 const uploading = ref(false)
 const selectedFiles = ref<File[]>([])
+// Files the server held back until the uploader confirms their pixels show no identifying text.
+const heldForReview = ref<File[]>([])
+const reviewForm = reactive({ confirmed: false })
 const fileInputRef = ref<HTMLInputElement | null>(null)
 const studyToDelete = ref<DicomStudyOut | null>(null)
 const studyToShare = ref<DicomStudyOut | null>(null)
@@ -237,6 +273,8 @@ function openUploadDialog() {
 
 function closeUploadDialog() {
     showUploadDialog.value = false
+    heldForReview.value = []
+    reviewForm.confirmed = false
 }
 
 function chooseFiles() {
@@ -252,32 +290,72 @@ async function startUpload() {
     if (!selectedFiles.value.length) {
         return
     }
+    await upload(selectedFiles.value, false)
+}
+
+async function uploadReviewed() {
+    if (!heldForReview.value.length || !reviewForm.confirmed) {
+        return
+    }
+    await upload(heldForReview.value, true)
+}
+
+/**
+ * Upload *files* and report the outcome. Files the server holds back for a pixel check stay in the dialog, which
+ * then asks for the confirmation instead of closing.
+ * @param files - The batch, in the order the report's `index` refers to.
+ * @param confirmBurnedIn - The uploader confirmed the batch's images show no identifying text.
+ */
+async function upload(files: File[], confirmBurnedIn: boolean) {
     uploading.value = true
     try {
-        const result = await dicomApi.uploadFiles(selectedFiles.value)
-        showUploadDialog.value = false
+        const result = await dicomApi.uploadFiles(files, confirmBurnedIn)
+        const held = result.files
+            .filter(f => f.code === BURNED_IN_CONFIRMATION_REQUIRED)
+            .map(f => files[f.index])
         selectedFiles.value = []
-        // Ingest is synchronous — the returned studies are immediately ready.
-        showToast(
-            t('Uploaded {count} file(s).', SCOPE, { count: result.accepted }),
-            'success',
-        )
-        if (result.rejected > 0) {
-            const firstError = result.files.find(f => !f.accepted)?.error ?? ''
-            showToast(
-                t(
-                    '{count} file(s) were rejected: {reason}',
-                    SCOPE,
-                    { count: result.rejected, reason: firstError }
-                ),
-                'warning',
-            )
+        reviewForm.confirmed = false
+        heldForReview.value = held
+        if (!held.length) {
+            showUploadDialog.value = false
         }
+        reportUpload(result)
         await loadStudies()
     } catch {
         showToast(t('Upload failed. Please try again.', SCOPE), 'danger')
     } finally {
         uploading.value = false
+    }
+}
+
+function reportUpload(result: DicomUploadOut) {
+    // Ingest is synchronous — the returned studies are immediately ready.
+    if (result.accepted > 0) {
+        showToast(
+            t('Uploaded {count} file(s).', SCOPE, { count: result.accepted }),
+            'success',
+        )
+    }
+    if (result.warnings.length) {
+        showToast(
+            t(
+                'A description is stored as written and may identify someone: {reason}',
+                SCOPE,
+                { reason: result.warnings[0].message }
+            ),
+            'warning',
+        )
+    }
+    const refused = result.files.filter(f => !f.accepted && f.code !== BURNED_IN_CONFIRMATION_REQUIRED)
+    if (refused.length) {
+        showToast(
+            t(
+                '{count} file(s) were rejected: {reason}',
+                SCOPE,
+                { count: refused.length, reason: refused[0].error ?? '' }
+            ),
+            'warning',
+        )
     }
 }
 
@@ -293,6 +371,22 @@ async function openShareDialog(study: DicomStudyOut) {
     } finally {
         accessLoading.value = false
     }
+}
+
+function shareNotice(study: DicomStudyOut): string {
+    if (study.deidentification_version === null) {
+        return t(
+            'This study is stored as uploaded: its files and patient details are not de-identified, and everyone '
+                + 'you share it with receives them as they are.',
+            SCOPE
+        )
+    }
+    return t(
+        'Patient details were removed from this study\'s files when they were uploaded. The platform does not check '
+            + 'the images themselves for text; for ultrasound and similar images, the uploader confirmed they show '
+            + 'none.',
+        SCOPE
+    )
 }
 
 function closeShareDialog() {
@@ -421,6 +515,12 @@ async function deleteStudy() {
     margin-left: 0.75rem;
     color: var(--wa-color-text-quiet);
     font-size: 0.9rem;
+}
+
+.review-step {
+    display: flex;
+    flex-direction: column;
+    gap: 1rem;
 }
 
 .dialog-footer {

@@ -43,6 +43,7 @@ from recordings.preservation import (
     MODE_ALL,
     MODE_FAILED,
     MODE_NONE,
+    PLUGIN_ORIGINALS_DIR,
     VALID_PRESERVE_MODES,
 )
 
@@ -202,6 +203,9 @@ def _build_report(
     size_mismatches: list[dict] = []
 
     for entry in sorted(originals_root.iterdir()):
+        if entry.name == PLUGIN_ORIGINALS_DIR and entry.is_dir():
+            # Plugins' preserved files, which describe no recording.
+            continue
         if not entry.is_dir():
             # Stray files at the volume root are reported as malformed for
             # operator attention.

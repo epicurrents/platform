@@ -74,9 +74,9 @@ class DicomStudy(models.Model):
     study_time = models.CharField(max_length=16, blank=True, default="")
     study_description = models.CharField(max_length=256, blank=True, default="")
 
-    # Patient demographics — stored as parsed from the file. Masked out of
-    # audit payloads (see apps.py); ingest de-identification is a tracked
-    # roadmap item (plugins/dicom/README.md → Roadmap).
+    # Patient demographics — stored as parsed from the stored file, so with
+    # de-identification on they hold the pass's dummies. Masked out of audit
+    # payloads either way (see apps.py).
     patient_name = models.CharField(max_length=256, blank=True, default="")
     patient_id = models.CharField(max_length=64, blank=True, default="")
     patient_birth_date = models.CharField(max_length=8, blank=True, default="")
@@ -87,6 +87,11 @@ class DicomStudy(models.Model):
     # Derived / cached fields refreshed by ingest.refresh_study_aggregates.
     num_instances = models.IntegerField(default=0)
     modalities = models.CharField(max_length=256, blank=True, default="")  # comma-joined
+    # The lowest de-identification version among the study's ready instances,
+    # or null when any of them is stored as uploaded: a study counts as
+    # de-identified only when every file of it is.
+    deidentification_version = models.PositiveSmallIntegerField(null=True, blank=True, default=None)
+    patient_characteristics_retained = models.BooleanField(default=False)
 
     # Opaque public identifier — see make_content_hash. Use this in URLs
     # instead of the integer PK.
@@ -213,6 +218,16 @@ class DicomInstance(models.Model):
         READY = "ready", "Ready"
         FAILED = "failed", "Failed"
 
+    class PixelReview(models.TextChoices):
+        """Who decided the image's pixels carry no identifying text; the platform reads no pixels.
+
+        Blank when the file is stored as uploaded, where no review applies.
+        """
+
+        NOT_REQUIRED = "not_required", "Not required"
+        # The uploader confirmed it; nothing on the platform has looked.
+        ATTESTED = "attested", "Attested by the uploader"
+
     series = models.ForeignKey(
         DicomSeries,
         on_delete=models.CASCADE,
@@ -257,7 +272,21 @@ class DicomInstance(models.Model):
     # Never derived from user input; generated at upload time.
     stored_name = models.CharField(max_length=255, unique=True)
     file_size = models.BigIntegerField()
+    # SHA-256 of the stored file, which with de-identification on is the
+    # rewritten one.
     file_hash = models.CharField(max_length=64, blank=True, default="")
+    # SHA-256 of the file as uploaded. A bit-exact link to the original held by
+    # whoever acquired it, so it is never serialised to anyone, the author
+    # included, and is withheld from the audit trail (apps.py). Read only by
+    # index_dicom --resume.
+    source_hash = models.CharField(max_length=64, blank=True, default="")
+    # The version of plugins/dicom/deidentify.py that wrote the stored file, or
+    # null when it is stored as uploaded.
+    deidentification_version = models.PositiveSmallIntegerField(null=True, blank=True, default=None)
+    patient_characteristics_retained = models.BooleanField(default=False)
+    # Set by ingest.prepare_file; see PixelReview. A later redaction stage or a
+    # re-review finds the attested images by this field.
+    pixel_review = models.CharField(max_length=16, choices=PixelReview.choices, blank=True, default="")
 
     status = models.CharField(
         max_length=16,

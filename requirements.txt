@@ -54,6 +54,9 @@ mne>=1.0.0,<2
 # pylibjpeg + pylibjpeg-libjpeg enable lossless JPEG decompression during
 # tag extraction; they are optional but recommended for JPEG-compressed DICOM.
 pydicom>=3.0.2,<4
+# dicom-anonymizer ships the PS3.15 Annex E tag table the de-identification pass
+# (plugins/dicom/deidentify.py) applies; its own actions are not used.
+dicom-anonymizer>=2.1.0,<3
 pylibjpeg>=2.1.0,<3; platform_system != "Windows"
 pylibjpeg-libjpeg>=2.4.0,<3; platform_system != "Windows"
 

@@ -720,6 +720,10 @@ decorator==5.3.1 \
     --hash=sha256:4cbcdd55a6efadb9dbea26b858f4fb3264567b52d69ca0d25b721b553f60ea82 \
     --hash=sha256:f47fe6fdbd2edd623ecfe36875d37aba411624e2670dd395dddae1358689bb3c
     # via mne
+dicom-anonymizer==2.1.0 \
+    --hash=sha256:bf642a6b43afd362faa2c7d2b101a3d4765cf85cf0d7590795e3ee556e636b8b \
+    --hash=sha256:ee8ff2013a960d27c41481a8768612ea6bea1802641b0d3baf8a356867213c47
+    # via -r requirements.txt
 django==6.0.8 \
     --hash=sha256:9b98b7e1902e0e575ea4f42c175fc9512784f7f2580898286aee3388b322219d \
     --hash=sha256:cb0bd962d27fc866f3c514b20aae6a7df56ec80b488f9899da46d675cd051526
@@ -2033,7 +2037,9 @@ pydantic-core==2.50.1 \
 pydicom==3.0.2 \
     --hash=sha256:5942bfc2d72c6fa4b3b5b62c527f54b7f2355f21d6f5d296df6bb30188df6a4f \
     --hash=sha256:abf971a5440f84dbaf42c4b6758e30e62480902584f8b270b9a5d146e278a07b
-    # via -r requirements.txt
+    # via
+    #   -r requirements.txt
+    #   dicom-anonymizer
 pylibjpeg==2.1.0 ; sys_platform != 'win32' \
     --hash=sha256:25df9496a69e64e98c887fddee12a1271e275b5f74ba804f9bf98a08bb80993e \
     --hash=sha256:2decda24982394533f16f1c6a17a6242f3391b95f69fac56c6a598a6b1362105
@@ -2189,7 +2195,9 @@ sqlparse==0.6.0 \
 tqdm==4.70.1 \
     --hash=sha256:c293e525e6fef9c20e8728fd4612df02a0aa31bb5fe91ecd93e123b1b7bffa73 \
     --hash=sha256:cefd0eca11b2a37a3aee776544d4f4ae913f02688135b5556b8788dfa474afc4
-    # via mne
+    # via
+    #   dicom-anonymizer
+    #   mne
 typing-extensions==4.16.0 \
     --hash=sha256:481caa481374e813c1b176ada14e97f1f67a4539ce9cfeb3f350d78d6370c2e8 \
     --hash=sha256:dc983d19a509c94dba722ee6abd33940f7c05a89e243c47e907eb4db6f1a43e5

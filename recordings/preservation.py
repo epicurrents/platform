@@ -278,6 +278,82 @@ def _write_manifest(
 
 
 # ---------------------------------------------------------------------------
+# Plugin originals
+# ---------------------------------------------------------------------------
+
+#: The directory at the volume root under which plugins preserve their own files, one subdirectory per plugin.
+#: ``validate_originals`` checks recording directories only and passes over this one; a recording directory is a
+#: 32-hex prefix, so the name cannot collide with one.
+PLUGIN_ORIGINALS_DIR = "plugins"
+
+#: plugin name → callable taking a user and returning the directory keys of the originals held for their uploads.
+_PLUGIN_ORIGINAL_OWNERS: dict = {}
+
+
+def register_plugin_originals(plugin: str, keys_for_user) -> None:
+    """Register how to find a user's preserved originals under ``plugins/<plugin>/``, for account erasure.
+
+    ``erase_user`` prints the directories for the operator's out-of-band
+    reconciliation, as it does the recordings' stored names; the platform never
+    reads the volume. Called from the plugin's ``AppConfig.ready()``.
+    """
+    _PLUGIN_ORIGINAL_OWNERS[plugin] = keys_for_user
+
+
+def plugin_original_paths(user) -> list[str]:
+    """Return ``plugins/<plugin>/<key>`` for every registered plugin's originals that *user* uploaded."""
+    return [
+        f"{PLUGIN_ORIGINALS_DIR}/{plugin}/{key}"
+        for plugin, keys_for_user in sorted(_PLUGIN_ORIGINAL_OWNERS.items())
+        for key in keys_for_user(user)
+    ]
+
+
+def write_plugin_original(
+    plugin: str,
+    key: str,
+    source_path: str | Path,
+    *,
+    reason: str,
+    original_name: str,
+    manifest: dict,
+) -> bool:
+    """Copy *source_path* to ``<originals>/plugins/<plugin>/<key>/`` with *manifest* beside it.
+
+    The plugin counterpart of :func:`write_original`, under the same contract: the
+    volume is written and never read back, a directory that already holds a
+    ``manifest.json`` is left alone, and every failure is logged and swallowed so
+    preservation never blocks ingest. *key* names the directory and must be a
+    platform-generated identifier, never user input; *original_name* names the
+    data file and is reduced to its final path segment. The caller decides
+    whether the configured mode asks for a copy. Returns True when one was
+    written.
+    """
+    if reason not in (REASON_ALL, REASON_FAILED):
+        raise ValueError(f"write_plugin_original reason must be {REASON_ALL!r} or {REASON_FAILED!r}, got {reason!r}")
+    root = _originals_root()
+    if root is None or not key or Path(key).name != key or not plugin or Path(plugin).name != plugin:
+        return False
+    target_dir = root / PLUGIN_ORIGINALS_DIR / plugin / key
+    source = Path(source_path)
+    if not source.is_file():
+        logger.warning("write_plugin_original: source missing for %s/%s — preservation skipped", plugin, key)
+        return False
+    if (target_dir / "manifest.json").exists():
+        return False
+    target_file = target_dir / _safe_original_filename(original_name)
+    try:
+        target_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, target_file)
+        (target_dir / "manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True))
+    except OSError as exc:
+        logger.error("write_plugin_original: failed to preserve %s/%s — %s", plugin, key, exc)
+        return False
+    logger.info("write_plugin_original: preserved %s/%s (reason=%s)", plugin, key, reason)
+    return True
+
+
+# ---------------------------------------------------------------------------
 # Source-bytes stash for converter-bound formats in mode "failed"
 # ---------------------------------------------------------------------------
 #

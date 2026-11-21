@@ -32,6 +32,8 @@ export interface DicomStudyOut {
     is_author: boolean
     /** Whether the caller may manage the study's access rights: author, superuser or a `can_share` grant. */
     can_share: boolean
+    /** The de-identification pass every file was rewritten by, or null when any file is stored as uploaded. */
+    deidentification_version: number | null
 }
 
 export interface DicomStudyDetailOut extends DicomStudyOut {
@@ -45,10 +47,22 @@ export interface DicomUploadStudyOut {
 }
 
 export interface DicomUploadFileOut {
+    /** The file's position in the request; the report is not in request order. */
+    index: number
     filename: string
     accepted: boolean
     study_hash: string | null
     error: string | null
+    /** A refusal the client can act on: `BURNED_IN_CONFIRMATION_REQUIRED`. */
+    code: string | null
+}
+
+/** A study or series description that looks like it holds an identifier; it is stored as written. */
+export interface DicomNameWarningOut {
+    field: string
+    kind: string
+    message: string
+    study_hash: string
 }
 
 export interface DicomUploadOut {
@@ -56,9 +70,17 @@ export interface DicomUploadOut {
     files: DicomUploadFileOut[]
     accepted: number
     rejected: number
+    warnings: DicomNameWarningOut[]
 }
 
 const BASE = '/plugin/dicom/api/v1/dicom'
+
+/**
+ * The refusal code for an image that may show identifying text in its pixels (ultrasound, secondary capture, or a
+ * flagged burned-in annotation). The server decides which files it applies to; resubmitting them with
+ * `confirmBurnedIn` records that the uploader checked them.
+ */
+export const BURNED_IN_CONFIRMATION_REQUIRED = 'burned_in_confirmation_required'
 
 export const dicomApi = {
     listStudies(): Promise<DicomStudyOut[]> {
@@ -79,8 +101,9 @@ export const dicomApi = {
     },
 
     /**
-     * Grant a user an access right on a study. Only user targets are accepted for now, and there is no
-     * de-identifying serving path for DICOM, so the payload's `apply_middleware` is ignored.
+     * Grant a user an access right on a study. Only user targets are accepted for now. A study is de-identified, or
+     * not, when it is stored, and every grantee receives the stored files, so the payload's `apply_middleware` is
+     * ignored.
      * @param hash - The study's `hash` from the study listing.
      * @param payload - The grant, as the shared access-rights panel builds it.
      */
@@ -92,13 +115,19 @@ export const dicomApi = {
         return http.delete(`${BASE}/studies/${hash}/access/${rightId}/`)
     },
 
-    uploadFiles(files: File[]): Promise<DicomUploadOut> {
+    /**
+     * Upload a batch of DICOM files. The report's `index` names each file's position in *files*.
+     * @param files - The files to upload, in the order the report's `index` refers to.
+     * @param confirmBurnedIn - The uploader has checked these images and they show no identifying text.
+     */
+    uploadFiles(files: File[], confirmBurnedIn = false): Promise<DicomUploadOut> {
         const form = new FormData()
         for (const file of files) {
             form.append('files', file)
         }
         return http.post<DicomUploadOut>(`${BASE}/upload/`, form, {
             headers: { 'Content-Type': 'multipart/form-data' },
+            params: confirmBurnedIn ? { confirm_burned_in: true } : undefined,
         }).then(r => r.data)
     },
 

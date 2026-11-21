@@ -48,6 +48,25 @@ DICOM_OHIF_DIST_PATH = os.getenv(
 DICOM_OHIF_DEMO_DATA = env_bool("DICOM_OHIF_DEMO_DATA", default=False)
 
 # ---------------------------------------------------------------------------
+# De-identification
+# ---------------------------------------------------------------------------
+
+# Rewrite every file at ingest through the Annex E pass in plugins/dicom/deidentify.py,
+# so the stored file, and everything served from it, carries no patient identity. Off
+# stores and serves files as uploaded; turning it off is a deliberate choice an
+# operator makes for data that is already de-identified at the source.
+DICOM_DEIDENTIFY_ON_INGEST = env_bool("DICOM_DEIDENTIFY_ON_INGEST", default=True)
+
+# Keep patient sex, age, size and weight (PS3.15 Retain Patient Characteristics).
+DICOM_RETAIN_PATIENT_CHARACTERISTICS = env_bool("DICOM_RETAIN_PATIENT_CHARACTERISTICS", default=False)
+
+# Key for the HMAC that replaces every UID. A dedicated secret rather than SECRET_KEY,
+# so rotating the session secret does not split every study uploaded since. Generated
+# by init_env and by scripts/enable_plugin.sh; changing it makes a later upload of an
+# existing study a separate study. While it is empty, de-identified upload is refused.
+DICOM_UID_KEY = os.getenv("DICOM_UID_KEY", "")
+
+# ---------------------------------------------------------------------------
 # Behaviour flags
 # ---------------------------------------------------------------------------
 

@@ -85,3 +85,30 @@ class TestStudyInheritsAttachmentAccess:
         assert can_read_object(grantee, study) is False
         # The recording's author still reads through the attachment.
         assert can_read_object(recording.author, study) is True
+
+
+@pytest.mark.django_db
+class TestDeidentifyingParentGrant:
+    """A study stored as uploaded conveys nothing through a parent read under de-identifying terms."""
+
+    def _grantee(self, make_user, recording, *, apply_middleware):
+        grantee = make_user()
+        AccessRight.objects.create(
+            content_type=ContentType.objects.get_for_model(recording, for_concrete_model=False),
+            object_id=str(recording.pk),
+            access_giver=recording.author,
+            access_target=grantee,
+            can_read=True,
+            apply_middleware=apply_middleware,
+        )
+        return grantee
+
+    @pytest.mark.parametrize(
+        ("version", "apply_middleware", "readable"),
+        [(None, True, False), (None, False, True), (1, True, True), (1, False, True)],
+    )
+    def test_matrix(self, make_user, make_study, recording, version, apply_middleware, readable):
+        study = make_study(recording.author, deidentification_version=version)
+        _attach(study, recording)
+        grantee = self._grantee(make_user, recording, apply_middleware=apply_middleware)
+        assert can_read_object(grantee, study) is readable

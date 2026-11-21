@@ -138,6 +138,9 @@ _KEY_REPLACEMENTS: dict[str, callable] = {
     "DB_PASSWORD": _env_file_safe(_random_password),
     "REDIS_PASSWORD": _env_file_safe(_random_password),
     "ACTIVITY_HASH_KEY_V1": _env_file_safe(_random_hmac_key),
+    # The dicom plugin's UID-replacement key. Generated on every deployment so
+    # enabling the plugin later needs no edit; unused until it is enabled.
+    "DICOM_UID_KEY": _env_file_safe(_random_hmac_key),
 }
 
 _VAPID_PUBLIC_KEY = "WEBPUSH_VAPID_PUBLIC_KEY"

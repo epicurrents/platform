@@ -19,10 +19,11 @@ GET    /dicomweb/studies/{uid}/series          QIDO-RS series of a study.
 GET    /dicomweb/studies/{uid}/metadata        WADO-RS metadata of a study.
 GET    /dicomweb/studies/{uid}/series/{uid}/metadata   WADO-RS metadata of a series.
 
-Upload parses every file's header synchronously (pydicom, header only) and
-creates the real study/series/instance rows before responding, so the returned
-study hashes are immediately valid for the other endpoints. See
-``plugins/dicom/ingest.py`` for the shared parse/persist logic.
+Upload parses every file's header synchronously, rewrites it through the
+de-identification pass while ``DICOM_DEIDENTIFY_ON_INGEST`` is on, and creates
+the real study/series/instance rows before responding, so the returned study
+hashes are immediately valid for the other endpoints. See
+``plugins/dicom/ingest.py`` for the shared prepare/persist logic.
 """
 
 import hashlib
@@ -60,15 +61,22 @@ from epicurrents.permissions import (
     can_read_object,
     ensure_can_write_object,
 )
+from epicurrents.text_hygiene import NameWarningOut, name_warnings
 from plugins.dicom import dicomweb
 from plugins.dicom.ingest import (
+    DeidentificationFailed,
+    DeidentificationUnavailable,
     MissingUidsError,
-    parse_dicom_header,
+    PixelReviewRequired,
+    deidentification_enabled,
     persist_instance,
+    prepare_file,
+    preserve_original,
     refresh_study_aggregates,
-    required_uids,
+    require_uid_key,
 )
 from plugins.dicom.models import DicomInstance, DicomStudy
+from recordings.preservation import REASON_ALL, REASON_FAILED, should_preserve_failed, should_preserve_original
 
 logger = logging.getLogger(__name__)
 
@@ -129,6 +137,8 @@ class DicomStudyOut(Schema):
     created_at: datetime
     is_author: bool
     can_share: bool
+    #: The de-identification pass every file of the study was rewritten by, or null when any is stored as uploaded.
+    deidentification_version: int | None = None
 
 
 class DicomStudyDetailOut(DicomStudyOut):
@@ -148,19 +158,30 @@ class DicomUploadStudyOut(Schema):
 class DicomUploadFileOut(Schema):
     """Per-file outcome of an upload batch."""
 
+    #: The file's position in the request's ``files``; the report is not in request order.
+    index: int
     filename: str
     accepted: bool
     study_hash: str | None = None
     error: str | None = None
+    #: A machine-readable reason for a refusal the client can act on: ``burned_in_confirmation_required``.
+    code: str | None = None
+
+
+class DicomNameWarningOut(NameWarningOut):
+    """A text-hygiene warning on a study or series description the upload stored, kept as written."""
+
+    study_hash: str
 
 
 class DicomUploadOut(Schema):
-    """Response after a batch upload — real study hashes, per-file report."""
+    """Response after a batch upload — real study hashes, per-file report, description warnings."""
 
     studies: list[DicomUploadStudyOut]
     files: list[DicomUploadFileOut]
     accepted: int
     rejected: int
+    warnings: list[DicomNameWarningOut] = []
 
 
 class GrantStudyAccessIn(Schema):
@@ -230,6 +251,7 @@ def _study_out(study: DicomStudy, user) -> DicomStudyOut:
         created_at=study.created_at,
         is_author=study.author_id == user.pk,
         can_share=_can_share_study(user, study),
+        deidentification_version=study.deidentification_version,
     )
 
 
@@ -425,17 +447,31 @@ def upload_dicom(
     files: list[UploadedFile] = File(...),
     attached_to_type: str | None = None,
     attached_to_id: str | None = None,
+    confirm_burned_in: bool = False,
 ):
     """Accept a batch of DICOM files, parse their headers, and persist them.
 
     Each file is streamed to ``DICOM_STAGING_PATH`` (hashing as it lands),
-    header-parsed with pydicom, and — when valid — persisted as real
+    header-parsed with pydicom, rewritten through the de-identification pass
+    into a second staged file, and — when valid — persisted as real
     study/series/instance rows in one transaction. After the transaction
-    commits, files move to ``DICOM_UPLOAD_PATH`` and their instances flip to
-    ``ready``. Unparseable files, files missing required UIDs, oversized
-    files, and duplicates of already-ready instances are rejected per file
-    and reported in the ``files`` list; they never abort the rest of the
-    batch.
+    commits, the as-uploaded file goes to the originals volume when the
+    preservation mode asks for it and is deleted, the stored file moves to
+    ``DICOM_UPLOAD_PATH`` and its instance flips to ``ready``. Unparseable
+    files, files missing required UIDs, files the pass cannot rewrite,
+    oversized files, and duplicates of already-ready instances are rejected
+    per file and reported in the ``files`` list; they never abort the rest of
+    the batch. With de-identification on and no ``DICOM_UID_KEY``, the whole
+    request is refused with a 503 before anything is staged.
+
+    With de-identification on, a file that may show identifying text in its
+    pixels (``ingest.pixel_review_required``: ultrasound, secondary capture,
+    other, or Burned In Annotation YES) is refused with the code
+    ``burned_in_confirmation_required`` and nothing written for it, unless
+    ``confirm_burned_in`` says the author has checked the batch's images. The
+    client resubmits those files, found by their ``index``, with the flag set.
+    A batch with nothing accepted answers 400, except when some of its files
+    await that confirmation: then it answers 200 with the report.
 
     ``attached_to_type`` + ``attached_to_id`` optionally attach the resulting
     study to a parent object (today only ``type="recording"``, identified by
@@ -453,16 +489,25 @@ def upload_dicom(
 
     attach_target = _resolve_attachment(user, attached_to_type, attached_to_id)
 
+    if deidentification_enabled():
+        try:
+            require_uid_key()
+        except DeidentificationUnavailable as exc:
+            logger.error("DICOM upload refused: %s", exc)
+            raise HttpError(503, "DICOM upload is unavailable: de-identification is not configured.")
+
     staging = _staging_path()
     upload = _upload_path()
     max_size = getattr(settings, "DICOM_MAX_UPLOAD_FILE_SIZE", 2 * 1024**3)
 
     file_reports: list[DicomUploadFileOut] = []
-    # Entries that passed staging + parsing and await the DB transaction:
-    # (original filename, staging path, stored name, size, sha256, dataset).
+    # Entries that passed staging + preparation and await the DB transaction:
+    # (index, original filename, staging path, stored name, PreparedFile). The staging
+    # path holds the bytes as uploaded; the prepared file's path the bytes to
+    # store, which is the same path when nothing was rewritten.
     staged: list[tuple] = []
 
-    for upload_file in files:
+    for index, upload_file in enumerate(files):
         original_name = upload_file.name or "upload.dcm"
         stored_name = f"{uuid.uuid4().hex}.dcm"
         staging_file = os.path.join(staging, stored_name)
@@ -484,6 +529,7 @@ def upload_dicom(
             _unlink_quietly(staging_file)
             file_reports.append(
                 DicomUploadFileOut(
+                    index=index,
                     filename=original_name,
                     accepted=False,
                     error="Failed to store the uploaded file.",
@@ -495,6 +541,7 @@ def upload_dicom(
             _unlink_quietly(staging_file)
             file_reports.append(
                 DicomUploadFileOut(
+                    index=index,
                     filename=original_name,
                     accepted=False,
                     error=f"File exceeds maximum upload size ({max_size} bytes).",
@@ -503,12 +550,36 @@ def upload_dicom(
             continue
 
         try:
-            ds = parse_dicom_header(staging_file)
-            required_uids(ds)
+            prepared = prepare_file(
+                staging_file,
+                target_path=os.path.join(staging, f"{stored_name}.deid"),
+                source_hash=hasher.hexdigest(),
+                confirm_burned_in=confirm_burned_in,
+            )
+        except DeidentificationFailed as exc:
+            if should_preserve_failed():
+                preserve_original(
+                    staging_file,
+                    stored_name=stored_name,
+                    original_name=original_name,
+                    prepared=None,
+                    author_id=user.pk,
+                    reason=REASON_FAILED,
+                )
+            _unlink_quietly(staging_file)
+            file_reports.append(DicomUploadFileOut(index=index, filename=original_name, accepted=False, error=str(exc)))
+            continue
+        except PixelReviewRequired as exc:
+            _unlink_quietly(staging_file)
+            file_reports.append(
+                DicomUploadFileOut(index=index, filename=original_name, accepted=False, error=str(exc), code=exc.code)
+            )
+            continue
         except MissingUidsError as exc:
             _unlink_quietly(staging_file)
             file_reports.append(
                 DicomUploadFileOut(
+                    index=index,
                     filename=original_name,
                     accepted=False,
                     error=str(exc),
@@ -519,6 +590,7 @@ def upload_dicom(
             _unlink_quietly(staging_file)
             file_reports.append(
                 DicomUploadFileOut(
+                    index=index,
                     filename=original_name,
                     accepted=False,
                     error="Not a parseable DICOM file.",
@@ -526,27 +598,32 @@ def upload_dicom(
             )
             continue
 
-        staged.append((original_name, staging_file, stored_name, total_size, hasher.hexdigest(), ds))
+        staged.append((index, original_name, staging_file, stored_name, prepared))
 
     # Persist all parsed files in one transaction (multi-step write rule).
-    persisted: list[tuple] = []  # (original_name, staging_file, PersistResult)
+    persisted: list[tuple] = []  # (index, original_name, staging_file, PreparedFile, PersistResult)
     studies: dict[int, DicomStudy] = {}
     instances_added: dict[int, int] = {}
     try:
         with transaction.atomic():
-            for original_name, staging_file, stored_name, size, sha, ds in staged:
+            for index, original_name, staging_file, stored_name, prepared in staged:
                 result = persist_instance(
                     author=user,
-                    ds=ds,
+                    ds=prepared.ds,
                     stored_name=stored_name,
-                    file_size=size,
-                    file_hash=sha,
+                    file_size=prepared.file_size,
+                    file_hash=prepared.file_hash,
                     status=DicomInstance.Status.PENDING,
+                    source_hash=prepared.source_hash,
+                    deidentification_version=prepared.deidentification_version,
+                    patient_characteristics_retained=prepared.patient_characteristics_retained,
+                    pixel_review=prepared.pixel_review,
                 )
                 if result.outcome == "duplicate":
-                    _unlink_quietly(staging_file)
+                    _discard_staged(staging_file, prepared)
                     file_reports.append(
                         DicomUploadFileOut(
+                            index=index,
                             filename=original_name,
                             accepted=False,
                             study_hash=result.study.content_hash,
@@ -556,7 +633,7 @@ def upload_dicom(
                     continue
                 studies[result.study.pk] = result.study
                 instances_added[result.study.pk] = instances_added.get(result.study.pk, 0) + 1
-                persisted.append((original_name, staging_file, result))
+                persisted.append((index, original_name, staging_file, prepared, result))
 
             if attach_target is not None and persisted:
                 if len(studies) != 1:
@@ -583,25 +660,38 @@ def upload_dicom(
                     )
     except HttpError:
         # The transaction rolled back — remove every file still in staging.
-        for _, staging_file, *_rest in staged:
-            _unlink_quietly(staging_file)
+        for _index, _name, staging_file, _stored_name, prepared in staged:
+            _discard_staged(staging_file, prepared)
         raise
 
     # Post-commit: move accepted files to final storage and flip to READY.
     accepted = 0
-    for original_name, staging_file, result in persisted:
+    attested = 0
+    for index, original_name, staging_file, prepared, result in persisted:
         inst = result.instance
         final_path = os.path.join(upload, inst.stored_name)
+        if prepared.path != staging_file:
+            if should_preserve_original():
+                preserve_original(
+                    staging_file,
+                    stored_name=inst.stored_name,
+                    original_name=original_name,
+                    prepared=prepared,
+                    author_id=user.pk,
+                    reason=REASON_ALL,
+                )
+            _unlink_quietly(staging_file)
         try:
-            shutil.move(staging_file, final_path)
+            shutil.move(prepared.path, final_path)
         except OSError as exc:
             logger.error("Failed to move DICOM file %s to storage: %s", inst.stored_name, exc)
             inst.status = DicomInstance.Status.FAILED
             inst.error_message = "Failed to move the file to permanent storage."
             inst.save(update_fields=["status", "error_message", "modified_at"])
-            _unlink_quietly(staging_file)
+            _discard_staged(staging_file, prepared)
             file_reports.append(
                 DicomUploadFileOut(
+                    index=index,
                     filename=original_name,
                     accepted=False,
                     study_hash=result.study.content_hash,
@@ -614,8 +704,10 @@ def upload_dicom(
         if result.previous_stored_name:
             _unlink_quietly(os.path.join(upload, result.previous_stored_name))
         accepted += 1
+        attested += prepared.pixel_review == DicomInstance.PixelReview.ATTESTED
         file_reports.append(
             DicomUploadFileOut(
+                index=index,
                 filename=original_name,
                 accepted=True,
                 study_hash=result.study.content_hash,
@@ -625,10 +717,14 @@ def upload_dicom(
     for study in studies.values():
         refresh_study_aggregates(study)
 
-    if accepted == 0:
+    held = sum(1 for report in file_reports if report.code == PixelReviewRequired.code)
+    if accepted == 0 and held == 0:
         raise HttpError(400, "No files were accepted. See the per-file report in logs.")
 
+    file_reports.sort(key=lambda report: report.index)
     single_study = next(iter(studies.values())) if len(studies) == 1 else None
+    # Counts and the flag, never which images or what they show: the actor is
+    # the row's user, and the instances carry pixel_review themselves.
     log_activity(
         verb="dicom.study.upload",
         target=single_study,
@@ -636,10 +732,14 @@ def upload_dicom(
             "study_count": len(studies),
             "accepted": accepted,
             "rejected": len(file_reports) - accepted,
+            "confirm_burned_in": confirm_burned_in,
+            "burned_in_attested": attested,
+            "burned_in_held": held,
         },
     )
 
     return DicomUploadOut(
+        warnings=_description_warnings(studies.values()),
         studies=[
             DicomUploadStudyOut(
                 hash=s.content_hash,
@@ -652,6 +752,30 @@ def upload_dicom(
         accepted=accepted,
         rejected=len(file_reports) - accepted,
     )
+
+
+def _description_warnings(studies) -> list[DicomNameWarningOut]:
+    """Text-hygiene warnings for the descriptions of *studies* and their series.
+
+    The de-identification pass keeps both descriptions, and every grantee sees
+    them as written, so an upload reports what looks like an identifier in one,
+    as every write of a grantee-visible label does. A warning, never a refusal.
+    """
+    rows = []
+    for study in studies:
+        texts = {("study_description", study.study_description)}
+        texts |= {("series_description", d) for d in study.series.values_list("series_description", flat=True)}
+        for field, text in sorted(texts):
+            for row in name_warnings(**{field: text}):
+                rows.append(DicomNameWarningOut(study_hash=study.content_hash, **row))
+    return rows
+
+
+def _discard_staged(staging_file: str, prepared) -> None:
+    """Remove a staged upload and, when the pass rewrote it, the rewritten copy beside it."""
+    _unlink_quietly(staging_file)
+    if prepared.path != staging_file:
+        _unlink_quietly(prepared.path)
 
 
 def _unlink_quietly(path: str) -> None:

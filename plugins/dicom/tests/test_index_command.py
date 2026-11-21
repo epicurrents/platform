@@ -4,6 +4,7 @@ import pytest
 from django.core.management import call_command
 
 from plugins.dicom.models import DicomInstance, DicomStudy
+from plugins.dicom.tests.conftest import stored_uid
 
 
 @pytest.mark.django_db
@@ -16,7 +17,7 @@ class TestIndexDicomCommand:
 
         call_command("index_dicom", str(src), "--user", user.username)
 
-        study = DicomStudy.objects.get(study_instance_uid="1.2.3.1")
+        study = DicomStudy.objects.get(study_instance_uid=stored_uid("1.2.3.1"))
         assert study.author == user
         assert study.num_instances == 2
         for inst in DicomInstance.objects.all():

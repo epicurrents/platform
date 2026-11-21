@@ -8,7 +8,7 @@ Run with the plugin test settings:
 ``/plugin/dicom/api/v1/`` prefix for every test; ``dicom_dirs`` points the
 storage paths at a per-test tmp_path so no test touches real volumes. The
 ``make_dicom_bytes`` / ``make_dicom_file`` factories build minimal valid
-DICOM Secondary Capture files with pydicom.
+DICOM CT image files with pydicom.
 """
 
 import io
@@ -16,7 +16,16 @@ import uuid
 
 import pytest
 
-SC_SOP_CLASS_UID = "1.2.840.10008.5.1.4.1.1.7"  # Secondary Capture Image Storage
+CT_SOP_CLASS_UID = "1.2.840.10008.5.1.4.1.1.2"  # CT Image Storage
+
+
+def stored_uid(uid: str) -> str:
+    """Return the UID the de-identification pass stores for *uid* under the test settings' key."""
+    from django.conf import settings
+
+    from plugins.dicom.deidentify import hash_uid
+
+    return hash_uid(uid, settings.DICOM_UID_KEY)
 
 
 @pytest.fixture(autouse=True)
@@ -55,18 +64,19 @@ def _build_dataset(
     patient_name: str = "Doe^John",
     patient_id: str = "P001",
     modality: str = "CT",
+    sop_class_uid: str = CT_SOP_CLASS_UID,
     extra: dict | None = None,
 ):
     import pydicom
     from pydicom.dataset import FileDataset, FileMetaDataset
 
     file_meta = FileMetaDataset()
-    file_meta.MediaStorageSOPClassUID = pydicom.uid.UID(SC_SOP_CLASS_UID)
+    file_meta.MediaStorageSOPClassUID = pydicom.uid.UID(sop_class_uid)
     file_meta.MediaStorageSOPInstanceUID = pydicom.uid.UID(sop_uid)
     file_meta.TransferSyntaxUID = pydicom.uid.ExplicitVRLittleEndian
 
     ds = FileDataset(None, {}, file_meta=file_meta, preamble=b"\x00" * 128)
-    ds.SOPClassUID = SC_SOP_CLASS_UID
+    ds.SOPClassUID = sop_class_uid
     ds.SOPInstanceUID = sop_uid
     ds.StudyInstanceUID = study_uid
     ds.SeriesInstanceUID = series_uid
@@ -131,8 +141,11 @@ def make_study(dicom_dirs):
     """Factory: create a READY study/series/instance tree directly in the ORM.
 
     Writes a small placeholder file for each instance so unlink-asserting
-    tests have something on disk. Returns the DicomStudy.
+    tests have something on disk. The study is stamped de-identified, as
+    ingest stores one by default; pass ``deidentification_version=None`` for
+    one stored as uploaded. Returns the DicomStudy.
     """
+    from plugins.dicom.deidentify import DICOM_DEIDENTIFICATION_VERSION
     from plugins.dicom.models import DicomInstance, DicomSeries, DicomStudy
 
     upload, _ = dicom_dirs
@@ -144,6 +157,7 @@ def make_study(dicom_dirs):
         instance_count: int = 1,
         deleted_at=None,
         with_files: bool = True,
+        deidentification_version: int | None = DICOM_DEIDENTIFICATION_VERSION,
     ):
         study_uid = study_uid or f"1.2.826.0.1.{uuid.uuid4().int % 10**12}"
         study = DicomStudy.objects.create(
@@ -154,6 +168,7 @@ def make_study(dicom_dirs):
             modalities="CT",
             num_instances=instance_count,
             deleted_at=deleted_at,
+            deidentification_version=deidentification_version,
         )
         series = DicomSeries.objects.create(
             study=study,
@@ -170,6 +185,7 @@ def make_study(dicom_dirs):
                 stored_name=stored_name,
                 file_size=8,
                 status=DicomInstance.Status.READY,
+                deidentification_version=deidentification_version,
             )
         return study
 

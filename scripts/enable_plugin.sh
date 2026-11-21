@@ -91,6 +91,13 @@ echo ""
 
 echo "--- Step 3/4: Updating environment files..."
 set_kv EPICURRENTS_PLUGINS "$NEW_BACKEND" "$ENV_FILE"
+# The dicom plugin refuses uploads until its UID key is set; generate one when
+# .env has none, and never replace one it has, since a new key splits every
+# study uploaded since from its later uploads.
+if [[ "$PLUGIN" == "dicom" && -z "$(read_list DICOM_UID_KEY "$ENV_FILE")" ]]; then
+    set_kv DICOM_UID_KEY "$(head -c 32 /dev/urandom | base64 | tr '+/' '-_' | tr -d '=\n')" "$ENV_FILE"
+    echo "    .env:          DICOM_UID_KEY generated"
+fi
 touch "$FRONTEND_ENV"
 set_kv VITE_PLUGINS "$NEW_FRONTEND" "$FRONTEND_ENV"
 echo "    .env:          EPICURRENTS_PLUGINS=$NEW_BACKEND"

@@ -16,11 +16,14 @@ from django.test import Client
 from activity.models import Activity
 from epicurrents.models import AccessRight
 from plugins.dicom.models import DicomInstance, DicomStudy
-from plugins.dicom.tests.conftest import STUDIES_URL, UPLOAD_URL, WADO_URL
+from plugins.dicom.tests.conftest import STUDIES_URL, UPLOAD_URL, WADO_URL, stored_uid
 
 STUDY_UID = "1.2.826.0.1.5555001"
 SERIES_UID = "1.2.826.0.1.5555001.1"
 SOP_UID = "1.2.826.0.1.5555001.1.1"
+# The UIDs an upload stores, replaced by the de-identification pass.
+STORED_STUDY_UID = stored_uid(STUDY_UID)
+STORED_SOP_UID = stored_uid(SOP_UID)
 
 
 def _upload(client, *payloads, **extra_params):
@@ -51,11 +54,11 @@ class TestUpload:
 
         study = DicomStudy.objects.get(content_hash=body["studies"][0]["hash"])
         assert study.author == user
-        assert study.study_instance_uid == STUDY_UID
+        assert study.study_instance_uid == STORED_STUDY_UID
         assert study.num_instances == 1
-        assert study.patient_name == "Doe^John"
+        assert study.patient_name == ""
 
-        inst = DicomInstance.objects.get(sop_instance_uid=SOP_UID)
+        inst = DicomInstance.objects.get(sop_instance_uid=STORED_SOP_UID)
         assert inst.status == DicomInstance.Status.READY
         assert (upload_dir / inst.stored_name).exists()
         assert not any(staging_dir.iterdir())
@@ -64,7 +67,7 @@ class TestUpload:
         client, _ = auth_client
         payload = make_dicom_bytes(sop_uid=SOP_UID, extra={"RescaleSlope": "1", "RescaleIntercept": "-1024"})
         assert _upload(client, payload).json()["accepted"] == 1
-        inst = DicomInstance.objects.get(sop_instance_uid=SOP_UID)
+        inst = DicomInstance.objects.get(sop_instance_uid=STORED_SOP_UID)
         assert (inst.rescale_slope, inst.rescale_intercept) == ("1", "-1024")
 
     def test_author_gets_self_access_right(self, auth_client, make_dicom_bytes):
@@ -115,14 +118,14 @@ class TestUpload:
         assert _upload(client, payload).status_code == 200
         response = _upload(client, payload)
         assert response.status_code == 400  # sole file rejected as duplicate
-        assert DicomInstance.objects.filter(sop_instance_uid=SOP_UID).count() == 1
+        assert DicomInstance.objects.filter(sop_instance_uid=STORED_SOP_UID).count() == 1
 
     def test_reupload_replaces_failed_instance(self, auth_client, make_dicom_bytes, dicom_dirs):
         client, _ = auth_client
         upload_dir, _ = dicom_dirs
         payload = make_dicom_bytes(study_uid=STUDY_UID, series_uid=SERIES_UID, sop_uid=SOP_UID)
         _upload(client, payload)
-        inst = DicomInstance.objects.get(sop_instance_uid=SOP_UID)
+        inst = DicomInstance.objects.get(sop_instance_uid=STORED_SOP_UID)
         old_stored_name = inst.stored_name
         inst.status = DicomInstance.Status.FAILED
         inst.save(update_fields=["status"])
@@ -148,7 +151,7 @@ class TestUpload:
         hash_b = _upload(client_b, make_dicom_bytes(**payload_kwargs)).json()["studies"][0]["hash"]
 
         assert hash_a != hash_b
-        assert DicomStudy.objects.filter(study_instance_uid=STUDY_UID).count() == 2
+        assert DicomStudy.objects.filter(study_instance_uid=STORED_STUDY_UID).count() == 2
         study_a = DicomStudy.objects.get(content_hash=hash_a)
         study_b = DicomStudy.objects.get(content_hash=hash_b)
         assert study_a.author == user_a

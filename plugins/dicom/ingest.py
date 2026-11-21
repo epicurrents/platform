@@ -1,9 +1,17 @@
 """Shared DICOM ingest logic for the upload endpoint and the import command.
 
-Both entry points follow the same shape: stage a file, parse its header with
-pydicom, and persist the study/series/instance rows for the uploading author.
-This module owns the parsing, tag extraction, and persistence so the two
+Both entry points follow the same shape: stage a file, prepare it, and persist
+the study/series/instance rows for the uploading author. This module owns the
+parsing, the de-identification step, tag extraction, and persistence so the two
 callers cannot drift apart.
+
+Preparing a file (:func:`prepare_file`) parses its header and, while
+``DICOM_DEIDENTIFY_ON_INGEST`` is on, rewrites it through
+``plugins/dicom/deidentify.py`` into a new file beside it. The rows are
+extracted from the rewritten file, so every field and every byte the platform
+serves is the de-identified one; the as-uploaded file is kept only until the
+caller has copied it to the originals volume, when the preservation mode asks
+for that, and deleted.
 
 Extraction is synchronous — ``dcmread(stop_before_pixels=True)`` reads only
 the header, so a full tag extraction costs microseconds once the dataset is
@@ -13,12 +21,18 @@ no benefit.
 """
 
 import hashlib
+import logging
+import os
 from collections.abc import Sequence
 from dataclasses import dataclass
 
+from django.conf import settings
 from django.contrib.contenttypes.models import ContentType
+from django.utils import timezone
 
 from plugins.dicom.models import DicomInstance, DicomSeries, DicomStudy
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Parsing helpers
@@ -94,6 +108,193 @@ def required_uids(ds) -> tuple[str, str, str]:
     if not study_uid or not series_uid or not sop_uid:
         raise MissingUidsError("Missing required UIDs (Study/Series/SOPInstance).")
     return study_uid, series_uid, sop_uid
+
+
+# ---------------------------------------------------------------------------
+# De-identification
+# ---------------------------------------------------------------------------
+
+
+class DeidentificationUnavailable(RuntimeError):
+    """Raised when de-identification is on but ``DICOM_UID_KEY`` is empty, so no file can be accepted."""
+
+    message = (
+        "DICOM de-identification is on but DICOM_UID_KEY is not set. Run `python manage.py init_env` "
+        "or `scripts/enable_plugin.sh dicom` to generate it, then restart."
+    )
+
+    def __init__(self):
+        super().__init__(self.message)
+
+
+class DeidentificationFailed(ValueError):
+    """Raised when the pass cannot rewrite a parsed file; the file is refused rather than stored as uploaded."""
+
+
+class PixelReviewRequired(ValueError):
+    """Raised for a file that may carry text in its pixels when the author has not confirmed it carries none."""
+
+    code = "burned_in_confirmation_required"
+
+    def __init__(self):
+        super().__init__(
+            "This image may show identifying text in its pixels. Check it and confirm before uploading it."
+        )
+
+
+#: Modalities whose images routinely carry text rendered into the pixels: ultrasound, secondary capture, other.
+BURNED_IN_MODALITIES = frozenset({"US", "SC", "OT"})
+
+#: SOP class UID prefixes of the same kinds of object, which a screen capture or a converted ultrasound can carry
+#: under another Modality: the Secondary Capture family (…1.1.7), the Ultrasound family (…1.1.6) and the retired
+#: Ultrasound Multi-frame class (…1.1.3.1).
+BURNED_IN_SOP_CLASS_PREFIXES = ("1.2.840.10008.5.1.4.1.1.7", "1.2.840.10008.5.1.4.1.1.6", "1.2.840.10008.5.1.4.1.1.3.1")
+
+
+def pixel_review_required(ds) -> bool:
+    """Return True when *ds* may carry identifying text in its pixels, which the header pass cannot remove.
+
+    Decided from the parsed header on the server: an ultrasound, secondary
+    capture or other image by Modality or by SOP class, or any image whose
+    Burned In Annotation is YES. The SOP class is checked as well because a
+    secondary capture keeps the Modality of what it captured.
+    """
+    modality = _clean_str(getattr(ds, "Modality", "")).upper()
+    burned_in = _clean_str(getattr(ds, "BurnedInAnnotation", "")).upper()
+    sop_class = _clean_uid(getattr(ds, "SOPClassUID", ""))
+    by_class = any(sop_class == p or sop_class.startswith(f"{p}.") for p in BURNED_IN_SOP_CLASS_PREFIXES)
+    return modality in BURNED_IN_MODALITIES or burned_in == "YES" or by_class
+
+
+def deidentification_enabled() -> bool:
+    """Return True when ingest rewrites files through the de-identification pass."""
+    return getattr(settings, "DICOM_DEIDENTIFY_ON_INGEST", True)
+
+
+def require_uid_key() -> str:
+    """Return ``DICOM_UID_KEY``, or raise :class:`DeidentificationUnavailable` when it is empty."""
+    key = getattr(settings, "DICOM_UID_KEY", "")
+    if not key:
+        raise DeidentificationUnavailable()
+    return key
+
+
+@dataclass
+class PreparedFile:
+    """A parsed file ready to persist: the header to extract from and the bytes to store.
+
+    ``path`` is the file to store: the rewritten one when the pass ran, else the
+    source itself. ``source_hash`` is the digest of the file as uploaded.
+    ``pixel_review`` is the instance's ``DicomInstance.PixelReview`` value.
+    """
+
+    ds: object
+    path: str
+    file_size: int
+    file_hash: str
+    source_hash: str
+    deidentification_version: int | None = None
+    patient_characteristics_retained: bool = False
+    pixel_review: str = ""
+
+
+def prepare_file(
+    source_path: str,
+    *,
+    target_path: str,
+    source_hash: str | None = None,
+    confirm_burned_in: bool = False,
+) -> PreparedFile:
+    """Parse *source_path* and, with de-identification on, rewrite it to *target_path*.
+
+    Raises whatever pydicom raises for a file that is not DICOM,
+    :class:`MissingUidsError` for one lacking the required UIDs,
+    :class:`PixelReviewRequired` for one :func:`pixel_review_required` flags
+    when *confirm_burned_in* is not set, and :class:`DeidentificationFailed`
+    when the pass cannot rewrite it, after removing anything it wrote at
+    *target_path*. With de-identification off, nothing is written, no
+    confirmation is asked for, and the returned ``path`` is *source_path*.
+    """
+    ds = parse_dicom_header(source_path)
+    required_uids(ds)
+    source_hash = source_hash or sha256_file(source_path)
+    if not deidentification_enabled():
+        return PreparedFile(
+            ds=ds,
+            path=source_path,
+            file_size=os.path.getsize(source_path),
+            file_hash=source_hash,
+            source_hash=source_hash,
+        )
+
+    from plugins.dicom.deidentify import DICOM_DEIDENTIFICATION_VERSION, deidentify_file
+
+    review_required = pixel_review_required(ds)
+    if review_required and not confirm_burned_in:
+        raise PixelReviewRequired()
+    key = require_uid_key()
+    retain = getattr(settings, "DICOM_RETAIN_PATIENT_CHARACTERISTICS", False)
+    try:
+        deidentify_file(source_path, target_path, key=key, retain_patient_characteristics=retain)
+        cleaned = parse_dicom_header(target_path)
+        required_uids(cleaned)
+    except Exception as exc:
+        # The source is a parseable DICOM file, so any failure here is the pass's:
+        # an attribute it has no rule for, or a dataset pydicom cannot write back.
+        logger.warning("DICOM de-identification failed: %s", type(exc).__name__)
+        try:
+            os.remove(target_path)
+        except OSError:
+            pass
+        raise DeidentificationFailed("The file could not be de-identified.") from exc
+    return PreparedFile(
+        ds=cleaned,
+        path=target_path,
+        file_size=os.path.getsize(target_path),
+        file_hash=sha256_file(target_path),
+        source_hash=source_hash,
+        deidentification_version=DICOM_DEIDENTIFICATION_VERSION,
+        patient_characteristics_retained=retain,
+        pixel_review=DicomInstance.PixelReview.ATTESTED if review_required else DicomInstance.PixelReview.NOT_REQUIRED,
+    )
+
+
+def preserve_original(
+    source_path: str,
+    *,
+    stored_name: str,
+    original_name: str,
+    prepared: PreparedFile | None,
+    author_id: int,
+    reason: str,
+) -> None:
+    """Copy the as-uploaded file to the originals volume under ``plugins/dicom/<stored prefix>/``.
+
+    Called only for a file the pass rewrote or failed on; the volume is
+    write-only (``recordings/preservation.py``), and the manifest names the
+    stored file and the digests, never a UID or a tag value.
+    """
+    from recordings.preservation import write_plugin_original
+
+    manifest = {
+        "stored_name": stored_name,
+        "original_name": original_name,
+        "source_hash": prepared.source_hash if prepared else sha256_file(source_path),
+        "file_size": os.path.getsize(source_path),
+        "stored_hash": prepared.file_hash if prepared else None,
+        "deidentification_version": prepared.deidentification_version if prepared else None,
+        "author_id": author_id,
+        "uploaded_at": timezone.now().isoformat(),
+        "preservation_reason": reason,
+    }
+    write_plugin_original(
+        "dicom",
+        stored_name.split(".", 1)[0],
+        source_path,
+        reason=reason,
+        original_name=original_name,
+        manifest=manifest,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -198,6 +399,10 @@ def persist_instance(
     file_size: int,
     file_hash: str,
     status: str = DicomInstance.Status.PENDING,
+    source_hash: str = "",
+    deidentification_version: int | None = None,
+    patient_characteristics_retained: bool = False,
+    pixel_review: str = "",
 ) -> PersistResult:
     """Persist the study/series/instance rows for one parsed DICOM file.
 
@@ -209,6 +414,9 @@ def persist_instance(
     ``status`` is the initial instance status: the upload endpoint passes
     ``PENDING`` (the file moves to final storage after commit), the import
     command passes ``READY`` (the file is copied before persisting).
+    ``source_hash``, ``deidentification_version``,
+    ``patient_characteristics_retained`` and ``pixel_review`` come from
+    :class:`PreparedFile`.
 
     The caller owns the surrounding ``transaction.atomic()`` block; raising
     :class:`MissingUidsError` (from :func:`required_uids`) or a database error
@@ -263,7 +471,13 @@ def persist_instance(
         if changed:
             series.save(update_fields=changed)
 
-    instance_fields = extract_instance_fields(ds)
+    instance_fields = {
+        **extract_instance_fields(ds),
+        "source_hash": source_hash,
+        "deidentification_version": deidentification_version,
+        "patient_characteristics_retained": patient_characteristics_retained,
+        "pixel_review": pixel_review,
+    }
     existing = DicomInstance.objects.filter(series=series, sop_instance_uid=sop_uid).first()
 
     if existing is not None and existing.status == DicomInstance.Status.READY:
@@ -315,14 +529,27 @@ def persist_instance(
 
 
 def refresh_study_aggregates(study: DicomStudy) -> None:
-    """Recompute ``num_instances`` and ``modalities`` for *study* from the DB."""
-    count = DicomInstance.objects.filter(
-        series__study=study,
-        status=DicomInstance.Status.READY,
-    ).count()
+    """Recompute the study's cached fields from its ready instances.
+
+    ``deidentification_version`` is the lowest version among them, or null as
+    soon as one is stored as uploaded, so a study a later batch added raw files
+    to stops counting as de-identified.
+    """
+    ready = DicomInstance.objects.filter(series__study=study, status=DicomInstance.Status.READY)
+    versions = list(ready.values_list("deidentification_version", flat=True))
     modality_values = (
         DicomSeries.objects.filter(study=study).exclude(modality="").values_list("modality", flat=True).distinct()
     )
-    study.num_instances = count
+    study.num_instances = len(versions)
     study.modalities = ",".join(sorted(set(modality_values)))
-    study.save(update_fields=["num_instances", "modalities", "modified_at"])
+    study.deidentification_version = min(versions) if versions and None not in versions else None
+    study.patient_characteristics_retained = ready.filter(patient_characteristics_retained=True).exists()
+    study.save(
+        update_fields=[
+            "num_instances",
+            "modalities",
+            "deidentification_version",
+            "patient_characteristics_retained",
+            "modified_at",
+        ]
+    )

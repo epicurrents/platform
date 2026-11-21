@@ -18,11 +18,23 @@ Options
             anything.
 --resume    Skip files whose content hash (SHA-256) already appears on one of
             the owning user's instances, so a crashed run can be continued
-            without duplicating imports.
+            without duplicating imports. The hash compared is the file's as it
+            is in the archive, which with de-identification on is not the hash
+            of the stored file.
+--confirm-burned-in
+            Confirm that the archive's images show no identifying text in
+            their pixels. Without it, an ultrasound, secondary capture or other
+            image, or one flagged Burned In Annotation YES, is held back and
+            counted, as the upload endpoint refuses it without the
+            confirmation. Ignored with de-identification off.
 
 The command recursively walks the given directory, treating every file with
 the ``.dcm`` extension *or* no extension *or* a ``DICM`` magic byte sequence
 as a candidate DICOM file. Non-DICOM candidates are reported and skipped.
+
+With ``DICOM_DEIDENTIFY_ON_INGEST`` on (the default), each file is rewritten
+through the de-identification pass straight into storage; the archive is only
+read. The command refuses to start while ``DICOM_UID_KEY`` is empty.
 """
 
 import os
@@ -55,9 +67,14 @@ class Command(BaseCommand):
             help="Discover files and print counts without importing anything.",
         )
         parser.add_argument(
+            "--confirm-burned-in",
+            action="store_true",
+            help="Confirm the images show no identifying text in their pixels (ultrasound and similar).",
+        )
+        parser.add_argument(
             "--resume",
             action="store_true",
-            help="Skip files whose SHA-256 already appears on the user's instances.",
+            help="Skip files whose as-archived SHA-256 already appears on the user's instances.",
         )
 
     def handle(self, *args, **options):
@@ -66,14 +83,20 @@ class Command(BaseCommand):
         from activity.models import Activity
         from activity.system_activity import with_system_activity
         from plugins.dicom.ingest import (
+            DeidentificationFailed,
+            DeidentificationUnavailable,
             MissingUidsError,
-            parse_dicom_header,
+            PixelReviewRequired,
+            deidentification_enabled,
             persist_instance,
+            prepare_file,
+            preserve_original,
             refresh_study_aggregates,
-            required_uids,
+            require_uid_key,
             sha256_file,
         )
         from plugins.dicom.models import DicomInstance
+        from recordings.preservation import REASON_ALL, REASON_FAILED, should_preserve_failed, should_preserve_original
 
         src_dir = os.path.realpath(options["directory"])
         if not os.path.isdir(src_dir):
@@ -86,6 +109,13 @@ class Command(BaseCommand):
 
         dry_run = options["dry_run"]
         resume = options["resume"]
+        confirm_burned_in = options["confirm_burned_in"]
+
+        if deidentification_enabled():
+            try:
+                require_uid_key()
+            except DeidentificationUnavailable as exc:
+                raise CommandError(str(exc))
 
         upload_path = getattr(settings, "DICOM_UPLOAD_PATH", "/data/dicom")
         os.makedirs(upload_path, exist_ok=True)
@@ -103,18 +133,22 @@ class Command(BaseCommand):
             self.stdout.write(self.style.SUCCESS("Dry run — no files imported."))
             return
 
-        # Content hashes already imported for this user, for --resume support.
+        # As-archived hashes already imported for this user, for --resume. A row
+        # written before source_hash existed stored its file unchanged, so its
+        # file_hash is the as-archived one.
         existing_hashes: set[str] = set()
         if resume:
-            existing_hashes = set(
-                DicomInstance.objects.filter(series__study__author=user).values_list("file_hash", flat=True)
-            )
+            for source_hash, file_hash in DicomInstance.objects.filter(series__study__author=user).values_list(
+                "source_hash", "file_hash"
+            ):
+                existing_hashes.add(source_hash or file_hash)
             existing_hashes.discard("")
 
         imported = 0
         skipped = 0
         failed = 0
         duplicates = 0
+        held = 0
         touched_studies: dict = {}
 
         # The source directory is not recorded. Directories holding clinical
@@ -126,7 +160,7 @@ class Command(BaseCommand):
         with with_system_activity(
             "dicom.import",
             interface=Activity.Interface.COMMAND,
-            metadata={"file_count": len(candidates), "user_id": user.pk},
+            metadata={"file_count": len(candidates), "user_id": user.pk, "confirm_burned_in": confirm_burned_in},
         ):
             for src_path in candidates:
                 file_hash = sha256_file(src_path)
@@ -134,11 +168,30 @@ class Command(BaseCommand):
                     skipped += 1
                     continue
 
+                stored_name = f"{uuid.uuid4().hex}.dcm"
+                dst_path = os.path.join(upload_path, stored_name)
                 try:
-                    ds = parse_dicom_header(src_path)
-                    required_uids(ds)
+                    prepared = prepare_file(
+                        src_path, target_path=dst_path, source_hash=file_hash, confirm_burned_in=confirm_burned_in
+                    )
+                except PixelReviewRequired:
+                    held += 1
+                    continue
                 except MissingUidsError as exc:
                     self.stderr.write(f"  SKIP (invalid): {src_path} — {exc}")
+                    failed += 1
+                    continue
+                except DeidentificationFailed as exc:
+                    self.stderr.write(f"  SKIP (de-identification failed): {src_path} — {exc}")
+                    if should_preserve_failed():
+                        preserve_original(
+                            src_path,
+                            stored_name=stored_name,
+                            original_name=os.path.basename(src_path),
+                            prepared=None,
+                            author_id=user.pk,
+                            reason=REASON_FAILED,
+                        )
                     failed += 1
                     continue
                 except Exception as exc:
@@ -146,24 +199,28 @@ class Command(BaseCommand):
                     failed += 1
                     continue
 
-                stored_name = f"{uuid.uuid4().hex}.dcm"
-                dst_path = os.path.join(upload_path, stored_name)
-                try:
-                    shutil.copy2(src_path, dst_path)
-                except OSError as exc:
-                    self.stderr.write(f"  SKIP (copy failed): {src_path} — {exc}")
-                    failed += 1
-                    continue
+                if prepared.path == src_path:
+                    # Not rewritten: store a copy of the archive's file as it is.
+                    try:
+                        shutil.copy2(src_path, dst_path)
+                    except OSError as exc:
+                        self.stderr.write(f"  SKIP (copy failed): {src_path} — {exc}")
+                        failed += 1
+                        continue
 
                 try:
                     with transaction.atomic():
                         result = persist_instance(
                             author=user,
-                            ds=ds,
+                            ds=prepared.ds,
                             stored_name=stored_name,
                             file_size=os.path.getsize(dst_path),
-                            file_hash=file_hash,
+                            file_hash=prepared.file_hash,
                             status=DicomInstance.Status.READY,
+                            source_hash=prepared.source_hash,
+                            deidentification_version=prepared.deidentification_version,
+                            patient_characteristics_retained=prepared.patient_characteristics_retained,
+                            pixel_review=prepared.pixel_review,
                         )
                 except Exception as exc:
                     self.stderr.write(f"  SKIP (db error): {src_path} — {exc}")
@@ -175,6 +232,15 @@ class Command(BaseCommand):
                     _unlink_quietly(dst_path)
                     duplicates += 1
                     continue
+                if prepared.path != src_path and should_preserve_original():
+                    preserve_original(
+                        src_path,
+                        stored_name=stored_name,
+                        original_name=os.path.basename(src_path),
+                        prepared=prepared,
+                        author_id=user.pk,
+                        reason=REASON_ALL,
+                    )
                 if result.previous_stored_name:
                     _unlink_quietly(os.path.join(upload_path, result.previous_stored_name))
                 touched_studies[result.study.pk] = result.study
@@ -188,6 +254,13 @@ class Command(BaseCommand):
             f"Imported {imported} file(s) into {len(touched_studies)} study/-ies; "
             f"skipped {skipped} (resume), {duplicates} duplicate(s), {failed} failed."
         )
+        if held:
+            self.stdout.write(
+                self.style.WARNING(
+                    f"Held back {held} image(s) that may show identifying text in their pixels. Check them, then "
+                    "re-run with --confirm-burned-in (and --resume to skip what was imported)."
+                )
+            )
         self.stdout.write(self.style.SUCCESS("Done."))
 
 

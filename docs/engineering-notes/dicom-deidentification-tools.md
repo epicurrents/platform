@@ -192,6 +192,8 @@ surface it, not to pretend header scrubbing covers pixels.
 
 ## Integration sketch
 
+> Superseded by [dicom-deidentification-plan.md](dicom-deidentification-plan.md), which was built on 2026-11-21. The sketch below is kept as the reasoning it started from; [plugins/dicom/deidentify.py](../../plugins/dicom/deidentify.py) is what the platform does. It uses the library's Annex E table and not its action functions, which apply the table to the top level only and write `ANONYMIZED` as their dummy.
+
 **Hook location.** A `deidentify_dataset(ds)` function in
 [ingest.py](../../plugins/dicom/ingest.py) (or a sibling `deidentify.py`),
 called by the upload endpoint and `index_dicom` after `parse_dicom_header`

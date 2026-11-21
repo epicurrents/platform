@@ -5,7 +5,8 @@ in ``plugins.dicom.apps.DicomConfig.ready()``, mirroring the media app's
 extension of the same name. A ``DicomStudy`` attached to a parent object
 (typically the ``Recording`` acquired in the same session) is readable by
 anyone who can read that parent — from any source: a direct ``AccessRight``
-on the parent, dataset share inheritance, or a share token.
+on the parent, dataset share inheritance, or a share token — except where the
+parent is read under de-identifying terms and the study is stored as uploaded.
 """
 
 from epicurrents.permissions import ReadAccessTerms
@@ -20,9 +21,13 @@ def can_read_via_attachment(user, obj, share_token: str | None = None):
     ``granted=False`` so other extensions and the default deny still apply.
     Returns default metadata (``apply_middleware=False``) because DICOM bytes
     never pass through the EDF sanitization pipeline — the parent's
-    header-de-identification flag has no meaning for them.
+    header-de-identification flag has no meaning for them. It still decides
+    one thing: a caller who reads the parent under ``apply_middleware`` gets
+    nothing from a study stored as uploaded (``deidentification_version`` null,
+    which is how ``DICOM_DEIDENTIFY_ON_INGEST`` off stores it), since that study
+    would hand them in full the patient details the parent's grant withholds.
     """
-    from epicurrents.permissions import can_read_object
+    from epicurrents.permissions import get_read_access_result
     from plugins.dicom.models import DicomStudy
     from recordings.models import Recording
 
@@ -45,6 +50,9 @@ def can_read_via_attachment(user, obj, share_token: str | None = None):
         is_superuser = bool(user and getattr(user, "is_superuser", False))
         if not (is_author or is_superuser):
             return ReadAccessTerms(granted=False)
-    if can_read_object(user=user, obj=parent, share_token=share_token):
-        return ReadAccessTerms(granted=True)
-    return ReadAccessTerms(granted=False)
+    terms = get_read_access_result(user, parent, share_token=share_token)
+    if not terms.granted:
+        return ReadAccessTerms(granted=False)
+    if terms.apply_middleware and obj.deidentification_version is None:
+        return ReadAccessTerms(granted=False)
+    return ReadAccessTerms(granted=True)
