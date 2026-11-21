@@ -3,6 +3,7 @@
  */
 
 import { http } from '#lib/http'
+import type { AccessRight, GrantAccessPayload } from '#api/library'
 
 export interface DicomSeriesOut {
     series_instance_uid: string
@@ -29,6 +30,8 @@ export interface DicomStudyOut {
     modalities: string
     created_at: string
     is_author: boolean
+    /** Whether the caller may manage the study's access rights: author, superuser or a `can_share` grant. */
+    can_share: boolean
 }
 
 export interface DicomStudyDetailOut extends DicomStudyOut {
@@ -70,12 +73,23 @@ export const dicomApi = {
         return http.delete(`${BASE}/studies/${hash}/`)
     },
 
-    shareStudy(hash: string, username: string): Promise<void> {
-        return http.post(`${BASE}/studies/${hash}/share/`, { username })
+    /** The study's access rights other than its author's own. */
+    listAccess(hash: string): Promise<AccessRight[]> {
+        return http.get<AccessRight[]>(`${BASE}/studies/${hash}/access/`).then(r => r.data)
     },
 
-    revokeStudyAccess(hash: string, username: string): Promise<void> {
-        return http.delete(`${BASE}/studies/${hash}/share/${username}/`)
+    /**
+     * Grant a user an access right on a study. Only user targets are accepted for now, and there is no
+     * de-identifying serving path for DICOM, so the payload's `apply_middleware` is ignored.
+     * @param hash - The study's `hash` from the study listing.
+     * @param payload - The grant, as the shared access-rights panel builds it.
+     */
+    grantAccess(hash: string, payload: GrantAccessPayload): Promise<AccessRight> {
+        return http.post<AccessRight>(`${BASE}/studies/${hash}/access/`, payload).then(r => r.data)
+    },
+
+    revokeAccess(hash: string, rightId: number): Promise<void> {
+        return http.delete(`${BASE}/studies/${hash}/access/${rightId}/`)
     },
 
     uploadFiles(files: File[]): Promise<DicomUploadOut> {
@@ -88,13 +102,18 @@ export const dicomApi = {
         }).then(r => r.data)
     },
 
-    /** URL of the OHIF viewer pre-loaded with a specific study. */
+    /**
+     * URL of the OHIF viewer pre-loaded with a specific study.
+     * @remarks
+     * `viewer` is OHIF's longitudinal mode route and `dicomjson` the data source configured in
+     * plugins/dicom/ohif-app-config.js, which fetches the study from the `url` parameter. The bare
+     * mount would open OHIF's worklist instead of the study.
+     * @param studyHash - The study's `hash` from the study listing.
+     */
     ohifViewerUrl(studyHash: string): string {
-        // OHIF resolves the encoded URL with its dicomjson datasource; the
-        // backend serves the JSON at /plugin/dicom/api/v1/dicom/studies/{hash}/ohif-json/.
         const jsonUrl = encodeURIComponent(
             `${window.location.origin}${BASE}/studies/${studyHash}/ohif-json/`
         )
-        return `/plugin/dicom/viewer/?url=${jsonUrl}`
+        return `/plugin/dicom/ohif/viewer/dicomjson?url=${jsonUrl}`
     },
 }

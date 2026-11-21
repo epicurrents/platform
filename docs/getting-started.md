@@ -74,7 +74,7 @@ git clone https://github.com/epicurrents/platform epicurrents
 cd epicurrents
 ```
 
-Submodules are initialised by `bootstrap.sh` in the next step. Two are checked out by default — the viewer and the vendored documentation. A third, dicom's OHIF viewer, is declared with `update = none` in [.gitmodules](../.gitmodules) and skipped unless the dicom project needs it.
+Submodules are initialised by `bootstrap.sh` in the next step. Two are checked out by default — the viewer and the vendored documentation. A third, dicom's OHIF viewer, is declared with `update = none` in [.gitmodules](../.gitmodules) and skipped unless the dicom plugin is enabled.
 
 ### 2. Run bootstrap.sh (first pass)
 

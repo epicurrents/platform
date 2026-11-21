@@ -248,6 +248,10 @@ class DicomInstance(models.Model):
     frame_of_reference_uid = models.CharField(max_length=64, blank=True, default="")
     window_center = models.CharField(max_length=32, blank=True, default="")
     window_width = models.CharField(max_length=32, blank=True, default="")
+    # Modality LUT. OHIF takes it from the dicomjson metadata rather than the
+    # file, so without it CT values are shown as stored rather than in HU.
+    rescale_slope = models.CharField(max_length=32, blank=True, default="")
+    rescale_intercept = models.CharField(max_length=32, blank=True, default="")
 
     # File storage — stored_name is the filename under DICOM_UPLOAD_PATH.
     # Never derived from user input; generated at upload time.

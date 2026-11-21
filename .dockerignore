@@ -89,6 +89,9 @@ artifact_cache/
 # in the build context — and must not be, since baking recordings into an image
 # would ship patient data.
 testdata/
+# The OHIF source checkout and its node_modules, several GB the Python image never
+# uses. The built viewer it produces, plugins/dicom/ohif-dist/, stays in the context.
+plugins/dicom/ohif-viewer/
 
 # Format-converter checkouts. A converter for a proprietary format is a separate
 # repository the operator clones in and the platform does not track, and it is

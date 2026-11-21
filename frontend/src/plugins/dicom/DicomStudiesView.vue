@@ -59,6 +59,13 @@
                         >
                             {{ t('View', SCOPE) }}
                         </wa-button>
+                        <wa-button v-if="study.can_share"
+                            appearance="plain"
+                            size="s"
+                            @click="openShareDialog(study)"
+                        >
+                            {{ t('Share', SCOPE) }}
+                        </wa-button>
                         <wa-button
                             v-if="canDeleteStudy(study)"
                             appearance="plain"
@@ -111,6 +118,26 @@
             </div>
         </wa-dialog>
 
+        <!-- Share dialog -->
+        <wa-dialog
+            class="share-dialog"
+            :label="t('Share study', SCOPE)"
+            :open="!!studyToShare"
+            @wa-after-hide.self="closeShareDialog"
+        >
+            <div v-if="accessLoading" class="loading-state">
+                <wa-spinner></wa-spinner>
+                {{ t('Loading access rights…', SCOPE) }}
+            </div>
+            <AccessRightsPanel v-else-if="studyToShare"
+                v-model:accessRights="accessRights"
+                :grantFn="grantFn"
+                :infoMessage="t('Shared studies are served as uploaded: the files and their patient details are not de-identified.', SCOPE)"
+                :modes="['user']"
+                :revokeFn="revokeFn"
+            ></AccessRightsPanel>
+        </wa-dialog>
+
         <!-- Delete confirmation dialog -->
         <wa-dialog
             :label="t('Delete Study', SCOPE)"
@@ -147,6 +174,8 @@ import { onMounted, ref } from 'vue'
 import { useAuthStore } from '#stores/auth'
 import { showToast } from '#lib/toast'
 import { t } from '#i18n'
+import AccessRightsPanel from '#components/AccessRightsPanel.vue'
+import type { AccessRight, GrantAccessPayload } from '#api/library'
 import type { DicomStudyOut } from './api'
 import { dicomApi } from './api'
 
@@ -162,6 +191,9 @@ const uploading = ref(false)
 const selectedFiles = ref<File[]>([])
 const fileInputRef = ref<HTMLInputElement | null>(null)
 const studyToDelete = ref<DicomStudyOut | null>(null)
+const studyToShare = ref<DicomStudyOut | null>(null)
+const accessRights = ref<AccessRight[]>([])
+const accessLoading = ref(false)
 
 onMounted(loadStudies)
 
@@ -249,6 +281,32 @@ async function startUpload() {
     }
 }
 
+async function openShareDialog(study: DicomStudyOut) {
+    studyToShare.value = study
+    accessRights.value = []
+    accessLoading.value = true
+    try {
+        accessRights.value = await dicomApi.listAccess(study.hash)
+    } catch {
+        showToast(t('Failed to load access rights.', SCOPE), 'danger')
+        studyToShare.value = null
+    } finally {
+        accessLoading.value = false
+    }
+}
+
+function closeShareDialog() {
+    studyToShare.value = null
+}
+
+function grantFn(payload: GrantAccessPayload): Promise<AccessRight> {
+    return dicomApi.grantAccess(studyToShare.value!.hash, payload)
+}
+
+function revokeFn(right: AccessRight): Promise<void> {
+    return dicomApi.revokeAccess(studyToShare.value!.hash, right.id)
+}
+
 function confirmDelete(study: DicomStudyOut) {
     studyToDelete.value = study
 }
@@ -274,6 +332,10 @@ async function deleteStudy() {
 </script>
 
 <style scoped>
+.share-dialog {
+    --width: min(44rem, 95vw);
+}
+
 .dicom-studies-view {
     display: flex;
     flex-direction: column;

@@ -157,6 +157,8 @@ def extract_instance_fields(ds) -> dict:
         "frame_of_reference_uid": _clean_uid(getattr(ds, "FrameOfReferenceUID", "")),
         "window_center": _first_value(getattr(ds, "WindowCenter", None)),
         "window_width": _first_value(getattr(ds, "WindowWidth", None)),
+        "rescale_slope": _clean_str(getattr(ds, "RescaleSlope", "")),
+        "rescale_intercept": _clean_str(getattr(ds, "RescaleIntercept", "")),
     }
 
 

@@ -11,15 +11,15 @@ import icons from './icons'
  *
  * Viewer integration
  * ------------------
- * The OHIF viewer is served as a standalone SPA at /plugin/dicom/viewer/ (a
- * Django view in plugins/dicom/views.py).  The Vue plugin opens it in a new
+ * The OHIF viewer is served as a standalone SPA at /plugin/dicom/ohif/ (a
+ * Django view in plugins/dicom/views.py). The Vue plugin opens it in a new
  * browser tab rather than embedding it in an iframe, avoiding cross-origin
  * header complications and keeping the OHIF experience full-screen.
  *
- * OHIF is configured via its app-config.js to use the platform's
- * /plugin/dicom/api/v1/dicom/studies/{hash}/ohif-json/ endpoint as its
- * ``dicomjson`` datasource and /plugin/dicom/api/v1/dicom/wado/ as its WADO-URI
- * endpoint.
+ * OHIF's ``dicomjson`` data source (plugins/dicom/ohif-app-config.js) loads the
+ * study from the platform's /plugin/dicom/api/v1/dicom/studies/{hash}/ohif-json/
+ * endpoint, whose instance URLs point at the WADO-URI endpoint
+ * /plugin/dicom/api/v1/dicom/wado/.
  */
 export const plugin: ViewerPlugin = {
     icons,

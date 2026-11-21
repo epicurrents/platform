@@ -11,8 +11,13 @@ GET    /dicom/studies/{hash}/                  Study detail with series summary.
 GET    /dicom/studies/{hash}/ohif-json/        DICOMweb JSON for the OHIF viewer.
 DELETE /dicom/studies/{hash}/                  Trash a study (soft delete).
 GET    /dicom/wado/                            WADO-URI — stream one DICOM instance file.
-POST   /dicom/studies/{hash}/share/            Grant read access to another user.
-DELETE /dicom/studies/{hash}/share/{username}/ Revoke a user's access.
+GET    /dicom/studies/{hash}/access/           List a study's access rights.
+POST   /dicom/studies/{hash}/access/           Grant a user an access right.
+DELETE /dicom/studies/{hash}/access/{id}/      Revoke one access right.
+GET    /dicomweb/studies                       QIDO-RS study search (see dicomweb.py).
+GET    /dicomweb/studies/{uid}/series          QIDO-RS series of a study.
+GET    /dicomweb/studies/{uid}/metadata        WADO-RS metadata of a study.
+GET    /dicomweb/studies/{uid}/series/{uid}/metadata   WADO-RS metadata of a series.
 
 Upload parses every file's header synchronously (pydicom, header only) and
 creates the real study/series/instance rows before responding, so the returned
@@ -21,29 +26,41 @@ study hashes are immediately valid for the other endpoints. See
 """
 
 import hashlib
+import json
 import logging
+import math
 import os
 import shutil
 import uuid
 from datetime import datetime
 
 from django.conf import settings
+from django.contrib.auth import get_user_model
 from django.contrib.contenttypes.models import ContentType
-from django.db import transaction
-from django.db.models import Q
-from django.http import FileResponse
+from django.db import IntegrityError, transaction
+from django.http import FileResponse, HttpResponse
 from django.utils import timezone
 from ninja import File, NinjaAPI, Query, Schema, UploadedFile
 from ninja.errors import HttpError
 
 from activity.audit import log_activity
+from epicurrents.api.schemas import AccessRightOut, access_right_out
+from epicurrents.assessment import assessment_visible
 from epicurrents.auth import enforce_session_csrf
+from epicurrents.granting import (
+    conferrable_rights,
+    ensure_can_confer,
+    ensure_can_manage_access,
+    ensure_can_revoke,
+    held_grant_ids,
+    share_refusal,
+)
 from epicurrents.models import AccessRight
 from epicurrents.permissions import (
-    can_modify_object,
     can_read_object,
     ensure_can_write_object,
 )
+from plugins.dicom import dicomweb
 from plugins.dicom.ingest import (
     MissingUidsError,
     parse_dicom_header,
@@ -111,6 +128,7 @@ class DicomStudyOut(Schema):
     modalities: str
     created_at: datetime
     is_author: bool
+    can_share: bool
 
 
 class DicomStudyDetailOut(DicomStudyOut):
@@ -145,17 +163,20 @@ class DicomUploadOut(Schema):
     rejected: int
 
 
-class ShareIn(Schema):
-    """Payload for granting read access to a DICOM study."""
+class GrantStudyAccessIn(Schema):
+    """Payload for granting an access right on a study.
 
-    username: str
+    User targets only for now; group grants are a planned extension (see the
+    plugin README). There is no ``apply_middleware``: no DICOM serving path
+    de-identifies, so every row is written with it off rather than claiming a
+    sanitisation that does not happen.
+    """
 
-
-class ShareOut(Schema):
-    """Confirmation of a granted read access."""
-
-    username: str
-    can_read: bool
+    access_target_id: int
+    can_read: bool = True
+    can_write: bool = False
+    can_share: bool = False
+    expires_at: datetime | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -208,24 +229,14 @@ def _study_out(study: DicomStudy, user) -> DicomStudyOut:
         modalities=study.modalities,
         created_at=study.created_at,
         is_author=study.author_id == user.pk,
+        can_share=_can_share_study(user, study),
     )
 
 
 def _can_share_study(user, study: DicomStudy) -> bool:
-    """Return True when *user* may manage access grants on *study*."""
-    if can_modify_object(user=user, obj=study):
-        return True
-    study_ct = ContentType.objects.get_for_model(study, for_concrete_model=False)
-    return (
-        AccessRight.objects.active()
-        .filter(
-            content_type=study_ct,
-            object_id=str(study.pk),
-            can_share=True,
-        )
-        .filter(Q(access_target=user) | Q(access_target_group_id__in=list(user.groups.values_list("id", flat=True))))
-        .exists()
-    )
+    """Return True when *user* may manage access grants on *study*: author, superuser or a ``can_share`` grant."""
+    rights = conferrable_rights(user, study)
+    return rights.unrestricted or rights.can_share
 
 
 def _resolve_attachment(user, attached_to_type: str | None, attached_to_id: str | None):
@@ -287,13 +298,14 @@ def _build_ohif_json(study: DicomStudy, request) -> dict:
         series_node: dict = {
             "SeriesInstanceUID": series.series_instance_uid,
             "SeriesDescription": series.series_description,
-            "SeriesNumber": series.series_number,
+            "SeriesNumber": _number(series.series_number),
             "Modality": series.modality,
-            "SliceThickness": series.slice_thickness,
+            "SliceThickness": _number(series.slice_thickness),
             "instances": [],
         }
 
-        for inst in series.instances.filter(status=DicomInstance.Status.READY):
+        instances = sorted(series.instances.filter(status=DicomInstance.Status.READY), key=_instance_order)
+        for inst in instances:
             wado_url = (
                 f"{wado_base}?requestType=WADO"
                 f"&studyUID={study.study_instance_uid}"
@@ -302,11 +314,13 @@ def _build_ohif_json(study: DicomStudy, request) -> dict:
             )
             frames = inst.number_of_frames or 0
             if frames > 1:
+                # ``frame`` is the parameter both OHIF's dicomjson source and the
+                # cornerstone WADO-URI loader read the 1-based frame index from.
                 for i in range(1, frames + 1):
                     series_node["instances"].append(
                         {
                             "metadata": _instance_metadata(inst, series, study),
-                            "url": f"dicomweb:{wado_url}&frameNumber={i}",
+                            "url": f"dicomweb:{wado_url}&frame={i}",
                         }
                     )
             else:
@@ -322,36 +336,78 @@ def _build_ohif_json(study: DicomStudy, request) -> dict:
     return {"studies": [study_node]}
 
 
+def _number(value):
+    """Return a DS/IS string as an int or float, or None when it does not parse.
+
+    The model keeps DICOM's character-string form; OHIF does arithmetic on the
+    dicomjson metadata, where a string concatenates instead of adding.
+    """
+    if value is None or value == "":
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    # float() accepts "NaN" and "inf", which serialise to JSON no parser accepts:
+    # one malformed header would make the whole study unloadable.
+    if not math.isfinite(number):
+        return None
+    return int(number) if number.is_integer() and "." not in str(value) else number
+
+
+def _numbers(values):
+    """Return a multi-valued DS tag as a list of numbers, or None if any entry does not parse."""
+    if not values:
+        return None
+    numbers = [_number(v) for v in values]
+    return None if any(n is None for n in numbers) else numbers
+
+
+def _instance_order(inst: DicomInstance):
+    """Sort key putting instances in numeric InstanceNumber order, unnumbered last."""
+    number = _number(inst.instance_number)
+    return (number is None, number or 0, inst.sop_instance_uid)
+
+
 def _instance_metadata(
     inst: DicomInstance,
     series,
     study: DicomStudy,
 ) -> dict:
-    return {
+    """Return the naturalised metadata OHIF reads for *inst* instead of the file header.
+
+    A tag the file did not carry is left out rather than sent empty: OHIF reads
+    an empty WindowWidth as a zero-width window, which renders every image as a
+    black-and-white threshold.
+    """
+    metadata = {
         "Columns": inst.columns,
         "Rows": inst.rows,
-        "InstanceNumber": inst.instance_number,
+        "InstanceNumber": _number(inst.instance_number),
         "SOPClassUID": inst.sop_class_uid,
         "PhotometricInterpretation": inst.photometric_interpretation,
         "BitsAllocated": inst.bits_allocated,
         "BitsStored": inst.bits_stored,
         "PixelRepresentation": inst.pixel_representation,
         "SamplesPerPixel": inst.samples_per_pixel,
-        "PixelSpacing": inst.pixel_spacing,
+        "PixelSpacing": _numbers(inst.pixel_spacing),
         "HighBit": inst.high_bit,
-        "ImageOrientationPatient": inst.image_orientation_patient,
-        "ImagePositionPatient": inst.image_position_patient,
+        "ImageOrientationPatient": _numbers(inst.image_orientation_patient),
+        "ImagePositionPatient": _numbers(inst.image_position_patient),
         "FrameOfReferenceUID": inst.frame_of_reference_uid,
         "ImageType": inst.image_type,
         "Modality": series.modality,
         "SOPInstanceUID": inst.sop_instance_uid,
         "SeriesInstanceUID": series.series_instance_uid,
         "StudyInstanceUID": study.study_instance_uid,
-        "WindowCenter": inst.window_center,
-        "WindowWidth": inst.window_width,
+        "WindowCenter": _number(inst.window_center),
+        "WindowWidth": _number(inst.window_width),
+        "RescaleSlope": _number(inst.rescale_slope),
+        "RescaleIntercept": _number(inst.rescale_intercept),
         "SeriesDate": series.series_date,
         "NumberOfFrames": inst.number_of_frames,
     }
+    return {key: value for key, value in metadata.items() if value is not None and value != ""}
 
 
 # ---------------------------------------------------------------------------
@@ -620,21 +676,7 @@ def list_studies(request):
     recording) do not appear here — they surface through their parent object.
     """
     user = _require_auth(request)
-
-    if user.is_superuser:
-        qs = DicomStudy.objects.filter(deleted_at__isnull=True)
-    else:
-        ct = ContentType.objects.get_for_model(DicomStudy)
-        # Materialise into a set rather than leaving it a subquery: object_id is
-        # a CharField, and Postgres rejects bigint pk IN (varchar subquery) with
-        # "operator does not exist: bigint = character varying". As a set of
-        # literals Django coerces each value to the pk type.
-        granted_ids = set(
-            AccessRight.objects.active()
-            .filter(content_type=ct, can_read=True, access_target=user)
-            .values_list("object_id", flat=True)
-        )
-        qs = DicomStudy.objects.filter(deleted_at__isnull=True).filter(Q(author=user) | Q(pk__in=granted_ids))
+    qs = dicomweb.listed_studies(user)
 
     result = [_study_out(s, user) for s in qs.order_by("-created_at")]
     log_activity(verb="dicom.study.list", metadata={"count": len(result)})
@@ -710,90 +752,105 @@ def delete_study(request, content_hash: str):
     return 204, None
 
 
-@api.post(
-    "/dicom/studies/{content_hash}/share/",
-    response={201: ShareOut},
-    summary="Grant another user read access to a study.",
-)
-def share_study(request, content_hash: str, payload: ShareIn):
-    """Create a can_read ``AccessRight`` on the study for *username*.
+def _study_ct() -> ContentType:
+    return ContentType.objects.get_for_model(DicomStudy, for_concrete_model=False)
 
-    Requires authorship, superuser status, or a can_share grant on the study.
-    """
-    from django.contrib.auth import get_user_model
 
+@api.get("/dicom/studies/{content_hash}/access/", response=list[AccessRightOut])
+def list_study_access_rights(request, content_hash: str):
+    """List the access rights on a study other than its author's own. Requires the right to manage access."""
     user = _require_auth(request)
     study = _get_study_or_404(content_hash, user)
-    if not _can_share_study(user, study):
-        raise HttpError(403, "You do not have permission to share this study.")
-
-    username = (payload.username or "").strip()
-    UserModel = get_user_model()
-    try:
-        target = UserModel.objects.get(username=username)
-    except UserModel.DoesNotExist:
-        raise HttpError(400, f"User {username!r} not found.")
-    if target.pk == user.pk:
-        raise HttpError(400, "You cannot share a study with yourself.")
-
-    study_ct = ContentType.objects.get_for_model(study, for_concrete_model=False)
-    with transaction.atomic():
-        existing = (
-            AccessRight.objects.active()
-            .filter(
-                content_type=study_ct,
-                object_id=str(study.pk),
-                access_target=target,
-                can_read=True,
-            )
-            .exists()
-        )
-        if existing:
-            raise HttpError(409, f"User {username!r} already has read access.")
-        right = AccessRight.objects.create(
-            content_type=study_ct,
-            object_id=str(study.pk),
-            access_giver=user,
-            access_target=target,
-            can_read=True,
-        )
-        log_activity(verb="dicom.study.access.grant", target=right)
-
-    return 201, ShareOut(username=target.username, can_read=True)
-
-
-@api.delete(
-    "/dicom/studies/{content_hash}/share/{username}/",
-    response={204: None},
-    summary="Revoke a user's access to a study.",
-)
-def revoke_study_access(request, content_hash: str, username: str):
-    """Delete every ``AccessRight`` the named user holds on the study.
-
-    Requires authorship, superuser status, or a can_share grant.
-    """
-    user = _require_auth(request)
-    study = _get_study_or_404(content_hash, user)
-    if not _can_share_study(user, study):
-        raise HttpError(403, "You do not have permission to manage access to this study.")
-
-    study_ct = ContentType.objects.get_for_model(study, for_concrete_model=False)
+    ensure_can_manage_access(user, study, object_label="study", action="manage access for")
     rights = list(
-        AccessRight.objects.filter(
-            content_type=study_ct,
-            object_id=str(study.pk),
-            access_target__username=username,
-        )
+        AccessRight.objects.filter(content_type=_study_ct(), object_id=str(study.pk))
+        .exclude(access_target_id=study.author_id)
+        .select_related("access_target", "access_target_group")
+        .order_by("id")
     )
-    if not rights:
-        raise HttpError(404, "No access rights found for that user.")
+    # A grant a registered workflow holds is that workflow's to show and revoke.
+    held = held_grant_ids(rights)
+    rights = [right for right in rights if right.pk not in held]
+    log_activity(verb="dicom.study.access.list", target=study, metadata={"returned_count": len(rights)})
+    return [access_right_out(r, assessment_visible=assessment_visible(r, user, study)) for r in rights]
 
+
+@api.post("/dicom/studies/{content_hash}/access/", response={201: AccessRightOut})
+def grant_study_access(request, content_hash: str, payload: GrantStudyAccessIn):
+    """Grant a user an access right on a study.
+
+    Requires the author, a superuser or an active ``can_share`` grant, and a
+    delegated grant may confer only rights the grantor holds (see
+    ``epicurrents.granting``). A target that already holds a right on the
+    study answers 409; revoke it first.
+    """
+    user = _require_auth(request)
+    study = _get_study_or_404(content_hash, user)
+    rights = ensure_can_manage_access(user, study, object_label="study", action="share")
+    refusal = share_refusal(study)
+    if refusal:
+        raise HttpError(409, refusal)
+    if not (payload.can_read or payload.can_write or payload.can_share):
+        raise HttpError(400, "At least one permission flag must be true")
+    ensure_can_confer(
+        request,
+        user,
+        study,
+        rights,
+        can_read=payload.can_read,
+        can_write=payload.can_write,
+        can_share=payload.can_share,
+        apply_middleware=False,
+        expires_at=payload.expires_at,
+    )
+    if not get_user_model().objects.filter(pk=payload.access_target_id).exists():
+        raise HttpError(400, f"User {payload.access_target_id} not found")
+
+    conflict = "This user already has an access right on the study. Revoke it first."
+    try:
+        with transaction.atomic():
+            if AccessRight.objects.filter(
+                content_type=_study_ct(), object_id=str(study.pk), access_target_id=payload.access_target_id
+            ).exists():
+                raise HttpError(409, conflict)
+            right = AccessRight.objects.create(
+                content_type=_study_ct(),
+                object_id=str(study.pk),
+                access_giver=user,
+                access_target_id=payload.access_target_id,
+                can_read=payload.can_read,
+                can_write=payload.can_write,
+                can_share=payload.can_share,
+                apply_middleware=False,
+                expires_at=payload.expires_at,
+            )
+            log_activity(verb="dicom.study.access.grant", target=right)
+    except IntegrityError as exc:
+        # Race backstop: two concurrent grants for one target both pass the
+        # pre-check, and the per-target uniqueness constraint rejects the loser.
+        raise HttpError(409, conflict) from exc
+    right = AccessRight.objects.select_related("access_target", "access_target_group").get(pk=right.pk)
+    return 201, access_right_out(right, assessment_visible=True)
+
+
+@api.delete("/dicom/studies/{content_hash}/access/{right_id}/")
+def revoke_study_access(request, content_hash: str, right_id: int):
+    """Revoke one access right on a study.
+
+    Requires the author, a superuser or an active ``can_share`` grant; the
+    author's own row is revocable only by the author or a superuser.
+    """
+    user = _require_auth(request)
+    study = _get_study_or_404(content_hash, user)
+    rights = ensure_can_manage_access(user, study, object_label="study", action="manage access for")
+    right = AccessRight.objects.filter(pk=right_id, content_type=_study_ct(), object_id=str(study.pk)).first()
+    if right is None or held_grant_ids([right]):
+        raise HttpError(404, "Access right not found")
+    ensure_can_revoke(request, user, study, right, rights)
     with transaction.atomic():
-        for right in rights:
-            log_activity(verb="dicom.study.access.revoke", target=right)
-            right.delete()
-
-    return 204, None
+        log_activity(verb="dicom.study.access.revoke", target=right)
+        right.delete()
+    return {"status": "ok"}
 
 
 @api.get(
@@ -867,6 +924,95 @@ def wado_uri(
         content_type="application/dicom",
         filename=inst.stored_name,
     )
+
+
+# ---------------------------------------------------------------------------
+# DICOMweb (QIDO-RS search, WADO-RS metadata) — see plugins/dicom/dicomweb.py
+# ---------------------------------------------------------------------------
+
+DICOM_JSON = "application/dicom+json"
+
+
+def _dicom_json_response(body) -> HttpResponse:
+    return HttpResponse(json.dumps(body), content_type=DICOM_JSON)
+
+
+def _resolve_study_or_404(user, study_uid: str) -> DicomStudy:
+    study = dicomweb.resolve_study(user, study_uid)
+    if study is None:
+        raise HttpError(404, "Study not found.")
+    return study
+
+
+def _series_or_404(study: DicomStudy, series_uid: str):
+    series = study.series.filter(series_instance_uid=series_uid).first()
+    if series is None:
+        raise HttpError(404, "Series not found.")
+    return series
+
+
+def _paging(request) -> tuple[int, int]:
+    """Read QIDO ``offset`` / ``limit``; an unreadable value falls back to the default."""
+
+    def read(name, default):
+        try:
+            return max(0, int(request.GET.get(name, default)))
+        except ValueError:
+            return default
+
+    return read("offset", 0), read("limit", 0)
+
+
+@api.get("/dicomweb/studies", summary="QIDO-RS: search the studies the caller may list.")
+def qido_studies(request):
+    """Return one QIDO-RS study object per study the caller's study listing shows.
+
+    Copies of one study held by different authors collapse to the copy a
+    retrieval by that UID opens. Matching follows ``dicomweb.search_studies``;
+    ``limit`` of 0 or absent means no limit.
+    """
+    user = _require_auth(request)
+    studies = dicomweb.search_studies(user, request.GET)
+    offset, limit = _paging(request)
+    page = studies[offset : offset + limit] if limit else studies[offset:]
+    # Filter names only: a value is whatever the caller typed, a patient's name included.
+    filters = sorted(k for k in dicomweb.STUDY_FILTERS if request.GET.get(k))
+    log_activity(verb="dicom.study.list.qido", metadata={"count": len(page), "filters": filters})
+    return _dicom_json_response([dicomweb.study_json(s) for s in page])
+
+
+@api.get("/dicomweb/studies/{study_uid}/series", summary="QIDO-RS: the series of one study.")
+def qido_series(request, study_uid: str):
+    """Return the QIDO-RS series objects of the study *study_uid* resolves to for the caller."""
+    user = _require_auth(request)
+    study = _resolve_study_or_404(user, study_uid)
+    series = list(study.series.all())
+    log_activity(verb="dicom.series.list.qido", target=study, metadata={"count": len(series)})
+    return _dicom_json_response([dicomweb.series_json(s) for s in series])
+
+
+@api.get("/dicomweb/studies/{study_uid}/metadata", summary="WADO-RS: instance metadata of a whole study.")
+def wado_study_metadata(request, study_uid: str):
+    """Return WADO-RS metadata for every ready instance of the study *study_uid* resolves to."""
+    user = _require_auth(request)
+    study = _resolve_study_or_404(user, study_uid)
+    body = [item for series in study.series.all() for item in dicomweb.series_metadata(series)]
+    log_activity(verb="dicom.study.read.metadata", target=study, metadata={"instances": len(body)})
+    return _dicom_json_response(body)
+
+
+@api.get(
+    "/dicomweb/studies/{study_uid}/series/{series_uid}/metadata",
+    summary="WADO-RS: instance metadata of one series.",
+)
+def wado_series_metadata(request, study_uid: str, series_uid: str):
+    """Return WADO-RS metadata for every ready instance of one series of the resolved study."""
+    user = _require_auth(request)
+    study = _resolve_study_or_404(user, study_uid)
+    series = _series_or_404(study, series_uid)
+    body = dicomweb.series_metadata(series)
+    log_activity(verb="dicom.series.read.metadata", target=series, metadata={"instances": len(body)})
+    return _dicom_json_response(body)
 
 
 # The platform mounts each enabled plugin with ``include("plugins.<name>.urls")``

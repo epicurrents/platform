@@ -1,4 +1,4 @@
-"""Non-API URL patterns for the *dicom* project.
+"""Non-API URL patterns for the *dicom* plugin.
 
 Mounted at ``/plugin/dicom/`` by the extended URL loader in
 ``epicurrents/urls.py``. These patterns serve the OHIF viewer SPA and are
@@ -7,9 +7,13 @@ so the API and the SPA can evolve independently.
 
 Routes
 ------
-GET  /plugin/dicom/                  Redirect to the viewer.
-GET  /plugin/dicom/viewer/           OHIF viewer index.html.
-GET  /plugin/dicom/viewer/<subpath>  OHIF viewer assets and sub-routes.
+GET  /plugin/dicom/                  Redirect to the study list in the platform SPA.
+GET  /plugin/dicom/ohif/             OHIF's study list (index.html), searching the plugin's DICOMweb surface.
+GET  /plugin/dicom/ohif/<subpath>    OHIF viewer assets and client-side routes.
+
+The OHIF build is made for this mount (``PUBLIC_URL`` in
+``scripts/build_ohif.sh``, ``routerBasename`` in ``ohif-app-config.js``); moving
+it means rebuilding the viewer.
 """
 
 from django.http import HttpResponseRedirect
@@ -18,15 +22,14 @@ from django.urls import path, re_path
 from plugins.dicom.views import ohif_viewer
 
 
-def _redirect_to_viewer(request):
-    return HttpResponseRedirect("/plugin/dicom/viewer/")
+def _redirect_to_studies(request):
+    return HttpResponseRedirect("/dicom/studies")
 
 
 urlpatterns = [
-    # Redirect bare /plugin/dicom/ to the viewer.
-    path("", _redirect_to_viewer, name="dicom-root"),
-    # Serve the OHIF viewer SPA. Any sub-path is passed through so that
-    # OHIF's own React Router routes (e.g. /viewer/studyUID) work correctly.
-    path("viewer/", ohif_viewer, {"subpath": ""}, name="dicom-viewer"),
-    re_path(r"^viewer/(?P<subpath>.+)$", ohif_viewer, name="dicom-viewer-asset"),
+    path("", _redirect_to_studies, name="dicom-root"),
+    # Any sub-path is passed through so OHIF's own React Router routes
+    # (/plugin/dicom/ohif/viewer/dicomjson?url=…) reach index.html.
+    path("ohif/", ohif_viewer, {"subpath": ""}, name="dicom-viewer"),
+    re_path(r"^ohif/(?P<subpath>.+)$", ohif_viewer, name="dicom-viewer-asset"),
 ]

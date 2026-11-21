@@ -60,6 +60,13 @@ class TestUpload:
         assert (upload_dir / inst.stored_name).exists()
         assert not any(staging_dir.iterdir())
 
+    def test_upload_records_the_modality_lut(self, auth_client, make_dicom_bytes):
+        client, _ = auth_client
+        payload = make_dicom_bytes(sop_uid=SOP_UID, extra={"RescaleSlope": "1", "RescaleIntercept": "-1024"})
+        assert _upload(client, payload).json()["accepted"] == 1
+        inst = DicomInstance.objects.get(sop_instance_uid=SOP_UID)
+        assert (inst.rescale_slope, inst.rescale_intercept) == ("1", "-1024")
+
     def test_author_gets_self_access_right(self, auth_client, make_dicom_bytes):
         client, user = auth_client
         response = _upload(client, make_dicom_bytes())
@@ -295,6 +302,58 @@ class TestStudyListingAndDetail:
         assert "/plugin/dicom/api/v1/dicom/wado/" in url
         assert f"studyUID={study.study_instance_uid}" in url
 
+    def test_ohif_json_lists_each_frame_of_a_multiframe_instance(self, auth_client, make_study):
+        client, user = auth_client
+        study = make_study(user)
+        DicomInstance.objects.filter(series__study=study).update(number_of_frames=3)
+        response = client.get(f"{STUDIES_URL}{study.content_hash}/ohif-json/")
+        urls = [i["url"] for i in response.json()["studies"][0]["series"][0]["instances"]]
+        # ``frame`` is what OHIF's dicomjson source and the WADO-URI loader read.
+        assert [u.rsplit("&", 1)[1] for u in urls] == ["frame=1", "frame=2", "frame=3"]
+
+    def test_ohif_metadata_is_numeric_and_leaves_absent_tags_out(self, auth_client, make_study):
+        client, user = auth_client
+        study = make_study(user)
+        DicomInstance.objects.filter(series__study=study).update(
+            instance_number="7",
+            pixel_spacing=["0.661468", "0.661468"],
+            image_position_patient=["-158.1", "-179.0", "-75.7"],
+            rescale_slope="1",
+            rescale_intercept="-1024",
+            window_center="",
+            window_width="",
+        )
+        response = client.get(f"{STUDIES_URL}{study.content_hash}/ohif-json/")
+        metadata = response.json()["studies"][0]["series"][0]["instances"][0]["metadata"]
+        assert metadata["InstanceNumber"] == 7
+        assert metadata["PixelSpacing"] == [0.661468, 0.661468]
+        assert metadata["ImagePositionPatient"] == [-158.1, -179.0, -75.7]
+        assert (metadata["RescaleSlope"], metadata["RescaleIntercept"]) == (1, -1024)
+        # An empty window would reach OHIF as a zero-width window.
+        assert "WindowCenter" not in metadata
+        assert "WindowWidth" not in metadata
+
+    def test_ohif_metadata_drops_non_finite_values(self, auth_client, make_study):
+        client, user = auth_client
+        study = make_study(user)
+        DicomInstance.objects.filter(series__study=study).update(window_center="NaN", window_width="inf")
+        response = client.get(f"{STUDIES_URL}{study.content_hash}/ohif-json/")
+        # Strict parsing: a bare NaN or Infinity would make the payload unparseable in the browser.
+        body = json.loads(response.content, parse_constant=lambda c: pytest.fail(f"non-JSON constant {c}"))
+        metadata = body["studies"][0]["series"][0]["instances"][0]["metadata"]
+        assert "WindowCenter" not in metadata
+        assert "WindowWidth" not in metadata
+
+    def test_ohif_instances_follow_numeric_instance_order(self, auth_client, make_study):
+        client, user = auth_client
+        study = make_study(user, instance_count=3)
+        for inst, number in zip(DicomInstance.objects.filter(series__study=study).order_by("pk"), ["10", "2", ""]):
+            inst.instance_number = number
+            inst.save(update_fields=["instance_number"])
+        response = client.get(f"{STUDIES_URL}{study.content_hash}/ohif-json/")
+        instances = response.json()["studies"][0]["series"][0]["instances"]
+        assert [i["metadata"].get("InstanceNumber") for i in instances] == [2, 10, None]
+
 
 @pytest.mark.django_db
 class TestDeleteStudy:
@@ -333,75 +392,127 @@ class TestDeleteStudy:
 
 @pytest.mark.django_db
 class TestSharing:
-    def test_share_grants_read(self, auth_client, make_user, make_study):
+    """The study access surface, which follows the dataset grant rules through ``epicurrents.granting``."""
+
+    def _grant_row(self, study, giver, target, **perms):
+        return AccessRight.objects.create(
+            content_type=ContentType.objects.get_for_model(study, for_concrete_model=False),
+            object_id=str(study.pk),
+            access_giver=giver,
+            access_target=target,
+            **({"can_read": True, "apply_middleware": False} | perms),
+        )
+
+    def _grant(self, client, study, target_id, **perms):
+        return client.post(
+            f"{STUDIES_URL}{study.content_hash}/access/",
+            json.dumps({"access_target_id": target_id, **perms}),
+            content_type="application/json",
+        )
+
+    def test_grant_gives_read_and_returns_the_row(self, auth_client, make_user, make_study):
         client, user = auth_client
         study = make_study(user)
         grantee = make_user()
-        response = client.post(
-            f"{STUDIES_URL}{study.content_hash}/share/",
-            json.dumps({"username": grantee.username}),
-            content_type="application/json",
-        )
+        response = self._grant(client, study, grantee.pk)
         assert response.status_code == 201
+        body = response.json()
+        assert body["access_target_username"] == grantee.username
+        assert (body["can_read"], body["can_write"], body["can_share"]) == (True, False, False)
+        # No DICOM serving path de-identifies, so no row may claim one does.
+        assert body["apply_middleware"] is False
 
         grantee_client = Client()
         grantee_client.force_login(grantee)
         assert grantee_client.get(f"{STUDIES_URL}{study.content_hash}/").status_code == 200
 
-    def test_share_validations(self, auth_client, make_user, make_study):
+    def test_grant_validations(self, auth_client, make_user, make_study):
         client, user = auth_client
         study = make_study(user)
-        url = f"{STUDIES_URL}{study.content_hash}/share/"
-
-        def share(username):
-            return client.post(url, json.dumps({"username": username}), content_type="application/json")
-
-        assert share("no-such-user").status_code == 400
-        assert share(user.username).status_code == 400
         grantee = make_user()
-        assert share(grantee.username).status_code == 201
-        assert share(grantee.username).status_code == 409
+        assert self._grant(client, study, 999999).status_code == 400
+        assert self._grant(client, study, grantee.pk, can_read=False).status_code == 400
+        assert self._grant(client, study, grantee.pk).status_code == 201
+        assert self._grant(client, study, grantee.pk).status_code == 409
 
-    def test_non_author_cannot_share(self, auth_client, make_user, make_study):
+    def test_read_only_grantee_cannot_manage_access(self, auth_client, make_user, make_study):
         client, user = auth_client
         other = make_user()
         study = make_study(other)
-        ct = ContentType.objects.get_for_model(study, for_concrete_model=False)
-        AccessRight.objects.create(
-            content_type=ct,
-            object_id=str(study.pk),
-            access_giver=other,
-            access_target=user,
-            can_read=True,
-        )
-        response = client.post(
-            f"{STUDIES_URL}{study.content_hash}/share/",
-            json.dumps({"username": make_user().username}),
-            content_type="application/json",
-        )
-        assert response.status_code == 403
+        self._grant_row(study, other, user)
+        assert self._grant(client, study, make_user().pk).status_code == 403
+        assert client.get(f"{STUDIES_URL}{study.content_hash}/access/").status_code == 403
 
-    def test_revoke_removes_access(self, auth_client, make_user, make_study):
+    def test_delegate_confers_only_what_it_holds(self, auth_client, make_user, make_study):
+        client, user = auth_client
+        other = make_user()
+        study = make_study(other)
+        self._grant_row(study, other, user, can_share=True)
+        assert self._grant(client, study, make_user().pk, can_write=True).status_code == 403
+        assert self._grant(client, study, make_user().pk).status_code == 201
+
+    def test_list_leaves_out_the_authors_own_row(self, auth_client, make_user, make_study):
+        client, user = auth_client
+        study = make_study(user)
+        self._grant_row(study, user, user, can_write=True, can_share=True)
+        grantee = make_user()
+        self._grant(client, study, grantee.pk)
+        response = client.get(f"{STUDIES_URL}{study.content_hash}/access/")
+        assert response.status_code == 200
+        assert [r["access_target_username"] for r in response.json()] == [grantee.username]
+
+    def test_revoke_by_id_removes_access(self, auth_client, make_user, make_study):
         client, user = auth_client
         study = make_study(user)
         grantee = make_user()
-        client.post(
-            f"{STUDIES_URL}{study.content_hash}/share/",
-            json.dumps({"username": grantee.username}),
-            content_type="application/json",
-        )
-        response = client.delete(f"{STUDIES_URL}{study.content_hash}/share/{grantee.username}/")
-        assert response.status_code == 204
+        right_id = self._grant(client, study, grantee.pk).json()["id"]
+        response = client.delete(f"{STUDIES_URL}{study.content_hash}/access/{right_id}/")
+        assert response.status_code == 200
 
         grantee_client = Client()
         grantee_client.force_login(grantee)
         assert grantee_client.get(f"{STUDIES_URL}{study.content_hash}/").status_code == 404
+        assert client.delete(f"{STUDIES_URL}{study.content_hash}/access/{right_id}/").status_code == 404
 
-    def test_revoke_unknown_user_404(self, auth_client, make_study):
+    def test_delegate_cannot_revoke_the_authors_row(self, auth_client, make_user, make_study):
+        client, user = auth_client
+        other = make_user()
+        study = make_study(other)
+        author_row = self._grant_row(study, other, other, can_write=True, can_share=True)
+        self._grant_row(study, other, user, can_share=True)
+        assert client.delete(f"{STUDIES_URL}{study.content_hash}/access/{author_row.pk}/").status_code == 403
+
+    def test_registered_share_guard_refuses_the_grant(self, auth_client, make_user, make_study, monkeypatch):
+        from epicurrents import granting
+
         client, user = auth_client
         study = make_study(user)
-        response = client.delete(f"{STUDIES_URL}{study.content_hash}/share/nobody/")
-        assert response.status_code == 404
+        monkeypatch.setitem(granting._SHARE_GUARDS, "dicom.dicomstudy", [lambda obj: "held for review"])
+        response = self._grant(client, study, make_user().pk)
+        assert response.status_code == 409
+        assert not AccessRight.objects.filter(object_id=str(study.pk), access_target__isnull=False).exists()
+
+    def test_held_grant_is_neither_listed_nor_revocable(self, auth_client, make_user, make_study, monkeypatch):
+        from epicurrents import granting
+
+        client, user = auth_client
+        study = make_study(user)
+        held = self._grant_row(study, user, make_user())
+        monkeypatch.setattr(granting, "_HELD_GRANT_SOURCES", [lambda rows: {r.pk for r in rows if r.pk == held.pk}])
+        assert client.get(f"{STUDIES_URL}{study.content_hash}/access/").json() == []
+        assert client.delete(f"{STUDIES_URL}{study.content_hash}/access/{held.pk}/").status_code == 404
+        assert AccessRight.objects.filter(pk=held.pk).exists()
+
+    def test_listing_says_who_may_share(self, auth_client, make_user, make_study):
+        client, user = auth_client
+        other = make_user()
+        own = make_study(user)
+        read_only = make_study(other)
+        delegated = make_study(other)
+        self._grant_row(read_only, other, user)
+        self._grant_row(delegated, other, user, can_share=True)
+        listed = {s["hash"]: s["can_share"] for s in client.get(STUDIES_URL).json()}
+        assert listed == {own.content_hash: True, read_only.content_hash: False, delegated.content_hash: True}
 
 
 @pytest.mark.django_db
@@ -503,17 +614,19 @@ class TestDicomAuditTrail:
         client.delete(f"{STUDIES_URL}{study.content_hash}/")
         assert self._last_verb() == "dicom.study.trash"
 
-    def test_share_and_revoke_verbs(self, auth_client, make_user, make_study):
+    def test_access_list_grant_and_revoke_verbs(self, auth_client, make_user, make_study):
         client, user = auth_client
         study = make_study(user)
         grantee = make_user()
-        client.post(
-            f"{STUDIES_URL}{study.content_hash}/share/",
-            json.dumps({"username": grantee.username}),
+        right = client.post(
+            f"{STUDIES_URL}{study.content_hash}/access/",
+            json.dumps({"access_target_id": grantee.pk}),
             content_type="application/json",
-        )
+        ).json()
         assert Activity.objects.filter(verb="dicom.study.access.grant").exists()
-        client.delete(f"{STUDIES_URL}{study.content_hash}/share/{grantee.username}/")
+        client.get(f"{STUDIES_URL}{study.content_hash}/access/")
+        assert Activity.objects.filter(verb="dicom.study.access.list").exists()
+        client.delete(f"{STUDIES_URL}{study.content_hash}/access/{right['id']}/")
         assert Activity.objects.filter(verb="dicom.study.access.revoke").exists()
 
     def test_wado_verb_with_target(self, auth_client, make_study):

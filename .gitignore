@@ -59,6 +59,10 @@ ENV/
 # re-included by name here, in the /* form the projects rule explains.
 /recordings/converters/*/
 
+# The dicom plugin's built OHIF viewer (scripts/build_ohif.sh). A build output of
+# the pinned plugins/dicom/ohif-viewer submodule, and 126 MB of it.
+/plugins/dicom/ohif-dist/
+
 # Project lifecycle state — per-deployment archive registry written by the
 # activate_project / deactivate_project commands. Regenerated when missing
 # (project_loader.get_project_state returns {} if absent); not source.

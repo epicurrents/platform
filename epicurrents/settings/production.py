@@ -175,12 +175,14 @@ CONTENT_SECURITY_POLICY = config(
 # icons at all. Whatever that verification exercised, it was not this policy in
 # front of this SPA. Treat the coverage note below as a list of what is known to
 # be untested rather than as assurance about the rest, and prefer CSP_REPORT_ONLY
-# for a cycle after any change here. Two configurations remain uncovered and
-# should run report-only for a cycle before trusting this default — the dicom
-# plugin, whose OHIF viewer is a submodule that was not checked out when the
-# policy was tuned, and any project whose own views reach an external origin.
-# Both can extend or relax CONTENT_SECURITY_POLICY through their settings.py, or
-# the deployment can set CSP_REPORT_ONLY=True in .env for a cycle.
+# for a cycle after any change here. One configuration remains uncovered and
+# should run report-only for a cycle before trusting this default: any project
+# whose own views reach an external origin. It can extend or relax
+# CONTENT_SECURITY_POLICY through its settings.py, or the deployment can set
+# CSP_REPORT_ONLY=True in .env for a cycle. The dicom plugin was checked in a
+# browser against OHIF 3.13 under this policy: its codec worker needs
+# 'unsafe-eval', which the plugin's viewer adds to its own responses only (see
+# plugins/dicom/README.md → Content Security Policy).
 #
 # Failing loudly is the point of the default. An enforced policy names the
 # blocked URL and directive in the console, where report-only on a deployment
