@@ -1,8 +1,8 @@
 /**
  * How the platform lists the items of a dataset in the viewer before any of them is loaded.
  *
- * Every item becomes a deferred study: a listing the viewer shows by name, with the importer and URL to load it from
- * when it is opened. A recording that has finished processing also carries what the viewer would otherwise read from
+ * Every item is listed as a resource of its module that has read nothing: the viewer shows it by name, and opening it
+ * loads it in place with the importer and URL it was listed with. A recording that has finished processing also carries what the viewer would otherwise read from
  * its header to list it, its duration and channel count, which the platform parsed at ingest and serves as trusted
  * metadata; listing from it costs no fetch and no reader. An item without such metadata is listed by name, and the
  * caller loads up to `app.eagerStudyLoadLimit` of those straight away so they list with their properties.
@@ -64,24 +64,48 @@ export function listedFromBrowseRow(row: DatasetBrowseRow): ListedRecording {
     }
 }
 
+/** A resource listed in the viewer, which loads in place, on itself, when it is opened or when `load` is called. */
+export type ListedResource = DataResource & {
+    /** Read the study and finish the setup, resolving false when either fails, which leaves the resource in error. */
+    load (): Promise<boolean>
+}
+
 /**
- * The part of the viewer's deferred-study API the platform calls. The application the platform runs is the viewer
- * edition built from source, which has it; the `@epicurrents/core` dev dependency the SPA takes its types from
- * predates it, so it is declared here until that dependency moves to a release that does.
+ * The part of the viewer's listing API the platform calls. The application the platform runs is the viewer edition
+ * built from source, which has it; the `@epicurrents/core` dev dependency the SPA takes its types from predates it, so
+ * it is declared here until that dependency moves to a release that does.
  */
-export type DeferredStudyApp = EpicurrentsApp & {
-    addDeferredStudy (
-        study: {
+export type ListingStudyApp = EpicurrentsApp & {
+    listStudy (
+        listing: {
             loader: string
             name: string
-            onLoaded?: (resource: DataResource) => void | Promise<void>
+            onLoad?: (resource: DataResource) => void | Promise<void>
             options?: { isValidated?: boolean, name?: string }
             properties?: ListedProperty[]
             source: string
         },
         options?: { dataset?: unknown },
-    ): DataResource | null
-    openDeferredResource (resource: DataResource): Promise<DataResource | null>
+    ): ListedResource | null
+}
+
+/**
+ * A resource that names the resource it is attached to, a radiology study today. Declared here rather than taken from
+ * the interface package so the SPA type-checks without the viewer checkout on disk.
+ */
+type AttachedResource = DataResource & { parent: DataResource | null }
+
+/**
+ * Link an attached item to the recording it is attached to, which puts the recording in the item's way back. A listed
+ * resource keeps its object when it loads, so the link is set once, at listing. A resource that takes no parent
+ * (anything but a radiology study today) is left alone.
+ * @param resource - The attached item as listed.
+ * @param parent - The recording's resource, or null when its dataset does not hold it.
+ */
+export function linkToParent(resource: DataResource, parent: DataResource | null) {
+    if ('parent' in resource) {
+        (resource as AttachedResource).parent = parent
+    }
 }
 
 /** The viewer's eager load limit, `app.eagerStudyLoadLimit`, or its default where the setting is absent. */

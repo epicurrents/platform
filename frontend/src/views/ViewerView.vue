@@ -31,17 +31,18 @@ import { mergeSetup } from '#plugins/base'
 import { waitForEventBus } from '#projects/eventBus'
 import { getViewerConfig } from '#api/viewerConfig'
 import { applyViewerSettingsOverrides, VIEWER_USER_SETTINGS_PATH, type ViewerSettingsOverrides } from '#lib/viewerConfig'
-import { AttachmentParents } from '#viewer/attachmentParents'
 import { leadFieldProvider } from '#viewer/leadFields'
 import {
     describeMedia,
     describeMediaAttachment,
     describeRecording,
     eagerStudyLoadLimit,
+    linkToParent,
     listedFromBrowseRow,
     listedFromRecording,
-    type DeferredStudyApp,
     type ListedRecording,
+    type ListedResource,
+    type ListingStudyApp,
     type StudyDescription,
 } from '#viewer/datasetStudies'
 import { createUploadTarget } from '#lib/exportTargets'
@@ -153,29 +154,15 @@ function seedTrustedInterruptions(resource: DataResource, recording: Recording):
 }
 
 /**
- * Keep the link between an attached item and its recording current as either of them loads.
- * @param parents - The bundle's attachment links.
- * @param resource - The loaded resource.
- * @param item - The bundle item it was loaded from.
- */
-function itemLoaded(parents: AttachmentParents, resource: DataResource, item: BundleItem) {
-    if (item.kind === 'recording') {
-        parents.recordingHeld(item.listed.hash, resource)
-    } else if (item.kind === 'described' && item.parent) {
-        parents.childLoaded(item.parent, resource)
-    }
-}
-
-/**
- * Finish a study once the viewer has loaded it, whether up front or when it was opened: seed a recording's trusted
- * interruption table, from its detail, and attach its videos. Runs before the loaded resource is activated, which is
- * when the activation flow delivers the interruption table to the reader. A detail that cannot be read leaves the
- * viewer to discover the gaps itself.
- * @param resource - The loaded resource.
+ * Give a recording what the platform holds for it as the viewer loads it, whether up front or when it is opened: its
+ * trusted interruption table, from its detail, and its videos. Runs beside the read of the study, and the recording's
+ * setup waits for it, which is when the setup delivers the interruption table to the reader. A detail that cannot be
+ * read leaves the viewer to discover the gaps itself.
+ * @param resource - The listed resource being loaded.
  * @param item - The item it was listed from.
  * @param shareToken - Share token the item's dataset was opened with, if any.
  */
-async function studyLoaded(resource: DataResource, item: BundleItem, shareToken: string | undefined): Promise<void> {
+async function studyLoading(resource: DataResource, item: BundleItem, shareToken: string | undefined): Promise<void> {
     if (item.kind !== 'recording') {
         return
     }
@@ -673,18 +660,17 @@ onMounted(async () => {
                 }
                 const first = ds.resources?.values().next().value?.resource
                 if (first && epic) {
-                    // Through the interface, which loads a listed study before activating it.
+                    // Through the interface, whose activation loads a listed study in place.
                     epic.interface?.openResource(first)
                 }
             })
 
-            // Every item is listed first and loads when it is opened, so a large dataset costs no fetch and no reader
-            // per member. A dataset flagged to preload, and an item the platform holds no metadata to list, are loaded
-            // up front instead, as many as the viewer's eager load limit allows.
-            const app = epic as DeferredStudyApp
-            const parents = new AttachmentParents()
+            // Every item is listed, and loads in place when it is opened, so a large dataset costs no fetch and no
+            // reader per member. A dataset flagged to preload, and an item the platform holds no metadata to list, are
+            // loaded up front instead, as many as the viewer's eager load limit allows.
+            const app = epic as ListingStudyApp
             const eagerLimit = eagerStudyLoadLimit(app)
-            const eager: DataResource[] = []
+            const eager: ListedResource[] = []
             const viewerDatasets: MediaDataset[] = []
             for (const [bundleIdx, bundle] of bundles.value.entries()) {
                 // Only the first dataset is marked active; later ones must not
@@ -692,6 +678,8 @@ onMounted(async () => {
                 // inconsistent state on mount.
                 const viewerDataset = app.createDataset(bundle.name, bundleIdx === 0)
                 viewerDatasets.push(viewerDataset)
+                // The bundle's recordings by hash, for the items attached to them, which are listed after them.
+                const recordings = new Map<string, DataResource>()
                 for (const item of bundle.items) {
                     const description = item.kind === 'recording'
                         ? describeRecording(item.listed, bundle.shareToken)
@@ -703,18 +691,15 @@ onMounted(async () => {
                         console.warn(`[Epicurrents] No importer registered for media ${media.file_extension}; skipping ${media.content_hash}`)
                         continue
                     }
-                    const listing = app.addDeferredStudy({
+                    const listed = app.listStudy({
                         loader: description.loader,
                         name: description.name,
-                        onLoaded: (resource) => {
-                            itemLoaded(parents, resource, item)
-                            return studyLoaded(resource, item, bundle.shareToken)
-                        },
+                        onLoad: resource => studyLoading(resource, item, bundle.shareToken),
                         options: { isValidated: true, name: description.name },
                         properties: description.properties ?? undefined,
                         source: description.source,
                     }, { dataset: viewerDataset })
-                    if (!listing) {
+                    if (!listed) {
                         const hash = item.kind === 'recording'
                             ? item.listed.hash
                             : item.kind === 'media' ? item.media.content_hash : item.description.name
@@ -722,10 +707,12 @@ onMounted(async () => {
                         continue
                     }
                     if (item.kind === 'recording') {
-                        parents.recordingHeld(item.listed.hash, listing)
+                        recordings.set(item.listed.hash.toUpperCase(), listed)
+                    } else if (item.kind === 'described' && item.parent) {
+                        linkToParent(listed, recordings.get(item.parent) ?? null)
                     }
                     if (bundle.preload || !description.properties) {
-                        eager.push(listing)
+                        eager.push(listed)
                     }
                 }
             }
@@ -736,15 +723,14 @@ onMounted(async () => {
             }
             const loadedStudies: DataResource[] = []
             const eagerLoads = eager.slice(0, eagerLimit)
-            for (const [index, listing] of eagerLoads.entries()) {
+            for (const [index, listed] of eagerLoads.entries()) {
                 if (eagerLoads.length > 1) {
                     openingStatus.value = t(
                         'Loading {done} of {count} items…', SCOPE, { done: index + 1, count: eagerLoads.length },
                     )
                 }
-                const loaded = await app.openDeferredResource(listing)
-                if (loaded) {
-                    loadedStudies.push(loaded)
+                if (await listed.load()) {
+                    loadedStudies.push(listed)
                 }
             }
             // Open the first item that did not fail to load, loading it if it is still a listing. The rest stay in the
