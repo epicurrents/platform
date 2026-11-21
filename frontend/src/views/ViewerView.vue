@@ -37,7 +37,6 @@ import {
     describeMediaAttachment,
     describeRecording,
     eagerStudyLoadLimit,
-    linkToParent,
     listedFromBrowseRow,
     listedFromRecording,
     type ListedRecording,
@@ -79,8 +78,7 @@ type BundleItem =
  * List what is attached to the bundle's recordings after each of them, one request per page of recordings. Videos are
  * left out, since they play on their recording's timeline; so is a media file the bundle already holds as an item of
  * its own or a plugin's item the bundle already lists, and an attachment no media importer or viewer item source
- * describes. Each listed attachment carries its
- * parent's hash, for a navigator that lists it under the recording. Listing nothing when the request fails leaves the
+ * describes. Each listed attachment carries its parent's hash, under which the viewer lists it. Listing nothing when the request fails leaves the
  * recordings themselves to open.
  * @param items - The bundle's items, in order.
  * @param shareToken - Share token the bundle is read with, if any.
@@ -691,6 +689,10 @@ onMounted(async () => {
                         console.warn(`[Epicurrents] No importer registered for media ${media.file_extension}; skipping ${media.content_hash}`)
                         continue
                     }
+                    // An attachment is listed under its recording, which is listed before it.
+                    const parent = item.kind === 'described' && item.parent
+                        ? recordings.get(item.parent) ?? null
+                        : null
                     const listed = app.listStudy({
                         loader: description.loader,
                         name: description.name,
@@ -698,7 +700,7 @@ onMounted(async () => {
                         options: { isValidated: true, name: description.name },
                         properties: description.properties ?? undefined,
                         source: description.source,
-                    }, { dataset: viewerDataset })
+                    }, parent ? { parent } : { dataset: viewerDataset })
                     if (!listed) {
                         const hash = item.kind === 'recording'
                             ? item.listed.hash
@@ -708,8 +710,6 @@ onMounted(async () => {
                     }
                     if (item.kind === 'recording') {
                         recordings.set(item.listed.hash.toUpperCase(), listed)
-                    } else if (item.kind === 'described' && item.parent) {
-                        linkToParent(listed, recordings.get(item.parent) ?? null)
                     }
                     if (bundle.preload || !description.properties) {
                         eager.push(listed)

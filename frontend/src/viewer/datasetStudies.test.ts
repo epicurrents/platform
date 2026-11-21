@@ -15,12 +15,11 @@ import {
     describeMediaAttachment,
     describeRecording,
     eagerStudyLoadLimit,
-    linkToParent,
     listedFromBrowseRow,
     listedFromRecording,
     recordingProperties,
 } from './datasetStudies'
-import type { DataResource, EpicurrentsApp } from '@epicurrents/core/dist/types'
+import type { EpicurrentsApp } from '@epicurrents/core/dist/types'
 
 const recording = (overrides: Partial<Recording> = {}): Recording => ({
     content_hash: '',
@@ -151,24 +150,6 @@ describe('the eager load limit', () => {
     })
     it('falls back to the default where the setting is absent', () => {
         expect(eagerStudyLoadLimit(app({}))).toBe(50)
-    })
-})
-
-describe('linkToParent', () => {
-    const resource = (name: string, parent?: DataResource | null) =>
-        (parent === undefined ? { name } : { name, parent }) as unknown as DataResource & { parent?: DataResource | null }
-
-    it('links an attached study to its recording', () => {
-        const recording = resource('EEG')
-        const study = resource('US', null)
-        linkToParent(study, recording)
-        expect(study.parent).toBe(recording)
-    })
-
-    it('leaves alone a resource that takes no parent', () => {
-        const document = resource('Report')
-        linkToParent(document, resource('EEG'))
-        expect('parent' in document).toBe(false)
     })
 })
 

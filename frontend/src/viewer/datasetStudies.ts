@@ -85,27 +85,8 @@ export type ListingStudyApp = EpicurrentsApp & {
             properties?: ListedProperty[]
             source: string
         },
-        options?: { dataset?: unknown },
+        options?: { dataset?: unknown, parent?: DataResource },
     ): ListedResource | null
-}
-
-/**
- * A resource that names the resource it is attached to, a radiology study today. Declared here rather than taken from
- * the interface package so the SPA type-checks without the viewer checkout on disk.
- */
-type AttachedResource = DataResource & { parent: DataResource | null }
-
-/**
- * Link an attached item to the recording it is attached to, which puts the recording in the item's way back. A listed
- * resource keeps its object when it loads, so the link is set once, at listing. A resource that takes no parent
- * (anything but a radiology study today) is left alone.
- * @param resource - The attached item as listed.
- * @param parent - The recording's resource, or null when its dataset does not hold it.
- */
-export function linkToParent(resource: DataResource, parent: DataResource | null) {
-    if ('parent' in resource) {
-        (resource as AttachedResource).parent = parent
-    }
 }
 
 /** The viewer's eager load limit, `app.eagerStudyLoadLimit`, or its default where the setting is absent. */
