@@ -3,7 +3,7 @@
  * whichever of the two loads first.
  */
 import { describe, expect, it } from 'vitest'
-import type { DataResource } from '#epicurrents/core/dist/types'
+import type { DataResource } from '@epicurrents/core/dist/types'
 import { AttachmentParents } from './attachmentParents'
 
 const resource = (name: string, parent?: DataResource | null) =>

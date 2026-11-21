@@ -8,11 +8,16 @@
  * radiology study today) is left alone.
  */
 
-import type { DataResource } from '#epicurrents/core/dist/types'
-import type { RadiologyResource } from '@epicurrents/interface/modules/rad'
+import type { DataResource } from '@epicurrents/core/dist/types'
+
+/**
+ * A resource that names the resource it is attached to, a radiology study today. Declared here rather than taken from
+ * the interface package so the SPA type-checks without the viewer checkout on disk.
+ */
+type AttachedResource = DataResource & { parent: DataResource | null }
 
 /** True for a resource that names the resource it is attached to. */
-function takesParent(resource: DataResource): resource is RadiologyResource {
+function takesParent(resource: DataResource): resource is AttachedResource {
     return 'parent' in resource
 }
 
