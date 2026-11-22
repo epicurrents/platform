@@ -241,8 +241,11 @@ export default defineConfig(({ mode }) => {
                         return next()
                     }
 
-                    // Only intercept known API path prefixes.
+                    // Any path carrying an api/v<n> segment, as _API_SHAPED_PATH in epicurrents/urls.py reads it.
+                    const apiShaped = /^\/(?:[\w-]+\/)*api\/v\d+(?:\/|$)/.test(path)
+                    // Only intercept API paths and the prefixes the mock serves.
                     if (
+                        !apiShaped &&
                         !path.startsWith('/api/') &&
                         !path.startsWith('/recordings/') &&
                         !path.startsWith('/annotations/')
@@ -255,7 +258,18 @@ export default defineConfig(({ mode }) => {
                         req,
                         res,
                     ).catch((err: unknown) => { next(err); return true })
-                    if (!handled) next()
+                    if (handled) {
+                        return
+                    }
+                    // An API path the mock does not serve is a 404 in the server's shape, as api_not_found answers
+                    // it. Falling through would reach Vite's SPA fallback: index.html with a 200, which a client
+                    // reads as the response it asked for.
+                    if (apiShaped) {
+                        res.writeHead(404, { 'Content-Type': 'application/json' })
+                        res.end(JSON.stringify({ detail: 'Not found' }))
+                        return
+                    }
+                    next()
                 })
             },
         } satisfies import('vite').Plugin)
