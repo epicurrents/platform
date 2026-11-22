@@ -32,6 +32,7 @@ const SCOPE = 'ExampleNotesView'
     margin: 0 auto;
     max-width: 48rem;
     padding: 1rem;
+    width: 100%;
 }
 
 .example-notes-view__subtitle {

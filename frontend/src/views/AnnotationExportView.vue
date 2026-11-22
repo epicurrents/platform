@@ -343,6 +343,7 @@ async function onExport () {
     max-width: 720px;
     min-height: 0;
     overflow: hidden;
+    width: 100%;
 }
 
 .annotation-export-view h1 {

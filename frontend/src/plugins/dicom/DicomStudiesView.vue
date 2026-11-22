@@ -1,5 +1,5 @@
 <template>
-    <div class="dicom-studies-view">
+    <main class="page-view">
         <header class="page-header">
             <h1>{{ t('DICOM Studies', SCOPE) }}</h1>
             <wa-button
@@ -278,7 +278,7 @@
                 </wa-button>
             </div>
         </wa-dialog>
-    </div>
+    </main>
 </template>
 
 <script setup lang="ts">
@@ -626,27 +626,6 @@ async function deleteStudy() {
 
 .study-description {
     margin-right: var(--wa-space-xs);
-}
-
-.dicom-studies-view {
-    display: flex;
-    flex-direction: column;
-    gap: 1.5rem;
-    padding: 1.5rem;
-    max-width: 1200px;
-    margin: 0 auto;
-}
-
-.page-header {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: 1rem;
-}
-
-.page-header h1 {
-    margin: 0;
-    font-size: 1.5rem;
 }
 
 .loading-state,
