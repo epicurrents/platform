@@ -106,11 +106,14 @@ happens in your context window.
 ### Step 1 — Read the diff from the staging file
 
 A PreToolUse hook in [.claude/settings.json](../../.claude/settings.json)
-regenerates `.review/staged.diff` from `git diff --staged -U0` every
+regenerates `.review/diff/staged.diff` from `git diff --staged -U0` every
 time this agent is invoked, so the file is fresh by the time you read
 it. (When hooks are disabled, the caller must write the file manually
 before invoking — a stale file silently reviews the wrong commit.)
-Read that file with the Read tool — it is your complete source of
+A caller reviewing something other than this repository's staged
+changes writes its diff under another name in `.review/diff/`, where
+every file is ignored, and names that file in the invocation prompt;
+read the named file then. Read the file with the Read tool — it is your complete source of
 truth for all subsequent steps. Do not attempt to run any shell
 commands. If the file is empty, nothing is staged: report that and
 write an empty findings file.

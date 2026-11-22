@@ -163,9 +163,11 @@ scripts-local/
 # closure). Fetched at deploy, served at /vendor/, never committed.
 /frontend/vendor/
 
-# Review-agent transient diff snapshot — produced by the caller before
-# invoking the documentation-style agent (see .review/agents/documentation-style.md).
-.review/staged.diff
+# Review-agent transient diff snapshots, under any name — produced by the caller
+# before invoking an agent that reads its diff from a file (see
+# .review/agents/documentation-style.md).
+.review/diff/*
+!.review/diff/.gitkeep
 # Don't track the findings produced by agents.
 .review/findings/*.md
 

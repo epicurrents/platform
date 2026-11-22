@@ -15,6 +15,7 @@ Tool-agnostic home for the project's automated review surface.
 │   ├── gdpr-compliance.md
 │   ├── load-bearing-diff-reviewer.md
 │   └── phi-exposure.md
+├── diff/                 # transient diff snapshots handed to agents; every file ignored
 ├── exemptions/           # per-agent exemption registries; one file per agent that has one
 │   ├── README.md
 │   ├── anonymisation.md
