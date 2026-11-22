@@ -114,7 +114,9 @@ class TestEnablePlugin:
         assert result.returncode == 0, result.stderr
         compose = f"docker compose -f {tmp_path}/docker-compose.yml"
         assert fakebin.has_call(f"{compose} up -d db redis")
-        assert fakebin.has_call(f"{compose} run --rm --no-deps -e EPICURRENTS_PLUGINS=dicom web python manage.py migrate")
+        assert fakebin.has_call(
+            f"{compose} run --rm --no-deps -e EPICURRENTS_PLUGINS=dicom web python manage.py migrate"
+        )
         assert not any(call.startswith(("podman", "sudo")) for call in fakebin.calls())
         assert f"    {compose} up -d" in result.stdout
 

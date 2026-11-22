@@ -207,7 +207,9 @@ class TestProductionOverlays:
 
 class TestCommandLine:
     def test_plain_words_print_as_typed(self, fakebin, tmp_path):
-        code = _helper("COMPOSE=(sudo -E podman compose -f /opt/epicurrents/docker-compose.yml)", "compose_command_line")
+        code = _helper(
+            "COMPOSE=(sudo -E podman compose -f /opt/epicurrents/docker-compose.yml)", "compose_command_line"
+        )
         result = _bash(fakebin, tmp_path, code)
         assert result.stdout == "sudo -E podman compose -f /opt/epicurrents/docker-compose.yml"
 
