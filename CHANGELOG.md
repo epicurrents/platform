@@ -8,15 +8,26 @@ Entries are written for the person deciding whether to upgrade, so the ones that
 
 ## [Unreleased]
 
+## [0.2.2] — 2026-11-22
+
 ### Changed
 
+- **The viewer edition must be built from core 2.4.0 or later.** The SPA lists a dataset's members with core's `listStudy`, which replaces the deferred study API 0.2.1 used, and opening a member loads it in place. With an older edition nothing opens from a dataset, a `?files=` link or a session link. [frontend/README.md](frontend/README.md#opening-a-dataset-in-the-viewer).
+- **A dataset's members are listed in the order its managers arranged, then by name.** `GET /datasets/{id}/items/` follows the dataset's folder tree, each folder's arranged members first and the unsorted ones after them by name, gated or not, and never by addition. An item row's `id` and `position` are served to the dataset's managers only, and null to every other reader, who names a member by `object_hash`. [library/README.md](library/README.md#manual-order).
 - **A recording's attachments are listed in the viewer after it.** Attached documents, images and audio, and a plugin's attachable types, now appear in the viewer's dataset after the recording they are attached to, from a new attachments listing (`GET /recordings/api/v1/attachments/`); attached video still plays on the recording's timeline. A plugin with an attachable model registers it with `register_attachment_type`, and one with a dataset-member model with `register_item_type`, so neither is listed by its primary key. [recordings/README.md](recordings/README.md#attachments), [library/README.md](library/README.md#member-types).
 - **A grant carrying `apply_middleware` now conveys nothing of an object its model declares it cannot honour.** `register_terms_refusal` in `epicurrents.permissions` is applied to every local read, direct and inherited, the object's author excepted; the dicom plugin declares a study stored without its header pass, which a de-identifying dataset grant used to serve raw. [epicurrents/README.md](epicurrents/README.md#permissions).
 - **dicom: "View" opens the platform's viewer, which frames OHIF in its radiology view.** This needs a viewer edition carrying the interface's `rad` module; with an edition that predates it, nothing opens from a `?dicom=` link, the study list's View button, an attached study or a study in a dataset. Studies can be dataset members, never of a release-gated dataset. [plugins/dicom/README.md](plugins/dicom/README.md#embedded-view).
+- **dicom: studies are de-identified at ingest.** With `DICOM_DEIDENTIFY_ON_INGEST` on, the default, every stored file is rewritten by the plugin's header pass and stamped with its version (migration `dicom.0003`), and UIDs are replaced under `DICOM_UID_KEY`. A deployment running the plugin adds that key to `.env` before updating, since with it empty every DICOM upload and import is refused; `init_env` generates it for new deployments. The pass is defence in depth: a study remains its submitter's responsibility. [plugins/dicom/README.md](plugins/dicom/README.md#de-identification).
+
+### Added
+
+- **A dataset's managers arrange its members.** `POST /datasets/{id}/items/{item_id}/order` places a member within its folder (migration `library.0007`), and the dataset page offers the actions. Adding a member leaves it unsorted, so a position never records arrival. [library/README.md](library/README.md#manual-order).
+- **dicom: OHIF 3.13 with a DICOMweb study list and sharing.** OHIF is pinned to v3.13.15 and built for the `/plugin/dicom/ohif/` mount, a QIDO-RS and WADO-RS surface lists the studies a caller may read, and a study is shared with users through a Share dialog under the dataset grant rules. [plugins/dicom/README.md](plugins/dicom/README.md#dicomweb).
 
 ### Fixed
 
 - **A guest opening a share link in the viewer is shown the viewer's disclaimer again.** The signed-in viewer marked the disclaimer accepted for every caller, share-token guests included; it now does so for signed-in users only.
+- **`switch_project.sh` refuses an option where the project name belongs.** A flag passed in that position used to be taken as a project name.
 
 ## [0.2.1] — 2026-11-20
 
@@ -423,7 +434,8 @@ Started at 0.x rather than 1.0.0 deliberately. The code is not early — it is f
 - `recordings.processors.edf._build_header` is now `build_header`. It was private with sixteen call sites across the federation middleware, the FUSE filesystem and a project. Its de-identifying counterpart `_build_clean_header` stays private on purpose: its blanking values are a PHI contract, not parameters.
 - `pandas` and `PyWavelets` left the platform's dependency closure for the one project that used them. A deployment needing them gets them from that project.
 
-[Unreleased]: https://github.com/epicurrents/platform/compare/v0.2.1...HEAD
+[Unreleased]: https://github.com/epicurrents/platform/compare/v0.2.2...HEAD
+[0.2.2]: https://github.com/epicurrents/platform/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/epicurrents/platform/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/epicurrents/platform/compare/v0.1.3...v0.2.0
 [0.1.3]: https://github.com/epicurrents/platform/compare/v0.1.2...v0.1.3
