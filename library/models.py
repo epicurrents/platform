@@ -571,6 +571,11 @@ class DatasetItem(models.Model):
     # the anonymity report can tell a member re-written since from one released at a
     # newer version by the same run. Null for unreleased members and non-recordings.
     released_deidentification_version = models.PositiveIntegerField(null=True, blank=True)
+    # The member's place in the manual order of its folder (the dataset root being one), which a manager
+    # arranges through the order endpoint; null means unsorted, listed after the arranged members by name.
+    # Never written on arrival: a counter assigned as members are added would be an arrival order, which a
+    # release-gated dataset must not show (library.release.dataset_member_ordering).
+    position = models.PositiveIntegerField(null=True, blank=True)
 
     added_at = models.DateTimeField(auto_now_add=True)
 

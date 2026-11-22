@@ -6,6 +6,8 @@ data source's ``wadoUriRoot``. This module holds what they share: which studies 
 resolves to one of them, the QIDO matching rules, and the DICOM JSON encoding.
 
 A ``StudyInstanceUID`` is unique per author, not globally: two users who upload the same study hold two copies.
+With de-identification on the copies carry different UIDs, since the pass replaces a UID under its author's own
+key, so one UID names one copy; stored as uploaded, the copies share the source UID. Nothing here relies on either.
 DICOMweb addresses a study by UID alone, so a UID resolves to the caller's own copy, then to the lowest-keyed copy
 the study listing shows them, then to the lowest-keyed copy they can read by any route (an attached parent
 included). The search applies the same preference when it collapses copies to one row per UID, which is what keeps
@@ -15,7 +17,7 @@ the study a list row names and the study that opens the same one.
 import math
 
 from django.contrib.contenttypes.models import ContentType
-from django.db.models import Q
+from django.db.models import Count, Prefetch, Q
 from pydicom.datadict import dictionary_VR
 from pydicom.dataset import Dataset
 
@@ -44,19 +46,29 @@ _TEXT_FIELDS = {
 
 
 def listed_studies(user):
-    """Return the active studies the caller's study listing shows: owned, or held on a direct read grant."""
+    """Return the active studies the caller's study listing shows: owned, or held on a direct read grant.
+
+    The grant rows are read here rather than through ``get_read_access_result``, one query for the whole listing,
+    so the plugin's terms refusal (``apps.py``) is applied here as well: a grant carrying ``apply_middleware``
+    lists no study stored without the header pass, which is what the per-object check answers for it. Per-target
+    uniqueness makes the user's row the one whose terms apply.
+    """
     qs = DicomStudy.objects.filter(deleted_at__isnull=True)
     if user.is_superuser:
         return qs
     ct = ContentType.objects.get_for_model(DicomStudy)
-    # A set of literals rather than a subquery: object_id is a CharField, and
+    # Sets of literals rather than a subquery: object_id is a CharField, and
     # Postgres refuses bigint IN (varchar subquery).
-    granted_ids = set(
+    plain_ids, deidentifying_ids = set(), set()
+    for object_id, apply_middleware in (
         AccessRight.objects.active()
         .filter(content_type=ct, can_read=True, access_target=user)
-        .values_list("object_id", flat=True)
+        .values_list("object_id", "apply_middleware")
+    ):
+        (deidentifying_ids if apply_middleware else plain_ids).add(object_id)
+    return qs.filter(
+        Q(author=user) | Q(pk__in=plain_ids) | Q(pk__in=deidentifying_ids, deidentification_version__isnull=False)
     )
-    return qs.filter(Q(author=user) | Q(pk__in=granted_ids))
 
 
 def resolve_study(user, study_uid: str) -> DicomStudy | None:
@@ -192,26 +204,45 @@ def _ready_instances(series: DicomSeries):
     return series.instances.filter(status=DicomInstance.Status.READY)
 
 
-def study_json(study: DicomStudy) -> dict:
-    """Return the QIDO-RS study-level response object for *study*."""
-    series = list(study.series.all())
+def series_with_counts(study: DicomStudy) -> list[DicomSeries]:
+    """Return the series of *study* in their listing order, each with its ready-instance count as ``ready_instances``.
+
+    One query for the study, where a count per series is one each.
+    """
+    ready = Count("instances", filter=Q(instances__status=DicomInstance.Status.READY))
+    return list(study.series.annotate(ready_instances=ready))
+
+
+def study_json(study: DicomStudy, series_count: int) -> dict:
+    """Return the QIDO-RS study-level response object for *study*, which holds *series_count* series."""
     return to_json(
         {
             **_study_attributes(study),
             "ModalitiesInStudy": _split(study.modalities),
-            "NumberOfStudyRelatedSeries": str(len(series)),
+            "NumberOfStudyRelatedSeries": str(series_count),
             "NumberOfStudyRelatedInstances": str(study.num_instances),
         }
     )
 
 
-def series_json(series: DicomSeries) -> dict:
-    """Return the QIDO-RS series-level response object for *series*."""
+def studies_json(studies: list[DicomStudy]) -> list[dict]:
+    """Return the QIDO-RS study-level response objects for *studies*, counting their series in one query."""
+    counts = dict(
+        DicomSeries.objects.filter(study__in=[s.pk for s in studies])
+        .order_by()
+        .values_list("study_id")
+        .annotate(n=Count("pk"))
+    )
+    return [study_json(study, counts.get(study.pk, 0)) for study in studies]
+
+
+def series_json(series: DicomSeries, study: DicomStudy) -> dict:
+    """Return the QIDO-RS series-level response object for *series* of *study*, as ``series_with_counts`` returns it."""
     return to_json(
         {
             **_series_attributes(series),
-            "StudyInstanceUID": series.study.study_instance_uid,
-            "NumberOfSeriesRelatedInstances": str(_ready_instances(series).count()),
+            "StudyInstanceUID": study.study_instance_uid,
+            "NumberOfSeriesRelatedInstances": str(series.ready_instances),
         }
     )
 
@@ -247,6 +278,16 @@ def instance_json(inst: DicomInstance, series: DicomSeries, study: DicomStudy) -
     )
 
 
-def series_metadata(series: DicomSeries) -> list[dict]:
-    """Return WADO-RS metadata for every ready instance of *series*."""
-    return [instance_json(inst, series, series.study) for inst in _ready_instances(series)]
+def series_metadata(series: DicomSeries, study: DicomStudy) -> list[dict]:
+    """Return WADO-RS metadata for every ready instance of *series*, a series of *study*."""
+    return [instance_json(inst, series, study) for inst in _ready_instances(series)]
+
+
+def study_metadata(study: DicomStudy) -> list[dict]:
+    """Return WADO-RS metadata for every ready instance of *study*, series by series, from two queries."""
+    ready = Prefetch("instances", queryset=DicomInstance.objects.filter(status=DicomInstance.Status.READY))
+    return [
+        instance_json(inst, series, study)
+        for series in study.series.prefetch_related(ready)
+        for inst in series.instances.all()
+    ]

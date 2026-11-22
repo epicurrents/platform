@@ -3,7 +3,9 @@
 The membership comes from the caller, already gated (``_visible_members`` in the library API), so the
 rules for which members a reader sees live in one place. This module adds the columns and the order.
 
-The order is an allowlist. None of its keys is an arrival order: the date key sorts by the month a
+The order is an allowlist. None of its keys is an arrival order: the default, ``order``, is the dataset's own
+(the recordings of the item listing as that listing orders them, folder by folder, the ones a manager arranged
+first and the rest by name), the date key sorts by the month a
 reader is shown, a released member's release month or the first of its upload month in UTC, and every key
 breaks ties by name and then by the random stored name, never by a sequential id. Each subject field the
 caller is shown adds a key, ``subject.<key>``, which sorts by the field's declared choice order, so age
@@ -43,8 +45,9 @@ from django.db.models.functions import Cast, Coalesce, Lower, NullIf, TruncMonth
 
 from recordings.models import Recording, RecordingMeta, SignalInfo
 
-SORT_KEYS = ("name", "modality", "duration", "channels", "sampling_rate", "date")
-DEFAULT_SORT = "name"
+SORT_KEYS = ("order", "name", "modality", "duration", "channels", "sampling_rate", "date")
+#: The dataset's own order, so the browser and a viewer opened from it start as the item listing does.
+DEFAULT_SORT = "order"
 SUBJECT_SORT_PREFIX = "subject."
 
 
@@ -90,9 +93,11 @@ def browse_rows(member_ids, *, sort: str, descending: bool, dataset=None, schema
 
     Trashed and FAILED recordings are left out for every caller, as in the dataset's item listing.
     Columns a recording does not have yet, before its ingest has written the metadata, are null and
-    sort last in either direction. A ``subject.<key>`` sort needs the *dataset* and its shown *schema*.
+    sort last in either direction. A ``subject.<key>`` sort needs the *dataset* and its shown *schema*, and
+    ``order`` the *dataset*, whose manual order it is (``library.release.dataset_member_ordering``); without a
+    dataset it is the name order.
     """
-    from library.release import release_month_subquery
+    from library.release import member_order_annotations, release_month_subquery
 
     recording_ct = ContentType.objects.get_for_model(Recording, for_concrete_model=False)
     meta = RecordingMeta.objects.filter(content_type=recording_ct, object_id=Cast(OuterRef("pk"), CharField()))
@@ -123,6 +128,16 @@ def browse_rows(member_ids, *, sort: str, descending: bool, dataset=None, schema
             ),
         )
     )
+    if sort == "order":
+        if dataset is None:
+            sort = "name"
+        else:
+            qs = qs.annotate(**member_order_annotations(Recording, dataset))
+            rank, position = F("member_folder_rank"), F("member_position")
+            if descending:
+                # The listing read from its end: the unsorted members, last in it, come first.
+                return qs.order_by(rank.desc(), position.desc(nulls_first=True), "-sort_name", "-stored_name")
+            return qs.order_by(rank.asc(), position.asc(nulls_last=True), "sort_name", "stored_name")
     if sort.startswith(SUBJECT_SORT_PREFIX):
         from library.subjects import is_number_field
 

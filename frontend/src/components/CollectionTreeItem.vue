@@ -94,11 +94,11 @@ function onExpand () {
 
             <wa-tree-item v-for="item in items" :key="item.id"
                 :data-recording-hash="item.object_hash"
-                :data-recording-name="item.object_name ?? item.object_id"
+                :data-recording-name="item.object_name ?? item.object_hash"
                 slot="children"
             >
                 <wa-icon class="icon-file" name="file-music"></wa-icon>
-                {{ item.object_name ?? item.object_id }}
+                {{ item.object_name ?? item.object_hash }}
             </wa-tree-item>
 
             <wa-tree-item v-if="!children.length && !items.length" disabled slot="children">

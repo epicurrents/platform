@@ -17,7 +17,12 @@ import {
     eagerStudyLoadLimit,
     listedFromBrowseRow,
     listedFromRecording,
+    loadsUpFront,
+    mergeAttachments,
     recordingProperties,
+    videoAttachments,
+    type BundleItem,
+    type StudyDescription,
 } from './datasetStudies'
 import type { EpicurrentsApp } from '@epicurrents/core/dist/types'
 
@@ -117,7 +122,8 @@ describe('describing a recording', () => {
         expect(source.pathname).toBe(`/recordings/api/v1/${'a'.repeat(32)}/file`)
         expect(source.searchParams.get('version')).toBe('default')
         expect(source.searchParams.get('share_token')).toBe('token-1')
-        expect(new URL(describeRecording(listedFromRecording(recording())).source).searchParams.has('share_token')).toBe(false)
+        const tokenless = new URL(describeRecording(listedFromRecording(recording())).source)
+        expect(tokenless.searchParams.has('share_token')).toBe(false)
     })
 })
 
@@ -139,6 +145,134 @@ describe('describing a media file', () => {
     })
     it('returns null for a format the viewer cannot open', () => {
         expect(describeMedia(media({ file_extension: '.zip', media_type: 'document' }))).toBeNull()
+    })
+    it('loads it from its file, carrying the share token when given, as an attachment does', () => {
+        const source = new URL(describeMedia(media({}), 'tok')!.source)
+        expect(source.pathname).toBe(`/media/api/v1/${'b'.repeat(32)}/file`)
+        expect(source.searchParams.get('share_token')).toBe('tok')
+        expect(new URL(describeMedia(media({}))!.source).searchParams.has('share_token')).toBe(false)
+    })
+})
+
+describe('what loads up front', () => {
+    const listedWith = (properties: StudyDescription['properties']): StudyDescription => ({
+        loader: 'eeg/edf-file', name: 'A', properties, source: 'https://example.test/a',
+    })
+
+    it('loads a member the platform holds no metadata for, and lists one it does', () => {
+        expect(loadsUpFront(false, listedWith(null), false)).toBe(true)
+        expect(loadsUpFront(false, listedWith([['duration', 60]]), false)).toBe(false)
+    })
+    it('loads every member of a bundle flagged to preload', () => {
+        expect(loadsUpFront(true, listedWith([['duration', 60]]), false)).toBe(true)
+    })
+    it('never loads a child, which has no metadata by construction, in a preloading bundle either', () => {
+        expect(loadsUpFront(false, listedWith(null), true)).toBe(false)
+        expect(loadsUpFront(true, listedWith(null), true)).toBe(false)
+    })
+})
+
+describe('mergeAttachments', () => {
+    const P1 = 'a'.repeat(32)
+    const P2 = 'b'.repeat(32)
+    const recordingItem = (hash: string): BundleItem => ({
+        kind: 'recording',
+        listed: { channel_count: null, duration: null, file_extension: '.edf', hash, modality: 'eeg', name: hash },
+        recording: null,
+        videos: null,
+    })
+    const attached = (
+        parent: string, hash: string, details: RecordingAttachment['details'] = { media_type: 'document' },
+        type = 'mediafile',
+    ): RecordingAttachment => ({ details, hash, name: hash, parent, platform_pass: 'none', type })
+    /** Describes everything, a video included, by its hash, as a careless source might. */
+    const describeAll = (attachment: RecordingAttachment): StudyDescription => ({
+        loader: 'doc/pdf-url',
+        name: attachment.name,
+        properties: null,
+        source: `https://example.test/${attachment.hash}`,
+    })
+    const kinds = (items: BundleItem[]) => items.map(item => {
+        if (item.kind === 'recording') {
+            return `recording:${item.listed.hash}`
+        }
+        return item.kind === 'described'
+            ? `child:${item.description.name}@${item.parent}`
+            : `media:${item.media.content_hash}`
+    })
+
+    it('lists each attachment after its own recording, keyed by the upper-cased parent hash', () => {
+        const merged = mergeAttachments(
+            [recordingItem(P1), recordingItem(P2)],
+            [attached(P2.toUpperCase(), 'x'), attached(P1, 'y'), attached(P2, 'z')],
+            describeAll,
+        )
+        expect(kinds(merged)).toEqual([
+            `recording:${P1}`, `child:y@${P1.toUpperCase()}`,
+            `recording:${P2}`, `child:x@${P2.toUpperCase()}`, `child:z@${P2.toUpperCase()}`,
+        ])
+    })
+
+    it('gives a video to its recording and never lists it as a child, whatever would describe it', () => {
+        const merged = mergeAttachments(
+            [recordingItem(P1)],
+            [
+                attached(P1, 'v1', { is_supported: true, media_type: 'video', time_offset: 12.5 }),
+                attached(P1, 'v2', { is_supported: true, media_type: 'video', time_offset: null }),
+                attached(P1, 'v3', { is_supported: false, media_type: 'video', time_offset: 3 }),
+            ],
+            describeAll,
+        )
+        expect(merged).toHaveLength(1)
+        expect(merged[0]).toMatchObject({
+            videos: [{ hash: 'v1', time_offset: 12.5 }, { hash: 'v2', time_offset: null }],
+        })
+    })
+
+    it('answers an empty video list for a listed recording without one, and null for one the listing missed', () => {
+        const merged = mergeAttachments([recordingItem(P1), recordingItem(P2)], [], describeAll, [P2.toUpperCase()])
+        expect(merged[0]).toMatchObject({ videos: [] })
+        expect(merged[1]).toMatchObject({ videos: null })
+    })
+
+    it('lists once what the bundle already holds, what is attached twice, and nothing that is not described', () => {
+        const member: BundleItem = { kind: 'media', media: { content_hash: 'HELD' } as MediaFileDetail }
+        const study: BundleItem = { description: describeAll(attached(P1, 'study')), kind: 'described' }
+        const merged = mergeAttachments(
+            [recordingItem(P1), member, study],
+            [
+                attached(P1, 'held'),
+                attached(P1, 'study', {}, 'dicomstudy'),
+                attached(P1, 'twice'),
+                attached(P1, 'twice'),
+                attached(P1, 'unknown', {}, 'other'),
+            ],
+            attachment => attachment.type === 'other' ? null : describeAll(attachment),
+        )
+        expect(kinds(merged)).toEqual([
+            `recording:${P1}`, `child:twice@${P1.toUpperCase()}`, 'media:HELD', 'child:study@undefined',
+        ])
+    })
+
+    it('leaves the other items where they were', () => {
+        const member: BundleItem = { kind: 'media', media: { content_hash: 'M' } as MediaFileDetail }
+        expect(mergeAttachments([member], [], describeAll)).toEqual([member])
+    })
+})
+
+describe('videoAttachments', () => {
+    it('places each video at its offset, at its absolute file address', () => {
+        const [first, second] = videoAttachments([{ hash: 'v1', time_offset: 12.5 }, { hash: 'v2', time_offset: null }])
+        expect(first.startTime).toBe(12.5)
+        expect(second.startTime).toBe(0)
+        const url = new URL(first.url)
+        expect(url.origin).toBe(window.location.origin)
+        expect(url.pathname).toBe('/media/api/v1/v1/file')
+        expect(url.searchParams.has('share_token')).toBe(false)
+    })
+    it('carries the share token, which the video element can send no other way', () => {
+        const [video] = videoAttachments([{ hash: 'v1', time_offset: 0 }], 'tok')
+        expect(new URL(video.url).searchParams.get('share_token')).toBe('tok')
     })
 })
 

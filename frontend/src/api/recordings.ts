@@ -129,24 +129,49 @@ export interface RecordingAttachment {
     details: Record<string, string | number | boolean | null>
 }
 
-/** Most recordings one attachments request may name. */
-export const ATTACHMENT_LISTING_LIMIT = 200
+/**
+ * Most recordings one attachments request may name. The hashes travel in the query, and a hundred of them keep the
+ * request line under the 4094 bytes a production gunicorn accepts by default; the endpoint refuses more.
+ */
+export const ATTACHMENT_LISTING_LIMIT = 100
+
+/** What `listRecordingAttachments` answers. */
+export interface RecordingAttachmentListing {
+    /** The attachments of the recordings whose page was read, in the order the recordings were named. */
+    attachments: RecordingAttachment[]
+    /** The named recordings whose page could not be read, so nothing is known of what is attached to them. */
+    failedHashes: string[]
+}
 
 /**
  * The attachments the caller may read on the named recordings, one request per `ATTACHMENT_LISTING_LIMIT` hashes.
+ * The pages settle individually and the call never rejects: a page that fails leaves its recordings in
+ * `failedHashes` and the other pages' attachments are still answered.
  * @param hashes - Recording hashes, in the order items should come back.
  * @param shareToken - Share token the recordings are read with, if any.
  */
-export async function listRecordingAttachments(hashes: string[], shareToken?: string): Promise<RecordingAttachment[]> {
+export async function listRecordingAttachments(
+    hashes: string[],
+    shareToken?: string,
+): Promise<RecordingAttachmentListing> {
     const pages: string[][] = []
     for (let i = 0; i < hashes.length; i += ATTACHMENT_LISTING_LIMIT) {
         pages.push(hashes.slice(i, i + ATTACHMENT_LISTING_LIMIT))
     }
-    const responses = await Promise.all(pages.map(page => http.get<RecordingAttachment[]>(
+    const settled = await Promise.allSettled(pages.map(page => http.get<RecordingAttachment[]>(
         '/recordings/api/v1/attachments/',
         { params: { recordings: page.join(','), ...(shareToken ? { share_token: shareToken } : {}) } },
     )))
-    return responses.flatMap(response => response.data)
+    const listing: RecordingAttachmentListing = { attachments: [], failedHashes: [] }
+    for (const [index, result] of settled.entries()) {
+        if (result.status === 'fulfilled') {
+            listing.attachments.push(...result.value.data)
+        } else {
+            console.warn('[Epicurrents] Could not list a page of recording attachments.', result.reason)
+            listing.failedHashes.push(...pages[index])
+        }
+    }
+    return listing
 }
 
 export async function getRecordingStatus(hash: string): Promise<RecordingStatus> {

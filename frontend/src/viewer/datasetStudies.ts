@@ -2,10 +2,12 @@
  * How the platform lists the items of a dataset in the viewer before any of them is loaded.
  *
  * Every item is listed as a resource of its module that has read nothing: the viewer shows it by name, and opening it
- * loads it in place with the importer and URL it was listed with. A recording that has finished processing also carries what the viewer would otherwise read from
- * its header to list it, its duration and channel count, which the platform parsed at ingest and serves as trusted
- * metadata; listing from it costs no fetch and no reader. An item without such metadata is listed by name, and the
- * caller loads up to `app.eagerStudyLoadLimit` of those straight away so they list with their properties.
+ * loads it in place with the importer and URL it was listed with. A recording that has finished processing also
+ * carries what the viewer would otherwise read from its header to list it, its duration and channel count, which the
+ * platform parsed at ingest and serves as trusted metadata; listing from it costs no fetch and no reader. A dataset
+ * member without such metadata is listed by name, and the caller loads up to `app.eagerStudyLoadLimit` of those
+ * straight away so they list with their properties. An attachment, listed under its recording, always waits to be
+ * opened.
  *
  * A recording is listed from a `ListedRecording`, which a dataset's browser row and a recording's detail both give, so
  * a dataset of any size is listed from its browser pages rather than one detail request per member.
@@ -14,7 +16,7 @@
 import type { DatasetBrowseRow } from '#api/library'
 import type { MediaFileDetail } from '#api/media'
 import { recordingName, type Recording, type RecordingAttachment } from '#api/recordings'
-import type { DataResource, EpicurrentsApp } from '@epicurrents/core/dist/types'
+import type { DataResource, EpicurrentsApp, VideoAttachment } from '@epicurrents/core/dist/types'
 
 /** A property a study is listed with: its duration in seconds, or its number of signal channels. */
 export type ListedProperty = [string, number]
@@ -123,8 +125,12 @@ export function importerForMedia(media: Pick<MediaFileDetail, 'file_extension' |
         return `media/${media.media_type}-url`
     }
     const ext = (media.file_extension || '').toLowerCase()
-    if (ext === '.pdf') return 'doc/pdf-url'
-    if (ext === '.md') return 'doc/htm-url'
+    if (ext === '.pdf') {
+        return 'doc/pdf-url'
+    }
+    if (ext === '.md') {
+        return 'doc/htm-url'
+    }
     return null
 }
 
@@ -146,13 +152,6 @@ export function recordingProperties(recording: ListedRecording): ListedProperty[
 }
 
 /**
- * Describe a recording for the viewer. The URL is absolute because the reader fetches ranges from a worker, which has
- * no document base URL to resolve a relative one against. It names the default version, the one the recording's
- * reconstruction stages built and the stored file when there is none.
- * @param recording - The recording as listed.
- * @param shareToken - Share token the dataset was opened with, if any.
- */
-/**
  * The recording's name without its file extension. Only that extension is taken off: a browser row's name is the
  * label its author gave it, which carries none and may hold a dot of its own.
  */
@@ -164,6 +163,13 @@ function nameWithoutExtension (recording: ListedRecording) {
     return recording.name
 }
 
+/**
+ * Describe a recording for the viewer. The URL is absolute because the reader fetches ranges from a worker, which has
+ * no document base URL to resolve a relative one against. It names the default version, the one the recording's
+ * reconstruction stages built and the stored file when there is none.
+ * @param recording - The recording as listed.
+ * @param shareToken - Share token the dataset was opened with, if any.
+ */
 export function describeRecording(recording: ListedRecording, shareToken?: string): StudyDescription {
     const query = new URLSearchParams({ version: 'default' })
     if (shareToken) {
@@ -182,11 +188,12 @@ export function describeRecording(recording: ListedRecording, shareToken?: strin
 }
 
 /**
- * Describe a media file for the viewer, or return null when the viewer has no importer for its format. The media
- * download endpoint is session-authenticated, so a dataset opened with a share token does not render its media.
+ * Describe a media file for the viewer, or return null when the viewer has no importer for its format. The address
+ * carries the share token the dataset was opened with, which the media file endpoint accepts.
  * @param media - The media file.
+ * @param shareToken - Share token the dataset was opened with, if any.
  */
-export function describeMedia(media: MediaFileDetail): StudyDescription | null {
+export function describeMedia(media: MediaFileDetail, shareToken?: string): StudyDescription | null {
     const loader = importerForMedia(media)
     if (!loader) {
         return null
@@ -195,11 +202,15 @@ export function describeMedia(media: MediaFileDetail): StudyDescription | null {
     // template literal there and emits ``new URL(Object.assign({})[`/media/...`], ...)``, which resolves to
     // ``/assets/undefined``.
     const relativePath = `/media/api/v1/${media.content_hash}/file`
+    const source = new URL(relativePath, import.meta.url)
+    if (shareToken) {
+        source.searchParams.set('share_token', shareToken)
+    }
     return {
         loader,
         name: media.display_name,
         properties: null,
-        source: new URL(relativePath, import.meta.url).toString(),
+        source: source.toString(),
     }
 }
 
@@ -211,9 +222,12 @@ export function describeMedia(media: MediaFileDetail): StudyDescription | null {
  * @param attachment - The attachment as the attachments listing gives it.
  * @param shareToken - Share token the recording was read with, if any.
  */
-export function describeMediaAttachment(attachment: RecordingAttachment, shareToken?: string): StudyDescription | null {
+export function describeMediaAttachment(
+    attachment: RecordingAttachment,
+    shareToken?: string,
+): StudyDescription | null {
     const details = attachment.details
-    if (attachment.type !== 'mediafile' || details.is_supported === false || details.media_type === 'video') {
+    if (attachment.type !== 'mediafile' || details.is_supported === false || isAttachedVideo(attachment)) {
         return null
     }
     const loader = importerForMedia({
@@ -233,4 +247,124 @@ export function describeMediaAttachment(attachment: RecordingAttachment, shareTo
         properties: null,
         source: source.toString(),
     }
+}
+
+/** True for an attached media file that is a video, which plays on its recording's timeline. */
+export function isAttachedVideo(attachment: RecordingAttachment): boolean {
+    return attachment.type === 'mediafile' && attachment.details.media_type === 'video'
+}
+
+/** A video attached to a recording, as the attachments listing gives it. */
+export interface AttachedVideo {
+    /** The media file's content hash. */
+    hash: string
+    /** Position in seconds of the video's start on the recording's timeline, or null when unplaced. */
+    time_offset: number | null
+}
+
+/**
+ * A dataset bundle's item after the platform-side fetch, discriminated so the viewer page can pick the importer and
+ * URL without re-querying. A recording is listed from what its dataset's browser rows give; its detail, which carries
+ * the interruption table, is read when it is loaded, unless the link named it and it was read up front. Its `videos`
+ * are the playable videos attached to it, or null when no attachments listing covers it. A described item is a
+ * plugin's, or an attachment, which carries the hash of its parent recording.
+ */
+export type BundleItem =
+    | { kind: 'recording'; listed: ListedRecording; recording: Recording | null; videos: AttachedVideo[] | null }
+    | { kind: 'media'; media: MediaFileDetail }
+    | { kind: 'described'; description: StudyDescription; parent?: string }
+
+/**
+ * Join the attachments listing into a bundle's items. Each recording the listing covered is given its playable
+ * videos, and is followed by its other attachments as items carrying its upper-cased hash as `parent`, under which
+ * the viewer lists them. A video is never listed as an item, whatever would describe it, since it plays on its
+ * recording's timeline; nor is a media file the bundle already holds as an item of its own, an attachment whose
+ * address the bundle already lists (a plugin's item that is both a member and attached, or a row listed twice), or
+ * one nothing describes. A recording named in *unlisted* keeps `videos: null`, which tells its loader the listing
+ * knows nothing of it.
+ * @param items - The bundle's items, in order.
+ * @param attachments - The attachments listing of the bundle's recordings.
+ * @param describe - Describes an attachment that is not a video, or answers null for one nothing opens.
+ * @param unlisted - Hashes of the recordings the listing could not be read for.
+ */
+export function mergeAttachments(
+    items: BundleItem[],
+    attachments: RecordingAttachment[],
+    describe: (attachment: RecordingAttachment) => StudyDescription | null,
+    unlisted: string[] = [],
+): BundleItem[] {
+    const held = new Set(items.flatMap(item => item.kind === 'media' ? [item.media.content_hash.toUpperCase()] : []))
+    const heldSources = new Set(items.flatMap(item => item.kind === 'described' ? [item.description.source] : []))
+    const unlistedParents = new Set(unlisted.map(hash => hash.toUpperCase()))
+    const children = new Map<string, BundleItem[]>()
+    const videos = new Map<string, AttachedVideo[]>()
+    for (const attachment of attachments) {
+        const parent = attachment.parent.toUpperCase()
+        if (isAttachedVideo(attachment)) {
+            if (attachment.details.is_supported !== false) {
+                const offset = attachment.details.time_offset
+                const listed = videos.get(parent) ?? []
+                listed.push({ hash: attachment.hash, time_offset: typeof offset === 'number' ? offset : null })
+                videos.set(parent, listed)
+            }
+            continue
+        }
+        if (held.has(attachment.hash.toUpperCase())) {
+            continue
+        }
+        const description = describe(attachment)
+        if (!description || heldSources.has(description.source)) {
+            continue
+        }
+        heldSources.add(description.source)
+        const listed = children.get(parent) ?? []
+        listed.push({ kind: 'described', description, parent })
+        children.set(parent, listed)
+    }
+    return items.flatMap((item): BundleItem[] => {
+        if (item.kind !== 'recording') {
+            return [item]
+        }
+        const hash = item.listed.hash.toUpperCase()
+        const recording = unlistedParents.has(hash) ? item : { ...item, videos: videos.get(hash) ?? [] }
+        return [recording, ...(children.get(hash) ?? [])]
+    })
+}
+
+/**
+ * The videos attached to a recording as the viewer's video window takes them, each at its absolute file address. The
+ * address carries the share token the recording was read with, which the media file endpoint accepts, since the
+ * browser's video element fetches it directly and can send nothing else.
+ * @param videos - The recording's attached videos.
+ * @param shareToken - Share token the recording was read with, if any.
+ */
+export function videoAttachments(videos: AttachedVideo[], shareToken?: string): VideoAttachment[] {
+    return videos.map(video => {
+        const url = new URL(`/media/api/v1/${video.hash}/file`, window.location.origin)
+        if (shareToken) {
+            url.searchParams.set('share_token', shareToken)
+        }
+        return {
+            // The platform stores no duration, so the end point is left open. The video window plays the first video
+            // directly and does not depend on it.
+            endTime: Number.MAX_SAFE_INTEGER,
+            group: 0,
+            startTime: video.time_offset ?? 0,
+            syncPoints: [],
+            url: url.toString(),
+        }
+    })
+}
+
+/**
+ * Whether an item loads when the viewer opens rather than when the item is opened: a member of a bundle flagged to
+ * preload, or one the platform holds no metadata to list. Never a child, an attachment listed under its recording,
+ * which loads in place when it is opened: loading children up front would read a document per recording before the
+ * first recording opens, and take the eager slots of the recordings a preloading workflow waits for.
+ * @param preload - The bundle loads its members up front.
+ * @param description - What the item is listed by.
+ * @param isChild - The item is listed under a parent recording.
+ */
+export function loadsUpFront(preload: boolean, description: StudyDescription, isChild: boolean): boolean {
+    return !isChild && (preload || !description.properties)
 }

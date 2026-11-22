@@ -506,6 +506,7 @@ To check the table against the tree, walk the AST for `log_activity` / `with_sys
 | `library.dataset.item.add` | `add_dataset_item` |
 | `library.dataset.item.list` | `list_dataset_items` |
 | `library.dataset.item.move` | `move_dataset_item` |
+| `library.dataset.item.order` | `order_dataset_item` |
 | `library.dataset.item.remove` | `remove_dataset_item` |
 | `library.dataset.list` | `list_datasets` |
 | `library.dataset.listing.clear` | `clear_public_listing` |

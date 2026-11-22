@@ -219,11 +219,13 @@ class DicomInstance(models.Model):
         FAILED = "failed", "Failed"
 
     class PixelReview(models.TextChoices):
-        """Who decided the image's pixels carry no identifying text; the platform reads no pixels.
+        """Who decided what the file displays carries no identity; the platform reads no pixels.
 
         Blank when the file is stored as uploaded, where no review applies.
         """
 
+        # The header describes an object on ingest's acquisition allowlist, so nobody was asked. A statement about
+        # the kind of object the file says it is, not about its pixels.
         NOT_REQUIRED = "not_required", "Not required"
         # The uploader confirmed it; nothing on the platform has looked.
         ATTESTED = "attested", "Attested by the uploader"

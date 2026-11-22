@@ -1003,6 +1003,34 @@ class TestTermsRefusal:
         assert can_read_object(user, dataset) is True
         assert can_read_object(make_superuser(), dataset) is True
 
+    def test_a_proxy_of_a_registered_model_is_refused_as_the_model_is(self, user, make_user, refusal_registry):
+        from django.apps import apps
+
+        from epicurrents.permissions import _refused_under_terms, register_terms_refusal
+        from library.models import Dataset
+
+        try:
+            proxy_model = apps.get_model("library", "TermsRefusalProxy")
+        except LookupError:
+            proxy_model = type(
+                "TermsRefusalProxy",
+                (Dataset,),
+                {"__module__": Dataset.__module__, "Meta": type("Meta", (), {"proxy": True, "app_label": "library"})},
+            )
+        try:
+            proxy = proxy_model.objects.get(pk=self._dataset(user).pk)
+            assert proxy._meta.label_lower != "library.dataset"
+            register_terms_refusal("library.dataset", self._refuse_all)
+            de_identifying = ReadAccessTerms(granted=True, apply_middleware=True)
+            assert _refused_under_terms(make_user(), proxy, de_identifying).granted is False
+            # The author's exemption and raw terms hold for the proxy as they do for the model.
+            assert _refused_under_terms(user, proxy, de_identifying).granted is True
+            assert _refused_under_terms(make_user(), proxy, ReadAccessTerms(granted=True)).granted is True
+        finally:
+            # Left registered, the proxy would be seen by every later test that walks the app's models.
+            apps.all_models["library"].pop("termsrefusalproxy", None)
+            apps.clear_cache()
+
     def test_a_rule_answering_false_leaves_the_grant(self, user, make_user, refusal_registry):
         from epicurrents.permissions import register_terms_refusal
 
@@ -1028,3 +1056,82 @@ class TestTermsRefusal:
         register_terms_refusal("library.dataset", self._refuse_all)
         register_terms_refusal("library.dataset", self._refuse_all)
         assert _TERMS_REFUSALS["library.dataset"].count(self._refuse_all) == 1
+
+
+@pytest.mark.django_db
+class TestGetDirectReadTerms:
+    """The batch answer for direct rows ranks them as ``get_read_access_result`` does, object by object."""
+
+    def _recordings(self, author, count):
+        from model_bakery import baker
+
+        return [baker.make("recordings.Recording", author=author) for _ in range(count)]
+
+    def _batch(self, reader, recordings, share_token=None):
+        from epicurrents.permissions import get_direct_read_terms
+
+        ct = ContentType.objects.get_for_model(recordings[0], for_concrete_model=False)
+        return get_direct_read_terms(reader, ct, [recording.pk for recording in recordings], share_token=share_token)
+
+    def test_agrees_with_the_per_object_answer_across_every_ranking_case(self, user, make_user):
+        from datetime import timedelta
+
+        from django.contrib.auth.models import Group
+        from django.utils import timezone
+
+        reader = make_user()
+        raw_group, strict_group = Group.objects.create(name="raw"), Group.objects.create(name="strict")
+        reader.groups.add(raw_group, strict_group)
+        user_raw, user_strict, user_over_group, groups, expired, token_only, none = self._recordings(user, 7)
+        _make_access_right(user_raw, user, target=reader, can_read=True, apply_middleware=False)
+        _make_access_right(user_strict, user, target=reader, can_read=True, apply_middleware=True)
+        _make_access_right(user_over_group, user, target=reader, can_read=True, apply_middleware=False)
+        _make_access_right(user_over_group, user, group=strict_group, can_read=True, apply_middleware=True)
+        _make_access_right(groups, user, group=raw_group, can_read=True, apply_middleware=False)
+        _make_access_right(groups, user, group=strict_group, can_read=True, apply_middleware=True)
+        _make_access_right(
+            expired,
+            user,
+            target=reader,
+            can_read=True,
+            apply_middleware=False,
+            expires_at=timezone.now() - timedelta(days=1),
+        )
+        _make_access_right(token_only, user, token="tok", can_read=True, apply_middleware=False)
+        recordings = [user_raw, user_strict, user_over_group, groups, expired, token_only, none]
+        for share_token in (None, "tok"):
+            batch = self._batch(reader, recordings, share_token=share_token)
+            for recording in recordings:
+                single = get_read_access_result(reader, recording, share_token=share_token)
+                found = batch.get(str(recording.pk))
+                assert (found is not None) is single.granted
+                if found is not None:
+                    assert found.apply_middleware is single.apply_middleware
+        assert set(self._batch(reader, recordings)) == {
+            str(recording.pk) for recording in (user_raw, user_strict, user_over_group, groups)
+        }
+
+    def test_a_row_without_can_read_is_not_a_read_grant(self, user, make_user):
+        reader = make_user()
+        (recording,) = self._recordings(user, 1)
+        _make_access_right(recording, user, target=reader, can_read=False, can_write=True)
+        assert self._batch(reader, [recording]) == {}
+
+    def test_a_caller_with_no_target_matches_nothing(self, user):
+        from django.contrib.auth.models import AnonymousUser
+
+        (recording,) = self._recordings(user, 1)
+        _make_access_right(recording, user, token="tok", can_read=True)
+        assert self._batch(None, [recording]) == {}
+        assert self._batch(AnonymousUser(), [recording], share_token="  ") == {}
+        assert set(self._batch(None, [recording], share_token="tok")) == {str(recording.pk)}
+
+    def test_one_query_whatever_the_number_of_objects(self, user, make_user, django_assert_num_queries):
+        reader = make_user()
+        recordings = self._recordings(user, 5)
+        for recording in recordings:
+            _make_access_right(recording, user, target=reader, can_read=True)
+        ContentType.objects.get_for_model(recordings[0], for_concrete_model=False)
+        # The reader's groups, then the rows.
+        with django_assert_num_queries(2):
+            assert len(self._batch(reader, recordings)) == 5

@@ -560,6 +560,9 @@ decline_marker() {
 }
 
 # ── Runtime detection, as update.sh settles it ────────────────────────────────
+# A copy of scripts/lib/compose.sh, as update.sh's is: the agent is installed as
+# a single root-owned file. scripts/tests/test_compose_lib.py runs the copies
+# beside the helper; change them together.
 
 CONTAINER_RUNTIME=""
 COMPOSE=()

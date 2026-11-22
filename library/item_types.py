@@ -34,7 +34,9 @@ class ItemType:
     to those a caller reading under ``apply_middleware`` gets nothing of: the queryset form of the type's terms refusal
     (``epicurrents.permissions.register_terms_refusal``), which a dataset listing applies before it pages and which
     must agree with the refusal row for row; it needs the type's model to carry ``author_id``, since a caller's own
-    members are exempt as they are from the refusal.
+    members are exempt as they are from the refusal. ``platform_pass`` names the pass the platform applied to a
+    member's stored content, or ``epicurrents.attachments.PASS_NONE``, as the type's attachment registration does; a
+    row carries it as a record of what was done, and a type that declares none is listed with null.
     """
 
     object_type: str
@@ -46,6 +48,7 @@ class ItemType:
     release_gateable: bool = False
     serves_share_tokens: bool = True
     withheld_under_middleware: Callable[[QuerySet], QuerySet] | None = None
+    platform_pass: Callable[[Any], str] | None = None
 
     @property
     def model(self):
@@ -59,12 +62,34 @@ class ItemType:
 _TYPES: dict[str, ItemType] = {}
 
 
+def _declared_terms(item_type: ItemType) -> tuple:
+    """The fields of *item_type* that compare by value.
+
+    Its callables are left out: a lambda is a new object each time the module defining it runs, so two registrations
+    of one type never compare equal on them.
+    """
+    return (
+        item_type.object_type,
+        item_type.hash_field,
+        item_type.release_gateable,
+        item_type.serves_share_tokens,
+        item_type.withheld_under_middleware is None,
+    )
+
+
 def register_item_type(item_type: ItemType) -> None:
-    """Register a member type. A model registered twice under different terms is refused."""
-    current = _TYPES.get(item_type.model_label.lower())
-    if current is not None and current != item_type:
-        raise ValueError(f"Library item type {item_type.model_label!r} is already registered.")
-    _TYPES[item_type.model_label.lower()] = item_type
+    """Register a member type. A model registered twice under different terms is refused.
+
+    Registering a model again under the same terms has no effect and the first registration stands, so a second
+    ``ready()`` in one process is harmless.
+    """
+    key = item_type.model_label.lower()
+    current = _TYPES.get(key)
+    if current is not None:
+        if _declared_terms(current) != _declared_terms(item_type):
+            raise ValueError(f"Library item type {item_type.model_label!r} is already registered.")
+        return
+    _TYPES[key] = item_type
 
 
 def registered_item_types() -> list[ItemType]:
@@ -98,30 +123,61 @@ def resolve_hash(item_type: ItemType, value: str) -> str | None:
 def without_unservable_members(qs: QuerySet, dataset: Any, user: Any, share_token: str | None) -> QuerySet:
     """Narrow a dataset's ``DatasetItem`` queryset to the registered-type members this caller can be served.
 
-    A caller without an account loses the types that serve no share token. A caller who reads the dataset under
-    ``apply_middleware`` loses the members their type withholds under it, except the caller's own, which the terms
-    refusal exempts as well. Superusers lose neither. The dataset's author is no exception: their own row on the
-    dataset carries ``apply_middleware`` at its default, and a member someone else wrote is served to them under it.
-    """
-    from django.db.models import CharField
-    from django.db.models.functions import Cast
+    A type that serves no share token is decided by the session alone, since its endpoints take no token: a caller
+    without an account loses it, and a signed-in caller presenting a token keeps it only where their own access
+    reaches the dataset, on the terms of that access.
 
-    from epicurrents.permissions import get_read_access_result
+    A member its type withholds under ``apply_middleware`` is listed on the terms the caller reads that member by, as
+    ``get_read_access_result`` ranks them: the caller's direct row on the member where one exists, the dataset's
+    terms otherwise. A de-identifying reader of the dataset therefore keeps a member a raw grant of their own reaches
+    and loses the rest, and a raw reader of the dataset loses a member their own direct row de-identifies. The
+    caller's own members are exempt, as they are from the terms refusal.
+
+    Superusers lose nothing, and neither does the dataset's author, whose own row on the dataset carries
+    ``apply_middleware`` at its default: they are listed every member, one they would be refused on opening included,
+    because a member that is not listed cannot be removed.
+    """
+    from epicurrents.permissions import ReadAccessTerms, get_direct_read_terms, get_read_access_result
 
     types = registered_item_types()
     if not types:
         return qs
-    superuser = user is not None and getattr(user, "is_superuser", False)
-    de_identifying = not superuser and get_read_access_result(user, dataset, share_token=share_token).apply_middleware
+    signed_in = user is not None and getattr(user, "is_authenticated", False)
+    superuser = signed_in and getattr(user, "is_superuser", False)
+    token_value = (share_token or "").strip()
+    if superuser:
+        terms = ReadAccessTerms(granted=True)
+    else:
+        terms = get_read_access_result(user, dataset, share_token=share_token)
+    # What the session reaches with the token set aside, for the types that serve none.
+    own_terms = terms
+    if signed_in and not superuser and token_value:
+        own_terms = get_read_access_result(user, dataset, share_token=None)
     for item_type in types:
         ct = item_type.content_type
-        if user is None and not item_type.serves_share_tokens:
-            qs = qs.exclude(content_type=ct)
+        type_terms = terms
+        if not item_type.serves_share_tokens:
+            if not signed_in or not (own_terms.granted or dataset.author_id == user.pk):
+                qs = qs.exclude(content_type=ct)
+                continue
+            type_terms = own_terms
+        if item_type.withheld_under_middleware is None or superuser:
             continue
-        if de_identifying and item_type.withheld_under_middleware is not None:
-            withheld = item_type.withheld_under_middleware(item_type.model.objects.all())
-            if user is not None:
-                withheld = withheld.exclude(author_id=user.pk)
-            keys = withheld.annotate(key=Cast("pk", CharField())).values("key")
-            qs = qs.exclude(content_type=ct, object_id__in=keys)
+        if signed_in and dataset.author_id == user.pk:
+            continue
+        member_pks = [
+            int(key) for key in qs.filter(content_type=ct).values_list("object_id", flat=True) if key.isdigit()
+        ]
+        withheld = item_type.withheld_under_middleware(item_type.model.objects.filter(pk__in=member_pks))
+        if signed_in:
+            withheld = withheld.exclude(author_id=user.pk)
+        withheld_keys = [str(pk) for pk in withheld.values_list("pk", flat=True)]
+        if not withheld_keys:
+            continue
+        # One query for the caller's direct rows on the withheld members, ranked as the per-object check ranks them.
+        token = share_token if item_type.serves_share_tokens else None
+        direct = get_direct_read_terms(user, ct, withheld_keys, share_token=token)
+        refused = [key for key in withheld_keys if direct.get(key, type_terms).apply_middleware]
+        if refused:
+            qs = qs.exclude(content_type=ct, object_id__in=refused)
     return qs

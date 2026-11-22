@@ -2,8 +2,8 @@
  * Tests for the library's client calls: the collection, collection item and dataset item listings read to their end,
  * the repeated `hash` parameter of the tag lookup, the subject write naming what to clear, the filters as repeated
  * parameters, the share token a browser page is read with, the tag search, tagging by hash, the batch tagging sending
- * the browser's filters, the browser query carried in a viewer link and read back in its order, and the public
- * listing naming the token to list through.
+ * the browser's filters, the browser query carried in a viewer link and read back in its order, the public
+ * listing naming the token to list through, and the order action of a dataset item.
  */
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
@@ -28,6 +28,7 @@ import {
     listMatchingRecordings,
     listRecordingTags,
     listTags,
+    orderDatasetItem,
     setPublicListing,
     tagDatasetMembers,
     tagObject,
@@ -270,6 +271,15 @@ describe('public listing', () => {
         await clearPublicListing('abc')
         expect(mockPut).toHaveBeenCalledWith('/api/v1/library/datasets/abc/public-listing/', { access_right_id: 12 })
         expect(mockDelete).toHaveBeenCalledWith('/api/v1/library/datasets/abc/public-listing/')
+    })
+})
+
+describe('orderDatasetItem', () => {
+    it('names the item by its id and sends the action alone', async () => {
+        const answer = { changed: 2, folder_id: null, items: [{ id: 7, position: 1 }, { id: 4, position: 2 }] }
+        mockPost.mockResolvedValueOnce({ data: answer })
+        expect(await orderDatasetItem('abc', 7, 'up')).toEqual(answer)
+        expect(mockPost).toHaveBeenCalledWith('/api/v1/library/datasets/abc/items/7/order', { action: 'up' })
     })
 })
 

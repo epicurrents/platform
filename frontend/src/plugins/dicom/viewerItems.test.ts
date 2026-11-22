@@ -13,10 +13,22 @@ vi.mock('#lib/http', () => ({
 
 import { http } from '#lib/http'
 import type { DatasetItem } from '#api/library'
-import type { DicomStudyOut } from './api'
-import { describeAttachedStudy, describeStudy, describeStudyMember, dicomViewerItems, studyHashesFromQuery, STUDY_IMPORTER } from './viewerItems'
+import { studyStoredAsUploaded, type DicomStudyOut } from './api'
+import {
+    describeAttachedStudy,
+    describeStudy,
+    describeStudyMember,
+    dicomViewerItems,
+    studyHashesFromQuery,
+    STUDY_IMPORTER,
+} from './viewerItems'
 
 const mockGet = vi.mocked(http.get)
+
+/** Three study hashes, the second in upper case. */
+const A = 'a'.repeat(32)
+const B = 'B'.repeat(32)
+const C = '0123456789abcdef'.repeat(2)
 
 const study = (fields: Partial<DicomStudyOut>) => ({
     hash: 'abc',
@@ -32,8 +44,16 @@ beforeEach(() => {
 
 describe('studyHashesFromQuery', () => {
     it('reads every dicom parameter as a comma-separated list, in order', () => {
-        expect(studyHashesFromQuery({ dicom: ['a, b', 'c'] })).toEqual(['a', 'b', 'c'])
-        expect(studyHashesFromQuery({ dicom: 'a' })).toEqual(['a'])
+        expect(studyHashesFromQuery({ dicom: [`${A}, ${B}`, C] })).toEqual([A, B, C])
+        expect(studyHashesFromQuery({ dicom: A })).toEqual([A])
+    })
+
+    it('leaves out, with a warning, a value that is not a study hash', () => {
+        const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined)
+        const hostile = ['../../../../api/v1/user/me', 'abc', `${A}0`, `${A.slice(1)}g`, `${A}/x`]
+        expect(studyHashesFromQuery({ dicom: [...hostile, A].join(',') })).toEqual([A])
+        expect(warn).toHaveBeenCalledTimes(hostile.length)
+        warn.mockRestore()
     })
 
     it('names nothing without the parameter', () => {
@@ -66,9 +86,16 @@ describe('dicomViewerItems', () => {
         mockGet.mockImplementation(url => Promise.resolve({
             data: study({ hash: String(url).split('/').at(-2), study_description: String(url).split('/').at(-2) }),
         }))
-        const items = await dicomViewerItems.fromQuery({ dicom: 'one,two' })
-        expect(items.map(i => i.name)).toEqual(['one', 'two'])
-        expect(mockGet).toHaveBeenCalledWith('/plugin/dicom/api/v1/dicom/studies/one/')
+        const items = await dicomViewerItems.fromQuery({ dicom: `${A},${B}` })
+        expect(items.map(i => i.name)).toEqual([A, B])
+        expect(mockGet).toHaveBeenCalledWith(`/plugin/dicom/api/v1/dicom/studies/${A}/`)
+    })
+
+    it('requests nothing for a value that is not a study hash', async () => {
+        const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined)
+        expect(await dicomViewerItems.fromQuery({ dicom: '../../../../api/v1/user/me' })).toEqual([])
+        expect(mockGet).not.toHaveBeenCalled()
+        warn.mockRestore()
     })
 
     it('answers no items, and reads nothing, for a link naming none', async () => {
@@ -99,5 +126,42 @@ describe('describeStudyMember', () => {
         expect(described?.name).toBe('CT volume')
         expect(describeStudyMember({ ...item, object_type: 'recording' })).toBeNull()
         expect(describeStudyMember({ ...item, object_hash: null })).toBeNull()
+    })
+})
+
+describe('a study stored as uploaded', () => {
+    const MARK = ' (stored as uploaded)'
+
+    it('is tested on the study row by its missing pass version', () => {
+        expect(studyStoredAsUploaded({ deidentification_version: null })).toBe(true)
+        expect(studyStoredAsUploaded({ deidentification_version: 1 })).toBe(false)
+    })
+
+    it('says so in its listed name when a link names it', () => {
+        const raw = describeStudy(study({ deidentification_version: null, study_description: 'Median nerve US' }))
+        expect(raw.name).toBe(`Median nerve US${MARK}`)
+        expect(describeStudy(study({ deidentification_version: null })).name).toBe(`US study${MARK}`)
+        expect(describeStudy(study({ deidentification_version: 2, study_description: 'Median nerve US' })).name)
+            .toBe('Median nerve US')
+    })
+
+    it('says so when attached to a recording, by the pass the attachments listing records', () => {
+        const attachment = {
+            details: { modalities: 'US' }, hash: 'abc', name: 'Wrist', parent: 'P', platform_pass: 'none',
+            type: 'dicomstudy',
+        }
+        expect(describeAttachedStudy(attachment)?.name).toBe(`Wrist${MARK}`)
+        expect(describeAttachedStudy({ ...attachment, platform_pass: 'dicom-header' })?.name).toBe('Wrist')
+    })
+
+    it('says so as a dataset member, by the pass the item listing records', () => {
+        const item = { object_hash: 'abc', object_name: 'CT volume', object_type: 'dicomstudy' } as DatasetItem
+        expect(describeStudyMember({ ...item, platform_pass: 'none' })?.name).toBe(`CT volume${MARK}`)
+        expect(describeStudyMember({ ...item, platform_pass: 'dicom-header' })?.name).toBe('CT volume')
+        expect(describeStudyMember({ ...item, platform_pass: null })?.name).toBe('CT volume')
+    })
+
+    it('stays listed without properties, so it is still loaded up front', () => {
+        expect(describeStudy(study({ deidentification_version: null })).properties).toBeNull()
     })
 })

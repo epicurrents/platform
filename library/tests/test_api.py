@@ -20,6 +20,20 @@ from library.models import (
 BASE = "/api/v1/library/collections/"
 
 
+def _hash(recording) -> str:
+    """The public hash an item row names *recording* by."""
+    return recording.stored_name.split(".", 1)[0]
+
+
+def _listed_recording_pks(rows) -> set[str]:
+    """The primary keys of the recordings *rows* name by ``object_hash``; no row serves a member's key itself."""
+    from recordings.models import Recording
+
+    assert all("object_id" not in row for row in rows)
+    hashes = {row["object_hash"] for row in rows}
+    return {str(rec.pk) for rec in Recording.objects.all() if _hash(rec) in hashes}
+
+
 def _url(collection_id=None, suffix=""):
     if collection_id is None:
         return BASE
@@ -304,7 +318,8 @@ class TestItemMembership:
         )
         assert resp.status_code == 201
         assert resp.json()["content_type_id"] == ct.pk
-        assert resp.json()["object_id"] == str(rec.pk)
+        assert resp.json()["object_hash"] == _hash(rec)
+        assert "object_id" not in resp.json()
         assert CollectionItem.objects.filter(collection=col, content_type=ct, object_id=str(rec.pk)).exists()
 
     def test_add_duplicate_item_returns_409(self, auth_client):
@@ -404,7 +419,7 @@ class TestItemMembership:
         resp = c.get(_url(col.pk, "items/"))
         assert resp.status_code == 200
         assert len(resp.json()) == 1
-        assert resp.json()[0]["object_id"] == str(rec.pk)
+        assert resp.json()[0]["object_hash"] == _hash(rec)
 
     def test_list_items_author_sees_original_name(self, auth_client):
         c, user = auth_client
@@ -440,7 +455,7 @@ class TestItemMembership:
         CollectionItem.objects.create(collection=col, content_type=ct, object_id=str(rec.pk))
         resp = c.get(_url(col.pk, "items/"))
         assert resp.status_code == 200
-        row = next(i for i in resp.json() if i["object_id"] == str(rec.pk))
+        row = next(i for i in resp.json() if i["object_hash"] == _hash(rec))
         # Grantee never sees the filename — only the hash-prefix fallback.
         assert row["object_name"] == "C3C3C3C3"
 
@@ -591,7 +606,7 @@ class TestItemMembership:
 
         resp = c.get(_url(col.pk, "items/"))
         assert resp.status_code == 200
-        obj_ids = {item["object_id"] for item in resp.json()}
+        obj_ids = _listed_recording_pks(resp.json())
         assert str(readable_rec.pk) in obj_ids
         assert str(private_rec.pk) not in obj_ids
 
@@ -614,7 +629,7 @@ class TestItemMembership:
 
         resp = c.get(_url(col.pk, "items/"))
         assert resp.status_code == 200
-        assert any(item["object_id"] == str(rec.pk) for item in resp.json())
+        assert any(item["object_hash"] == _hash(rec) for item in resp.json())
 
     def test_list_items_hides_failed_recordings(self, auth_client):
         """FAILED recordings are dropped from the collection listing for every viewer.
@@ -637,7 +652,7 @@ class TestItemMembership:
 
         resp = c.get(_url(col.pk, "items/"))
         assert resp.status_code == 200
-        obj_ids = {item["object_id"] for item in resp.json()}
+        obj_ids = _listed_recording_pks(resp.json())
         assert str(ready_rec.pk) in obj_ids
         assert str(failed_rec.pk) not in obj_ids
 
@@ -679,7 +694,7 @@ class TestItemMembership:
         with override_settings(MEDIA_ALLOWED_UPLOAD_EXTENSIONS=[".pdf"]):
             resp = c.get(_url(col.pk, "items/"))
         assert resp.status_code == 200
-        row = next(r for r in resp.json() if r["object_id"] == str(media.pk))
+        row = next(r for r in resp.json() if r["object_hash"] == media.content_hash)
         assert row["object_type"] == "mediafile"
         assert row["object_hash"] == media.content_hash
         assert row["media_type"] == "document"
@@ -704,7 +719,7 @@ class TestItemMembership:
         with override_settings(MEDIA_ALLOWED_UPLOAD_EXTENSIONS=[".md"]):
             resp = c.get(_url(col.pk, "items/"))
         assert resp.status_code == 200
-        row = next(r for r in resp.json() if r["object_id"] == str(media.pk))
+        row = next(r for r in resp.json() if r["object_hash"] == media.content_hash)
         assert row["is_supported"] is False
         assert row["object_type"] == "mediafile"
 
@@ -747,7 +762,7 @@ class TestItemMembership:
         )
         resp = c.get(_url(col.pk, "items/"))
         assert resp.status_code == 200
-        assert all(row["object_id"] != str(media.pk) for row in resp.json())
+        assert all(row["object_hash"] != media.content_hash for row in resp.json())
 
 
 # ---------------------------------------------------------------------------
@@ -1523,7 +1538,9 @@ class TestDatasetItemMembership:
 
         resp = c.get(_ds_url(ds.pk, "items/"))
         assert resp.status_code == 200
-        assert any(item["object_id"] == str(private_rec.pk) for item in resp.json())
+        # Named by its hash: a reader who does not manage the dataset gets no item id, and nobody the member's key.
+        assert [(item["object_hash"], item["id"]) for item in resp.json()] == [(_hash(private_rec), None)]
+        assert "object_id" not in resp.json()[0]
 
 
 # ---------------------------------------------------------------------------
@@ -1967,7 +1984,8 @@ class TestTagItem:
         assert resp.status_code == 201
         data = resp.json()
         assert data["tag_id"] == tag.pk
-        assert data["object_id"] == str(rec.pk)
+        assert data["object_hash"] == _hash(rec)
+        assert "object_id" not in data
 
     def test_duplicate_tag_returns_409(self, auth_client):
         c, user = auth_client
@@ -2118,7 +2136,7 @@ class TestListTaggedItems:
         root, mid, leaf, rec_root, rec_mid, rec_leaf = self._setup_tree(user)
         resp = c.get(_tag_url(root.pk, "items/"))
         assert resp.status_code == 200
-        obj_ids = {item["object_id"] for item in resp.json()}
+        obj_ids = _listed_recording_pks(resp.json())
         assert str(rec_root.pk) in obj_ids
         assert str(rec_mid.pk) in obj_ids
         assert str(rec_leaf.pk) in obj_ids
@@ -2128,7 +2146,7 @@ class TestListTaggedItems:
         root, mid, leaf, rec_root, rec_mid, rec_leaf = self._setup_tree(user)
         resp = c.get(_tag_url(root.pk, "items/"), {"include_children": "false"})
         assert resp.status_code == 200
-        obj_ids = {item["object_id"] for item in resp.json()}
+        obj_ids = _listed_recording_pks(resp.json())
         assert str(rec_root.pk) in obj_ids
         assert str(rec_mid.pk) not in obj_ids
         assert str(rec_leaf.pk) not in obj_ids
@@ -2138,7 +2156,7 @@ class TestListTaggedItems:
         root, mid, leaf, rec_root, rec_mid, rec_leaf = self._setup_tree(user)
         resp = c.get(_tag_url(mid.pk, "items/"))
         assert resp.status_code == 200
-        obj_ids = {item["object_id"] for item in resp.json()}
+        obj_ids = _listed_recording_pks(resp.json())
         assert str(rec_root.pk) not in obj_ids
         assert str(rec_mid.pk) in obj_ids
         assert str(rec_leaf.pk) in obj_ids
@@ -2174,7 +2192,7 @@ class TestListTaggedItems:
 
         resp = c.get(_tag_url(tag.pk, "items/"))
         assert resp.status_code == 200
-        obj_ids = {item["object_id"] for item in resp.json()}
+        obj_ids = _listed_recording_pks(resp.json())
         assert str(readable_rec.pk) in obj_ids
         assert str(private_rec.pk) not in obj_ids
 
@@ -2198,7 +2216,7 @@ class TestListTaggedItems:
 
         resp = c.get(_tag_url(tag.pk, "items/"))
         assert resp.status_code == 200
-        obj_ids = {item["object_id"] for item in resp.json()}
+        obj_ids = _listed_recording_pks(resp.json())
         assert str(ready_rec.pk) in obj_ids
         assert str(failed_rec.pk) not in obj_ids
 
@@ -2232,7 +2250,9 @@ class TestListTaggedItems:
 
         resp = c.get(_tag_url(tag.pk, "items/"))
         assert resp.status_code == 200
-        assert any(item["object_id"] == str(rec.pk) for item in resp.json())
+        # Named by its hash: the caller did not write the recording, so the row carries no item id.
+        assert [(item["object_hash"], item["id"]) for item in resp.json()] == [(_hash(rec), None)]
+        assert "object_id" not in resp.json()[0]
 
 
 # ---------------------------------------------------------------------------

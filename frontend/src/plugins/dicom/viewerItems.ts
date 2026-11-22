@@ -11,9 +11,10 @@ import type { LocationQuery } from 'vue-router'
 import type { DatasetItem } from '#api/library'
 import type { RecordingAttachment } from '#api/recordings'
 import { t } from '#i18n'
+import { storedAsUploaded } from '#lib/platformPass'
 import type { ViewerItemSource } from '#projects/types'
 import type { StudyDescription } from '#viewer/datasetStudies'
-import { dicomApi, type DicomStudyOut } from './api'
+import { dicomApi, studyStoredAsUploaded, type DicomStudyOut } from './api'
 
 const SCOPE = 'DicomViewerItems'
 
@@ -28,7 +29,7 @@ export const STUDY_IMPORTER = 'rad/viewer-url'
  * @param study - The study as the study endpoints serve it.
  */
 export function describeStudy(study: DicomStudyOut): StudyDescription {
-    return studyDescription(study.hash, study.study_description, study.modalities)
+    return studyDescription(study.hash, study.study_description, study.modalities, studyStoredAsUploaded(study))
 }
 
 /**
@@ -40,7 +41,9 @@ export function describeAttachedStudy(attachment: RecordingAttachment): StudyDes
     if (attachment.type !== 'dicomstudy') {
         return null
     }
-    return studyDescription(attachment.hash, attachment.name, String(attachment.details.modalities ?? ''))
+    return studyDescription(
+        attachment.hash, attachment.name, String(attachment.details.modalities ?? ''), storedAsUploaded(attachment),
+    )
 }
 
 /**
@@ -52,21 +55,36 @@ export function describeStudyMember(item: DatasetItem): StudyDescription | null 
     if (item.object_type !== 'dicomstudy' || !item.object_hash) {
         return null
     }
-    return studyDescription(item.object_hash, item.object_name ?? '', '')
+    return studyDescription(item.object_hash, item.object_name ?? '', '', storedAsUploaded(item))
 }
 
-/** The description of a study by its hash, its description as typed and its modalities. */
-function studyDescription(hash: string, description: string, modalities: string): StudyDescription {
+/**
+ * The description of a study by its hash, its description as typed and its modalities. A study stored as uploaded
+ * says so in its listed name, which is the one thing the viewer shows of an item listed without properties; a
+ * property would show too, but an item with properties is no longer loaded up front.
+ */
+function studyDescription(
+    hash: string,
+    description: string,
+    modalities: string,
+    asUploaded: boolean,
+): StudyDescription {
+    const name = description?.trim() || t('{modality} study', SCOPE, { modality: modalities || 'DICOM' })
     return {
         loader: STUDY_IMPORTER,
-        name: description?.trim() || t('{modality} study', SCOPE, { modality: modalities || 'DICOM' }),
+        name: asUploaded ? t('{name} (stored as uploaded)', SCOPE, { name }) : name,
         properties: null,
         source: `${window.location.origin}${dicomApi.ohifViewerUrl(hash)}`,
     }
 }
 
+/** The shape of a study's public hash. */
+const STUDY_HASH = /^[0-9a-f]{32}$/i
+
 /**
- * The study hashes a viewer URL names: every `dicom` parameter, each a comma-separated list, in order.
+ * The study hashes a viewer URL names: every `dicom` parameter, each a comma-separated list, in order. A value that
+ * is not a study hash is left out with a warning and never reaches a request: the hash becomes a segment of the
+ * study's request path, and a link is anyone's to write.
  * @param query - The viewer route's query.
  */
 export function studyHashesFromQuery(query: LocationQuery): string[] {
@@ -77,6 +95,13 @@ export function studyHashesFromQuery(query: LocationQuery): string[] {
         .flatMap(value => value.split(','))
         .map(hash => hash.trim())
         .filter(Boolean)
+        .filter(hash => {
+            const valid = STUDY_HASH.test(hash)
+            if (!valid) {
+                console.warn('[Epicurrents] Ignoring a ?dicom= value that is not a study hash.')
+            }
+            return valid
+        })
 }
 
 /** The plugin's viewer item source: the studies `?dicom=` names, attached to a listed recording, or in a dataset. */

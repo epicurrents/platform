@@ -44,7 +44,12 @@
                         <span v-if="study.patient_id" class="patient-id">{{ study.patient_id }}</span>
                     </td>
                     <td>{{ formatDate(study.study_date) }}</td>
-                    <td>{{ study.study_description || '—' }}</td>
+                    <td>
+                        <span class="study-description">{{ study.study_description || '—' }}</span>
+                        <StoredAsUploadedTag v-if="studyStoredAsUploaded(study)"
+                            :anchor="`dicom-study-as-uploaded-${study.hash}`"
+                        ></StoredAsUploadedTag>
+                    </td>
                     <td>
                         <wa-badge v-for="mod in modalityList(study)" :key="mod" variant="neutral">
                             {{ mod }}
@@ -70,8 +75,7 @@
                         >
                             {{ t('Share', SCOPE) }}
                         </wa-button>
-                        <wa-button
-                            v-if="canDeleteStudy(study)"
+                        <wa-button v-if="canDeleteStudy(study)"
                             appearance="plain"
                             size="s"
                             variant="danger"
@@ -88,15 +92,16 @@
         <wa-dialog
             :label="t('Upload DICOM Files', SCOPE)"
             :open="showUploadDialog"
-            @wa-after-hide="closeUploadDialog"
+            @wa-after-hide.self="closeUploadDialog"
+            @wa-hide.self="onUploadDialogHide"
         >
             <div v-if="heldForReview.length" class="review-step">
                 <wa-callout variant="warning">
                     {{
                         t(
-                            '{count} image(s) may show identifying text in the picture itself: ultrasound images, '
-                                + 'secondary captures and images marked as carrying burned-in annotation. What the '
-                                + 'images show is your responsibility: the platform clears identifying header fields '
+                            '{count} file(s) may show identifying text or features in their content: every file '
+                                + 'other than an original CT, MR or PET acquisition is held for this check. What the '
+                                + 'files show is your responsibility: the platform clears identifying header fields '
                                 + 'as a safeguard, but it cannot see text in an image.',
                             SCOPE,
                             { count: heldForReview.length }
@@ -141,13 +146,13 @@
             </template>
 
             <div class="dialog-footer" slot="footer">
-                <wa-button appearance="plain" @click="closeUploadDialog">
+                <wa-button appearance="plain" :disabled="uploading" @click="closeUploadDialog">
                     {{ t('Cancel', SCOPE) }}
                 </wa-button>
                 <wa-button v-if="heldForReview.length"
                     appearance="filled-outlined"
-                    variant="brand"
                     :disabled="!reviewForm.confirmed || uploading"
+                    variant="brand"
                     @click="uploadReviewed"
                 >
                     <wa-spinner v-if="uploading" slot="prefix"></wa-spinner>
@@ -155,8 +160,8 @@
                 </wa-button>
                 <wa-button v-else
                     appearance="filled-outlined"
-                    variant="brand"
                     :disabled="selectedFiles.length === 0 || uploading"
+                    variant="brand"
                     @click="startUpload"
                 >
                     <wa-spinner v-if="uploading" slot="prefix"></wa-spinner>
@@ -176,13 +181,18 @@
                 <wa-spinner></wa-spinner>
                 {{ t('Loading access rights…', SCOPE) }}
             </div>
-            <AccessRightsPanel v-else-if="studyToShare"
-                v-model:accessRights="accessRights"
-                :grantFn="grantFn"
-                :infoMessage="shareNotice(studyToShare)"
-                :modes="['user']"
-                :revokeFn="revokeFn"
-            ></AccessRightsPanel>
+            <template v-else-if="studyToShare">
+                <wa-callout v-if="studyStoredAsUploaded(studyToShare)" class="as-uploaded-warning" variant="warning">
+                    {{ asUploadedWarning() }}
+                </wa-callout>
+                <AccessRightsPanel
+                    :grantFn="grantFn"
+                    :infoMessage="shareNotice(studyToShare)"
+                    :modes="SHARE_MODES"
+                    :revokeFn="revokeFn"
+                    v-model:accessRights="accessRights"
+                ></AccessRightsPanel>
+            </template>
         </wa-dialog>
 
         <!-- Add to dataset dialog -->
@@ -196,6 +206,9 @@
                 {{ t('Loading datasets…', SCOPE) }}
             </div>
             <template v-else>
+                <wa-callout v-if="studyToAdd && studyStoredAsUploaded(studyToAdd)" variant="warning">
+                    {{ asUploadedWarning() }}
+                </wa-callout>
                 <p v-if="!datasetChoices.length">
                     {{ t('You have no dataset this study can be added to.', SCOPE) }}
                 </p>
@@ -206,7 +219,7 @@
                     size="s"
                     v-wa="[addForm, 'datasetHash']"
                 >
-                    <wa-option v-for="dataset in datasetChoices" :key="dataset.object_hash!" :value="dataset.object_hash!">
+                    <wa-option v-for="dataset in datasetChoices" :key="dataset.hash" :value="dataset.hash">
                         {{ dataset.name }}
                     </wa-option>
                 </wa-select>
@@ -245,7 +258,8 @@
             <p>
                 {{
                     t(
-                        'Move the study for {patient} to the trash? It is removed permanently after the retention period.',
+                        'Move the study for {patient} to the trash? It is removed permanently after the retention '
+                            + 'period.',
                         SCOPE,
                         { patient: studyToDelete?.patient_name || t('Unknown patient', SCOPE) }
                     )
@@ -274,11 +288,15 @@ import { useAuthStore } from '#stores/auth'
 import { showToast } from '#lib/toast'
 import { t } from '#i18n'
 import AccessRightsPanel from '#components/AccessRightsPanel.vue'
-import { addDatasetItem, listAllDatasets, type AccessRight, type Collection, type GrantAccessPayload } from '#api/library'
+import StoredAsUploadedTag from '#components/StoredAsUploadedTag.vue'
+import { addDatasetItem, listAllDatasets, type AccessRight, type GrantAccessPayload } from '#api/library'
 import type { DicomStudyOut, DicomUploadOut } from './api'
-import { BURNED_IN_CONFIRMATION_REQUIRED, dicomApi } from './api'
+import { BURNED_IN_CONFIRMATION_REQUIRED, dicomApi, studyStoredAsUploaded } from './api'
+import { datasetChoicesFor, type DatasetChoice } from './datasetChoices'
 
 const SCOPE = 'DicomStudiesView'
+/** A study is shared with users only; see `dicomApi.grantAccess`. */
+const SHARE_MODES: ['user'] = ['user']
 
 const router = useRouter()
 
@@ -297,7 +315,7 @@ const fileInputRef = ref<HTMLInputElement | null>(null)
 const studyToDelete = ref<DicomStudyOut | null>(null)
 const studyToShare = ref<DicomStudyOut | null>(null)
 const studyToAdd = ref<DicomStudyOut | null>(null)
-const datasetChoices = ref<Collection[]>([])
+const datasetChoices = ref<DatasetChoice[]>([])
 const datasetsLoading = ref(false)
 const addingToDataset = ref(false)
 const addForm = reactive({ datasetHash: '' })
@@ -344,14 +362,44 @@ function openUploadDialog() {
     showUploadDialog.value = true
 }
 
+/**
+ * Close the upload dialog and drop the files held for review, unless an upload is out: its answer decides what the
+ * dialog shows next, and a dialog closed meanwhile would keep the held files for the next time it opens.
+ */
 function closeUploadDialog() {
+    if (uploading.value) {
+        return
+    }
     showUploadDialog.value = false
     heldForReview.value = []
     reviewForm.confirmed = false
 }
 
+/**
+ * The upload dialog's `wa-hide` handler: refuse to close while an upload is out, otherwise close.
+ * @param event - The dialog's `wa-hide`, which asked to close.
+ */
+function onUploadDialogHide(event: Event) {
+    if (uploading.value) {
+        event.preventDefault()
+        return
+    }
+    closeUploadDialog()
+}
+
 function chooseFiles() {
     fileInputRef.value?.click()
+}
+
+/**
+ * Clear the selection and the file input with it. The input keeps its value otherwise, and picking the same files
+ * again would then fire no `change`.
+ */
+function clearSelection() {
+    selectedFiles.value = []
+    if (fileInputRef.value) {
+        fileInputRef.value.value = ''
+    }
 }
 
 function onFilesSelected(event: Event) {
@@ -380,25 +428,31 @@ async function uploadReviewed() {
  * @param confirmBurnedIn - The uploader confirmed the batch's images show no identifying text.
  */
 async function upload(files: File[], confirmBurnedIn: boolean) {
+    if (uploading.value) {
+        return
+    }
     uploading.value = true
+    let result: DicomUploadOut
     try {
-        const result = await dicomApi.uploadFiles(files, confirmBurnedIn)
-        const held = result.files
-            .filter(f => f.code === BURNED_IN_CONFIRMATION_REQUIRED)
-            .map(f => files[f.index])
-        selectedFiles.value = []
-        reviewForm.confirmed = false
-        heldForReview.value = held
-        if (!held.length) {
-            showUploadDialog.value = false
-        }
-        reportUpload(result)
-        await loadStudies()
+        result = await dicomApi.uploadFiles(files, confirmBurnedIn)
     } catch {
         showToast(t('Upload failed. Please try again.', SCOPE), 'danger')
+        return
     } finally {
+        // Before the dialog is closed below: it announces the close as a hide, which is refused while uploading.
         uploading.value = false
     }
+    const held = result.files
+        .filter(f => f.code === BURNED_IN_CONFIRMATION_REQUIRED)
+        .map(f => files[f.index])
+    clearSelection()
+    reviewForm.confirmed = false
+    heldForReview.value = held
+    if (!held.length) {
+        showUploadDialog.value = false
+    }
+    reportUpload(result)
+    await loadStudies()
 }
 
 function reportUpload(result: DicomUploadOut) {
@@ -446,8 +500,20 @@ async function openShareDialog(study: DicomStudyOut) {
     }
 }
 
+/**
+ * The warning shown before a study stored as uploaded is shared or added to a dataset: who receives it as it is.
+ * A reader on de-identifying terms is refused such a study, so the readers it reaches are the others.
+ */
+function asUploadedWarning() {
+    return t(
+        'This study was stored without the platform\'s header pass. Readers on terms that are not de-identifying '
+            + 'receive it as uploaded.',
+        SCOPE
+    )
+}
+
 function shareNotice(study: DicomStudyOut): string {
-    if (study.deidentification_version === null) {
+    if (studyStoredAsUploaded(study)) {
         return t(
             'The platform applied no header safeguard to this study: everyone you share it with receives the '
                 + 'files as they were uploaded, patient details included.',
@@ -457,7 +523,7 @@ function shareNotice(study: DicomStudyOut): string {
     return t(
         'The platform cleared identifying header fields when this study was uploaded, as a safeguard. What the study '
             + 'contains remains the uploader\'s responsibility: the platform does not check the images for text, and '
-            + 'for ultrasound and similar images the uploader confirmed they show none.',
+            + 'for every file other than an original CT, MR or PET acquisition the uploader confirmed it shows none.',
         SCOPE
     )
 }
@@ -467,8 +533,9 @@ async function openAddToDataset(study: DicomStudyOut) {
     addForm.datasetHash = ''
     datasetsLoading.value = true
     try {
-        // A release-gated dataset takes no study, so it is not offered.
-        datasetChoices.value = (await listAllDatasets()).filter(d => !d.release_gated && d.object_hash)
+        datasetChoices.value = datasetChoicesFor(
+            await listAllDatasets(), authStore.user?.id ?? null, authStore.isSuperuser,
+        )
     } catch {
         showToast(t('Failed to load datasets.', SCOPE), 'danger')
         studyToAdd.value = null
@@ -551,6 +618,14 @@ async function deleteStudy() {
 .dialog-note {
     color: var(--wa-color-text-quiet);
     font-size: var(--wa-font-size-s);
+}
+
+.as-uploaded-warning {
+    margin-bottom: var(--wa-space-m);
+}
+
+.study-description {
+    margin-right: var(--wa-space-xs);
 }
 
 .dicom-studies-view {

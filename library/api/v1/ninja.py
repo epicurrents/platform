@@ -23,7 +23,8 @@ Datasets
     POST   /datasets/{id}/items/             Add an object to the dataset.
     DELETE /datasets/{id}/items/{iid}/      Remove an item from the dataset.
     POST   /datasets/{id}/items/{iid}/move   Place an item in a folder (or the root).
-    GET    /datasets/{id}/folders/           List the folder tree.
+    POST   /datasets/{id}/items/{iid}/order  Move an item within its folder's manual order, or take it out.
+    GET   /datasets/{id}/folders/           List the folder tree.
     POST   /datasets/{id}/folders/           Create a folder.
     PATCH  /datasets/{id}/folders/{fid}/     Rename, move, or reposition a folder.
     DELETE /datasets/{id}/folders/{fid}/     Delete a folder (items fall to the root).
@@ -353,14 +354,20 @@ class CollectionItemOut(Schema):
     so the frontend can grey out items the current project can no longer
     open without hiding them from the list.
 
-    ``id`` and ``object_id`` are null where they would give away arrival order: for a reader of a
-    release-gated dataset who does not manage it, and for a pooled recording listed to anyone but
-    a superuser or a manager of its pool. Both are sequential; ``object_hash`` names the member.
+    ``id`` is sequential, the item id in add order, so a dataset serves it only to a caller who can act on the row
+    with it: the dataset's managers, who are its author, superusers and the holders of a write grant on it. Every
+    other reader of a dataset, gated or not, gets it as null, and so does anyone but a superuser or a manager of
+    its pool for a pooled recording. The member's own primary key is served to nobody; ``object_hash`` names the
+    member to everyone. A collection is read by its author only.
+
+    ``platform_pass`` is set for a registered member type that declares one: the pass the platform applied to the
+    member's stored content, or ``"none"`` for content stored as uploaded. A record of what was done, as on the
+    attachments listing, and never an assurance about the content.
     """
 
     id: int | None
     content_type_id: int
-    object_id: str | None
+    platform_pass: str | None = None
     added_at: datetime
     # Dataset items only — the containing folder, or null for the dataset root.
     folder_id: int | None = None
@@ -374,6 +381,18 @@ class CollectionItemOut(Schema):
     media_type: str | None = None
     file_extension: str | None = None
     is_supported: bool | None = None
+
+
+class DatasetItemOut(CollectionItemOut):
+    """Dataset item response: a collection item's row plus the member's place in the manual order.
+
+    ``position`` is the member's place among the arranged members of its folder, null for an unsorted one. It is
+    served where ``id`` is, to a caller who can act on the row, and null to every other reader: the order of the
+    listing already tells a reader what was arranged, and the number would add how many members stand ahead of a
+    row, the unreleased ones of a gated dataset included.
+    """
+
+    position: int | None = None
 
 
 class BulkRenameRecordingsIn(Schema):
@@ -454,15 +473,16 @@ class TagWriteOut(TagOut):
 class TaggedItemOut(Schema):
     """Tagged item response.
 
-    ``id`` and ``object_id`` are null for a pooled recording listed to anyone but a superuser or a
-    manager of its pool: both are sequential and would give away the pool's arrival order.
-    ``object_hash`` names a recording or a media file whoever is listed it; null for other types.
+    ``id`` is sequential and is served to a superuser, to the author of the tagged object and, for a pooled
+    recording, to a manager of its pool; every other caller gets it as null and addresses the row by
+    ``object_hash``, which ``DELETE /tags/{id}/items/`` takes. ``object_hash`` names a recording, a media file or a
+    member of a registered type whoever is listed it; null for other types. The tagged object's own primary key is
+    served to nobody.
     """
 
     id: int | None
     tag_id: int
     content_type_id: int
-    object_id: str | None
     object_hash: str | None = None
     tagged_at: datetime
 
@@ -588,7 +608,8 @@ def _resolve_recording_object_id(object_id: str) -> str:
 
 def _resolve_item_object_id(ct: ContentType, object_id: str) -> str:
     """The primary key string an item payload's *object_id* names: a recording's, a media file's or a registered
-    type's hash resolved (``library.item_types``), any other type's taken as given."""
+    type's hash resolved (``library.item_types``), any other type's taken as given. A recording and a media file are
+    also accepted by primary key; a registered type is named by its hash alone."""
     from library.item_types import item_type_for, resolve_hash
 
     if ct.app_label == "recordings" and ct.model == "recording":
@@ -597,11 +618,8 @@ def _resolve_item_object_id(ct: ContentType, object_id: str) -> str:
         return _resolve_media_object_id(object_id)
     item_type = item_type_for(ct)
     if item_type is not None:
-        # The primary key stays accepted for internal callers, as for the two types above.
-        if object_id.isascii() and object_id.isdigit():
-            if not item_type.live(item_type.model.objects.filter(pk=object_id)).exists():
-                raise HttpError(404, "Object not found")
-            return str(int(object_id))
+        # The hash only, never the primary key: a caller posting integers would read 404 against 403 as which keys
+        # are live, which gives away how many objects of the type exist and the order they arrived in.
         resolved = resolve_hash(item_type, object_id)
         if resolved is None:
             raise HttpError(404, "Object not found")
@@ -626,15 +644,20 @@ def _tag_target(user, ct: ContentType, object_id: str) -> str:
     return resolved
 
 
+#: The key a row under construction carries its member's primary key by. Neither response schema has the field, so
+#: it is never serialised: the member's sequential key is served to nobody, and ``object_hash`` names the member.
+MEMBER_PK = "_object_id"
+
+
 def _object_hashes(rows: list[dict]) -> dict[tuple[int, str], str]:
-    """The public hash of each recording and media file among *rows*, keyed ``(content_type_id, object_id)``."""
+    """The public hash of each recording and media file among *rows*, keyed by content type id and primary key."""
     from django.apps import apps
 
     from recordings.models import Recording
 
     found: dict[tuple[int, str], str] = {}
     recording_ct = ContentType.objects.get_for_model(Recording, for_concrete_model=False)
-    recording_pks = {row["object_id"] for row in rows if row["content_type_id"] == recording_ct.pk}
+    recording_pks = {row[MEMBER_PK] for row in rows if row["content_type_id"] == recording_ct.pk}
     recording_pks = {pk for pk in recording_pks if pk and pk.isdigit()}
     for pk, stored_name in Recording.objects.filter(pk__in=recording_pks).values_list("pk", "stored_name"):
         found[(recording_ct.pk, str(pk))] = stored_name.split(".", 1)[0]
@@ -642,7 +665,7 @@ def _object_hashes(rows: list[dict]) -> dict[tuple[int, str], str]:
         from media.models import MediaFile
 
         media_ct = ContentType.objects.get_for_model(MediaFile, for_concrete_model=False)
-        media_pks = {row["object_id"] for row in rows if row["content_type_id"] == media_ct.pk}
+        media_pks = {row[MEMBER_PK] for row in rows if row["content_type_id"] == media_ct.pk}
         media_pks = {pk for pk in media_pks if pk and pk.isdigit()}
         for pk, content_hash in MediaFile.objects.filter(pk__in=media_pks).values_list("pk", "content_hash"):
             found[(media_ct.pk, str(pk))] = content_hash
@@ -650,7 +673,7 @@ def _object_hashes(rows: list[dict]) -> dict[tuple[int, str], str]:
 
     for item_type in registered_item_types():
         type_ct = item_type.content_type
-        type_pks = {row["object_id"] for row in rows if row["content_type_id"] == type_ct.pk}
+        type_pks = {row[MEMBER_PK] for row in rows if row["content_type_id"] == type_ct.pk}
         type_pks = {pk for pk in type_pks if pk and pk.isdigit()}
         for pk, public in item_type.model.objects.filter(pk__in=type_pks).values_list("pk", item_type.hash_field):
             found[(type_ct.pk, str(pk))] = public
@@ -658,22 +681,22 @@ def _object_hashes(rows: list[dict]) -> dict[tuple[int, str], str]:
 
 
 def _tagged_item_rows(items: list, user) -> list[dict]:
-    """Serialise ``TaggedItem`` rows for *user*: each named by its object's hash, sequential ids nulled where they
-    would give away arrival order."""
+    """Serialise ``TaggedItem`` rows for *user*: each named by its object's hash, the item id kept only on the rows
+    of objects the caller wrote (and of pooled recordings whose pool they manage) unless they are a superuser."""
     rows = [
         {
             "id": item.pk,
             "tag_id": item.tag_id,
             "content_type_id": item.content_type_id,
-            "object_id": item.object_id,
+            MEMBER_PK: item.object_id,
             "tagged_at": item.tagged_at,
         }
         for item in items
     ]
     hashes = _object_hashes(rows)
     for row in rows:
-        row["object_hash"] = hashes.get((row["content_type_id"], row["object_id"]))
-    _null_sequential_ids(rows, user, all_rows=False)
+        row["object_hash"] = hashes.get((row["content_type_id"], row[MEMBER_PK]))
+    _null_sequential_ids(rows, user, all_rows=False, authored_only=True)
     return rows
 
 
@@ -755,16 +778,25 @@ def _enrich_collection_items(items: list, user) -> list[dict]:
     from library.item_types import registered_item_types
 
     # Registered types, by content type id: each live member's (name, hash), and the type's listed name.
-    registered: dict[int, tuple[str, dict[str, tuple[str, str]]]] = {}
+    # The third value is the pass the platform applied to the member's content, None for a type declaring none.
+    registered: dict[int, tuple[str, dict[str, tuple[str, str, str | None]]]] = {}
     for item_type in registered_item_types():
         type_ct = item_type.content_type
         pks = {item.object_id for item in items if item.content_type_id == type_ct.id}
         if not pks:
             continue
         members = item_type.live(item_type.model.objects.filter(pk__in=pks))
+        applied = item_type.platform_pass
         registered[type_ct.id] = (
             item_type.object_type,
-            {str(obj.pk): (item_type.display_name(obj), getattr(obj, item_type.hash_field)) for obj in members},
+            {
+                str(obj.pk): (
+                    item_type.display_name(obj),
+                    getattr(obj, item_type.hash_field),
+                    applied(obj) if applied is not None else None,
+                )
+                for obj in members
+            },
         )
 
     result = []
@@ -772,9 +804,11 @@ def _enrich_collection_items(items: list, user) -> list[dict]:
         base = {
             "id": item.id,
             "content_type_id": item.content_type_id,
-            "object_id": item.object_id,
+            MEMBER_PK: item.object_id,
+            "platform_pass": None,
             "added_at": item.added_at,
             "folder_id": getattr(item, "folder_id", None),
+            "position": getattr(item, "position", None),
             "release_month": None,
             "object_name": None,
             "object_hash": None,
@@ -803,7 +837,7 @@ def _enrich_collection_items(items: list, user) -> list[dict]:
             if entry is None:
                 # Not live (trashed or gone) — dropped, as a trashed media file is.
                 continue
-            base["object_name"], base["object_hash"] = entry
+            base["object_name"], base["object_hash"], base["platform_pass"] = entry
             base["object_type"] = object_type
         result.append(base)
     return result
@@ -1489,7 +1523,7 @@ def export_collection_to_dataset(request, collection_id: int, payload: Collectio
     }
 
 
-def _filter_readable(user, qs, order_by: str | tuple[str, ...], offset: int, limit: int) -> list:
+def _filter_readable(user, qs, order_by: str | tuple, offset: int, limit: int) -> list:
     """Iterate *qs* and return up to *limit* items the user can read.
 
     Handles pagination correctly even when items are filtered out: skips
@@ -2522,7 +2556,7 @@ def veto_dataset_member(request, dataset_id: str, recording_hash: str, payload: 
 # ---------------------------------------------------------------------------
 
 
-@api.get("/datasets/{dataset_id}/items/", response=list[CollectionItemOut])
+@api.get("/datasets/{dataset_id}/items/", response=list[DatasetItemOut])
 def list_dataset_items(
     request,
     dataset_id: str,
@@ -2537,7 +2571,7 @@ def list_dataset_items(
     when a valid *share_token* is provided.
     """
     from epicurrents.permissions import can_read_object
-    from library.release import member_name_subquery
+    from library.release import order_dataset_members
 
     user = getattr(request, "user", None)
     if not (user and getattr(user, "is_authenticated", False)):
@@ -2555,12 +2589,13 @@ def list_dataset_items(
 
     qs, manager = _visible_members(dataset, user, share_token)
     qs = without_unservable_members(_listable_items(qs), dataset, user, share_token)
+    # Folder by folder, the members a manager arranged first and the rest by name, ties by the member's hash, gated
+    # or not: added_at is an arrival order, which a gated dataset's release month hides and no other listing has a
+    # reason to show, and a position is written by a manager's order action alone. The order is total, so offset
+    # paging neither repeats nor skips a member, and it is applied to the whole member set before the page is sliced.
+    qs = order_dataset_members(qs, dataset, user)
     if dataset.release_gated:
-        # A gated dataset orders by name: added_at is the arrival order the release month hides.
-        qs = qs.select_related("release").annotate(sort_name=member_name_subquery()).order_by("sort_name", "object_id")
-    else:
-        # The pk breaks ties between members added together, so offset paging neither repeats nor skips one.
-        qs = qs.order_by("added_at", "pk")
+        qs = qs.select_related("release")
     if content_type_id is not None:
         qs = qs.filter(content_type_id=content_type_id)
     items = list(qs[offset : offset + limit])
@@ -2589,8 +2624,11 @@ def list_dataset_items(
         # time is served to. A token's reader may be anyone, where a grantee is someone the sharer chose.
         for row in rows:
             row["added_at"] = _to_month(row["added_at"])
-    # Without an account the keys go too: a recording is named by its hash to every reader.
-    _null_sequential_ids(rows, user, all_rows=not manager or user is None)
+    # The item id addresses a row for removal and placement, which take write access, so it goes to the dataset's
+    # managers alone, gated or not: to any other reader it would count the deployment's memberships in add order.
+    from library.release import is_dataset_manager
+
+    _null_sequential_ids(rows, user, all_rows=not (manager and is_dataset_manager(user, dataset)))
     return rows
 
 
@@ -2621,7 +2659,7 @@ def _browse_facts(request, dataset: Dataset, user, share_token: str | None) -> t
 def browse_dataset(
     request,
     dataset_id: str,
-    sort: str = Query("name", description="A sort key, prefixed with '-' for descending"),
+    sort: str = Query("order", description="A sort key, prefixed with '-' for descending"),
     limit: int = Query(50, ge=1, le=200),
     offset: int = Query(0, ge=0),
     share_token: str | None = None,
@@ -2630,7 +2668,8 @@ def browse_dataset(
 
     The same access and the same members as the item listing, recordings only. Sort keys are an
     allowlist (``library.browse.SORT_KEYS``, and ``subject.<key>`` for each subject field shown), and
-    none of them orders by arrival. ``modality``, ``subject.<key>`` and ``tag`` (a tag id) filter the rows and may
+    none of them orders by arrival; the default, ``order``, is the item listing's own, the members a manager
+    arranged first. ``modality``, ``subject.<key>`` and ``tag`` (a tag id) filter the rows and may
     repeat: any of a dimension's values, every one of the tags. A number field filters by ``subject.<key>.min`` and
     ``subject.<key>.max`` instead. The facets count each value under the other filters, and give a number field's
     lowest and highest value (``library.browse.facet_counts``). A member the caller cannot read is in neither the
@@ -2869,33 +2908,65 @@ def _gate_hidden_members(dataset: Dataset, user, share_token: str | None) -> dic
     return hidden
 
 
-def _null_sequential_ids(rows: list[dict], user, *, all_rows: bool) -> None:
-    """Null ``id`` and ``object_id`` where they would give away arrival order.
+def _null_sequential_ids(rows: list[dict], user, *, all_rows: bool, authored_only: bool = False) -> None:
+    """Null ``id`` where the caller cannot act on the row with it, and a dataset row's ``position`` with it.
 
-    Every row when *all_rows* (a reader of a gated dataset who does not manage it); otherwise the
-    rows of pooled recordings, unless the caller is a superuser or manages a pool holding them.
-    Both keys are sequential: the item id in add order, the object id in ingest order.
+    The item id is sequential, in add order, so a caller who holds it can count the deployment's memberships. It
+    addresses a row for removal and placement and is served for nothing else. A position is of use only to a
+    caller who can arrange the row, which takes the id, and to anyone else would count the members arranged ahead
+    of it, hidden ones included. Every row when *all_rows*: a reader
+    of a dataset who does not manage it. Otherwise the rows of pooled recordings, unless the caller is a superuser
+    or manages a pool holding them; and with *authored_only*, which the tag surfaces pass since a tag has no
+    manager of its members, every row whose object the caller did not write as well.
+
+    The member's own primary key is on no row to null: the rows carry it under ``MEMBER_PK`` for the decisions
+    here, and no response schema serves it to anyone, a superuser included.
     """
     from library.release import pooled_ids
     from recordings.models import Recording
 
-    if all_rows:
+    def withhold(row: dict) -> None:
+        row["id"] = None
+        if "position" in row:
+            row["position"] = None
+
+    if all_rows or user is None or not getattr(user, "is_authenticated", False):
         for row in rows:
-            row["id"] = None
-            row["object_id"] = None
+            withhold(row)
         return
-    if user is not None and getattr(user, "is_superuser", False):
+    if getattr(user, "is_superuser", False):
         return
     recording_ct = ContentType.objects.get_for_model(Recording, for_concrete_model=False)
-    recording_ids = [row["object_id"] for row in rows if row["content_type_id"] == recording_ct.pk and row["object_id"]]
+    recording_ids = [row[MEMBER_PK] for row in rows if row["content_type_id"] == recording_ct.pk and row[MEMBER_PK]]
     pooled = pooled_ids(recording_ct, recording_ids)
-    if not pooled:
-        return
-    concealed = pooled - _managed_pool_member_ids(user, recording_ct, pooled)
+    managed = _managed_pool_member_ids(user, recording_ct, pooled) if pooled else set()
+    authored = _authored_keys(rows, user) if authored_only else None
     for row in rows:
-        if row["content_type_id"] == recording_ct.pk and row["object_id"] in concealed:
-            row["id"] = None
-            row["object_id"] = None
+        key = (row["content_type_id"], row[MEMBER_PK])
+        is_recording = row["content_type_id"] == recording_ct.pk
+        if is_recording and row[MEMBER_PK] in managed:
+            continue
+        if (is_recording and row[MEMBER_PK] in pooled) or (authored is not None and key not in authored):
+            withhold(row)
+
+
+def _authored_keys(rows: list[dict], user) -> set[tuple[int, str]]:
+    """The content type id and primary key of the rows whose object *user* wrote, one query per content type.
+
+    An object whose model carries no ``author_id`` has no author to be, so its row is never among them.
+    """
+    by_type: dict[int, set[str]] = {}
+    for row in rows:
+        if row[MEMBER_PK] and row[MEMBER_PK].isdigit():
+            by_type.setdefault(row["content_type_id"], set()).add(row[MEMBER_PK])
+    authored: set[tuple[int, str]] = set()
+    for content_type_id, object_ids in by_type.items():
+        model = ContentType.objects.get_for_id(content_type_id).model_class()
+        if model is None or not any(field.attname == "author_id" for field in model._meta.concrete_fields):
+            continue
+        mine = model._default_manager.filter(pk__in=object_ids, author_id=user.pk).values_list("pk", flat=True)
+        authored.update((content_type_id, str(pk)) for pk in mine)
+    return authored
 
 
 def _managed_pool_member_ids(user, recording_ct, object_ids: set[str]) -> set[str]:
@@ -2917,13 +2988,14 @@ def _managed_pool_member_ids(user, recording_ct, object_ids: set[str]) -> set[st
     return managed
 
 
-@api.post("/datasets/{dataset_id}/items/", response={201: CollectionItemOut})
+@api.post("/datasets/{dataset_id}/items/", response={201: DatasetItemOut})
 def add_dataset_item(request, dataset_id: str, payload: CollectionItemIn):
     """Add an object to the dataset.
 
     Requires write access to the dataset. The caller must also be able to
     read the referenced object. A release-gated dataset takes only its author's
-    own objects, whoever adds them (409 otherwise).
+    own objects, whoever adds them (409 otherwise). The new member is unsorted:
+    it takes no place in the manual order until a manager gives it one.
     For ``recordings.Recording`` items the public hash (32-char hex) is also
     accepted and resolved to the internal primary key automatically.
     """
@@ -3097,7 +3169,9 @@ def list_dataset_folders(request, dataset_id: str, share_token: str | None = Non
         or can_read_object(user=user, obj=dataset, share_token=share_token)
     ):
         raise HttpError(403, "You do not have permission to view this dataset")
-    folders = list(DatasetFolder.objects.filter(dataset=dataset).order_by("parent_id", "position", "name"))
+    # The key last, so siblings sharing a position and a name are walked in the order the item listing ranks them
+    # by (library.release.folder_ranks).
+    folders = list(DatasetFolder.objects.filter(dataset=dataset).order_by("parent_id", "position", "name", "pk"))
     log_activity(
         verb="library.dataset.folder.list",
         target=dataset,
@@ -3211,7 +3285,9 @@ def delete_dataset_folder(request, dataset_id: str, folder_id: int):
         moved = 0
         for item in DatasetItem.objects.filter(folder_id__in=subtree):
             item.folder = None
-            item.save(update_fields=["folder"])
+            # Its place was among the folder's members; at the root it starts unsorted, as after any move.
+            item.position = None
+            item.save(update_fields=["folder", "position"])
             moved += 1
         log_activity(
             verb="library.dataset.folder.delete",
@@ -3222,12 +3298,14 @@ def delete_dataset_folder(request, dataset_id: str, folder_id: int):
     return {"status": "ok"}
 
 
-@api.post("/datasets/{dataset_id}/items/{item_id}/move", response=CollectionItemOut)
+@api.post("/datasets/{dataset_id}/items/{item_id}/move", response=DatasetItemOut)
 def move_dataset_item(request, dataset_id: str, item_id: int, payload: MoveDatasetItemIn):
     """Place an item in one of the dataset's folders, or back at the root.
 
     Presentation only — membership and access are untouched. Requires write access to the
     dataset. Idempotent: re-placing an item where it already is returns the row unchanged.
+    An item that changes folder leaves the manual order of the one it was in and arrives
+    unsorted, since its position was a place among that folder's members.
     """
     from epicurrents.permissions import can_write_object
 
@@ -3242,14 +3320,116 @@ def move_dataset_item(request, dataset_id: str, item_id: int, payload: MoveDatas
 
     folder = _get_dataset_folder(dataset, payload.folder_id) if payload.folder_id is not None else None
     target_folder_id = folder.pk if folder is not None else None
-    if item.folder_id == target_folder_id:
-        return _enrich_collection_items([item], user)[0]
+    changed = item.folder_id != target_folder_id
+    if changed:
+        with transaction.atomic():
+            item.folder = folder
+            item.position = None
+            item.save(update_fields=["folder", "position"])
+    # Annotated either way, so a repeated request does not leave a row with the default verb and no target.
+    log_activity(verb="library.dataset.item.move", target=item, metadata={"changed": changed})
+    row = _enrich_collection_items([item], user)[0]
+    # The caller manages the dataset, so the item id stays, a pooled recording's excepted as on the listing.
+    _null_sequential_ids([row], user, all_rows=False)
+    return row
+
+
+class DatasetItemOrderIn(Schema):
+    """Payload of an order action on a dataset item."""
+
+    action: Literal["up", "down", "top", "bottom", "clear"]
+
+
+class DatasetItemOrderRowOut(Schema):
+    """One member of a folder after an order action, named by the item id the dataset's managers hold."""
+
+    id: int | None
+    position: int | None
+
+
+class DatasetItemOrderOut(Schema):
+    """The folder an order action arranged: how many rows it wrote, and the folder's members in listing order."""
+
+    changed: int
+    folder_id: int | None
+    items: list[DatasetItemOrderRowOut]
+
+
+@api.post("/datasets/{dataset_id}/items/{item_id}/order", response=DatasetItemOrderOut)
+def order_dataset_item(request, dataset_id: str, item_id: int, payload: DatasetItemOrderIn):
+    """Move an item within the manual order of its folder, bring it into that order, or take it out.
+
+    Presentation only, like the placement in a folder, and under the same rule: write access to the dataset, a
+    submission pool included. The order is the folder's (the dataset root being one). ``up`` and ``down`` swap an
+    arranged item with its neighbour and change nothing at the edge; ``top`` and ``bottom`` put the item first or
+    last among the arranged ones; on an unsorted item ``up`` arranges it last and ``down`` changes nothing;
+    ``clear`` returns it to the unsorted ones (``library.item_order.arrange``). The positions of the folder are
+    renumbered from 1 with no gaps under a lock, each changed row saved on its own so the audit trail records it.
+    Answers the folder's members as the caller's listing orders them.
+    """
+    from epicurrents.permissions import can_write_object
+    from library.item_order import arrange
+    from library.item_types import without_unservable_members
+    from library.release import order_dataset_members
+
+    user = _require_auth(request)
+    dataset = _get_active_dataset(dataset_id)
+    if not can_write_object(user=user, obj=dataset):
+        raise HttpError(403, "You do not have permission to modify this dataset")
 
     with transaction.atomic():
-        item.folder = folder
-        item.save(update_fields=["folder"])
-        log_activity(verb="library.dataset.item.move", target=item)
-    return _enrich_collection_items([item], user)[0]
+        # One order action at a time per dataset, and the rows it renumbers locked with it, so two managers
+        # arranging at once cannot leave a folder with a position held twice.
+        Dataset.objects.select_for_update().get(pk=dataset.pk)
+        item = DatasetItem.objects.select_for_update().filter(pk=item_id, dataset=dataset).first()
+        if item is None:
+            raise HttpError(404, "Item not found in this dataset")
+        folder_members = DatasetItem.objects.filter(dataset=dataset, folder_id=item.folder_id)
+        arranged = {row.pk: row for row in folder_members.select_for_update().filter(position__isnull=False)}
+        arranged.setdefault(item.pk, item)
+        sequence = list(
+            order_dataset_members(folder_members.filter(position__isnull=False), dataset, user).values_list(
+                "pk", flat=True
+            )
+        )
+        # The members the caller's own listing shows; a trashed or failed recording keeps its place and is stepped
+        # over, so a move passes the neighbour the caller sees.
+        members, _manager = _visible_members(dataset, user, None)
+        listed = without_unservable_members(_listable_items(members), dataset, user, None).filter(
+            folder_id=item.folder_id
+        )
+        shown = set(listed.values_list("pk", flat=True))
+        placed = arrange(sequence, item.pk, payload.action, shown)
+        changed = 0
+        for position, pk in enumerate(placed, start=1):
+            row = arranged[pk]
+            if row.position != position:
+                row.position = position
+                row.save(update_fields=["position"])
+                changed += 1
+        if item.pk not in placed and arranged[item.pk].position is not None:
+            row = arranged[item.pk]
+            row.position = None
+            row.save(update_fields=["position"])
+            changed += 1
+        log_activity(
+            verb="library.dataset.item.order",
+            target=item,
+            metadata={"action": payload.action, "changed": changed},
+        )
+        rows = [
+            {"id": pk, "position": position, "content_type_id": content_type_id, MEMBER_PK: object_id}
+            for pk, position, content_type_id, object_id in order_dataset_members(listed, dataset, user).values_list(
+                "pk", "position", "content_type_id", "object_id"
+            )
+        ]
+    # As on the listing: the caller manages the dataset, so the ids stay, a pooled recording of another pool excepted.
+    _null_sequential_ids(rows, user, all_rows=False)
+    return {
+        "changed": changed,
+        "folder_id": item.folder_id,
+        "items": [{"id": row["id"], "position": row["position"]} for row in rows],
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -3898,12 +4078,28 @@ def list_tagged_items(
         content_type_id=recording_ct.id,
         object_id__in=failed_object_ids,
     )
+    # A registered type's rows that are not live are left out as well. The per-item read check below is skipped for
+    # a superuser, so without this a trashed member's hash is still listed to one.
+    from django.db.models import Q
 
-    # Superusers see everything without per-item checks.
+    from library.item_types import registered_item_types
+
+    for item_type in registered_item_types():
+        live = item_type.live(item_type.model.objects.all()).annotate(key=Cast("pk", CharField())).values("key")
+        qs = qs.exclude(Q(content_type=item_type.content_type) & ~Q(object_id__in=live))
+
+    # By the tagged object's name, ties by its hash, as a dataset's members are listed: tagged_at is an order of
+    # tagging no reader needs. Superusers see everything without per-item checks.
+    from library.release import member_name_ordering
+
+    annotations, ordering = member_name_ordering(user)
+    # With descendants included one object can carry several of the listed tags, so the tag makes the order total.
+    ordering = (*ordering, "tag_id")
+    qs = qs.annotate(**annotations)
     if getattr(user, "is_superuser", False):
-        items = list(qs.order_by("tagged_at")[offset : offset + limit])
+        items = list(qs.order_by(*ordering)[offset : offset + limit])
     else:
-        items = _filter_readable(user, qs, order_by="tagged_at", offset=offset, limit=limit)
+        items = _filter_readable(user, qs, order_by=ordering, offset=offset, limit=limit)
     log_activity(
         verb="library.tag.item.list",
         target=tag,

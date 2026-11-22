@@ -39,6 +39,7 @@ from django.conf import settings
 from django.contrib.auth import get_user_model
 from django.contrib.contenttypes.models import ContentType
 from django.db import IntegrityError, transaction
+from django.db.models import Prefetch
 from django.http import FileResponse, HttpResponse
 from django.utils import timezone
 from ninja import File, NinjaAPI, Query, Schema, UploadedFile
@@ -59,6 +60,7 @@ from epicurrents.granting import (
 from epicurrents.models import AccessRight
 from epicurrents.permissions import (
     can_read_object,
+    can_write_object,
     ensure_can_write_object,
 )
 from epicurrents.text_hygiene import NameWarningOut, name_warnings
@@ -233,8 +235,26 @@ def _get_study_or_404(content_hash: str, user) -> DicomStudy:
     return study
 
 
-def _study_out(study: DicomStudy, user) -> DicomStudyOut:
-    """Serialize a study list item for *user*."""
+def _visible_study_created_at(study: DicomStudy, user) -> datetime:
+    """Return the study's upload time as *user* may see it: exact for the author and superusers, else its month.
+
+    The recording rule (``_visible_created_at`` in ``recordings/api/v1/ninja.py``),
+    for the same reason: an upload time falls close to the acquisition, and the
+    pass has replaced every date in the header with a dummy.
+    """
+    from recordings.api.v1.ninja import _visible_created_at
+
+    return _visible_created_at(study, exact=user.is_superuser or study.author_id == user.pk)
+
+
+def _study_out(study: DicomStudy, user, *, can_share: bool | None = None) -> DicomStudyOut:
+    """Serialize a study list item for *user*.
+
+    *can_share* is the answer a listing has already worked out for the whole
+    page (``_shareable_study_ids``); left out, it is resolved for this study.
+    """
+    if can_share is None:
+        can_share = _can_share_study(user, study)
     return DicomStudyOut(
         hash=study.content_hash,
         study_instance_uid=study.study_instance_uid,
@@ -248,9 +268,9 @@ def _study_out(study: DicomStudy, user) -> DicomStudyOut:
         accession_number=study.accession_number,
         num_instances=study.num_instances,
         modalities=study.modalities,
-        created_at=study.created_at,
+        created_at=_visible_study_created_at(study, user),
         is_author=study.author_id == user.pk,
-        can_share=_can_share_study(user, study),
+        can_share=can_share,
         deidentification_version=study.deidentification_version,
     )
 
@@ -261,13 +281,44 @@ def _can_share_study(user, study: DicomStudy) -> bool:
     return rights.unrestricted or rights.can_share
 
 
+def _shareable_study_ids(user, studies) -> set[int]:
+    """Return the keys of the *studies* whose access *user* may manage, in one query for the whole listing.
+
+    The batch form of ``_can_share_study``, and the same rule as
+    ``epicurrents.granting.conferrable_rights``: the author, a superuser, or
+    an active ``can_share`` row targeting the user or one of their groups.
+    """
+    if user.is_superuser:
+        return {study.pk for study in studies}
+    own = {study.pk for study in studies if study.author_id == user.pk}
+    others = [str(study.pk) for study in studies if study.pk not in own]
+    if not others:
+        return own
+    granted = (
+        AccessRight.objects.active()
+        .for_target(user)
+        .filter(content_type=_study_ct(), object_id__in=others, can_share=True)
+        .values_list("object_id", flat=True)
+    )
+    return own | {int(object_id) for object_id in granted}
+
+
+#: How many recordings sharing one identifier an attachment lookup checks for write access.
+_ATTACHMENT_CANDIDATES = 20
+
+
 def _resolve_attachment(user, attached_to_type: str | None, attached_to_id: str | None):
     """Resolve the optional upload attachment target.
 
     Returns ``None`` when no attachment was requested. Today only
-    ``type="recording"`` is supported; the target is resolved by its
-    ``content_hash`` and requires write access, so a user cannot attach
-    studies to someone else's recording.
+    ``type="recording"`` is supported. The target is named by the recording's
+    public hash, the 32-character prefix of its stored name that every
+    recording response and the attachments listing carry; the 64-character
+    content fingerprint is accepted as well, and since several recordings can
+    share one, the first the caller may write is taken. Write access is
+    required, so a user cannot attach studies to someone else's recording, and
+    a recording that does not exist and one the caller may not write both
+    answer 404, so the parameter says nothing about what exists.
     """
     if not (attached_to_type or attached_to_id):
         return None
@@ -281,24 +332,33 @@ def _resolve_attachment(user, attached_to_type: str | None, attached_to_id: str 
         )
     from recordings.models import Recording
 
-    try:
-        recording = Recording.objects.get(content_hash=attached_to_id, deleted_at__isnull=True)
-    except Recording.DoesNotExist:
+    identifier = attached_to_id.strip()
+    active = Recording.objects.filter(deleted_at__isnull=True).order_by("-created_at", "-pk")
+    if len(identifier) == 32 and identifier.isalnum():
+        normalized = identifier.upper()
+        candidates = active.filter(stored_name__startswith=f"{normalized}.") or active.filter(stored_name=normalized)
+    elif identifier:
+        candidates = active.filter(content_hash=identifier)
+    else:
+        candidates = Recording.objects.none()
+    recording = next((r for r in candidates[:_ATTACHMENT_CANDIDATES] if can_write_object(user, r)), None)
+    if recording is None:
         raise HttpError(404, "Attachment target not found.")
-    ensure_can_write_object(user, recording)
     return recording
 
 
-def _build_ohif_json(study: DicomStudy, request) -> dict:
+def _build_ohif_json(study: DicomStudy) -> dict:
     """Build the DICOMweb JSON payload consumed by OHIF's ``dicomjson`` datasource.
 
     The instance URL uses the WADO-URI endpoint mounted at
     ``/plugin/dicom/api/v1/dicom/wado/``. OHIF recognises the ``dicomweb:``
-    prefix and strips it before making its own fetch request.
+    prefix and strips it before making its own fetch request. The URL is
+    root-relative, as the ``platform`` data source's ``wadoUriRoot`` is: an
+    absolute one built from the request would say ``http:`` behind a TLS proxy
+    that does not forward the scheme, and the browser would refuse it as mixed
+    content. The viewer and this endpoint share an origin.
     """
-    scheme = request.scheme
-    host = request.get_host()
-    wado_base = f"{scheme}://{host}/plugin/dicom/api/v1/dicom/wado/"
+    wado_base = "/plugin/dicom/api/v1/dicom/wado/"
 
     study_node: dict = {
         "StudyInstanceUID": study.study_instance_uid,
@@ -316,7 +376,8 @@ def _build_ohif_json(study: DicomStudy, request) -> dict:
         "series": [],
     }
 
-    for series in study.series.prefetch_related("instances").all():
+    ready = Prefetch("instances", queryset=DicomInstance.objects.filter(status=DicomInstance.Status.READY))
+    for series in study.series.prefetch_related(ready):
         series_node: dict = {
             "SeriesInstanceUID": series.series_instance_uid,
             "SeriesDescription": series.series_description,
@@ -326,7 +387,7 @@ def _build_ohif_json(study: DicomStudy, request) -> dict:
             "instances": [],
         }
 
-        instances = sorted(series.instances.filter(status=DicomInstance.Status.READY), key=_instance_order)
+        instances = sorted(series.instances.all(), key=_instance_order)
         for inst in instances:
             wado_url = (
                 f"{wado_base}?requestType=WADO"
@@ -464,9 +525,10 @@ def upload_dicom(
     the batch. With de-identification on and no ``DICOM_UID_KEY``, the whole
     request is refused with a 503 before anything is staged.
 
-    With de-identification on, a file that may show identifying text in its
-    pixels (``ingest.pixel_review_required``: ultrasound, secondary capture,
-    other, or Burned In Annotation YES) is refused with the code
+    With de-identification on, every file outside the acquisition allowlist
+    (``ingest.pixel_review_required``: anything but an original CT, MR or PET
+    acquisition carrying neither Burned In Annotation nor Recognizable Visual
+    Features YES) is refused with the code
     ``burned_in_confirmation_required`` and nothing written for it, unless
     ``confirm_burned_in`` says the author has checked the batch's images. The
     client resubmits those files, found by their ``index``, with the flag set.
@@ -475,8 +537,13 @@ def upload_dicom(
 
     ``attached_to_type`` + ``attached_to_id`` optionally attach the resulting
     study to a parent object (today only ``type="recording"``, identified by
-    its content hash; requires write access to the recording). Attachment is
-    rejected when the batch spans more than one study.
+    the recording's public hash; requires write access to the recording, and
+    answers 404 without it). Attachment is rejected when the batch spans more
+    than one study, and is made only with a batch that adds a new file: a
+    batch of duplicates says in its reports that nothing was attached.
+
+    Whatever fails, a refusal or an unexpected error, no staged file outlives
+    the request; the purge task's staging sweep covers a request that died.
 
     The returned study hashes are immediately valid for the study endpoints;
     ``num_instances`` reflects the batch as soon as the response is returned.
@@ -506,11 +573,15 @@ def upload_dicom(
     # path holds the bytes as uploaded; the prepared file's path the bytes to
     # store, which is the same path when nothing was rewritten.
     staged: list[tuple] = []
+    # Every staging path this request has written to, so an unexpected failure can remove them all.
+    staging_files: list[str] = []
 
-    for index, upload_file in enumerate(files):
+    def stage(index: int, upload_file) -> None:
+        """Stage and prepare one file: append it to ``staged``, or report its refusal and leave nothing staged."""
         original_name = upload_file.name or "upload.dcm"
         stored_name = f"{uuid.uuid4().hex}.dcm"
         staging_file = os.path.join(staging, stored_name)
+        staging_files.append(staging_file)
 
         hasher = hashlib.sha256()
         total_size = 0
@@ -535,7 +606,7 @@ def upload_dicom(
                     error="Failed to store the uploaded file.",
                 )
             )
-            continue
+            return
 
         if oversized:
             _unlink_quietly(staging_file)
@@ -547,12 +618,13 @@ def upload_dicom(
                     error=f"File exceeds maximum upload size ({max_size} bytes).",
                 )
             )
-            continue
+            return
 
         try:
             prepared = prepare_file(
                 staging_file,
                 target_path=os.path.join(staging, f"{stored_name}.deid"),
+                author_id=user.pk,
                 source_hash=hasher.hexdigest(),
                 confirm_burned_in=confirm_burned_in,
             )
@@ -568,13 +640,13 @@ def upload_dicom(
                 )
             _unlink_quietly(staging_file)
             file_reports.append(DicomUploadFileOut(index=index, filename=original_name, accepted=False, error=str(exc)))
-            continue
+            return
         except PixelReviewRequired as exc:
             _unlink_quietly(staging_file)
             file_reports.append(
                 DicomUploadFileOut(index=index, filename=original_name, accepted=False, error=str(exc), code=exc.code)
             )
-            continue
+            return
         except MissingUidsError as exc:
             _unlink_quietly(staging_file)
             file_reports.append(
@@ -585,7 +657,7 @@ def upload_dicom(
                     error=str(exc),
                 )
             )
-            continue
+            return
         except Exception:
             _unlink_quietly(staging_file)
             file_reports.append(
@@ -596,14 +668,30 @@ def upload_dicom(
                     error="Not a parseable DICOM file.",
                 )
             )
-            continue
+            return
 
         staged.append((index, original_name, staging_file, stored_name, prepared))
+
+    def discard_everything_staged() -> None:
+        """Remove every as-uploaded and rewritten file this request staged, whatever became of it."""
+        for staged_path in staging_files:
+            _unlink_quietly(staged_path)
+            _unlink_quietly(f"{staged_path}.deid")
+
+    try:
+        for index, upload_file in enumerate(files):
+            stage(index, upload_file)
+    except Exception:
+        # Anything the per-file handling did not expect: a failure reading the request body, or writing the
+        # originals volume's copy. The request fails, and no as-uploaded file may outlive it in staging.
+        discard_everything_staged()
+        raise
 
     # Persist all parsed files in one transaction (multi-step write rule).
     persisted: list[tuple] = []  # (index, original_name, staging_file, PreparedFile, PersistResult)
     studies: dict[int, DicomStudy] = {}
     instances_added: dict[int, int] = {}
+    duplicate_reports: list[DicomUploadFileOut] = []
     try:
         with transaction.atomic():
             for index, original_name, staging_file, stored_name, prepared in staged:
@@ -621,7 +709,7 @@ def upload_dicom(
                 )
                 if result.outcome == "duplicate":
                     _discard_staged(staging_file, prepared)
-                    file_reports.append(
+                    duplicate_reports.append(
                         DicomUploadFileOut(
                             index=index,
                             filename=original_name,
@@ -658,11 +746,20 @@ def upload_dicom(
                             "modified_at",
                         ]
                     )
-    except HttpError:
-        # The transaction rolled back — remove every file still in staging.
-        for _index, _name, staging_file, _stored_name, prepared in staged:
-            _discard_staged(staging_file, prepared)
+    except Exception:
+        # The transaction rolled back, on a refusal (HttpError) or on anything else, a database error for a value
+        # no column takes included: remove every file still in staging. Left there, the as-uploaded bytes would sit
+        # on the backed-up media volume with no row pointing at them.
+        discard_everything_staged()
         raise
+
+    # An attachment is made with the batch's new instances. A batch that brought none attaches nothing, and each
+    # duplicate says so rather than leaving the caller to find the study unattached.
+    not_attached = attach_target is not None and not persisted and bool(duplicate_reports)
+    if not_attached:
+        for report in duplicate_reports:
+            report.error = f"{report.error} {_NOT_ATTACHED}"
+    file_reports.extend(duplicate_reports)
 
     # Post-commit: move accepted files to final storage and flip to READY.
     accepted = 0
@@ -719,6 +816,8 @@ def upload_dicom(
 
     held = sum(1 for report in file_reports if report.code == PixelReviewRequired.code)
     if accepted == 0 and held == 0:
+        if not_attached:
+            raise HttpError(400, f"No files were accepted: every file is already stored. {_NOT_ATTACHED}")
         raise HttpError(400, "No files were accepted. See the per-file report in logs.")
 
     file_reports.sort(key=lambda report: report.index)
@@ -752,6 +851,9 @@ def upload_dicom(
         accepted=accepted,
         rejected=len(file_reports) - accepted,
     )
+
+
+_NOT_ATTACHED = "The study was not attached: an attachment is made only with a batch that adds a new file."
 
 
 def _description_warnings(studies) -> list[DicomNameWarningOut]:
@@ -802,7 +904,9 @@ def list_studies(request):
     user = _require_auth(request)
     qs = dicomweb.listed_studies(user)
 
-    result = [_study_out(s, user) for s in qs.order_by("-created_at")]
+    studies = list(qs.order_by("-created_at"))
+    shareable = _shareable_study_ids(user, studies)
+    result = [_study_out(s, user, can_share=s.pk in shareable) for s in studies]
     log_activity(verb="dicom.study.list", metadata={"count": len(result)})
     return result
 
@@ -825,9 +929,9 @@ def get_study(request, content_hash: str):
             series_date=s.series_date,
             modality=s.modality,
             slice_thickness=s.slice_thickness,
-            instance_count=s.instances.filter(status=DicomInstance.Status.READY).count(),
+            instance_count=s.ready_instances,
         )
-        for s in study.series.all()
+        for s in dicomweb.series_with_counts(study)
     ]
 
     log_activity(verb="dicom.study.read", target=study)
@@ -848,7 +952,7 @@ def get_ohif_json(request, content_hash: str):
     user = _require_auth(request)
     study = _get_study_or_404(content_hash, user)
     log_activity(verb="dicom.study.read.ohif_json", target=study)
-    return _build_ohif_json(study, request)
+    return _build_ohif_json(study)
 
 
 @api.delete(
@@ -1102,7 +1206,7 @@ def qido_studies(request):
     # Filter names only: a value is whatever the caller typed, a patient's name included.
     filters = sorted(k for k in dicomweb.STUDY_FILTERS if request.GET.get(k))
     log_activity(verb="dicom.study.list.qido", metadata={"count": len(page), "filters": filters})
-    return _dicom_json_response([dicomweb.study_json(s) for s in page])
+    return _dicom_json_response(dicomweb.studies_json(page))
 
 
 @api.get("/dicomweb/studies/{study_uid}/series", summary="QIDO-RS: the series of one study.")
@@ -1110,9 +1214,9 @@ def qido_series(request, study_uid: str):
     """Return the QIDO-RS series objects of the study *study_uid* resolves to for the caller."""
     user = _require_auth(request)
     study = _resolve_study_or_404(user, study_uid)
-    series = list(study.series.all())
+    series = dicomweb.series_with_counts(study)
     log_activity(verb="dicom.series.list.qido", target=study, metadata={"count": len(series)})
-    return _dicom_json_response([dicomweb.series_json(s) for s in series])
+    return _dicom_json_response([dicomweb.series_json(s, study) for s in series])
 
 
 @api.get("/dicomweb/studies/{study_uid}/metadata", summary="WADO-RS: instance metadata of a whole study.")
@@ -1120,7 +1224,7 @@ def wado_study_metadata(request, study_uid: str):
     """Return WADO-RS metadata for every ready instance of the study *study_uid* resolves to."""
     user = _require_auth(request)
     study = _resolve_study_or_404(user, study_uid)
-    body = [item for series in study.series.all() for item in dicomweb.series_metadata(series)]
+    body = dicomweb.study_metadata(study)
     log_activity(verb="dicom.study.read.metadata", target=study, metadata={"instances": len(body)})
     return _dicom_json_response(body)
 
@@ -1134,7 +1238,7 @@ def wado_series_metadata(request, study_uid: str, series_uid: str):
     user = _require_auth(request)
     study = _resolve_study_or_404(user, study_uid)
     series = _series_or_404(study, series_uid)
-    body = dicomweb.series_metadata(series)
+    body = dicomweb.series_metadata(series, study)
     log_activity(verb="dicom.series.read.metadata", target=series, metadata={"instances": len(body)})
     return _dicom_json_response(body)
 

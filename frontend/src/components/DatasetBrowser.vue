@@ -5,7 +5,8 @@
  * beside the registered vocabularies it has none from.
  *
  * Sorting and paging are the server's (`GET /datasets/{id}/browse/`), which applies the release gate and never
- * orders a gated dataset by arrival. The subject columns are the fields the server says the caller is shown, so a
+ * orders a gated dataset by arrival. The page opens in the dataset's own order, the one its managers arranged, and
+ * returns to it with "Dataset order" once a column has sorted it. The subject columns are the fields the server says the caller is shown, so a
  * reader who does not manage a gated dataset gets its displayed fields only. A manager edits a member's subject
  * values in the drawer; the server refuses a released member's, and the refusal is shown as it comes.
  *
@@ -86,7 +87,12 @@ const facets = ref<DatasetFacets>({ modality: [], subject: {}, ranges: {}, tags:
 const filters = ref<DatasetBrowseFilters>({ modality: [], subject: {}, ranges: {}, tags: [] })
 const total = ref(0)
 const page = ref(1)
-const sort = ref('name')
+/**
+ * The sort the browser opens with: the dataset's own order, the item listing's, with the members a manager arranged
+ * first. It belongs to no column, so no header shows it as sorted and "Dataset order" returns to it.
+ */
+const DATASET_ORDER = 'order'
+const sort = ref(DATASET_ORDER)
 const loading = ref(true)
 const error = ref<string | null>(null)
 // Each load takes a number; an answer to an earlier one is dropped, so a slow page cannot overwrite a later one.
@@ -136,6 +142,10 @@ function onSort (next: string) {
     } else {
         page.value = 1
     }
+}
+
+function resetSort () {
+    onSort(DATASET_ORDER)
 }
 
 function onPage (next: number) {
@@ -645,6 +655,15 @@ function standardLabel (group: CodeSummary) {
         ></DatasetBrowserFilters>
         <div class="dataset-browser__toolbar">
             <p v-if="!loading || rows.length" class="dataset-browser__summary" role="status">{{ summary }}</p>
+            <wa-button v-if="sort !== DATASET_ORDER"
+                appearance="plain"
+                :disabled="loading"
+                size="s"
+                @click="resetSort"
+            >
+                <wa-icon name="list-ol" slot="start"></wa-icon>
+                {{ t('Dataset order', SCOPE) }}
+            </wa-button>
             <wa-button v-if="canManage"
                 appearance="plain"
                 :disabled="loading || !total"

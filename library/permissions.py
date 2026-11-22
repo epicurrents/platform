@@ -81,10 +81,13 @@ def ensure_can_write_collection(user, collection: Collection) -> None:
 def _dataset_read_right(user, token_value: str, dataset_ids):
     """The active ``can_read`` right on one of *dataset_ids* that targets the caller, or ``None``.
 
-    The caller is *user*, one of their groups, or the holder of the share token *token_value*.
+    The caller is *user*, one of their groups, or the holder of the share token *token_value*. Where several rows
+    match, the one returned is the one ``get_read_access_result`` picks for a dataset: the caller's direct user row
+    before group and token rows, and the de-identifying row among equals. A dataset listing resolves its terms through
+    that resolver, so any other choice here lets the listing and the per-object check disagree on a member.
     """
     from django.contrib.contenttypes.models import ContentType
-    from django.db.models import Q
+    from django.db.models import F, Q
 
     from epicurrents.models import AccessRight
     from library.models import Dataset
@@ -114,6 +117,10 @@ def _dataset_read_right(user, token_value: str, dataset_ids):
             can_read=True,
         )
         .filter(target_filter)
+        # The direct-row resolver's own expression. Unlike that query this one can span every dataset holding the
+        # object, so two rows of equal specificity are ordinary here, and the second key settles them toward
+        # de-identification rather than leaving the choice to the database's row order.
+        .order_by(F("access_target_id").asc(nulls_last=True), "-apply_middleware")
         .only("apply_middleware")
         .first()
     )

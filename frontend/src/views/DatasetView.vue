@@ -12,6 +12,7 @@ import MediaListRow from '#components/MediaListRow.vue'
 import EditRecordingDialog from '#components/EditRecordingDialog.vue'
 import RecordingListRow from '#components/RecordingListRow.vue'
 import RecordingMediaDialog from '#components/RecordingMediaDialog.vue'
+import StoredAsUploadedTag from '#components/StoredAsUploadedTag.vue'
 import {
     getDataset,
     updateDataset,
@@ -24,6 +25,7 @@ import {
     updateDatasetFolder,
     deleteDatasetFolder,
     moveDatasetItem,
+    orderDatasetItem,
     listDatasetAccess,
     grantDatasetAccess,
     revokeDatasetAccess,
@@ -31,6 +33,7 @@ import {
     getRecordingContentTypeId,
     type Collection,
     type DatasetItem,
+    type DatasetItemOrderAction,
     type AccessRight,
     type AssessmentPayload,
     type DatasetFolder,
@@ -50,8 +53,10 @@ import MediaPickerDialog from '#components/MediaPickerDialog.vue'
 import { useRecordingsStore } from '#stores/recordings'
 import { useLibraryStore } from '#stores/library'
 import { useAuthStore } from '#stores/auth'
+import { applyFolderOrder, isArranged, itemOrderStates, UNSORTED } from '#lib/datasetItemOrder'
 import { toastNameWarnings } from '#lib/nameWarnings'
 import { errorDetail, settledFailure } from '#lib/http'
+import { storedAsUploaded } from '#lib/platformPass'
 import { showToast } from '#lib/toast'
 import ViewerConfigEditor from '#components/ViewerConfigEditor.vue'
 import type { ViewerSettingsOverrides } from '#lib/viewerConfig'
@@ -526,6 +531,139 @@ function canRemoveItem (item: DatasetItem) {
 }
 
 /**
+ * Whether the caller can arrange an item in the manual order: a manager of the tree, and a row the server named.
+ * @param item - A row of the items section.
+ */
+function canOrderItem (item: DatasetItem) {
+    return canManageFolders.value && item.id !== null
+}
+
+/** The order actions by the value their menu entry carries. */
+const ORDER_ACTIONS: Record<string, DatasetItemOrderAction> = {
+    'order-bottom': 'bottom',
+    'order-clear': 'clear',
+    'order-down': 'down',
+    'order-top': 'top',
+    'order-up': 'up',
+}
+
+/** Where each arranged item stands in its folder's order, worked out once for the whole list. */
+const orderStates = computed(() => itemOrderStates(items.value))
+
+/** One entry of a row's order menu. */
+interface OrderMenuEntry {
+    disabled: boolean
+    icon: string
+    label: string
+    value: string
+}
+
+/**
+ * The order entries of an item's menu. An arranged item moves among the arranged ones, with the moves that would
+ * change nothing at an edge disabled, or leaves the order; an unsorted one joins it, at the end or at the top.
+ * @param item - A row of the items section.
+ */
+function orderMenu (item: DatasetItem): OrderMenuEntry[] {
+    if (!canOrderItem(item)) {
+        return []
+    }
+    if (!isArranged(item)) {
+        return [
+            { disabled: false, icon: 'list-ol', label: t('Add to order', SCOPE), value: 'order-bottom' },
+            { disabled: false, icon: 'arrow-up-to-line', label: t('Move to top', SCOPE), value: 'order-top' },
+        ]
+    }
+    const { canMoveDown, canMoveUp } = orderStates.value.get(item) ?? UNSORTED
+    return [
+        { disabled: !canMoveUp, icon: 'arrow-up', label: t('Move up', SCOPE), value: 'order-up' },
+        { disabled: !canMoveDown, icon: 'arrow-down', label: t('Move down', SCOPE), value: 'order-down' },
+        { disabled: !canMoveUp, icon: 'arrow-up-to-line', label: t('Move to top', SCOPE), value: 'order-top' },
+        {
+            disabled: !canMoveDown,
+            icon: 'arrow-down-to-line',
+            label: t('Move to bottom', SCOPE),
+            value: 'order-bottom',
+        },
+        { disabled: false, icon: 'rotate-left', label: t('Remove from order', SCOPE), value: 'order-clear' },
+    ]
+}
+
+/**
+ * An arranged item's place in its folder's order, or null for an unsorted one. Only a manager is served positions,
+ * so only a manager is shown the number.
+ * @param item - A row of the items section.
+ */
+function orderOrdinal (item: DatasetItem) {
+    return orderStates.value.get(item)?.ordinal ?? null
+}
+
+/**
+ * The hover text of an arranged item's number.
+ * @param item - A row of the items section.
+ */
+function orderOrdinalTitle (item: DatasetItem) {
+    return t('Arranged: number {n} in the manual order', SCOPE, { n: orderOrdinal(item) ?? '' })
+}
+
+// One order action at a time: the next one is worked out from the list the last one left.
+const orderPending = ref(false)
+
+/**
+ * Carry out an order action and show the folder as the server ordered it. The answer names the folder's members
+ * in their new order; where it and the page disagree about who they are, the listing is read again.
+ * @param item - The row to move.
+ * @param action - The order action.
+ */
+async function orderItem (item: DatasetItem, action: DatasetItemOrderAction) {
+    const itemId = item.id
+    if (itemId === null || orderPending.value) {
+        return
+    }
+    orderPending.value = true
+    try {
+        const result = await orderDatasetItem(datasetId.value, itemId, action)
+        items.value = applyFolderOrder(items.value, result.folder_id, result.items)
+            ?? await listAllDatasetItems(datasetId.value)
+    } catch (err) {
+        showToast(errorDetail(err, t('Failed to change the order.', SCOPE)), 'danger')
+    } finally {
+        orderPending.value = false
+    }
+}
+
+/**
+ * Carry out the order action a menu value names. Answers whether the value was one.
+ * @param value - The selected menu entry's value.
+ * @param item - The row the menu belongs to.
+ */
+function onOrderAction (value: string, item: DatasetItem) {
+    const action = ORDER_ACTIONS[value]
+    if (!action) {
+        return false
+    }
+    orderItem(item, action)
+    return true
+}
+
+/**
+ * Route the menu of a row that is neither a recording nor a media file, such as a member type a plugin registers:
+ * an order entry moves the row, move to folder opens the dialog, anything else removes.
+ * @param event - The dropdown's `wa-select`.
+ * @param item - The row the menu belongs to.
+ */
+function onOtherItemSelect (event: Event, item: DatasetItem) {
+    const value = (event as CustomEvent<{ item: { value: string } }>).detail.item.value
+    if (onOrderAction(value, item)) {
+        return
+    }
+    if (value === 'move-folder') {
+        openMoveItem(item)
+    } else {
+        removeItem(item)
+    }
+}
+
+/**
  * The label of an item row: its resolved name, or a placeholder naming whatever identifies it.
  * @param item - A row of the items section.
  */
@@ -671,9 +809,12 @@ async function submitMoveItem() {
     try {
         const folderId = moveInput.folderId ? Number(moveInput.folderId) : null
         const updated = await moveDatasetItem(datasetId.value, itemId, folderId)
-        const row = items.value.find(i => i.id === updated.id)
+        // By the id the request named: the response's own id is null for a pooled recording of another pool.
+        const row = items.value.find(i => i.id === itemId)
         if (row) {
             row.folder_id = updated.folder_id
+            // A move to another folder leaves the order of the one it was in; the server cleared the position.
+            row.position = updated.position ?? null
         }
         movingItem.value = null
     } catch (err) {
@@ -914,6 +1055,9 @@ const attachMediaItem = ref<DatasetItem | null>(null)
 
 /** Route the recording row menu: attach media opens the dialog, anything else removes. */
 function onRecordingAction(value: string, item: DatasetItem) {
+    if (onOrderAction(value, item)) {
+        return
+    }
     if (value === 'attach-media') {
         attachMediaItem.value = item
     } else if (value === 'edit') {
@@ -931,6 +1075,9 @@ function onRecordingAction(value: string, item: DatasetItem) {
 
 /** Route the media row menu: move to folder opens the dialog, anything else removes. */
 function onMediaAction(value: string, item: DatasetItem) {
+    if (onOrderAction(value, item)) {
+        return
+    }
     if (value === 'move-folder') {
         openMoveItem(item)
     } else {
@@ -1111,6 +1258,12 @@ const assessFn = (right: AccessRight, payload: AssessmentPayload) =>
                                         @row-dblclick="openRecordings([item.object_hash])"
                                     >
                                         <template #meta>
+                                            <span v-if="orderOrdinal(item) !== null"
+                                                class="item-ordinal"
+                                                :title="orderOrdinalTitle(item)"
+                                            >
+                                                {{ orderOrdinal(item) }}
+                                            </span>
                                             <wa-tag v-if="isUnreleased(item)" size="s" variant="warning">
                                                 {{ t('Unreleased', SCOPE) }}
                                             </wa-tag>
@@ -1129,6 +1282,13 @@ const assessFn = (right: AccessRight, payload: AssessmentPayload) =>
                                                     {{ t('Attach media', SCOPE) }}
                                                 </wa-dropdown-item>
                                             </template>
+                                            <wa-dropdown-item v-for="entry in orderMenu(item)" :key="entry.value"
+                                                :disabled="entry.disabled"
+                                                :value="entry.value"
+                                            >
+                                                <wa-icon :name="entry.icon" slot="icon"></wa-icon>
+                                                {{ entry.label }}
+                                            </wa-dropdown-item>
                                             <wa-dropdown-item v-if="canMoveItem(item)" value="move-folder">
                                                 <wa-icon name="folder-open" slot="icon"></wa-icon>
                                                 {{ t('Move to folder', SCOPE) }}
@@ -1174,7 +1334,22 @@ const assessFn = (right: AccessRight, payload: AssessmentPayload) =>
                                         @open="openMedia(item.object_hash)"
                                         @row-dblclick="openMedia(item.object_hash)"
                                     >
+                                        <template #meta>
+                                            <span v-if="orderOrdinal(item) !== null"
+                                                class="item-ordinal"
+                                                :title="orderOrdinalTitle(item)"
+                                            >
+                                                {{ orderOrdinal(item) }}
+                                            </span>
+                                        </template>
                                         <template #actions>
+                                            <wa-dropdown-item v-for="entry in orderMenu(item)" :key="entry.value"
+                                                :disabled="entry.disabled"
+                                                :value="entry.value"
+                                            >
+                                                <wa-icon :name="entry.icon" slot="icon"></wa-icon>
+                                                {{ entry.label }}
+                                            </wa-dropdown-item>
                                             <wa-dropdown-item v-if="canMoveItem(item)" value="move-folder">
                                                 <wa-icon name="folder-open" slot="icon"></wa-icon>
                                                 {{ t('Move to folder', SCOPE) }}
@@ -1194,6 +1369,49 @@ const assessFn = (right: AccessRight, payload: AssessmentPayload) =>
                                             <span class="list-row-name">
                                                 {{ itemName(item) }}
                                             </span>
+                                            <span v-if="orderOrdinal(item) !== null"
+                                                class="item-ordinal"
+                                                :title="orderOrdinalTitle(item)"
+                                            >
+                                                {{ orderOrdinal(item) }}
+                                            </span>
+                                            <StoredAsUploadedTag v-if="storedAsUploaded(item)"
+                                                :anchor="`dataset-item-as-uploaded-${itemKey(item)}`"
+                                            ></StoredAsUploadedTag>
+                                            <div v-if="canOrderItem(item) || canMoveItem(item) || canRemoveItem(item)"
+                                                class="list-row-actions"
+                                            >
+                                                <wa-dropdown
+                                                    placement="bottom-end"
+                                                    @wa-select.stop="onOtherItemSelect($event, item)"
+                                                >
+                                                    <wa-button
+                                                        appearance="plain"
+                                                        size="s"
+                                                        slot="trigger"
+                                                    >
+                                                        <wa-icon name="ellipsis"></wa-icon>
+                                                    </wa-button>
+                                                    <wa-dropdown-item v-for="move in orderMenu(item)" :key="move.value"
+                                                        :disabled="move.disabled"
+                                                        :value="move.value"
+                                                    >
+                                                        <wa-icon :name="move.icon" slot="icon"></wa-icon>
+                                                        {{ move.label }}
+                                                    </wa-dropdown-item>
+                                                    <wa-dropdown-item v-if="canMoveItem(item)" value="move-folder">
+                                                        <wa-icon name="folder-open" slot="icon"></wa-icon>
+                                                        {{ t('Move to folder', SCOPE) }}
+                                                    </wa-dropdown-item>
+                                                    <wa-dropdown-item v-if="canRemoveItem(item)"
+                                                        value="remove"
+                                                        variant="danger"
+                                                    >
+                                                        <wa-icon name="xmark" slot="icon"></wa-icon>
+                                                        {{ t('Remove from dataset', SCOPE) }}
+                                                    </wa-dropdown-item>
+                                                </wa-dropdown>
+                                            </div>
                                         </div>
                                     </div>
                                 </div>
@@ -1704,6 +1922,18 @@ const assessFn = (right: AccessRight, payload: AssessmentPayload) =>
 .icon-muted {
     color: var(--wa-color-text-quiet);
     flex-shrink: 0;
+}
+
+/* The place of an arranged item in its folder's manual order, which only a manager is served. */
+.item-ordinal {
+    border: 1px solid var(--wa-color-surface-border);
+    border-radius: var(--wa-border-radius-pill);
+    color: var(--wa-color-text-quiet);
+    flex-shrink: 0;
+    font-size: var(--wa-font-size-xs);
+    font-variant-numeric: tabular-nums;
+    line-height: 1;
+    padding: 0.2rem 0.45rem;
 }
 
 .dialog-form {

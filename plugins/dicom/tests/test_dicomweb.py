@@ -76,6 +76,92 @@ class TestStudySearch:
         assert response["Content-Type"] == "application/dicom+json"
         assert {_value(s, STUDY_UID) for s in body} == {own.study_instance_uid, granted.study_instance_uid}
 
+    @pytest.mark.parametrize(
+        ("version", "apply_middleware", "listed"),
+        [(1, False, True), (1, True, True), (None, False, True), (None, True, False)],
+    )
+    def test_a_de_identifying_grant_lists_no_study_stored_as_uploaded(
+        self, auth_client, make_study, make_user, version, apply_middleware, listed
+    ):
+        """Contract: every surface that lists or resolves from direct rows applies the plugin's terms refusal.
+
+        No endpoint writes ``apply_middleware`` on a study grant, so the row is made through the ORM.
+        """
+        from epicurrents.permissions import can_read_object
+        from plugins.dicom.tests.conftest import STUDIES_URL
+
+        client, user = auth_client
+        other = make_user()
+        study = make_study(other, study_uid=UID, deidentification_version=version)
+        AccessRight.objects.create(
+            content_type=ContentType.objects.get_for_model(study, for_concrete_model=False),
+            object_id=str(study.pk),
+            access_giver=other,
+            access_target=user,
+            can_read=True,
+            apply_middleware=apply_middleware,
+        )
+        # The listing agrees with the per-object answer, whichever way the row reads.
+        assert can_read_object(user, study) is listed
+        status = 200 if listed else 404
+        _, found = _get(client, "/studies")
+        assert bool(found) is listed
+        assert [s["hash"] for s in client.get(STUDIES_URL).json()] == ([study.content_hash] if listed else [])
+        assert client.get(f"{ROOT}/studies/{UID}/series").status_code == status
+        assert client.get(f"{ROOT}/studies/{UID}/metadata").status_code == status
+        assert client.get(f"{ROOT}/studies/{UID}/series/{UID}.1/metadata").status_code == status
+        assert client.get(f"{STUDIES_URL}{study.content_hash}/").status_code == status
+
+    def test_the_author_lists_a_raw_study_whatever_rows_exist(self, auth_client, make_study):
+        client, user = auth_client
+        study = make_study(user, deidentification_version=None)
+        AccessRight.objects.create(
+            content_type=ContentType.objects.get_for_model(study, for_concrete_model=False),
+            object_id=str(study.pk),
+            access_giver=user,
+            access_target=user,
+            can_read=True,
+            apply_middleware=True,
+        )
+        _, found = _get(client, "/studies")
+        assert [_value(s, STUDY_UID) for s in found] == [study.study_instance_uid]
+
+    def test_search_and_metadata_cost_the_same_queries_whatever_the_size(self, auth_client, make_study):
+        from django.db import connection
+        from django.test.utils import CaptureQueriesContext
+
+        client, user = auth_client
+
+        def cost(path):
+            with CaptureQueriesContext(connection) as queries:
+                assert client.get(f"{ROOT}{path}").status_code == 200
+            return len(queries)
+
+        study = make_study(user, study_uid=UID)
+        cost("/studies")  # the first request also fills the content-type cache
+        search, series, metadata = cost("/studies"), cost(f"/studies/{UID}/series"), cost(f"/studies/{UID}/metadata")
+        for number in range(2, 5):
+            make_study(user)
+            extra = DicomSeries.objects.create(study=study, series_instance_uid=f"{UID}.{number}", modality="CT")
+            DicomInstance.objects.create(
+                series=extra,
+                sop_instance_uid=f"{UID}.{number}.1",
+                stored_name=f"extra-{number}.dcm",
+                file_size=8,
+                status=DicomInstance.Status.READY,
+            )
+        _, body = _get(client, f"/studies/{UID}/metadata")
+        assert len(body) == 4
+        _, listed = _get(client, f"/studies/{UID}/series")
+        assert [s["00201209"]["Value"] for s in listed] == [[1]] * 4
+        _, found = _get(client, "/studies")
+        assert {s["00201206"]["Value"][0] for s in found} == {1, 4}
+        assert (cost("/studies"), cost(f"/studies/{UID}/series"), cost(f"/studies/{UID}/metadata")) == (
+            search,
+            series,
+            metadata,
+        )
+
     def test_copies_of_one_study_collapse_to_the_callers_own(self, auth_client, make_study, make_user):
         client, user = auth_client
         other = make_user()

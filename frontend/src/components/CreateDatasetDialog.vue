@@ -231,7 +231,7 @@ const collectionRecordingPanel = computed<Array<{ hash: string; name: string }>>
         for (const item of loadedItems.get(id) ?? []) {
             if (item.object_hash && !selectedRecordingNames.has(item.object_hash) && !seen.has(item.object_hash) && !excludedHashes.has(item.object_hash)) {
                 seen.add(item.object_hash)
-                result.push({ hash: item.object_hash, name: item.object_name ?? String(item.object_id) })
+                result.push({ hash: item.object_hash, name: item.object_name ?? item.object_hash })
             }
         }
     }

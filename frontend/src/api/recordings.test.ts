@@ -61,9 +61,37 @@ describe('listRecordingAttachments', () => {
 
     it('names the recordings a page at a time and joins the pages in order', async () => {
         const hashes = Array.from({ length: ATTACHMENT_LISTING_LIMIT + 1 }, (_, i) => `H${i}`)
-        const items = await listRecordingAttachments(hashes)
+        const listing = await listRecordingAttachments(hashes)
         expect(mockGet).toHaveBeenCalledTimes(2)
-        expect(items.map(item => item.parent)).toEqual(['H0', `H${ATTACHMENT_LISTING_LIMIT}`])
+        expect(listing.attachments.map(item => item.parent)).toEqual(['H0', `H${ATTACHMENT_LISTING_LIMIT}`])
+        expect(listing.failedHashes).toEqual([])
+    })
+
+    it('keeps a page of 32-character hashes under the request line a production server accepts', () => {
+        const query = Array.from({ length: ATTACHMENT_LISTING_LIMIT }, () => 'a'.repeat(32)).join(',')
+        expect(`/recordings/api/v1/attachments/?recordings=${encodeURIComponent(query)}`.length).toBeLessThan(4094)
+    })
+
+    it('answers the pages that were read and names the recordings of a page that failed', async () => {
+        const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined)
+        const hashes = Array.from({ length: ATTACHMENT_LISTING_LIMIT * 2 + 1 }, (_, i) => `H${i}`)
+        mockGet.mockImplementation((_url, config) => {
+            const first = String(config?.params?.recordings).split(',')[0]
+            return first === `H${ATTACHMENT_LISTING_LIMIT}`
+                ? Promise.reject(new Error('400'))
+                : Promise.resolve({ data: [{ parent: first }] })
+        })
+        const listing = await listRecordingAttachments(hashes)
+        expect(listing.attachments.map(item => item.parent)).toEqual(['H0', `H${ATTACHMENT_LISTING_LIMIT * 2}`])
+        expect(listing.failedHashes).toEqual(hashes.slice(ATTACHMENT_LISTING_LIMIT, ATTACHMENT_LISTING_LIMIT * 2))
+        warn.mockRestore()
+    })
+
+    it('never rejects, naming every recording when every page failed', async () => {
+        const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined)
+        mockGet.mockRejectedValue(new Error('down'))
+        expect(await listRecordingAttachments(['A', 'B'])).toEqual({ attachments: [], failedHashes: ['A', 'B'] })
+        warn.mockRestore()
     })
 
     it('passes the share token when there is one', async () => {

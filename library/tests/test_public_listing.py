@@ -304,11 +304,11 @@ class TestTokenReach:
         rows = Client().get(f"{DATASETS_URL}{dataset.object_hash}/items/?share_token={TOKEN}").json()
         assert len(rows) == 2
         for row in rows:
-            assert row["id"] is None and row["object_id"] is None
+            assert row["id"] is None and "object_id" not in row
             assert row["object_hash"]
             assert row["added_at"].startswith(timezone.now().strftime("%Y-%m-01T00:00:00")), row["added_at"]
         own = c.get(f"{DATASETS_URL}{dataset.object_hash}/items/").json()
-        assert all(row["id"] is not None and row["object_id"] is not None for row in own)
+        assert all(row["id"] is not None and "object_id" not in row for row in own)
 
     def test_folders_and_snapshots_follow_the_dataset(self, auth_client, dataset, user):
         from library.models import DatasetFolder

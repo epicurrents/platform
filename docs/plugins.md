@@ -20,11 +20,13 @@ scripts/enable_plugin.sh dicom
 This adds `dicom` to `EPICURRENTS_PLUGINS` in `.env` and `VITE_PLUGINS` in
 `frontend/.env`, fetches any plugin-specific submodule (DICOM ships its OHIF
 viewer as a `update = none` submodule), applies the plugin's migrations against
-PostgreSQL, and rebuilds the frontend. Restart the stack afterward:
+PostgreSQL, and rebuilds the frontend. Restart the stack afterward with the command the script prints, which is spelled for the runtime the host has. On Docker Engine that is:
 
 ```bash
 docker compose up -d
 ```
+
+On Podman it is `sudo -E podman compose up -d`. A host with neither runtime is refused before anything is fetched or edited.
 
 To enable several plugins, run the script once per plugin, or set the
 comma-separated lists directly:

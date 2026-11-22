@@ -202,6 +202,68 @@ class TestCanReadViaDataset:
 
 
 @pytest.mark.django_db
+class TestDatasetTermsParity:
+    """The member check picks the dataset row the resolver picks for the dataset itself.
+
+    A dataset listing takes its terms from ``get_read_access_result`` on the dataset and each member's own check takes
+    them from ``can_read_via_dataset``. Where a caller matches several rows the two must name the same one, or a
+    listing shows a member its endpoint refuses, or a file is served raw past a de-identifying grant.
+    """
+
+    @staticmethod
+    def _group_for(reader, name="readers"):
+        from django.contrib.auth.models import Group
+
+        group = Group.objects.create(name=name)
+        reader.groups.add(group)
+        return group
+
+    @pytest.mark.parametrize("user_row_first", [True, False])
+    @pytest.mark.parametrize("user_row_de_identifies", [True, False])
+    def test_a_user_row_outranks_a_group_row_whichever_was_written_first(
+        self, make_user, user_row_first, user_row_de_identifies
+    ):
+        owner, reader = make_user(), make_user()
+        group = self._group_for(reader)
+        dataset = baker.make(Dataset, author=owner)
+        recording = baker.make("recordings.Recording", author=owner)
+        _add_to_dataset(dataset, recording)
+        rows = [
+            {"access_target": reader, "apply_middleware": user_row_de_identifies},
+            {"access_target_group": group, "apply_middleware": not user_row_de_identifies},
+        ]
+        for row in rows if user_row_first else reversed(rows):
+            _dataset_right(dataset, owner, can_read=True, **row)
+        listing = get_read_access_result(reader, dataset)
+        member = can_read_via_dataset(user=reader, obj=recording)
+        assert listing.granted and member.granted
+        assert member.apply_middleware is listing.apply_middleware is user_row_de_identifies
+        assert get_read_access_result(reader, recording).apply_middleware is user_row_de_identifies
+
+    @pytest.mark.parametrize("creation_order", [(False, True), (True, False)])
+    def test_the_de_identifying_row_wins_between_two_group_rows(self, make_user, creation_order):
+        owner, reader = make_user(), make_user()
+        dataset = baker.make(Dataset, author=owner)
+        recording = baker.make("recordings.Recording", author=owner)
+        _add_to_dataset(dataset, recording)
+        for i, apply_middleware in enumerate(creation_order):
+            group = self._group_for(reader, name=f"readers-{i}")
+            _dataset_right(dataset, owner, access_target_group=group, can_read=True, apply_middleware=apply_middleware)
+        assert get_read_access_result(reader, dataset).apply_middleware is True
+        assert can_read_via_dataset(user=reader, obj=recording).apply_middleware is True
+
+    @pytest.mark.parametrize("creation_order", [(False, True), (True, False)])
+    def test_the_de_identifying_row_wins_between_two_datasets_holding_the_object(self, make_user, creation_order):
+        owner, reader = make_user(), make_user()
+        recording = baker.make("recordings.Recording", author=owner)
+        for apply_middleware in creation_order:
+            dataset = baker.make(Dataset, author=owner)
+            _add_to_dataset(dataset, recording)
+            _dataset_right(dataset, owner, access_target=reader, can_read=True, apply_middleware=apply_middleware)
+        assert can_read_via_dataset(user=reader, obj=recording).apply_middleware is True
+
+
+@pytest.mark.django_db
 class TestCollectionRowsGrantNothing:
     """A collection-targeted AccessRight must grant nothing.
 

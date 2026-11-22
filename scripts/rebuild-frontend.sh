@@ -89,6 +89,13 @@ ok "Frontend built"
 
 # ── 3. Restart web container ──────────────────────────────────────────────────
 
+# Docker or Podman, settled by the helper every operator script shares, so the
+# plugin scripts that end by calling this one restart the stack they migrated.
+# With no runtime the helper falls back to `docker compose`, which fails here
+# as it always has, after the build.
 info "Restarting web container"
-docker compose restart web
+# shellcheck source=scripts/lib/compose.sh
+. "$SCRIPT_DIR/lib/compose.sh"
+compose_detect_runtime
+"${COMPOSE[@]}" restart web
 ok "Web container restarted"

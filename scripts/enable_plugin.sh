@@ -28,12 +28,20 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(dirname "$SCRIPT_DIR")"
 ENV_FILE="$ROOT/.env"
 FRONTEND_ENV="$ROOT/frontend/.env"
-COMPOSE="docker compose -f $ROOT/docker-compose.yml"
 
 if [[ ! -d "$ROOT/plugins/$PLUGIN" ]]; then
     echo "Error: plugins/$PLUGIN/ does not exist." >&2
     exit 1
 fi
+
+# Docker or Podman, settled by the helper every operator script shares. Array
+# form keeps a root path with a space in it one argument. A host with no runtime
+# is refused here, before the submodule fetch and before any env file is edited.
+# shellcheck source=scripts/lib/compose.sh
+. "$SCRIPT_DIR/lib/compose.sh"
+compose_detect_runtime
+compose_require_runtime || exit 1
+COMPOSE+=(-f "$ROOT/docker-compose.yml")
 
 # Return the comma-separated value of KEY from FILE (empty if absent/blank).
 read_list() {
@@ -85,8 +93,8 @@ echo ""
 # the env files are only written once the migration has succeeded — a failed
 # migrate must not leave the plugin half-enabled in .env.
 echo "--- Step 2/4: Ensuring database is running and applying migrations..."
-$COMPOSE up -d db redis
-$COMPOSE run --rm --no-deps -e EPICURRENTS_PLUGINS="$NEW_BACKEND" web python manage.py migrate
+"${COMPOSE[@]}" up -d db redis
+"${COMPOSE[@]}" run --rm --no-deps -e EPICURRENTS_PLUGINS="$NEW_BACKEND" web python manage.py migrate
 echo ""
 
 echo "--- Step 3/4: Updating environment files..."
@@ -109,4 +117,4 @@ echo "--- Step 4/4: Rebuilding frontend..."
 echo ""
 
 echo "==> Plugin '$PLUGIN' enabled. Restart the stack to serve it:"
-echo "    $COMPOSE up -d"
+echo "    $(compose_command_line) up -d"

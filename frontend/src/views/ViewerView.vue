@@ -12,25 +12,28 @@ import {
     listMatchingRecordings,
     type DatasetBrowseFilters,
 } from '#api/library'
-import { getMediaDetail, listMediaFiles, type MediaFileDetail, type MediaFileSummary } from '#api/media'
+import { getMediaDetail, listMediaFiles } from '#api/media'
 import type {
     BiosignalResource,
     DataResource,
     EpicurrentsApp,
     EpicurrentsGlobal,
     MediaDataset,
-    VideoAttachment,
 } from '@epicurrents/core/dist/types'
 // viewer/interface has no compiled .d.ts output; declare only what we need here.
 type InterfaceSettings = { app: { disclaimerAccepted: number } }
-import type { Recording, RecordingAttachment } from '#api/recordings'
+import type { Recording } from '#api/recordings'
 import type { ViewerItemSource } from '#projects/types'
 import { plugin } from '#projects/active'
 import { plugin as pluginsPlugin } from '#plugins/active'
 import { mergeSetup } from '#plugins/base'
 import { waitForEventBus } from '#projects/eventBus'
 import { getViewerConfig } from '#api/viewerConfig'
-import { applyViewerSettingsOverrides, VIEWER_USER_SETTINGS_PATH, type ViewerSettingsOverrides } from '#lib/viewerConfig'
+import {
+    applyViewerSettingsOverrides,
+    VIEWER_USER_SETTINGS_PATH,
+    type ViewerSettingsOverrides,
+} from '#lib/viewerConfig'
 import { leadFieldProvider } from '#viewer/leadFields'
 import {
     describeMedia,
@@ -39,10 +42,13 @@ import {
     eagerStudyLoadLimit,
     listedFromBrowseRow,
     listedFromRecording,
-    type ListedRecording,
+    loadsUpFront,
+    mergeAttachments,
+    videoAttachments,
+    type AttachedVideo,
+    type BundleItem,
     type ListedResource,
     type ListingStudyApp,
-    type StudyDescription,
 } from '#viewer/datasetStudies'
 import { createUploadTarget } from '#lib/exportTargets'
 
@@ -64,22 +70,9 @@ interface DatasetBundle {
 }
 
 /**
- * Per-item payload after the platform-side fetch. Discriminated so the mount loop can pick the right importer + URL
- * without re-querying the list endpoint's metadata. A recording is listed from what its dataset's browser rows give;
- * its detail, which carries the interruption table, is read when it is loaded, unless the link named it and it was
- * read up front.
- */
-type BundleItem =
-    | { kind: 'recording'; listed: ListedRecording; recording: Recording | null }
-    | { kind: 'media'; media: MediaFileDetail }
-    | { kind: 'described'; description: StudyDescription; parent?: string }
-
-/**
- * List what is attached to the bundle's recordings after each of them, one request per page of recordings. Videos are
- * left out, since they play on their recording's timeline; so is a media file the bundle already holds as an item of
- * its own or a plugin's item the bundle already lists, and an attachment no media importer or viewer item source
- * describes. Each listed attachment carries its parent's hash, under which the viewer lists it. Listing nothing when the request fails leaves the
- * recordings themselves to open.
+ * List what is attached to the bundle's recordings after each of them, one request per page of recordings, and give
+ * each recording its videos; `mergeAttachments` decides what is listed. A page that cannot be read leaves its
+ * recordings to open without their attachments, and the user is told.
  * @param items - The bundle's items, in order.
  * @param shareToken - Share token the bundle is read with, if any.
  * @param sources - The viewer item sources that may describe a plugin's attachment.
@@ -93,36 +86,23 @@ async function withAttachments(
     if (!hashes.length) {
         return items
     }
-    let attachments: RecordingAttachment[]
-    try {
-        attachments = await listRecordingAttachments(hashes, shareToken)
-    } catch (e) {
-        console.warn('[Epicurrents] Could not list the attachments of the recordings.', e)
-        return items
+    const { attachments, failedHashes } = await listRecordingAttachments(hashes, shareToken)
+    if (failedHashes.length) {
+        showToast(
+            failedHashes.length === hashes.length
+                ? t('The attachments of the recordings could not be listed.', SCOPE)
+                : t('The attachments of some recordings could not be listed.', SCOPE),
+            'warning',
+        )
     }
-    // What the bundle already lists as an item of its own: a media member by its hash, and anything a plugin
-    // described by the address it loads from, so a study that is both a member and attached is listed once.
-    const held = new Set(items.flatMap(item => item.kind === 'media' ? [item.media.content_hash] : []))
-    const heldSources = new Set(items.flatMap(item => item.kind === 'described' ? [item.description.source] : []))
-    const byParent = new Map<string, BundleItem[]>()
-    for (const attachment of attachments) {
-        if (held.has(attachment.hash)) {
-            continue
-        }
-        const description = describeMediaAttachment(attachment, shareToken)
+    return mergeAttachments(
+        items,
+        attachments,
+        attachment => describeMediaAttachment(attachment, shareToken)
             ?? sources.map(source => source.describeAttachment?.(attachment, shareToken) ?? null).find(d => d)
-            ?? null
-        if (!description || heldSources.has(description.source)) {
-            continue
-        }
-        const parent = attachment.parent.toUpperCase()
-        const listed = byParent.get(parent) ?? []
-        listed.push({ kind: 'described', description, parent })
-        byParent.set(parent, listed)
-    }
-    return items.flatMap(item => item.kind === 'recording'
-        ? [item, ...(byParent.get(item.listed.hash.toUpperCase()) ?? [])]
-        : [item])
+            ?? null,
+        failedHashes,
+    )
 }
 
 /**
@@ -172,7 +152,7 @@ async function studyLoading(resource: DataResource, item: BundleItem, shareToken
                 console.warn(`[Epicurrents] Could not read the interruption table of ${hash}.`, e)
                 return null
             }),
-        attachRecordingVideos(resource, hash),
+        attachRecordingVideos(resource, item.videos, hash, shareToken),
     ])
     if (recording) {
         seedTrustedInterruptions(resource, recording)
@@ -180,50 +160,47 @@ async function studyLoading(resource: DataResource, item: BundleItem, shareToken
 }
 
 /**
- * Fetch the videos attached to a recording and expose them on the viewer
- * resource so the ACC module's video window can play them. Session auth only:
- * the ``<video>`` element fetches ``/media/api/v1/<hash>/file`` directly with
- * cookies — federated and share-token video playback are not supported (a
- * browser video element cannot carry the FederatedBearer header; see
- * media/README.md). Unsupported rows (extension outside the live allowlist) and
- * fetch failures are skipped so a missing video never blocks the recording.
+ * Expose the videos attached to a recording on the viewer resource, so the video window can play them. They come
+ * from the attachments listing the bundle was built with, which serves a share-token reader too and costs no request
+ * here. Where that listing did not cover the recording, a signed-in session asks the media listing for them instead;
+ * that listing is session-authenticated, so a share-token reader is not sent to it. The video element fetches the
+ * file directly, with the session cookie or the share token in its address; federated playback is not supported,
+ * since the element cannot carry the FederatedBearer header. A video outside the live allowlist is left out, and a
+ * failure to list never blocks the recording.
+ * @param resource - The recording's resource.
+ * @param listed - The recording's videos from the attachments listing, or null when it did not cover the recording.
+ * @param hash - The recording's hash.
+ * @param shareToken - Share token the recording is read with, if any.
  */
-async function attachRecordingVideos(resource: DataResource, hash: string): Promise<void> {
-    let mediaVideos: MediaFileSummary[]
-    try {
-        mediaVideos = await listMediaFiles({
-            attachedToType: 'recording',
-            attachedToId: hash,
-            mediaType: 'video',
-        })
-    } catch (e) {
-        console.warn(`[Epicurrents] Could not load attached videos for ${hash}.`, e)
-        return
-    }
-    const playable = mediaVideos.filter(v => v.is_supported)
-    if (!playable.length) {
-        return
-    }
-    const attachments: VideoAttachment[] = playable.map(v => {
-        // Bind the relative path to a local before ``new URL(...)``: Vite's
-        // minifier otherwise mishandles an inline template literal here and
-        // emits ``new URL(undefined, ...)``, which resolves to
-        // ``/assets/undefined``. The recording and media study branches above
-        // sidestep the same trap the same way.
-        const relativePath = `/media/api/v1/${v.content_hash}/file`
-        return {
-            // Duration isn't stored server-side yet, so the end point is left
-            // open. The ACC video window plays videos[0] directly and doesn't
-            // depend on it; a real end point follows once the conversion step
-            // probes duration.
-            endTime: Number.MAX_SAFE_INTEGER,
-            group: 0,
-            startTime: v.time_offset ?? 0,
-            syncPoints: [],
-            url: new URL(relativePath, import.meta.url).toString(),
+async function attachRecordingVideos(
+    resource: DataResource,
+    listed: AttachedVideo[] | null,
+    hash: string,
+    shareToken: string | undefined,
+): Promise<void> {
+    let videos = listed
+    if (videos === null) {
+        if (shareToken) {
+            return
         }
-    })
-    ;(resource as BiosignalResource).videos = attachments
+        try {
+            const mediaVideos = await listMediaFiles({
+                attachedToType: 'recording',
+                attachedToId: hash,
+                mediaType: 'video',
+            })
+            videos = mediaVideos
+                .filter(video => video.is_supported)
+                .map(video => ({ hash: video.content_hash, time_offset: video.time_offset }))
+        } catch (e) {
+            console.warn(`[Epicurrents] Could not load attached videos for ${hash}.`, e)
+            return
+        }
+    }
+    if (!videos.length) {
+        return
+    }
+    ;(resource as BiosignalResource).videos = videoAttachments(videos, shareToken)
 }
 
 const SCOPE = 'ViewerView'
@@ -329,8 +306,9 @@ const emptyMode = computed(() =>
  * A dataset's members as a bundle the viewer lists. Recordings are listed from the dataset browser's rows, a page of
  * 200 at a time, so the size of the dataset sets the number of pages rather than of requests; a media member is read
  * for its detail. With a browser query, only the recordings the browser lists under it, in its order; without one,
- * every member in the dataset's order. A member the browser does not list to the caller, one they cannot read, is
- * left out.
+ * every member in the dataset's order, which is the item listing's: folder by folder as the dataset page shows them,
+ * the members a manager arranged first and the rest by name. The first item the viewer lists is therefore the first
+ * row of the dataset page. A member the browser does not list to the caller, one they cannot read, is left out.
  * @param id - The dataset's object hash or primary key.
  * @param token - Share token the dataset is read with, if any.
  * @param filters - The browser filters the link carries, or null.
@@ -346,14 +324,16 @@ async function loadDatasetBundle(
     // The browser lists recordings only, so a browsed link opens no media and needs no member listing.
     const [dataset, rows, allItems] = await Promise.all([
         getDataset(id, token),
-        listMatchingRecordings(id, filters, sort ?? 'name', token),
+        listMatchingRecordings(id, filters, sort ?? 'order', token),
         browsed ? Promise.resolve(null) : listAllDatasetItems(id, token),
     ])
     const listedByHash = new Map(rows.map(row => [row.hash, listedFromBrowseRow(row)]))
     const recordingItem = (hash: string): BundleItem | null => {
         const listed = listedByHash.get(hash)
-        return listed ? { kind: 'recording', listed, recording: null } : null
+        return listed ? { kind: 'recording', listed, recording: null, videos: null } : null
     }
+    // Members whose detail could not be read; each is left out so the rest of the dataset still opens.
+    let unreadMembers = 0
     // Preserve dataset order. Unsupported media files are dropped here so the mount loop never tries to load them.
     const bundleItems = allItems === null
         ? rows.map(row => recordingItem(row.hash)).filter((i): i is BundleItem => i !== null)
@@ -370,8 +350,13 @@ async function loadDatasetBundle(
                         console.warn(`[Epicurrents] Skipping unsupported media ${item.object_hash}`)
                         return null
                     }
-                    const media = await getMediaDetail(item.object_hash)
-                    return { kind: 'media', media }
+                    try {
+                        return { kind: 'media', media: await getMediaDetail(item.object_hash, token) }
+                    } catch (e) {
+                        console.warn(`[Epicurrents] Could not read media ${item.object_hash}; skipping it.`, e)
+                        unreadMembers++
+                        return null
+                    }
                 }
                 // A type a plugin owns is described by the plugin's source; one nobody describes is left out.
                 const description = viewerItemSources
@@ -380,6 +365,16 @@ async function loadDatasetBundle(
                 return description ? { kind: 'described', description } : null
             }),
         )).filter((i): i is BundleItem => i !== null)
+    if (unreadMembers) {
+        showToast(
+            t(
+                '{count} item(s) of the dataset "{name}" could not be read and were left out.',
+                SCOPE,
+                { count: unreadMembers, name: dataset.name },
+            ),
+            'warning',
+        )
+    }
     return {
         items: await withAttachments(bundleItems, token, viewerItemSources),
         name: dataset.name,
@@ -462,13 +457,18 @@ onMounted(async () => {
             const recordingItems = await Promise.all(
                 hashes.value.map(async h => {
                     const recording = await getRecordingDetail(h, shareToken.value)
-                    return { kind: 'recording' as const, listed: listedFromRecording(recording), recording }
+                    return {
+                        kind: 'recording' as const,
+                        listed: listedFromRecording(recording),
+                        recording,
+                        videos: null,
+                    }
                 }),
             )
             const mediaItems = await Promise.all(
                 mediaHashes.value.map(async h => ({
                     kind: 'media' as const,
-                    media: await getMediaDetail(h),
+                    media: await getMediaDetail(h, shareToken.value),
                 })),
             )
             const pluginItems = (await Promise.all(viewerItemSources.map(source => source.fromQuery(route.query))))
@@ -476,7 +476,7 @@ onMounted(async () => {
                 .map(description => ({ kind: 'described' as const, description }))
             // A link naming its items is a selection the user made, so every item loads up front.
             bundles.value = [{
-                name: 'Dataset',
+                name: t('Dataset', SCOPE),
                 shareToken: shareToken.value,
                 items: await withAttachments(
                     [...recordingItems, ...mediaItems, ...pluginItems], shareToken.value, viewerItemSources,
@@ -569,11 +569,12 @@ onMounted(async () => {
                 )
             }
         }
-        requestAnimationFrame(async () => {
+        // Set once the first item is on its way to opening, which is then what clears the opening status.
+        let openScheduled = false
+        const openItems = async () => {
             epic = await Epicurrents.createEpicurrentsApp(setup)
             if (!epic) {
                 console.error('Failed to initialize Epicurrents app.')
-                openingStatus.value = null
                 return
             }
             if (totalItems.value === 1) {
@@ -664,12 +665,22 @@ onMounted(async () => {
             })
 
             // Every item is listed, and loads in place when it is opened, so a large dataset costs no fetch and no
-            // reader per member. A dataset flagged to preload, and an item the platform holds no metadata to list, are
-            // loaded up front instead, as many as the viewer's eager load limit allows.
+            // reader per member. The members of a dataset flagged to preload, and a member the platform holds no
+            // metadata to list, are loaded up front instead, as many as the viewer's eager load limit allows; an
+            // attachment never is.
             const app = epic as ListingStudyApp
+            // Listing arrived with the load-in-place release of the viewer; an older edition cannot open the items.
+            if (totalItems.value > 0 && typeof app.listStudy !== 'function') {
+                error.value = t(
+                    'The installed viewer edition is too old to list items. Ask an administrator to update the viewer.',
+                    SCOPE,
+                )
+                return
+            }
             const eagerLimit = eagerStudyLoadLimit(app)
             const eager: ListedResource[] = []
             const viewerDatasets: MediaDataset[] = []
+            let listedCount = 0
             for (const [bundleIdx, bundle] of bundles.value.entries()) {
                 // Only the first dataset is marked active; later ones must not
                 // override the active selection or the UI ends up in an
@@ -682,11 +693,15 @@ onMounted(async () => {
                     const description = item.kind === 'recording'
                         ? describeRecording(item.listed, bundle.shareToken)
                         : item.kind === 'media'
-                            ? describeMedia(item.media)
+                            ? describeMedia(item.media, bundle.shareToken)
                             : item.description
                     if (!description) {
-                        const media = (item as { media: MediaFileDetail }).media
-                        console.warn(`[Epicurrents] No importer registered for media ${media.file_extension}; skipping ${media.content_hash}`)
+                        if (item.kind === 'media') {
+                            console.warn(
+                                `[Epicurrents] No importer registered for media ${item.media.file_extension}; `
+                                    + `skipping ${item.media.content_hash}`
+                            )
+                        }
                         continue
                     }
                     // An attachment is listed under its recording, which is listed before it.
@@ -708,13 +723,22 @@ onMounted(async () => {
                         console.error(`[Epicurrents] Could not list the item ${hash}.`)
                         continue
                     }
+                    listedCount++
                     if (item.kind === 'recording') {
                         recordings.set(item.listed.hash.toUpperCase(), listed)
                     }
-                    if (bundle.preload || !description.properties) {
+                    if (loadsUpFront(bundle.preload, description, item.kind === 'described' && !!item.parent)) {
                         eager.push(listed)
                     }
                 }
+            }
+            if (totalItems.value > 0 && listedCount === 0) {
+                error.value = t(
+                    'None of the items could be listed in the viewer. The installed viewer edition may not support '
+                        + 'their type.',
+                    SCOPE,
+                )
+                return
             }
             if (eager.length > eagerLimit) {
                 console.warn(
@@ -737,17 +761,37 @@ onMounted(async () => {
             // dataset sidebar.
             const first = viewerDatasets[0]?.resources.find(ctx => ctx.resource.state !== 'error')?.resource
             if (first) {
+                openScheduled = true
                 window.setTimeout(() => {
-                    app.interface?.openResource(first)
-                    openingStatus.value = null
+                    try {
+                        app.interface?.openResource(first)
+                    } finally {
+                        openingStatus.value = null
+                    }
                 }, 250)
-            } else {
-                openingStatus.value = null
             }
             // Notify the active project and enabled plugins of the studies loaded up front: every member of a dataset
-            // flagged to preload, within the eager load limit, and none of a dataset listed from metadata.
-            await plugin.onStudiesReady?.(epic, loadedStudies)
-            await pluginsPlugin.onStudiesReady?.(epic, loadedStudies)
+            // flagged to preload, within the eager load limit, and none of a dataset listed from metadata. Never an
+            // attachment, which is not a study of the dataset and loads when it is opened. The items are listed and
+            // the first is opening by now, so a hook that fails is reported and the viewer stays.
+            try {
+                await plugin.onStudiesReady?.(epic, loadedStudies)
+                await pluginsPlugin.onStudiesReady?.(epic, loadedStudies)
+            } catch (e) {
+                console.error('[Epicurrents] A project or plugin failed in onStudiesReady.', e)
+            }
+        }
+        requestAnimationFrame(async () => {
+            try {
+                await openItems()
+            } catch (e) {
+                console.error('[Epicurrents] The viewer failed while opening the items.', e)
+                error.value = t('The viewer could not open the items because of an unexpected error.', SCOPE)
+            } finally {
+                if (!openScheduled) {
+                    openingStatus.value = null
+                }
+            }
         })
     }
     awaitApp()

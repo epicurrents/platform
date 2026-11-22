@@ -327,7 +327,7 @@ function startCreate () {
                         @keydown.enter="selectItem(item)"
                     >
                         <wa-icon name="file-music" class="picker-row__icon picker-row__icon--file"></wa-icon>
-                        <span class="picker-row__name">{{ item.object_name ?? item.object_id }}</span>
+                        <span class="picker-row__name">{{ item.object_name ?? item.object_hash }}</span>
                         <wa-button
                             appearance="filled-outlined"
                             size="s"

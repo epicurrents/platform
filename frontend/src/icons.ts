@@ -78,6 +78,8 @@ import share from '@material-symbols/svg-400/outlined/share.svg?raw'
 import tune from '@material-symbols/svg-400/outlined/tune.svg?raw'
 import undo from '@material-symbols/svg-400/outlined/undo.svg?raw'
 import unfold_more from '@material-symbols/svg-400/outlined/unfold_more.svg?raw'
+import vertical_align_bottom from '@material-symbols/svg-400/outlined/vertical_align_bottom.svg?raw'
+import vertical_align_top from '@material-symbols/svg-400/outlined/vertical_align_top.svg?raw'
 import vital_signs from '@material-symbols/svg-400/outlined/vital_signs.svg?raw'
 import warning from '@material-symbols/svg-400/outlined/warning.svg?raw'
 
@@ -144,6 +146,8 @@ const ICON_SVGS: Record<string, string> = {
     tune,
     undo,
     unfold_more,
+    vertical_align_bottom,
+    vertical_align_top,
     vital_signs,
     warning,
 }
@@ -157,9 +161,11 @@ const ICON_SVGS: Record<string, string> = {
 const FA_TO_MATERIAL: Record<string, string> = {
     'angle-right':                 'chevron_right',
     'arrow-down':                  'arrow_downward',
+    'arrow-down-to-line':          'vertical_align_bottom',
     'arrow-left':                  'arrow_back',
     'arrow-right':                 'arrow_forward',
     'arrow-up':                    'arrow_upward',
+    'arrow-up-to-line':            'vertical_align_top',
     'arrow-up-right-from-square':  'open_in_new',
     'arrows-rotate':               'directory_sync',
     'ban':                        'block',

@@ -255,6 +255,10 @@ ROOT_REAL="$(pwd -P)"
 # deployment's owner —
 # through sudo when this script is not root already, and directly when it is,
 # since a root-owned updater's host may not have sudo at all.
+# This is a copy of scripts/lib/compose.sh, kept here because this script runs
+# as a single file with no lib/ beside it, at a package's root and as the
+# updater agent's own copy. scripts/tests/test_compose_lib.py runs the two side
+# by side; change them together.
 if command -v docker >/dev/null 2>&1 && ! docker --version 2>&1 | grep -qi podman; then
     CONTAINER_RUNTIME=docker
     COMPOSE=(docker compose -f docker-compose.yml -f docker-compose.prod.yml)

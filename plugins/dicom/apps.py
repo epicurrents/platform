@@ -59,8 +59,14 @@ class DicomConfig(PluginConfig):
 
         # A study can be a dataset, collection or tag member, listed by its hash. The release gate has no gate for
         # studies, so a release-gated dataset takes none; under a de-identifying dataset grant a study stored
-        # without the pass is left out of the listing, as the terms refusal above leaves it out of every read.
+        # without the pass is left out of the listing, as the terms refusal above leaves it out of every read. The
+        # row names the pass applied to the stored files, as the attachments listing does: what was done, which a
+        # client marks a study stored as uploaded by, and no assurance about a study the pass did run on.
+        from epicurrents.attachments import PASS_NONE
         from library.item_types import ItemType, register_item_type
+
+        def _study_pass(study) -> str:
+            return "dicom-header" if study.deidentification_version is not None else PASS_NONE
 
         register_item_type(
             ItemType(
@@ -72,20 +78,21 @@ class DicomConfig(PluginConfig):
                 normalise_hash=lambda value: value.strip().lower(),
                 serves_share_tokens=False,
                 withheld_under_middleware=lambda qs: qs.filter(deidentification_version__isnull=True),
+                platform_pass=_study_pass,
             )
         )
 
         # An attached study is listed with every other attachment of a recording. Its header pass is defence in
         # depth, recorded as what was done; the submitter answers for the study. The study endpoints authenticate
         # by session only, so a share-token reader is not listed a study it could not open.
-        from epicurrents.attachments import PASS_NONE, AttachmentType, register_attachment_type
+        from epicurrents.attachments import AttachmentType, register_attachment_type
 
         register_attachment_type(
             AttachmentType(
                 key="dicomstudy",
                 model_label="dicom.dicomstudy",
                 describe=_describe_study,
-                platform_pass=lambda study: "dicom-header" if study.deidentification_version is not None else PASS_NONE,
+                platform_pass=_study_pass,
                 live=lambda qs: qs.filter(deleted_at__isnull=True),
                 serves_share_tokens=False,
             )
@@ -109,8 +116,9 @@ class DicomConfig(PluginConfig):
         register_masked_fields("dicom.dicominstance", {"source_hash"}, withhold=True)
 
         # Account erasure lists a DICOM author's preserved originals for the
-        # operator. Only a rewritten file was preserved; a file the pass refused
-        # has no row, and its manifest names the author_id instead.
+        # operator. A file the pass refused, or whose instance was purged, has
+        # no row; its manifest names the author_id, and the listing ends with a
+        # line telling the operator to search the manifests for it.
         from recordings.preservation import register_plugin_originals
 
         register_plugin_originals("dicom", _preserved_original_keys)
@@ -147,10 +155,20 @@ def _describe_study(study) -> dict:
 
 
 def _preserved_original_keys(user) -> list[str]:
-    """The originals-volume directory keys of *user*'s rewritten DICOM files: each stored name's prefix."""
+    """The originals-volume entries ``erase_user`` prints for *user*'s DICOM uploads, under ``plugins/dicom/``.
+
+    The stored-name prefix of each rewritten file that still has an instance row, then one line for what no row
+    leads to: an original preserved for a file the pass refused, or for an instance since purged, is tied to its
+    uploader only by ``author_id`` in its ``manifest.json``. The platform never reads the volume, so that line
+    tells the operator what to search the manifests for.
+    """
     from plugins.dicom.models import DicomInstance
 
     names = DicomInstance.objects.filter(
         series__study__author=user, deidentification_version__isnull=False
     ).values_list("stored_name", flat=True)
-    return [name.split(".", 1)[0] for name in names]
+    manifests = (
+        f'*/manifest.json  (also search every manifest here for "author_id": {user.pk}: originals of files the '
+        "de-identification pass refused, or whose study has since been purged, are named by no row)"
+    )
+    return [*(name.split(".", 1)[0] for name in names), manifests]

@@ -30,9 +30,10 @@ DATASETS = "/api/v1/library/datasets"
 ITEM_KEYS = {
     "id",
     "content_type_id",
-    "object_id",
+    "platform_pass",
     "added_at",
     "folder_id",
+    "position",
     "release_month",
     "object_name",
     "object_hash",
@@ -178,7 +179,7 @@ class TestGatedMembersInOtherListings:
 
 
 class TestSequentialIds:
-    def test_a_reader_of_a_gated_dataset_gets_no_item_or_object_id(self, make_user):
+    def test_a_reader_of_a_gated_dataset_gets_no_item_id_and_no_row_an_object_id(self, make_user):
         curator, reader = make_user(), make_user()
         pool, items = _pool(curator, _pooled(index=0), _pooled(index=1))
         _release(pool, *items)
@@ -187,16 +188,18 @@ class TestSequentialIds:
         assert len(rows) == 2
         for row in rows:
             assert set(row) == ITEM_KEYS
-            assert row["id"] is None and row["object_id"] is None
+            assert row["id"] is None
+            assert row["position"] is None
             assert row["object_hash"] in HASHES
 
-    def test_a_manager_keeps_both(self, make_user):
+    def test_a_manager_keeps_the_item_id_and_gets_no_object_id(self, make_user):
         curator, manager = make_user(), make_user()
         pool, items = _pool(curator, _pooled(index=0))
         _grant(pool, curator, target=manager, can_write=True)
         for user in (curator, manager):
             rows = _client(user).get(f"{DATASETS}/{pool.object_hash}/items/").json()
-            assert [(row["id"], row["object_id"]) for row in rows] == [(items[0].pk, items[0].object_id)]
+            assert [(row["id"], row["object_hash"]) for row in rows] == [(items[0].pk, HASHES[0])]
+            assert set(rows[0]) == ITEM_KEYS
 
     def test_a_pooled_recording_in_an_ungated_dataset_gets_no_ids(self, make_user):
         curator, viewer = make_user(), make_user()
@@ -208,7 +211,7 @@ class TestSequentialIds:
         _grant(side, curator, target=viewer)
         _grant(pool, curator, target=viewer)
         rows = _client(viewer).get(f"{DATASETS}/{side.object_hash}/items/").json()
-        assert [(row["id"], row["object_id"], row["object_hash"]) for row in rows] == [(None, None, HASHES[0])]
+        assert [(row["id"], row["object_hash"]) for row in rows] == [(None, HASHES[0])]
 
     def test_tag_listings_null_the_ids_of_pooled_recordings(self, make_user, superuser):
         curator, viewer = make_user(), make_user()
@@ -221,11 +224,12 @@ class TestSequentialIds:
         for recording in (pooled, own):
             TaggedItem.objects.create(tag=tag, content_type=_recording_ct(), object_id=str(recording.pk))
         rows = _client(viewer).get(f"/api/v1/library/tags/{tag.pk}/items/").json()
-        by_object = {row["object_id"]: row for row in rows}
-        assert set(by_object) == {None, str(own.pk)}
-        assert by_object[None]["id"] is None
+        by_hash = {row["object_hash"]: row for row in rows}
+        assert set(by_hash) == {HASHES[0], HASHES[1]}
+        assert by_hash[HASHES[0]]["id"] is None and by_hash[HASHES[1]]["id"] is not None
         rows = _client(superuser).get(f"/api/v1/library/tags/{tag.pk}/items/").json()
-        assert {row["object_id"] for row in rows} == {str(pooled.pk), str(own.pk)}
+        assert {row["object_hash"] for row in rows} == {HASHES[0], HASHES[1]}
+        assert all(row["id"] is not None and "object_id" not in row for row in rows)
 
 
 class TestPooledRecordingsStayPooled:

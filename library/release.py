@@ -6,8 +6,11 @@ each fails silently. :func:`member_hidden_from_reader` is what keeps an unreleas
 surfacing one by one as it arrives, and a member from resolving for a request carrying a share
 token; a narrowed condition serves a pooled recording to a forwardable link with nothing in any
 log to notice. :func:`release_month_for` and :func:`release_month_subquery` replace the upload time
-with the release month, and :func:`member_name_subquery` keeps a listing from being an arrival
+with the release month, and :func:`order_by_member_name` keeps a listing from being an arrival
 order; either regressing reinstates the arrival timing the pool exists to hide.
+:func:`dataset_member_ordering` puts the members a manager arranged ahead of that name order, and the
+only terms it adds are a folder's place in the tree and ``DatasetItem.position``, which nothing but a
+manager's order action writes; a position assigned as members are added would be the arrival order again.
 :func:`stored_digest_withheld_ids` keeps a member's digest, and the content pin that tests it, from
 readers who could hold a contributor's receipt; a widened answer lets a receipt find its member. And
 :func:`eligibility_cutoff` with :func:`eligible_items` is the cadence: a member uploaded in M
@@ -42,7 +45,7 @@ by one as they arrive. Four rules follow, all enforced here and registered from
   receipt. A pooled recording is withheld whatever has become of its pool.
 - **A released member is dated by its release month.** ``DatasetRelease.release_month`` replaces
   the upload time on every surface that serves a time to a reader who is not a manager, and
-  listings of members order by name rather than by any time. A pooled recording keeps its
+  listings of members order by the arrangement a manager made and then by name, never by any time. A pooled recording keeps its
   latest release month after its pool is trashed or ungated, and one never released is dated
   :data:`WITHHELD_DATE`.
 
@@ -66,10 +69,22 @@ from datetime import UTC, date, datetime
 from typing import Any
 
 from django.contrib.contenttypes.models import ContentType
-from django.db.models import BigIntegerField, Case, CharField, DateTimeField, OuterRef, Q, Subquery, Value, When
+from django.db.models import (
+    BigIntegerField,
+    Case,
+    CharField,
+    DateTimeField,
+    F,
+    IntegerField,
+    OuterRef,
+    Q,
+    Subquery,
+    Value,
+    When,
+)
 from django.db.models.functions import Cast, Coalesce, Lower, NullIf
 
-from library.models import Dataset, DatasetItem, DatasetRelease, month_start
+from library.models import Dataset, DatasetFolder, DatasetItem, DatasetRelease, month_start
 
 # ---------------------------------------------------------------------------
 # Naming datasets and members on the command line
@@ -267,7 +282,9 @@ def gate_refusal(dataset: Dataset) -> str | None:
 
     Every recording and media member must be the dataset author's own, or a pooled recording of
     a pool: a gate on anyone else's member would hide it from its own readers. A member of a registered
-    type that declares no gate of its own refuses the gate outright.
+    type that declares no gate of its own refuses the gate outright, and so does a member of any other type: the
+    rows of a disabled plugin outlive its registration, and a gate turned on over them would hold members nothing
+    hides once the plugin is enabled again.
     """
     from recordings.models import Recording
 
@@ -277,8 +294,10 @@ def gate_refusal(dataset: Dataset) -> str | None:
 
     if apps.is_installed("media"):
         member_types.append(apps.get_model("media", "MediaFile"))
+    covered_ct_ids = []
     for model in member_types:
         ct = ContentType.objects.get_for_model(model, for_concrete_model=False)
+        covered_ct_ids.append(ct.pk)
         ids = DatasetItem.objects.filter(dataset=dataset, content_type=ct).values_list("object_id", flat=True)
         for author_id in _author_ids(ct, ids).values():
             if not controls_membership(dataset, author_id, system_id):
@@ -291,6 +310,9 @@ def gate_refusal(dataset: Dataset) -> str | None:
             and DatasetItem.objects.filter(dataset=dataset, content_type=item_type.content_type).exists()
         ):
             return f"A dataset holding a {item_type.object_type} member cannot be release-gated."
+        covered_ct_ids.append(item_type.content_type.pk)
+    if DatasetItem.objects.filter(dataset=dataset).exclude(content_type_id__in=covered_ct_ids).exists():
+        return "A dataset holding a member of a type the release gate does not cover cannot be release-gated."
     return None
 
 
@@ -511,15 +533,37 @@ def _lower_or_null(field_name: str):
     return NullIf(Lower(field_name), Value(""))
 
 
-def member_name_subquery() -> Case:
+def _recording_name_expression(user):
+    """The case-folded name a recording's row shows *user*: its display name, else its stored name.
+
+    A superuser, and an author on their own recordings, are shown the original filename of a recording
+    with no display name (``_can_see_original_name`` in the recordings API), so theirs falls back to it
+    first. Nobody else's order depends on a name they are not shown.
+    """
+    labelled = _lower_or_null("display_name")
+    stored = Lower("stored_name")
+    if user is None or not getattr(user, "is_authenticated", False):
+        return Coalesce(labelled, stored)
+    original = _lower_or_null("original_name")
+    if getattr(user, "is_superuser", False):
+        return Coalesce(labelled, original, stored)
+    return Coalesce(
+        labelled,
+        Case(When(author_id=user.pk, then=original), default=Value(None), output_field=CharField()),
+        stored,
+    )
+
+
+def member_name_subquery(user=None) -> Case:
     """An annotation naming a dataset item by its member's name, whatever the member's type.
 
-    A recording is named by its display name, else its stored name; a media file the same way;
-    a nested dataset by its name; all case-folded, so an unnamed member's hex handle sorts among
-    the names rather than before them. Each branch is keyed on the item's content type, since primary
-    keys collide across models. A member of any other type annotates null and sorts last by
-    object id. For ordering the items of a gated dataset, where ``added_at`` would reveal the
-    arrival order the release month is there to hide.
+    A recording is named by its display name, else its stored name, with the original filename
+    between the two for a *user* the row shows it to; a media file by its display name, else its
+    stored name; a nested dataset by its name; all case-folded, so an unnamed member's hex handle
+    sorts among the names rather than before them. Each branch is keyed on the item's content type,
+    since primary keys collide across models. A member of any other type annotates null and sorts
+    last, by its hash. For ordering the items of a dataset, where ``added_at`` would reveal an
+    arrival order, which in a gated dataset is what the release month is there to hide.
     """
     from django.apps import apps
 
@@ -528,7 +572,7 @@ def member_name_subquery() -> Case:
     branches = [
         When(
             content_type=ContentType.objects.get_for_model(Recording, for_concrete_model=False),
-            then=_named_subquery(Recording, Coalesce(_lower_or_null("display_name"), Lower("stored_name"))),
+            then=_named_subquery(Recording, _recording_name_expression(user)),
         ),
         When(
             content_type=ContentType.objects.get_for_model(Dataset, for_concrete_model=False),
@@ -544,6 +588,140 @@ def member_name_subquery() -> Case:
             )
         )
     return Case(*branches, default=Value(None), output_field=CharField())
+
+
+def member_hash_subquery() -> Case:
+    """An annotation giving a ``DatasetItem`` or ``TaggedItem`` row its member's public identifier.
+
+    A recording's stored name, whose stem is its hash; a media file's content hash; a nested dataset's
+    object hash; a registered type's hash field. Null for a type nobody registered. Random per member,
+    so it breaks a tie between two names without the order of the tied rows saying which arrived first.
+    """
+    from django.apps import apps
+
+    from library.item_types import registered_item_types
+    from recordings.models import Recording
+
+    branches = [
+        When(
+            content_type=ContentType.objects.get_for_model(Recording, for_concrete_model=False),
+            then=_named_subquery(Recording, Lower("stored_name")),
+        ),
+        When(
+            content_type=ContentType.objects.get_for_model(Dataset, for_concrete_model=False),
+            then=_named_subquery(Dataset, Lower("object_hash")),
+        ),
+    ]
+    if apps.is_installed("media"):
+        MediaFile = apps.get_model("media", "MediaFile")
+        branches.append(
+            When(
+                content_type=ContentType.objects.get_for_model(MediaFile, for_concrete_model=False),
+                then=_named_subquery(MediaFile, Lower("content_hash")),
+            )
+        )
+    for item_type in registered_item_types():
+        branches.append(
+            When(
+                content_type=item_type.content_type, then=_named_subquery(item_type.model, Lower(item_type.hash_field))
+            )
+        )
+    return Case(*branches, default=Value(None), output_field=CharField())
+
+
+def member_name_ordering(user=None) -> tuple[dict, tuple]:
+    """The annotations and the ``order_by`` terms that list item rows by member name, as *user* is shown it.
+
+    The one ordering of every member listing, gated or not, so the two cannot drift: the name of
+    :func:`member_name_subquery`, unnamed types last, then the member's public hash. The content
+    type and object id come last and only make the order total for offset paging; they are reached
+    by members of a type with no public hash, which a listing names by nothing. No term is an item
+    id or an ``added_at``.
+    """
+    annotations = {"sort_name": member_name_subquery(user), "sort_hash": member_hash_subquery()}
+    ordering = (
+        F("sort_name").asc(nulls_last=True),
+        F("sort_hash").asc(nulls_last=True),
+        "content_type_id",
+        "object_id",
+    )
+    return annotations, ordering
+
+
+def order_by_member_name(qs, user=None):
+    """Order a ``DatasetItem`` or ``TaggedItem`` queryset by :func:`member_name_ordering`."""
+    annotations, ordering = member_name_ordering(user)
+    return qs.annotate(**annotations).order_by(*ordering)
+
+
+def folder_ranks(dataset) -> dict[int, int]:
+    """The place of each of *dataset*'s folders in its tree, from 1: depth first, siblings by position then name.
+
+    The order the dataset page walks the tree in, so a listing ordered by it reads top to bottom as that page
+    does. The dataset root is not a folder and ranks 0, ahead of every folder.
+    """
+    children: dict[int | None, list[int]] = {}
+    for pk, parent_id in (
+        DatasetFolder.objects.filter(dataset=dataset).order_by("position", "name", "pk").values_list("pk", "parent_id")
+    ):
+        children.setdefault(parent_id, []).append(pk)
+    ranks: dict[int, int] = {}
+    pending = list(reversed(children.get(None, [])))
+    while pending:
+        pk = pending.pop()
+        ranks[pk] = len(ranks) + 1
+        pending.extend(reversed(children.get(pk, [])))
+    return ranks
+
+
+def _folder_rank_expression(dataset, folder_field: str = "folder_id"):
+    """The rank of the folder a row names in *folder_field*, by :func:`folder_ranks`; 0 for the dataset root."""
+    ranks = folder_ranks(dataset)
+    if not ranks:
+        return Value(0, output_field=IntegerField())
+    return Case(
+        *(When(**{folder_field: pk}, then=Value(rank)) for pk, rank in ranks.items()),
+        default=Value(0),
+        output_field=IntegerField(),
+    )
+
+
+def dataset_member_ordering(dataset, user=None) -> tuple[dict, tuple]:
+    """The annotations and ``order_by`` terms of a dataset's item listing: the manual order, then the name.
+
+    Folder by folder as the dataset page shows them (:func:`folder_ranks`, the root first), and within a folder
+    the members a manager arranged in ascending ``position``, then the unsorted ones (a null position) by
+    :func:`member_name_ordering`. Arranged members come first, which is why unsorted is null with nulls last and
+    never a default of 0. The one ordering of every dataset member listing, gated or not. ``position`` is written
+    by a manager's order action alone and never as a member is added, so no term is an order of arrival; two
+    members sharing a position, which only a rollback can leave behind, fall back to the name terms.
+    """
+    annotations, name_ordering = member_name_ordering(user)
+    annotations["sort_folder"] = _folder_rank_expression(dataset)
+    return annotations, ("sort_folder", F("position").asc(nulls_last=True), *name_ordering)
+
+
+def order_dataset_members(qs, dataset, user=None):
+    """Order a ``DatasetItem`` queryset of *dataset* by :func:`dataset_member_ordering`."""
+    annotations, ordering = dataset_member_ordering(dataset, user)
+    return qs.annotate(**annotations).order_by(*ordering)
+
+
+def member_order_annotations(model, dataset) -> dict:
+    """Annotations giving each row of the member *model* its place in *dataset*'s manual order.
+
+    ``member_folder_rank`` and ``member_position``, the two terms :func:`dataset_member_ordering` puts ahead of
+    the name, for a listing that pages the members themselves rather than their item rows (the dataset browser).
+    Order by the rank, then the position with nulls last, then a name.
+    """
+    ct = ContentType.objects.get_for_model(model, for_concrete_model=False)
+    items = DatasetItem.objects.filter(dataset=dataset, content_type=ct, object_id=Cast(OuterRef("pk"), CharField()))
+    return {
+        "member_folder_rank": Subquery(
+            items.annotate(rank=_folder_rank_expression(dataset)).values("rank")[:1], output_field=IntegerField()
+        ),
+        "member_position": Subquery(items.values("position")[:1], output_field=IntegerField()),
+    }
 
 
 # ---------------------------------------------------------------------------

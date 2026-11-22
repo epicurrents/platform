@@ -2089,8 +2089,10 @@ def list_recordings(
     ]
 
 
-#: Most recordings one attachment listing names, a page of the dataset browser.
-ATTACHMENT_LISTING_LIMIT = 200
+#: Most recordings one attachment listing names. The names travel in the query string, and gunicorn refuses a request
+#: line over 4094 bytes by default: 100 hashes with their separators percent-encoded come to about 3.5 kB, where 200
+#: answered 400 before reaching the endpoint. A client holding more names asks in batches.
+ATTACHMENT_LISTING_LIMIT = 100
 
 
 class AttachmentOut(Schema):
@@ -2114,13 +2116,11 @@ class AttachmentOut(Schema):
 def list_attachments(request, recordings: str, share_token: str | None = None):
     """List what is attached to each named recording, for every recording and attachment the caller may read.
 
-    *recordings* is a comma-separated list of up to ``ATTACHMENT_LISTING_LIMIT`` recording hashes, one dataset browser
-    page, so a client lists a page's attachments in one request. A recording the caller may not read, or that is
+    *recordings* is a comma-separated list of up to ``ATTACHMENT_LISTING_LIMIT`` recording hashes, so a client lists
+    a dataset browser page's attachments in a request or two. A recording the caller may not read, or that is
     hidden from them, contributes nothing and is not told apart from one that does not exist or has nothing attached.
     Each attachment is decided by its own type's read rule; see ``epicurrents.attachments``.
     """
-    from django.db.models.functions import Left
-
     from epicurrents.attachments import attachments_of
 
     user = getattr(request, "user", None)
@@ -2137,12 +2137,14 @@ def list_attachments(request, recordings: str, share_token: str | None = None):
     if any(len(h) != 32 or not h.isalnum() for h in hashes):
         raise HttpError(400, "Invalid recording hash. Use 32 alphanumeric characters.")
 
+    # One prefix match per hash, the lookup every per-recording endpoint resolves a hash by, so the query can use the
+    # index on stored_name; a function of the column on the left of an IN cannot.
+    names = Q()
+    for value in set(hashes):
+        names |= Q(stored_name__startswith=f"{value}.")
     found = {
-        r.prefix: r
-        for r in Recording.objects.filter(deleted_at__isnull=True)
-        .annotate(prefix=Left("stored_name", 32))
-        .filter(prefix__in=set(hashes))
-        .order_by("created_at")
+        r.stored_name.split(".", 1)[0]: r
+        for r in Recording.objects.filter(names, deleted_at__isnull=True).order_by("created_at")
     }
     readable = [
         (h, found[h])

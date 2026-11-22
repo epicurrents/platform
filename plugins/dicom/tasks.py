@@ -2,8 +2,8 @@
 
 ``purge_deleted_dicom_studies``
     Hard-delete studies that have been soft-deleted longer than the retention
-    window, plus instances stranded mid-upload — the erasure half of the
-    soft-delete + purge contract.
+    window, plus instances stranded mid-upload and stale files left in the
+    staging directory — the erasure half of the soft-delete + purge contract.
 
 DICOM ingest itself is synchronous (see ``plugins/dicom/ingest.py``); there
 are no indexing tasks.
@@ -24,6 +24,14 @@ logger = logging.getLogger(__name__)
 # for this long marks a request that died in that gap.
 ORPHAN_PENDING_MAX_AGE = timedelta(hours=24)
 
+# A staged file lives for the length of one upload request. The same margin as
+# the row reaper's, so a file is never swept while a slow request may still be
+# writing the batch it belongs to.
+STAGING_FILE_MAX_AGE = ORPHAN_PENDING_MAX_AGE
+
+# The two names the upload endpoint stages: the file as uploaded, and its rewritten copy.
+_STAGED_SUFFIXES = (".dcm", ".dcm.deid")
+
 
 @shared_task(name="dicom.purge_deleted_dicom_studies")
 def purge_deleted_dicom_studies():
@@ -43,7 +51,10 @@ def purge_deleted_dicom_studies():
     The orphan branch reaps ``PENDING`` instances older than
     ``ORPHAN_PENDING_MAX_AGE``: rows stranded between the upload transaction
     commit and the staging→final move by a crashed request. Their staged
-    and/or final files are removed best-effort before the row deletion.
+    and/or final files are removed best-effort before the row deletion. The
+    staging sweep then removes staged files older than ``STAGING_FILE_MAX_AGE``
+    that no pending row names: the as-uploaded and rewritten files of a request
+    that died before its transaction, which no row leads to.
 
     Per-row deletes fire the audit signals inside the ``with_system_activity``
     scope, so each erasure lands in ``ObjectChangeLog`` under one parent
@@ -122,12 +133,56 @@ def _purge_body(*, cutoff, retention_days):
     for study in touched_studies.values():
         refresh_study_aggregates(study)
 
+    swept = _sweep_staging(staging_path)
+
     logger.info(
-        "purge_deleted_dicom_studies: purged=%d reaped=%d errors=%d cutoff=%s retention_days=%d",
+        "purge_deleted_dicom_studies: purged=%d reaped=%d swept=%d errors=%d cutoff=%s retention_days=%d",
         purged,
         reaped,
+        swept,
         errors,
         cutoff.isoformat(),
         retention_days,
     )
-    return {"purged": purged, "reaped": reaped, "errors": errors}
+    return {"purged": purged, "reaped": reaped, "swept": swept, "errors": errors}
+
+
+def _sweep_staging(staging_path: Path) -> int:
+    """Unlink staged upload files older than ``STAGING_FILE_MAX_AGE`` that no pending instance names.
+
+    The reaper above follows rows, so it never finds a file whose row was
+    never written or was rolled back, nor the rewritten ``.deid`` copy of any
+    file: what a request that died before its transaction leaves behind. Both
+    are patient data on a backed-up volume, the as-uploaded file identifying.
+    Only the two names the upload endpoint writes are touched, by modification
+    time, and a file a ``pending`` row still names is left for the request
+    that owns it. File housekeeping only: no row changes, so nothing to audit
+    beyond the count the task returns.
+    """
+    from plugins.dicom.models import DicomInstance
+
+    try:
+        candidates = [p for p in staging_path.iterdir() if p.name.endswith(_STAGED_SUFFIXES)]
+    except OSError:
+        return 0
+    if not candidates:
+        return 0
+    pending = set(
+        DicomInstance.objects.filter(status=DicomInstance.Status.PENDING).values_list("stored_name", flat=True)
+    )
+    cutoff = (timezone.now() - STAGING_FILE_MAX_AGE).timestamp()
+    swept = 0
+    for candidate in candidates:
+        if candidate.name.removesuffix(".deid") in pending:
+            continue
+        try:
+            if not candidate.is_file() or candidate.is_symlink() or candidate.stat().st_mtime >= cutoff:
+                continue
+            candidate.unlink()
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            logger.warning("Could not remove stale staged file %s: %s", candidate, exc)
+            continue
+        swept += 1
+    return swept

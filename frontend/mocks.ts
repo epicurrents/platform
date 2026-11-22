@@ -72,6 +72,7 @@
  *   DELETE /api/v1/library/datasets/{id}/
  *   GET    /api/v1/library/datasets/{id}/items/
  *   POST   /api/v1/library/datasets/{id}/items/
+ *   POST   /api/v1/library/datasets/{id}/items/{itemId}/order  (the manual order; nothing is arranged at the start)
  *   GET    /api/v1/library/datasets/{id}/folders/     (no dataset has folders)
  *   GET    /api/v1/library/datasets/{id}/browse/      (every dataset declares the same three subject fields, one a
  *                                                       number; a gated one answers as to a reader: displayed fields)
@@ -148,11 +149,12 @@ interface MockItem {
     id: number
     _parent_id: number      // which collection or dataset owns this item
     content_type_id: number
-    object_id: string       // recording hash (for recordings; avoids PK exposure)
+    object_id: string       // recording hash; the mock's own lookup key, never sent to the client
     added_at: string
     object_name: string | null
     object_hash: string | null
     deleted_at?: string | null   // soft-deleted with its collection (recursive trash)
+    position?: number | null     // dataset items: the place in the manual order; null or absent means unsorted
 }
 
 interface MockAccess {
@@ -1508,9 +1510,61 @@ function mockPage<T>(rows: T[], query: URLSearchParams): T[] {
     return rows.slice(offset, offset + limit)
 }
 
-/** Strip internal _parent_id before sending an item to the client. */
+/** Strip the internal _parent_id and object_id before sending an item to the client: no row serves a member's key. */
 function itemOut(item: MockItem) {
-    const { _parent_id: _, ...rest } = item
+    const { _parent_id: _, object_id: _objectId, ...rest } = item
+    return rest
+}
+
+/** A dataset item as the server sends it to a manager, which the mock caller always is: with its position. */
+function datasetItemOut(item: MockItem) {
+    return { ...itemOut(item), folder_id: null, position: item.position ?? null }
+}
+
+/** Item rows in the server's listing order: by the name each shows, ties by the member's hash, never by addition. */
+function byMemberName(a: MockItem, b: MockItem): number {
+    const name = (item: MockItem) => (item.object_name ?? '').toLowerCase()
+    return name(a).localeCompare(name(b)) || (a.object_hash ?? '').localeCompare(b.object_hash ?? '')
+}
+
+/**
+ * A dataset's item rows in the server's listing order: the members a manager arranged first, in their positions,
+ * then the unsorted ones by name. The mock keeps no folders, so the dataset root is the one order there is.
+ */
+function byManualOrder(a: MockItem, b: MockItem): number {
+    const left = a.position ?? null
+    const right = b.position ?? null
+    if (left !== null && right !== null && left !== right) {
+        return left - right
+    }
+    return (left === null ? 1 : 0) - (right === null ? 1 : 0) || byMemberName(a, b)
+}
+
+/**
+ * The arranged sequence of item ids after an order action, as library/item_order.py works it out: `up` and `down`
+ * swap neighbours and change nothing at an edge, `top` and `bottom` place the item first or last, an unsorted item
+ * joins last on `up` and stays out on `down`, and `clear` takes it out.
+ */
+function arrangeMockItems(sequence: number[], itemId: number, action: string): number[] {
+    const rest = sequence.filter(id => id !== itemId)
+    if (action === 'clear') {
+        return rest
+    }
+    if (action === 'top') {
+        return [itemId, ...rest]
+    }
+    if (action === 'bottom') {
+        return [...rest, itemId]
+    }
+    const index = sequence.indexOf(itemId)
+    if (index === -1) {
+        return action === 'up' ? [...rest, itemId] : sequence
+    }
+    const target = action === 'up' ? index - 1 : index + 1
+    if (target < 0 || target >= sequence.length) {
+        return sequence
+    }
+    rest.splice(target, 0, itemId)
     return rest
 }
 
@@ -2885,13 +2939,14 @@ export async function handleMock(
         if (m) {
             const dsId = Number(m[1])
             if (method === 'GET') {
-                // The mock caller manages every dataset, so ids are always served; a non-manager of a release-gated
-                // dataset receives `id` and `object_id` as null.
+                // The mock caller wrote every dataset and so manages it, which is who the server serves `id` to;
+                // every other reader of a dataset, gated or not, receives it as null. The mock holds recordings
+                // only, so no row names a `platform_pass`.
                 const query = new URL(req.url ?? path, 'http://mock').searchParams
                 const limit = Number(query.get('limit') ?? 50)
                 const offset = Number(query.get('offset') ?? 0)
-                const rows = _state.datasetItems.filter(i => i._parent_id === dsId)
-                return send(res, 200, rows.slice(offset, offset + limit).map(itemOut))
+                const rows = _state.datasetItems.filter(i => i._parent_id === dsId).sort(byManualOrder)
+                return send(res, 200, rows.slice(offset, offset + limit).map(datasetItemOut))
             }
             if (method === 'POST') {
                 const body = await readBody(req)
@@ -2908,9 +2963,43 @@ export async function handleMock(
                     added_at: new Date().toISOString(),
                     ...enrichItem(ctId, objectId),
                 }
+                // Unsorted, as the server adds every member: only an order action gives one a position.
                 _state.datasetItems.push(item)
-                return send(res, 201, itemOut(item))
+                return send(res, 201, datasetItemOut(item))
             }
+        }
+    }
+
+    // POST /api/v1/library/datasets/{id}/items/{itemId}/order — the mock caller manages every dataset
+    {
+        const m = path.match(/^\/api\/v1\/library\/datasets\/(\d+)\/items\/(\d+)\/order$/)
+        if (m && method === 'POST') {
+            const dsId = Number(m[1])
+            const itemId = Number(m[2])
+            const members = _state.datasetItems.filter(i => i._parent_id === dsId)
+            if (!members.some(i => i.id === itemId)) {
+                return notFound(res)
+            }
+            const action = String((await readBody(req)).action ?? '')
+            if (!['up', 'down', 'top', 'bottom', 'clear'].includes(action)) {
+                return send(res, 422, { detail: 'Unknown order action.' })
+            }
+            const sequence = members.filter(i => (i.position ?? null) !== null).sort(byManualOrder).map(i => i.id)
+            const placed = arrangeMockItems(sequence, itemId, action)
+            let changed = 0
+            for (const member of members) {
+                const index = placed.indexOf(member.id)
+                const position = index === -1 ? null : index + 1
+                if ((member.position ?? null) !== position) {
+                    member.position = position
+                    changed++
+                }
+            }
+            return send(res, 200, {
+                changed,
+                folder_id: null,
+                items: members.sort(byManualOrder).map(i => ({ id: i.id, position: i.position ?? null })),
+            })
         }
     }
 
@@ -3003,7 +3092,7 @@ export async function handleMock(
             const query = new URL(req.url ?? path, 'http://mock').searchParams
             const limit = Number(query.get('limit') ?? 50)
             const offset = Number(query.get('offset') ?? 0)
-            const sortParam = query.get('sort') ?? 'name'
+            const sortParam = query.get('sort') ?? 'order'
             const descending = sortParam.startsWith('-')
             const sortKey = sortParam.replace(/^-/, '')
             const { fields, subjectOf, tagFilter, passes, all } = mockBrowseQuery(dsId, query)
@@ -3055,16 +3144,30 @@ export async function handleMock(
                     default: return resolvedDisplayName(r).toLowerCase()
                 }
             }
-            members.sort((a, b) => {
-                const left = sortValue(a)
-                const right = sortValue(b)
-                // A member without a value sorts last in either direction, as the server orders it.
-                if (left === null || right === null) {
-                    return (left === null ? 1 : 0) - (right === null ? 1 : 0) || a.hash.localeCompare(b.hash)
+            if (sortKey === 'order') {
+                // The dataset's own order, the item listing's: the arranged members first, the rest by name.
+                const placeOf = new Map(
+                    _state.datasetItems
+                        .filter(i => i._parent_id === dsId)
+                        .sort(byManualOrder)
+                        .map((i, index) => [i.object_id, index]),
+                )
+                members.sort((a, b) => (placeOf.get(a.hash) ?? 0) - (placeOf.get(b.hash) ?? 0))
+                if (descending) {
+                    members.reverse()
                 }
-                const order = left < right ? -1 : left > right ? 1 : 0
-                return (descending ? -order : order) || a.hash.localeCompare(b.hash)
-            })
+            } else {
+                members.sort((a, b) => {
+                    const left = sortValue(a)
+                    const right = sortValue(b)
+                    // A member without a value sorts last in either direction, as the server orders it.
+                    if (left === null || right === null) {
+                        return (left === null ? 1 : 0) - (right === null ? 1 : 0) || a.hash.localeCompare(b.hash)
+                    }
+                    const order = left < right ? -1 : left > right ? 1 : 0
+                    return (descending ? -order : order) || a.hash.localeCompare(b.hash)
+                })
+            }
             const items = members.slice(offset, offset + limit).map(r => {
                 const tags = mockTagsOf(r.hash)
                 return {
@@ -3185,7 +3288,6 @@ export async function handleMock(
                 id: null,
                 tag_id: tag.id,
                 content_type_id: RECORDING_CT_ID,
-                object_id: null,
                 object_hash: recording.hash,
                 tagged_at: new Date().toISOString(),
             })

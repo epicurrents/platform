@@ -36,6 +36,15 @@ export interface DicomStudyOut {
     deidentification_version: number | null
 }
 
+/**
+ * Whether a study is stored as uploaded: the platform's header pass did not run on every file, so the study's header
+ * carries the uploaded patient fields. The cue the studies page, a dataset and the viewer mark such a study by.
+ * @param study - The study as the study endpoints serve it.
+ */
+export function studyStoredAsUploaded(study: Pick<DicomStudyOut, 'deidentification_version'>) {
+    return study.deidentification_version === null
+}
+
 export interface DicomStudyDetailOut extends DicomStudyOut {
     series: DicomSeriesOut[]
 }
@@ -76,8 +85,16 @@ export interface DicomUploadOut {
 const BASE = '/plugin/dicom/api/v1/dicom'
 
 /**
- * The refusal code for an image that may show identifying text in its pixels (ultrasound, secondary capture, or a
- * flagged burned-in annotation). The server decides which files it applies to; resubmitting them with
+ * The path of a study's endpoints, with the hash escaped so that whatever it holds stays one path segment.
+ * @param hash - The study's `hash` from the study listing.
+ */
+function studyPath(hash: string) {
+    return `${BASE}/studies/${encodeURIComponent(hash)}`
+}
+
+/**
+ * The refusal code for a file that may show identifying text in its content: every file other than an original CT,
+ * MR or PET acquisition with no flag set. The server decides which files it applies to; resubmitting them with
  * `confirmBurnedIn` records that the uploader checked them.
  */
 export const BURNED_IN_CONFIRMATION_REQUIRED = 'burned_in_confirmation_required'
@@ -109,16 +126,16 @@ export const dicomApi = {
     },
 
     getStudy(hash: string): Promise<DicomStudyDetailOut> {
-        return http.get<DicomStudyDetailOut>(`${BASE}/studies/${hash}/`).then(r => r.data)
+        return http.get<DicomStudyDetailOut>(`${studyPath(hash)}/`).then(r => r.data)
     },
 
     deleteStudy(hash: string): Promise<void> {
-        return http.delete(`${BASE}/studies/${hash}/`)
+        return http.delete(`${studyPath(hash)}/`)
     },
 
     /** The study's access rights other than its author's own. */
     listAccess(hash: string): Promise<AccessRight[]> {
-        return http.get<AccessRight[]>(`${BASE}/studies/${hash}/access/`).then(r => r.data)
+        return http.get<AccessRight[]>(`${studyPath(hash)}/access/`).then(r => r.data)
     },
 
     /**
@@ -129,11 +146,11 @@ export const dicomApi = {
      * @param payload - The grant, as the shared access-rights panel builds it.
      */
     grantAccess(hash: string, payload: GrantAccessPayload): Promise<AccessRight> {
-        return http.post<AccessRight>(`${BASE}/studies/${hash}/access/`, payload).then(r => r.data)
+        return http.post<AccessRight>(`${studyPath(hash)}/access/`, payload).then(r => r.data)
     },
 
     revokeAccess(hash: string, rightId: number): Promise<void> {
-        return http.delete(`${BASE}/studies/${hash}/access/${rightId}/`)
+        return http.delete(`${studyPath(hash)}/access/${encodeURIComponent(rightId)}/`)
     },
 
     /**
@@ -161,9 +178,7 @@ export const dicomApi = {
      * @param studyHash - The study's `hash` from the study listing.
      */
     ohifViewerUrl(studyHash: string): string {
-        const jsonUrl = encodeURIComponent(
-            `${window.location.origin}${BASE}/studies/${studyHash}/ohif-json/`
-        )
+        const jsonUrl = encodeURIComponent(`${window.location.origin}${studyPath(studyHash)}/ohif-json/`)
         return `/plugin/dicom/ohif/viewer/dicomjson?url=${jsonUrl}`
     },
 }

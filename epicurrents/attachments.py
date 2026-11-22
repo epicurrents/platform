@@ -50,9 +50,20 @@ _TYPES: dict[str, AttachmentType] = {}
 
 
 def register_attachment_type(attachment_type: AttachmentType) -> None:
-    """Register an attachment type. A key registered twice is refused, since two owners would list one model twice."""
-    if attachment_type.key in _TYPES and _TYPES[attachment_type.key] != attachment_type:
-        raise ValueError(f"Attachment type {attachment_type.key!r} is already registered.")
+    """Register an attachment type. A key registered twice by different owners is refused.
+
+    Registering a key again for the same model, with the same share-token setting, has no effect and the first
+    registration stands, so a second ``ready()`` in one process is harmless. The callables are not compared: a lambda
+    is a new object each time the module defining it runs.
+    """
+    current = _TYPES.get(attachment_type.key)
+    if current is not None:
+        if (current.model_label.lower(), current.serves_share_tokens) != (
+            attachment_type.model_label.lower(),
+            attachment_type.serves_share_tokens,
+        ):
+            raise ValueError(f"Attachment type {attachment_type.key!r} is already registered.")
+        return
     _TYPES[attachment_type.key] = attachment_type
 
 
@@ -66,8 +77,9 @@ def attachments_of(parents: Iterable[tuple[str, Model]], user, share_token: str 
 
     *parents* pairs each parent with the public key it is named by, its hash; the parent's primary key is sequential
     and never leaves this function. The caller is expected to have checked that it may read every parent. Each row is
-    decided by ``can_read_object`` for the caller and *share_token*; a type that serves no share token is skipped for
-    a token caller who has no session. Items come in the order of *parents*, and by name within a parent. Each item is
+    decided by ``can_read_object`` for the caller and *share_token*. A type that serves no share token is decided
+    without the token, since its endpoints take none: it is skipped for a token caller who has no session, and listed
+    to a signed-in caller only where their own access reaches it. Items come in the order of *parents*, and by name within a parent. Each item is
     a dict with ``parent`` (the parent's public key), ``type``, ``hash``, ``name``, ``platform_pass`` and ``details``.
     """
     from epicurrents.permissions import can_read_object
@@ -90,13 +102,14 @@ def attachments_of(parents: Iterable[tuple[str, Model]], user, share_token: str 
     for attachment_type in registered_attachment_types():
         if token_only and not attachment_type.serves_share_tokens:
             continue
+        type_token = share_token if attachment_type.serves_share_tokens else None
         model = apps.get_model(attachment_type.model_label)
         for ct_id, pks in by_type.items():
             rows = attachment_type.live(
                 model.objects.filter(attachment_content_type_id=ct_id, attachment_object_id__in=pks)
             )
             for obj in rows:
-                if not can_read_object(user=user, obj=obj, share_token=share_token):
+                if not can_read_object(user=user, obj=obj, share_token=type_token):
                     continue
                 described = attachment_type.describe(obj)
                 ref = (ct_id, obj.attachment_object_id)

@@ -101,6 +101,84 @@ class TestPurgeDeletedDicomStudiesContract:
         study.refresh_from_db()
         assert study.num_instances == 1
 
+    def test_staging_sweep_removes_stale_files_no_row_names(self, user, make_study, dicom_dirs):
+        import os
+
+        upload_dir, staging_dir = dicom_dirs
+        old = (timezone.now() - timedelta(hours=25)).timestamp()
+        stale = [staging_dir / "aaaa.dcm", staging_dir / "aaaa.dcm.deid", staging_dir / "bbbb.dcm.deid"]
+        fresh = [staging_dir / "cccc.dcm", staging_dir / "cccc.dcm.deid"]
+        # Not a name the upload endpoint writes: left alone whatever its age.
+        foreign = [staging_dir / "notes.txt", staging_dir / "dddd.dcm.part"]
+        for path in stale + fresh + foreign:
+            path.write_bytes(b"x")
+        for path in stale + foreign:
+            os.utime(path, (old, old))
+        (staging_dir / "eeee.dcm").mkdir()
+        os.utime(staging_dir / "eeee.dcm", (old, old))
+        stored = upload_dir / "aaaa.dcm"
+        stored.write_bytes(b"x")
+        os.utime(stored, (old, old))
+
+        result = purge_deleted_dicom_studies()
+
+        assert result["swept"] == 3
+        assert not any(path.exists() for path in stale)
+        assert all(path.exists() for path in fresh + foreign)
+        assert (staging_dir / "eeee.dcm").is_dir()
+        # Only the staging directory is swept.
+        assert stored.exists()
+
+    def test_staging_sweep_leaves_the_files_of_a_pending_instance(self, user, make_study, dicom_dirs):
+        import os
+
+        _, staging_dir = dicom_dirs
+        series = make_study(user).series.first()
+        DicomInstance.objects.create(
+            series=series,
+            sop_instance_uid="1.2.3.4",
+            stored_name="pending.dcm",
+            file_size=1,
+            status=DicomInstance.Status.PENDING,
+        )
+        old = (timezone.now() - timedelta(hours=30)).timestamp()
+        for name in ("pending.dcm", "pending.dcm.deid"):
+            (staging_dir / name).write_bytes(b"x")
+            os.utime(staging_dir / name, (old, old))
+
+        # The row is younger than the reaper's threshold, so the request may still own its files.
+        result = purge_deleted_dicom_studies()
+
+        assert (result["reaped"], result["swept"]) == (0, 0)
+        assert (staging_dir / "pending.dcm").exists() and (staging_dir / "pending.dcm.deid").exists()
+
+    def test_staging_sweep_takes_the_rewritten_copy_of_a_reaped_orphan(self, user, make_study, dicom_dirs):
+        import os
+
+        _, staging_dir = dicom_dirs
+        series = make_study(user).series.first()
+        orphan = DicomInstance.objects.create(
+            series=series,
+            sop_instance_uid="1.2.3.5",
+            stored_name="orphan.dcm",
+            file_size=1,
+            status=DicomInstance.Status.PENDING,
+        )
+        _backdate_created(orphan, days=2)
+        old = (timezone.now() - timedelta(days=2)).timestamp()
+        for name in ("orphan.dcm", "orphan.dcm.deid"):
+            (staging_dir / name).write_bytes(b"x")
+            os.utime(staging_dir / name, (old, old))
+
+        result = purge_deleted_dicom_studies()
+
+        assert (result["reaped"], result["swept"]) == (1, 1)
+        assert not any(staging_dir.iterdir())
+
+    def test_staging_sweep_survives_a_missing_directory(self, settings, tmp_path):
+        settings.DICOM_STAGING_PATH = str(tmp_path / "absent")
+        assert purge_deleted_dicom_studies()["swept"] == 0
+
     def test_orphan_reaper_keeps_fresh_pending_and_old_ready(self, user, make_study):
         study = make_study(user)
         series = study.series.first()

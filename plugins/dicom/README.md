@@ -49,7 +49,7 @@ To move to a new OHIF release, check out its tag in the submodule, rebuild, and 
 
 ### `DicomStudy`
 
-One row per DICOM study **per author**. The same `StudyInstanceUID` uploaded by two different users produces two independent rows (and two file copies), exactly as two users uploading the same EDF produce two independent `Recording` rows — this is what keeps one user's upload from attaching to, or probing for, another user's study.
+One row per DICOM study **per author**. The same `StudyInstanceUID` uploaded by two different users produces two independent rows (and two file copies), exactly as two users uploading the same EDF produce two independent `Recording` rows — this is what keeps one user's upload from attaching to, or probing for, another user's study. With [de-identification](#de-identification) on, the two rows do not share a UID either: each carries the replacement made under its own author's key.
 
 | Field | Notes |
 |---|---|
@@ -86,13 +86,13 @@ One row per SOP instance (one DICOM file). Stores all pixel-geometry metadata ne
 | Field | Notes |
 |---|---|
 | `series` | FK to `DicomSeries`; cascades on delete. |
-| `sop_instance_uid` | DICOM (0008,0018); unique per series (`dicominstance_unique_sop_per_series`) — per-author study copies repeat it. |
+| `sop_instance_uid` | DICOM (0008,0018); unique per series (`dicominstance_unique_sop_per_series`) — per-author study copies stored as uploaded repeat it. |
 | `sop_class_uid` | DICOM (0008,0016). Identifies the storage class (CT Image Storage, MR Image Storage, etc.). |
 | `stored_name` | Filename under `DICOM_UPLOAD_PATH`. UUID-derived, never from user input. |
 | `file_size`, `file_hash` | Size and SHA-256 of the stored file, which with de-identification on is the rewritten one. |
 | `source_hash` | SHA-256 of the file as uploaded, the `--resume` key for bulk import. Never serialised to anyone, the author included, and withheld from the audit trail: it is a bit-exact link to the original held by whoever acquired it. |
 | `deidentification_version`, `patient_characteristics_retained` | The pass version that wrote the stored file (null when stored as uploaded) and whether the retain option was on. |
-| `pixel_review` | `not_required`, `attested` (the uploader confirmed the pixels show no identifying text; nothing on the platform looked), or blank when the file is stored as uploaded. See [Burned-in text](#burned-in-text). |
+| `pixel_review` | `not_required` (the header describes an object on the acquisition allowlist, so nobody was asked), `attested` (the uploader confirmed the file shows no identifying text or features; nothing on the platform looked), or blank when the file is stored as uploaded. Neither value says anything looked at a pixel. See [Burned-in text](#burned-in-text). |
 | `status` | `ready` means row **and** file are in final storage. `pending` exists only inside the upload request between the DB commit and the file move; a stranded `pending` row is reaped by the purge task's orphan branch. `failed` marks a post-commit move failure; re-uploading the instance replaces it in place. |
 | `columns`, `rows`, `bits_allocated`, `bits_stored`, `high_bit`, `pixel_representation`, `samples_per_pixel`, `photometric_interpretation` | Pixel encoding attributes. Nullable for non-image objects (SR, RT plans, etc.). |
 | `pixel_spacing`, `image_orientation_patient`, `image_position_patient`, `image_type` | Multi-value tags stored as JSON string arrays. |
@@ -105,7 +105,9 @@ One row per SOP instance (one DICOM file). Stores all pixel-geometry metadata ne
 
 Upload and bulk import share the prepare/persist logic in [ingest.py](ingest.py). `prepare_file` parses each file's header, applies the [burned-in text](#burned-in-text) gate, and rewrites the file through the [de-identification](#de-identification) pass into a second file beside it; the study/series/instance rows are extracted from the rewritten file and created for the uploading author, and the rewritten file lands under `DICOM_UPLOAD_PATH` with a UUID-derived name. There is no per-file Celery task: the pass costs milliseconds per file once the upload has been received, and the synchronous flow means the study hashes in the upload response are immediately valid.
 
-The upload endpoint stages each file (hashing as it streams), prepares it, persists the whole batch's rows in one transaction, then for each accepted file copies the as-uploaded bytes to the originals volume when the preservation mode asks for it, deletes them, moves the stored file into place and flips its instance to `ready`. Unparseable files, files missing required UIDs, files the pass cannot rewrite, oversized files, and duplicates of already-ready instances are rejected per file — reported in the response's `files` list, by `index` in the request, without aborting the rest of the batch.
+The upload endpoint stages each file (hashing as it streams), prepares it, persists the whole batch's rows in one transaction, then for each accepted file copies the as-uploaded bytes to the originals volume when the preservation mode asks for it, deletes them, moves the stored file into place and flips its instance to `ready`. Unparseable files, files missing required UIDs or carrying one over 64 characters, files the pass cannot rewrite, oversized files, and duplicates of already-ready instances are rejected per file — reported in the response's `files` list, by `index` in the request, without aborting the rest of the batch. Any other header string longer than its column is cut to fit by the `extract_*_fields` helpers, so a 17-character DS cannot fail the batch's transaction.
+
+**No staged file outlives its request.** The staging directory holds the bytes as uploaded, on the backed-up media volume, so every exit removes them: a per-file refusal removes that file, and a failure of the request as a whole, a refusal or an unexpected error in staging or in the transaction, removes every file the request staged, rewritten copies included. A request that dies outright is covered by the [purge](#purge) task's staging sweep.
 
 ## De-identification
 
@@ -115,20 +117,60 @@ On by default (`DICOM_DEIDENTIFY_ON_INGEST`). The stored file is the rewritten o
 
 [deidentify.py](deidentify.py) applies the PS3.15 Annex E basic profile from the table dicom-anonymizer ships for the standard's 2026c edition, with actions of its own: the library applies its table to the top level only, writes `ANONYMIZED` as its dummy, and draws UIDs at random per process, which would split a study uploaded in several requests into several studies. The pass, wherever an attribute appears, nested sequences included:
 
-- **D / Z / X / U** as the table says; composite codes resolve to the form that keeps a dataset valid without knowing its IOD (Z/D, X/D and X/Z/D to D, X/Z to Z, X/Z/U* to the sequence with its UIDs replaced).
+- **D / Z / X / U** as the table says; composite codes resolve to the form that keeps a dataset valid without knowing its IOD (Z/D, X/D and X/Z/D to D, X/Z to Z, X/Z/U* to the sequence with its UIDs replaced). A U attribute the file declares under a VR other than UI has its string values replaced all the same, and a value that is not a string refuses the file.
+- **Attributes the table does not list** are decided by VR rather than kept, since the table covers the attributes Annex E names and a dataset may carry others: `SOPInstanceUIDOfConcatenationSource`, `EvaluatorName` and `DocumentTitle` are among those it is silent on. The dictionary's VR decides where the file declares another.
+
+    | VR | Action |
+    |---|---|
+    | UI | Replaced as any other UID, unless the tag is in `KEPT_UID_TAGS` or the value is one the standard registers |
+    | PN | Emptied |
+    | DA, DT, TM | The date and time dummies |
+    | LT, ST, UT, UC, UR | Emptied |
+    | SQ | Kept, its items cleaned by the same rules |
+    | UN, or a tag the dictionary does not know | Removed, group lengths and overlay descriptors included |
+    | Everything else: CS, SH, LO, numbers, pixel data | Kept |
+
+    `KEPT_UID_TAGS` is the SOP class, transfer syntax, coding scheme, context group and mapping resource attributes: UIDs that name a kind of thing, never an instance, a study, a series, a device or an event. The value rule keeps a well-known frame of reference or colour palette wherever it appears. Short and long strings stay because rendering and reading need them (`SoftwareVersions`, `Manufacturer`, `WindowCenterWidthExplanation`, code meanings), which leaves an unlisted LO or SH as the one text class the pass keeps without a rule; coded values in UC and UR (`LongCodeValue`, `URNCodeValue`) are emptied with the free text they share a VR with.
 - **Dummies** are `X` for text and the recording pass's `19850101` with a midnight time for every date and time, under Z as well as D.
-- **UIDs** become `2.25.` and 128 bits of HMAC-SHA256 under `DICOM_UID_KEY`, so every upload of a study converges on one study and the source UID cannot be recomputed from the result.
+- **UIDs** become `2.25.` and 128 bits of HMAC-SHA256 over the source UID, under a key of the uploading author's own; see [UIDs](#uids).
 - **Kept**: study and series descriptions, against the profile, with a [text-hygiene](../../epicurrents/text_hygiene.py) warning in the upload response's `warnings` for one that looks like an identifier; sex, age, size and weight under `DICOM_RETAIN_PATIENT_CHARACTERISTICS`.
 - **Removed**: every private attribute, overlays, the preamble, and the file meta header's source AE titles (it is rebuilt).
-- **Marked**: Patient Identity Removed `YES`, De-identification Method naming the pass version, and the Annex E codes applied (113100, plus 113108 with the retain option).
+- **Marked**: De-identification Method naming the pass version, the Annex E codes applied to the header (113100, plus 113108 with the retain option), Longitudinal Temporal Information Modified `REMOVED`, and Patient Identity Removed; see [The identity stamp](#the-identity-stamp).
 
-`DICOM_DEIDENTIFICATION_VERSION` is stamped on each instance and aggregated onto its study. [tests/test_deidentify.py](tests/test_deidentify.py) pins a digest of the module's definitions and the table to the version, so a behaviour change fails the suite until the version moves with it; an existing version is never re-pinned. The as-uploaded file goes to the originals volume under `plugins/dicom/<stored prefix>/` with a manifest when `RECORDINGS_PRESERVE_MODE` is `all` (or `failed`, for a file the pass refused), under the volume's write-only rule; `validate_originals` passes over that directory.
+`DICOM_DEIDENTIFICATION_VERSION` is stamped on each instance and aggregated onto its study. [tests/test_deidentify.py](tests/test_deidentify.py) pins a digest of the module's definitions, the table and the upload gate's rule and allowlist to the version, so a behaviour change fails the suite until the version moves with it; an existing version is never re-pinned. The as-uploaded file goes to the originals volume under `plugins/dicom/<stored prefix>/` with a manifest when `RECORDINGS_PRESERVE_MODE` is `all` (or `failed`, for a file the pass refused), under the volume's write-only rule; `validate_originals` passes over that directory.
 
 While the setting is on and `DICOM_UID_KEY` is empty, upload answers 503 and `index_dicom` refuses to start; `manage.py check` warns (`dicom.W001`) rather than refusing the boot. Turning the setting off stores and serves files as uploaded: an operator's choice for data de-identified at the source, which the Share dialog then says plainly.
 
+### UIDs
+
+A replacement UID is `2.25.` followed by the decimal of the first 128 bits of `HMAC-SHA256(author key, source UID)` (PS3.5 B.2), where the author key is `HMAC-SHA256(DICOM_UID_KEY, "epicurrents.dicom.uid.author:" + <author's primary key in decimal>)`. `author_uid_key` in [deidentify.py](deidentify.py) derives it, and the upload endpoint and `index_dicom` both pass the user the rows are created for. Deriving a key per author, rather than hashing the author and the UID together, leaves no encoding in which one author's input reads as another's. The primary key is stable for the life of the account and is written nowhere by the pass.
+
+- **One author converges.** The same source UID gives the same replacement across requests, workers, restarts and the two ingest paths, so a study uploaded in several batches is one study, a re-uploaded instance is detected as a duplicate, `index_dicom --resume` continues a study an earlier run began, and a reference from one file to another still names it.
+- **Two authors share nothing.** A deployment-wide key made the replacement a function of the source UID alone, and the upload response, the study list and DICOMweb return it. Any signed-in account could then upload a stub file carrying a source UID it suspected and read back the replacement, which confirmed whether a study shared with it was a particular examination, and two authors' copies of one examination were linked by equal UIDs. Under an author key the stub's replacement is the prober's own and says nothing about anyone else's study.
+- **What remains.** An author uploading a source UID again gets the same replacement, which convergence needs, so an author can link their own uploads to each other. That is their own data. The deployment, holding `DICOM_UID_KEY` and the author's primary key, can test a guessed source UID against a stored one, which is one of the reasons the output is pseudonymised. After `erase_user` the studies are gone with the account.
+
+### The identity stamp
+
+Patient Identity Removed (0012,0062) is defined as the identity having been removed "from the Attributes and the Pixel Data" (PS3.3 C.7.1.1), and the header pass does not address pixels. The pass therefore writes `YES` only for a file the [acquisition allowlist](#burned-in-text) stored as `not_required`, and `NO` for every file stored on the uploader's confirmation: its header went through the same pass, but nothing at the platform determined that what it displays carries no identity. The stamp follows `pixel_review` and nothing else, and `deidentify_dataset` takes it as a required argument so that no call site stamps `YES` by omission.
+
+De-identification Method, its code sequence and Longitudinal Temporal Information Modified are written in both cases, since they describe what was done to the header. The standard requires the two method attributes when the stamp is `YES` and says they "may be present otherwise"; `REMOVED` is what PS3.15 E.2 asks for when no option retaining dates is applied, and every date is dummied. A file stamped `NO` is not a claim of conformance to the Annex E profile, whose item 6 requires `YES`. A `YES` is still the header's word about an allowlisted kind of object: the platform read no pixel of it either.
+
 ### Burned-in text
 
-The header pass cannot touch text rendered into the pixels, which ultrasound (a main use case, alongside nerve conduction studies) carries routinely. Until a redaction stage exists, the uploader attests instead. A file with modality `US`, `SC` or `OT`, a Secondary Capture or Ultrasound SOP class whatever its modality (a capture keeps the modality of what it captured), or Burned In Annotation `YES`, decided from the parsed header on the server, is refused with the code `burned_in_confirmation_required` and nothing written for it unless the request carries `confirm_burned_in=true`; the rest of the batch is accepted, and a batch whose only refusals are these answers 200. The Upload dialog shows how many images need checking, asks the uploader to confirm they show no names, IDs, dates or other identifying text, and resubmits only those. `index_dicom --confirm-burned-in` is the same confirmation for an archive. The confirmation lands as `pixel_review = attested` on each instance and as counts and the flag in the upload's `Activity` metadata, with the actor as the row's user. The gate applies only with de-identification on.
+The header pass cannot touch what is rendered into the pixels, and nothing on the platform reads them. Until a redaction stage exists, the uploader attests instead, for every file the platform has no positive reason to pass. The rule is an allowlist, `pixel_review_required` and `ACQUISITION_ALLOWLIST` in [ingest.py](ingest.py), decided from the parsed header as uploaded, on the server, before the pass runs. A file is stored as `not_required` only when all of these hold:
+
+| Condition | Why |
+|---|---|
+| Modality and SOP class are a pair on the allowlist: `CT` with CT Image or Enhanced CT Image Storage, `MR` with MR Image or Enhanced MR Image Storage, `PT` with PET Image or Enhanced PET Image Storage | Cross-sectional acquisitions, whose scanner reconstructs the pixels from measurements and draws no text into them. Requiring the pair keeps out a secondary capture, which carries the modality of what it captured |
+| Image Type is present and begins `ORIGINAL`, `PRIMARY` | Dose reports, protocol pages, reformats and screen saves are stored under the acquisition classes as `DERIVED` or `SECONDARY`. A file that does not say is not taken for an original |
+| Burned In Annotation is not `YES` | The file's own statement; an absent value is not read as a claim |
+| Recognizable Visual Features is not `YES` | The file's own statement that the subject can be recognised from the image |
+
+Everything else is held: ultrasound (a main use case, alongside nerve conduction studies), secondary captures, photographs, endoscopy and microscopy, projection radiography and fluoroscopy, nuclear medicine (its class also holds planar whole-body images and workstation result screens), the Legacy Converted Enhanced and Enhanced MR Color classes, an unknown or missing modality, a private SOP class, and every non-image object: structured reports, encapsulated documents, presentation states, radiotherapy objects. The header pass empties a report's free text and replaces an encapsulated document with a dummy, so little of those is left to show, but they are not acquisitions and are not passed as one.
+
+A held file is refused with the code `burned_in_confirmation_required` and nothing written for it unless the request carries `confirm_burned_in=true`; the rest of the batch is accepted, and a batch whose only refusals are these answers 200. The Upload dialog shows how many files need checking, asks the uploader to confirm they show no names, IDs, dates or other identifying text, and resubmits only those. `index_dicom --confirm-burned-in` is the same confirmation for an archive. The confirmation lands as `pixel_review = attested` on each instance that needed it, never on one the allowlist passed, and as counts and the flag in the upload's `Activity` metadata, with the actor as the row's user. The gate applies only with de-identification on.
+
+Neither outcome is a check by the platform. `not_required` rests on what the header says the object is, and `attested` on the uploader's word, so no surface may say an image was checked by anything but its uploader. Widening the allowlist stores a kind of object with nobody having looked at it and stamps it `YES`, which is why the allowlist is part of the pinned digest.
 
 ## API endpoints
 
@@ -136,8 +178,8 @@ All endpoints are mounted at `/plugin/dicom/api/v1/`.
 
 | Method | Path | Description |
 |---|---|---|
-| `POST` | `/dicom/upload/` | Upload one or more DICOM files. Returns real study hashes, a per-file accept/reject report keyed by `index`, and description `warnings`. Optional `attached_to_type` + `attached_to_id` query params attach the resulting study to a recording; `confirm_burned_in=true` confirms the batch's images show no identifying text ([Burned-in text](#burned-in-text)). |
-| `GET` | `/dicom/studies/` | List active studies owned by or shared with the caller (includes `is_author`, `can_share` and `deidentification_version`). |
+| `POST` | `/dicom/upload/` | Upload one or more DICOM files. Returns real study hashes, a per-file accept/reject report keyed by `index`, and description `warnings`. Optional `attached_to_type` + `attached_to_id` query params attach the resulting study to a recording, named by its public hash; `confirm_burned_in=true` confirms the batch's images show no identifying text ([Burned-in text](#burned-in-text)). |
+| `GET` | `/dicom/studies/` | List active studies owned by or shared with the caller (includes `is_author`, `can_share`, `deidentification_version` and `created_at`, on the [upload time](#upload-time) rule). |
 | `GET` | `/dicom/studies/{hash}/` | Study detail with per-series instance counts. |
 | `GET` | `/dicom/studies/{hash}/ohif-json/` | DICOMweb JSON consumed by OHIF. |
 | `DELETE` | `/dicom/studies/{hash}/` | Trash a study (soft delete; author, superuser, or can_write grant). |
@@ -151,6 +193,14 @@ All endpoints are mounted at `/plugin/dicom/api/v1/`.
 | `GET` | `/dicomweb/studies/{study_uid}/series/{series_uid}/metadata` | WADO-RS: instance metadata of one series. |
 
 Every endpoint annotates its `Activity` row via `log_activity` with a `dicom.<resource>.<action>` verb, and the purge task and the import command open a `with_system_activity` scope; the full set is in the [verb registry](#verb-registry).
+
+### Upload time
+
+A study's `created_at` is served exact to its author and to superusers, and truncated to the first of its month (UTC) to every other reader, in the list and the detail alike. It is the recording rule, applied through the same function: an upload usually follows the examination within hours, so the exact time would return the acquisition date the pass replaced with a dummy. No other surface serialises it; the DICOMweb responses and the attachments listing carry no upload time.
+
+### Attachment target
+
+`attached_to_id` is the recording's public hash, the 32-character identifier every recording response and the attachments listing carry. The 64-character content fingerprint is accepted too; several recordings can share one, so the first the caller may write is taken. A recording that does not exist and one the caller may not write both answer 404. The study is attached only by a batch that adds at least one new file: when every file is a duplicate, the duplicates' reports and the 400 say that nothing was attached.
 
 ### OHIF JSON format
 
@@ -169,7 +219,7 @@ Every endpoint annotates its `Activity` row via `log_activity` with a `dicom.<re
           "instances": [
             {
               "metadata": { "Columns": 512, "Rows": 512, ... },
-              "url": "dicomweb:http://host/plugin/dicom/api/v1/dicom/wado/?objectUID=..."
+              "url": "dicomweb:/plugin/dicom/api/v1/dicom/wado/?objectUID=..."
             }
           ]
         }
@@ -178,6 +228,8 @@ Every endpoint annotates its `Activity` row via `log_activity` with a `dicom.<re
   ]
 }
 ```
+
+Instance URLs are root-relative, like the `platform` source's `wadoUriRoot`: the viewer and the endpoint share an origin, and a URL built from the request's scheme reads `http:` behind a TLS proxy that does not forward it, which the browser then blocks as mixed content.
 
 Values are numbers where DICOM's are numeric strings (DS, IS), because OHIF does arithmetic on this metadata, and a tag the file did not carry is left out rather than sent empty — OHIF reads an empty `WindowWidth` as a zero-width window and renders every image as a black-and-white threshold. Instances are ordered by numeric `InstanceNumber`. `RescaleSlope` / `RescaleIntercept` are sent so CT values reach OHIF in HU: OHIF takes the modality LUT from this metadata, not from the file.
 
@@ -193,9 +245,13 @@ OHIF's WASM-based decoders (JPEG-LS, JPEG 2000, HTJ2K) need `SharedArrayBuffer`,
 
 `DELETE /dicom/studies/{hash}/` sets `deleted_at`; the rows and files stay on disk but drop out of every listing and read path. After `DICOM_TRASH_RETENTION_DAYS` (default 30) the `dicom.purge_deleted_dicom_studies` Celery task hard-deletes the study tree — the GDPR Art. 17 erasure half of the soft-delete contract, the imaging analog of `purge_deleted_media`. It is scheduled every 3 hours via the plugin's `CELERY_BEAT_SCHEDULE` contribution.
 
-The task is ⚠️ load-bearing. Its purge filter (`deleted_at__isnull=False, deleted_at__lt=cutoff`) is the line between erasing patient-identifying imaging past the window and reaping live studies. File unlinking happens in the `pre_delete` receiver ([signals.py](signals.py)) inside each per-study delete, so an unlink failure rolls that study's deletion back and the next run retries — rows and files never diverge. The same receiver fires on `erase_user`'s account cascade, so account erasure cleans the stored files too. An orphan branch reaps `pending` instances older than 24 hours (rows stranded between an upload's DB commit and its file move by a crashed request). Per-row deletes fire the audit signals inside the `with_system_activity` scope, so each erasure lands in `ObjectChangeLog` under one `dicom.purge` activity. See `TestPurgeDeletedDicomStudiesContract` in [tests/test_tasks.py](tests/test_tasks.py) before modifying.
+The task is ⚠️ load-bearing. Its purge filter (`deleted_at__isnull=False, deleted_at__lt=cutoff`) is the line between erasing patient-identifying imaging past the window and reaping live studies. File unlinking happens in the `pre_delete` receiver ([signals.py](signals.py)) inside each per-study delete, so an unlink failure rolls that study's deletion back and the next run retries — rows and files never diverge. The same receiver fires on `erase_user`'s account cascade, so account erasure cleans the stored files too. An orphan branch reaps `pending` instances older than 24 hours (rows stranded between an upload's DB commit and its file move by a crashed request). A staging sweep then unlinks `*.dcm` and `*.dcm.deid` files in `DICOM_STAGING_PATH` whose modification time is older than the same 24 hours (`STAGING_FILE_MAX_AGE`) and which no `pending` row names: what a request that died before its transaction leaves, and the rewritten copy of a reaped orphan, neither of which any row leads to. It touches no other name and no other directory, and its count is the task result's `swept`. Per-row deletes fire the audit signals inside the `with_system_activity` scope, so each erasure lands in `ObjectChangeLog` under one `dicom.purge` activity. See `TestPurgeDeletedDicomStudiesContract` in [tests/test_tasks.py](tests/test_tasks.py) before modifying.
 
 There is no trash listing / restore endpoint yet; until the retention window closes an operator can clear `deleted_at` manually.
+
+### Account erasure and preserved originals
+
+With preservation on, `erase_user` prints the originals-volume directories of the subject's uploads for the operator to remove out of band, since the platform never reads that volume. For DICOM it lists `plugins/dicom/<stored prefix>` for each rewritten file that still has an instance row. An original preserved for a file the pass refused, or for an instance since purged, has no row: only the `author_id` in its `manifest.json` ties it to the subject. The listing therefore ends with a line naming `plugins/dicom/*/manifest.json` and the subject's id, and completing the erasure means searching those manifests for it, for example with `grep -l '"author_id": <id>' <originals>/plugins/dicom/*/manifest.json`, and removing each directory found.
 
 ## Management command
 
@@ -203,7 +259,7 @@ There is no trash listing / restore endpoint yet; until the retention window clo
 python manage.py index_dicom /path/to/archive/ --user admin [--dry-run] [--resume] [--confirm-burned-in]
 ```
 
-Bulk-imports an existing DICOM directory tree through the same [ingest.py](ingest.py) logic as the upload endpoint: each candidate file is prepared, rewritten through the header pass to `DICOM_UPLOAD_PATH` (the archive is only read), and persisted as a `ready` instance. `--resume` skips files whose as-archived SHA-256 already appears on one of the owning user's instances as `source_hash`, so a crashed run can be restarted without duplicates. Images that need a [burned-in text](#burned-in-text) check are held back and counted until the run carries `--confirm-burned-in`. The whole run opens a `with_system_activity("dicom.import", interface=command)` scope, so every row lands in the audit trail.
+Bulk-imports an existing DICOM directory tree through the same [ingest.py](ingest.py) logic as the upload endpoint: each candidate file is prepared, rewritten through the header pass to `DICOM_UPLOAD_PATH` (the archive is only read), and persisted as a `ready` instance. `--resume` skips files whose as-archived SHA-256 already appears on one of the owning user's instances as `source_hash`, so a crashed run can be restarted without duplicates. UIDs are replaced under the key of the user named by `--user`, the same key that user's uploads get. Files outside the [acquisition allowlist](#burned-in-text) are held back and counted until the run carries `--confirm-burned-in`. The whole run opens a `with_system_activity("dicom.import", interface=command)` scope, so every row lands in the audit trail.
 
 ## Settings / env vars
 
@@ -230,7 +286,7 @@ Bulk-imports an existing DICOM directory tree through the same [ingest.py](inges
 - Anyone who can read the study's *attached parent* (typically the recording acquired in the same session), through the `can_read_via_attachment` extension in [permissions.py](permissions.py). Attachment-inherited studies do not appear in the flat study list; they surface through their parent, and through the [attachments listing](../../recordings/README.md#attachments).
 - Anyone who can read a dataset holding the study, through the library's dataset extension. A study is a dataset, collection and tag member by its hash through the [item-type registry](../../library/README.md#member-types), never in a release-gated dataset, since the gate has no way to hide a study before its release; "Add to dataset" on the study list adds one.
 
-**A study stored without the header pass is given to nobody who reads it under `apply_middleware`**, however the grant is reached: a dataset, an attachment or a direct row. The plugin registers that as a terms refusal (`register_terms_refusal` in [epicurrents/permissions.py](../../epicurrents/permissions.py)), so every surface that resolves a study inherits it; the study's own author is exempt, and a dataset listing leaves such a study out before it pages (`withheld_under_middleware` on the item type), which [tests/test_dataset_members.py](tests/test_dataset_members.py) pins to the refusal. No DICOM path de-identifies per grant, so this is the one thing a de-identifying grant changes for a study: what the platform knows to be raw is withheld rather than served.
+**A study stored without the header pass is given to nobody who reads it under `apply_middleware`**, however the grant is reached: a dataset, an attachment or a direct row. The plugin registers that as a terms refusal (`register_terms_refusal` in [epicurrents/permissions.py](../../epicurrents/permissions.py)), so every surface that resolves a study inherits it; the study's own author is exempt, and a dataset listing leaves such a study out before it pages (`withheld_under_middleware` on the item type) for a reader who would be refused it, while the dataset's author and superusers are listed every member so one can be removed and a row carries `platform_pass` (`none` or `dicom-header`) for the interface's "stored as uploaded" cue, which [tests/test_dataset_members.py](tests/test_dataset_members.py) pins to the refusal. The study list and the [DICOMweb](#dicomweb) search read grant rows in one query instead of resolving each study, so `listed_studies` in [dicomweb.py](dicomweb.py) applies the same refusal itself; [tests/test_dicomweb.py](tests/test_dicomweb.py) holds it to the per-object answer with a row written through the ORM, no endpoint writing one today. No DICOM path de-identifies per grant, so this is the one thing a de-identifying grant changes for a study: what the platform knows to be raw is withheld rather than served.
 
 Write access (trash, future patch) requires authorship, superuser status, or a `can_write` grant; sharing requires authorship, superuser status, or a `can_share` grant. Series and instances are not independently shareable; access is always inherited from the study. Trashed studies are hidden from every surface — including attachment inheritance — and direct hash lookups return 404 rather than 403, so access denials are indistinguishable from missing studies.
 
@@ -264,7 +320,7 @@ The signed-in viewer opens a study in its radiology view, which frames the study
 
 The `platform` data source is the plugin's own DICOMweb surface under `/plugin/dicom/api/v1/dicomweb`: QIDO-RS search over studies and over a study's series, and WADO-RS metadata for a study or a series. Everything is answered from the indexed rows in [dicomweb.py](dicomweb.py), never by reading a file, and returned as `application/dicom+json` encoded by pydicom, so each attribute carries its VR and DS / IS values are numbers. Pixels still come from [WADO-URI](#wado-uri), which the configuration names as the source's `wadoUriRoot` with `imageRendering: 'wadouri'`; there is no WADO-RS frame or bulkdata retrieval and no STOW.
 
-**Scope and UID resolution.** The search lists what the Vue study list lists — owned studies and direct read grants, never attachment-inherited ones. A `StudyInstanceUID` is unique per author, so two users who uploaded the same study hold two copies, and DICOMweb addresses a study by UID alone. A UID therefore resolves to the caller's own copy, then to the lowest-keyed listed copy, then to the lowest-keyed copy readable by any route; the search collapses copies to the same choice, so a list row and the study it opens are one copy. A series UID is looked up only inside the resolved copy. An unreadable, trashed or unknown study or series answers 404.
+**Scope and UID resolution.** The search lists what the Vue study list lists — owned studies and direct read grants, never attachment-inherited ones. A `StudyInstanceUID` is unique per author, and DICOMweb addresses a study by UID alone. With de-identification on, two users who uploaded the same study hold two copies under two [UIDs](#de-identification), so a UID names one copy and a reader granted both sees two studies; stored as uploaded, the copies share the source UID. For that case a UID resolves to the caller's own copy, then to the lowest-keyed listed copy, then to the lowest-keyed copy readable by any route; the search collapses copies to the same choice, so a list row and the study it opens are one copy. A series UID is looked up only inside the resolved copy. An unreadable, trashed or unknown study or series answers 404.
 
 **Matching.** `StudyInstanceUID` takes a list (backslash- or comma-separated); `PatientName`, `PatientID`, `AccessionNumber` and `StudyDescription` match case-insensitively on the literal part of a `*` / `?` pattern; `StudyDate` takes a date or a range open at either end; `ModalitiesInStudy` matches any of the listed modalities. Other attributes are ignored, as QIDO allows, and `includefield` is ignored too (`qidoSupportsIncludeField: false`): the response attribute set is fixed. `limit` and `offset` page the result; an unreadable value is treated as absent.
 
@@ -336,6 +392,8 @@ A † marks a verb emitted from a Celery task or management command rather than 
 - **WASM codecs**: OHIF requires `SharedArrayBuffer`. Set `ENABLE_CROSS_ORIGIN_ISOLATION=True` in `.env` to enable it deployment-wide — see [Cross-origin isolation](#cross-origin-isolation) for the requirement and the reverse-proxy implications.
 - **Multi-frame instances**: Each frame is listed as a separate OHIF instance with a `&frame=N` URL suffix. OHIF handles this correctly for CT/PET multi-frame, but older single-frame-oriented extensions may show duplicates.
 - **Changing `DICOM_UID_KEY`**: every UID is keyed on it, so a study uploaded before the change and again after becomes two studies. Keep the key with the rest of `.env`.
+- **One study, two uploaders**: UIDs are keyed on the author as well, so the halves of a study uploaded from two accounts are two studies and stay so. Import an archive for the account that will own it.
+- **Derived series ask for a confirmation**: reformats, ADC maps, dose reports and anything else whose Image Type does not begin `ORIGINAL`, `PRIMARY` are held for the uploader even under CT, MR or PET, as is a file with no Image Type. See [Burned-in text](#burned-in-text).
 - **Re-uploading a downloaded file**: a file fetched from the platform already carries replaced UIDs, which the pass replaces again, so it arrives as a new study rather than joining the one it came from.
 - **Dummied dates**: every stored date is `19850101`, so QIDO date filters and the study list's date column say nothing about when a study was acquired. A deliberate result of [de-identification](#de-identification), not a fault.
 - **Attaching after upload**: a study is attached to a recording only by the upload's `attached_to_type` / `attached_to_id`; there is no endpoint to attach, move or detach one later.
@@ -371,7 +429,7 @@ The OHIF JSON is missing or misstating the windowing or rescale tags — see [OH
 
 ### 🟡 Redact burned-in text
 
-The [burned-in text](#burned-in-text) gate rests on the uploader's confirmation. An optional Celery stage running `presidio-image-redactor` on the same modalities would check the pixels on the platform and could replace or supplement it; the attested instances are findable by `pixel_review`. Too heavy for the synchronous upload path ([dicom-deidentification-tools.md](../../docs/engineering-notes/dicom-deidentification-tools.md)).
+The [burned-in text](#burned-in-text) gate rests on the uploader's confirmation. An optional Celery stage running `presidio-image-redactor` on the attested instances would check the pixels on the platform and could replace or supplement it; the attested instances are findable by `pixel_review`. Too heavy for the synchronous upload path ([dicom-deidentification-tools.md](../../docs/engineering-notes/dicom-deidentification-tools.md)).
 
 ### 🟢 Attach after upload
 

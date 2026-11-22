@@ -36,10 +36,13 @@ export interface Collection {
     warnings?: NameWarning[]
 }
 
+/**
+ * A row of an item listing. The member is named by `object_hash`; its own primary key is served to nobody. A
+ * collection, read by its author alone, lists its rows in the order they were added.
+ */
 export interface CollectionItem {
     id: number
     content_type_id: number
-    object_id: string
     added_at: string
     /** Dataset items only — the containing folder, or null for the dataset root. */
     folder_id: number | null
@@ -62,16 +65,43 @@ export interface CollectionItem {
      * the current project can't open this type.
      */
     is_supported: boolean | null
+    /**
+     * For a member type that declares one, the pass the platform applied to the member's stored content, or
+     * `none` for content stored as uploaded; null for recordings, media files and types declaring none. A record of
+     * what was done, never an assurance about the content. Read it through `storedAsUploaded` in `#lib/platformPass`.
+     */
+    platform_pass?: string | null
 }
 
 /**
- * A row of a dataset's item listing. `id` and `object_id` are null where the row must not be addressable by the
- * caller: the members of a release-gated dataset as a reader who does not manage it sees them. Such a reader has no
- * item controls; key and match rows on `object_hash` instead.
+ * A row of a dataset's item listing. `id` is a sequential key served only to a caller who manages the dataset (its
+ * author, a superuser, a holder of a write grant), and null for every other reader, of a gated dataset or not, and
+ * for a pooled recording whose pool the caller does not manage. A row without it has no item controls; key and
+ * match rows on `object_hash` instead. The listing is ordered folder by folder as the dataset page walks the tree,
+ * and in a folder by the members a manager arranged, then the rest by the name each row shows, ties by the hash;
+ * never by `added_at`.
  */
-export interface DatasetItem extends Omit<CollectionItem, 'id' | 'object_id'> {
+export interface DatasetItem extends Omit<CollectionItem, 'id'> {
     id: number | null
-    object_id: string | null
+    /**
+     * The member's place among the arranged members of its folder, null for an unsorted one. Served where `id` is,
+     * to a caller who manages the dataset; null or absent for every other reader, who reads the order off the
+     * listing itself.
+     */
+    position?: number | null
+}
+
+/** An order action on a dataset item; see {@link orderDatasetItem}. */
+export type DatasetItemOrderAction = 'up' | 'down' | 'top' | 'bottom' | 'clear'
+
+/** A folder's members after an order action, in the listing's order. */
+export interface DatasetItemOrderResult {
+    /** How many rows the action wrote; 0 for one that changed nothing. */
+    changed: number
+    /** The folder that was arranged, null for the dataset root. */
+    folder_id: number | null
+    /** Each member's item id and position. An id is null for a pooled recording of a pool the caller does not manage. */
+    items: { id: number | null, position: number | null }[]
 }
 
 /** A presentation-only folder in a dataset's tree. */
@@ -428,8 +458,8 @@ export async function listAllDatasetItems(datasetId: number | string, shareToken
     return readAllPages(offset => listDatasetItems(datasetId, { limit: PAGE_SIZE, offset }, shareToken))
 }
 
-export async function addDatasetItem(datasetId: number | string, payload: { content_type_id: number; object_id: string }): Promise<CollectionItem> {
-    const response = await http.post<CollectionItem>(`/api/v1/library/datasets/${datasetId}/items/`, payload)
+export async function addDatasetItem(datasetId: number | string, payload: { content_type_id: number; object_id: string }): Promise<DatasetItem> {
+    const response = await http.post<DatasetItem>(`/api/v1/library/datasets/${datasetId}/items/`, payload)
     return response.data
 }
 
@@ -474,10 +504,30 @@ export async function moveDatasetItem(
     datasetId: number | string,
     itemId: number,
     folderId: number | null,
-): Promise<CollectionItem> {
-    const response = await http.post<CollectionItem>(
+): Promise<DatasetItem> {
+    const response = await http.post<DatasetItem>(
         `/api/v1/library/datasets/${datasetId}/items/${itemId}/move`,
         { folder_id: folderId },
+    )
+    return response.data
+}
+
+/**
+ * Move an item within the manual order of its folder: `up` and `down` swap it with its neighbour among the arranged
+ * members, `top` and `bottom` put it first or last among them, and `clear` returns it to the unsorted ones. On an
+ * unsorted item `up` and `bottom` arrange it last, `top` first, and `down` changes nothing. Dataset managers only.
+ * @param datasetId - The dataset's object hash or primary key.
+ * @param itemId - The item's id, as the listing serves it to a manager.
+ * @param action - The order action.
+ */
+export async function orderDatasetItem(
+    datasetId: number | string,
+    itemId: number,
+    action: DatasetItemOrderAction,
+): Promise<DatasetItemOrderResult> {
+    const response = await http.post<DatasetItemOrderResult>(
+        `/api/v1/library/datasets/${datasetId}/items/${itemId}/order`,
+        { action },
     )
     return response.data
 }
@@ -686,7 +736,7 @@ function appendFilters (query: URLSearchParams, filters?: DatasetBrowseFilters) 
 /**
  * One page of a dataset's recordings for the browser.
  * @param datasetId - The dataset's object hash or primary key.
- * @param params - `sort` is a key from the server's allowlist, or `subject.<key>`, prefixed with `-` for descending.
+ * @param params - `sort` is a key from the server's allowlist, or `subject.<key>`, prefixed with `-` for descending. The default, `order`, is the dataset's own order: the item listing's, the members a manager arranged first.
  * @param filters - Sent as repeated `modality`, `subject.<key>` and `tag` parameters, and a range as `subject.<key>.min` and `subject.<key>.max`.
  * @param shareToken - Share token the dataset is read with, for a reader without an account.
  */
@@ -967,14 +1017,15 @@ export interface TagWrite extends Tag {
 }
 
 /**
- * A tag on one object. `id` and `object_id` are null for a pooled recording listed to anyone but a manager of its
- * pool; `object_hash` names a recording or a media file to whoever is listed it.
+ * A tag on one object. `id` is a sequential key served to a superuser, to the author of the tagged object and, for
+ * a pooled recording, to a manager of its pool; null for every other caller. `object_hash` names a recording, a
+ * media file or a member of a registered type to whoever is listed it, and is what `untagObject` takes. The tagged
+ * object's own primary key is served to nobody.
  */
 export interface TaggedItem {
     id: number | null
     tag_id: number
     content_type_id: number
-    object_id: string | null
     object_hash: string | null
     tagged_at: string
 }

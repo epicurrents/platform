@@ -5,6 +5,9 @@ import type { DatasetItem } from '#api/library'
 import type { RecordingAttachment } from '#api/recordings'
 import type { StudyDescription } from '#viewer/datasetStudies'
 
+/** The `meta` a code of one standard is sent with; see `ViewerPlugin.codeMeta`. */
+export type CodeMetaProvider = () => unknown | Promise<unknown>
+
 export interface ProjectNavLink {
     /** Stable identifier used as a Vue key and for debugging. */
     id: string
@@ -31,6 +34,53 @@ export interface ProjectNavLink {
 }
 
 /**
+ * One dataset behind a session token, as `resolveSessionDatasets` returns it.
+ * `shareToken` is per dataset rather than per session, so each is loaded under
+ * its own grant. `preload` loads the dataset's members up front for this
+ * session, as the dataset's own `preload_members` flag does for every reader;
+ * a project whose session workflow spans the members sets it here rather than
+ * on a dataset the session only reads.
+ */
+export interface SessionDatasetRef {
+    id: number
+    name: string
+    preload?: boolean
+    share_token: string
+}
+
+/**
+ * One kind of item a plugin lists in the viewer. Each answer is the `StudyDescription` the viewer lists an item by,
+ * so the viewer never learns what the item is.
+ */
+export interface ViewerItemSource {
+    /**
+     * Query parameters of a viewer URL that name this source's items, as `files` names recordings. A URL carrying one
+     * opens the viewer on the items it names rather than blank.
+     */
+    params: string[]
+    /**
+     * The items the viewer URL's query names, in the order it names them; empty when it names none. A rejection means
+     * an item could not be found or read, and the viewer reports it as it does for a recording.
+     * @param query - The viewer route's query.
+     */
+    fromQuery: (query: LocationQuery) => Promise<StudyDescription[]>
+    /**
+     * Describe an attachment of a type this source owns, which the viewer lists after the recording it is attached
+     * to; null for any other type, or for one of its own it cannot open.
+     * @param attachment - The attachment as the recording attachments listing gives it.
+     * @param shareToken - Share token the recording was read with, if any.
+     */
+    describeAttachment?: (attachment: RecordingAttachment, shareToken?: string) => StudyDescription | null
+    /**
+     * Describe a dataset member of a type this source owns, as the dataset item listing gives it (`object_type`,
+     * `object_hash`, `object_name`); null for any other type, or for one of its own it cannot open.
+     * @param item - The member as the dataset item listing gives it.
+     * @param shareToken - Share token the dataset was opened with, if any.
+     */
+    describeDatasetItem?: (item: DatasetItem, shareToken?: string) => StudyDescription | null
+}
+
+/**
  * Plugin interface that project-specific modules implement to customise the
  * Epicurrents viewer without modifying the core ViewerView.
  *
@@ -48,16 +98,7 @@ export interface ProjectNavLink {
  * import { onEvent, offEvent, emitEvent } from '../eventBus'
  * ```
  */
-/** The `meta` a code of one standard is sent with; see `ViewerPlugin.codeMeta`. */
-export type CodeMetaProvider = () => unknown | Promise<unknown>
-
 export interface ViewerPlugin {
-    /**
-     * Optional Vue component rendered as a floating overlay inside the viewer
-     * page.  When provided, `ViewerView` mounts it via `<component :is="...">` and
-     * passes `datasetId: number | null` as a prop.  The component is responsible
-     * for deciding whether to render anything (e.g. by checking the user's role).
-     */
     /**
      * Additional routes registered into the application router at startup.
      * Use this to add project-specific pages (e.g. a student join page) that
@@ -110,6 +151,12 @@ export interface ViewerPlugin {
      */
     iconLibraries?: Record<string, Record<string, string>>
 
+    /**
+     * Optional Vue component rendered as a floating overlay inside the viewer
+     * page.  When provided, `ViewerView` mounts it via `<component :is="...">` and
+     * passes `datasetId: number | null` as a prop.  The component is responsible
+     * for deciding whether to render anything (e.g. by checking the user's role).
+     */
     viewerPanel?: Component | null
 
     /**
@@ -155,7 +202,9 @@ export interface ViewerPlugin {
      * `resolveSessionDatasets`, and every item of a `?files=` link, within the
      * viewer's eager load limit, and otherwise only the items the platform
      * holds no metadata to list. The rest are listed and load when opened, so
-     * a workflow spanning a dataset's members needs one of the two.
+     * a workflow spanning a dataset's members needs one of the two. An
+     * attachment listed under a recording is not a study of the dataset: it
+     * always loads when opened and is never passed.
      *
      * @param epic - The Epicurrents application instance.
      * @param studies - The studies loaded up front, in the order they were
@@ -189,51 +238,4 @@ export interface ViewerPlugin {
      * for a new type. Every source of every plugin and of the project is consulted.
      */
     viewerItems?: ViewerItemSource[]
-}
-
-/**
- * One kind of item a plugin lists in the viewer. Each answer is the `StudyDescription` the viewer lists an item by,
- * so the viewer never learns what the item is.
- */
-export interface ViewerItemSource {
-    /**
-     * Query parameters of a viewer URL that name this source's items, as `files` names recordings. A URL carrying one
-     * opens the viewer on the items it names rather than blank.
-     */
-    params: string[]
-    /**
-     * The items the viewer URL's query names, in the order it names them; empty when it names none. A rejection means
-     * an item could not be found or read, and the viewer reports it as it does for a recording.
-     * @param query - The viewer route's query.
-     */
-    fromQuery: (query: LocationQuery) => Promise<StudyDescription[]>
-    /**
-     * Describe an attachment of a type this source owns, which the viewer lists after the recording it is attached
-     * to; null for any other type, or for one of its own it cannot open.
-     * @param attachment - The attachment as the recording attachments listing gives it.
-     * @param shareToken - Share token the recording was read with, if any.
-     */
-    describeAttachment?: (attachment: RecordingAttachment, shareToken?: string) => StudyDescription | null
-    /**
-     * Describe a dataset member of a type this source owns, as the dataset item listing gives it (`object_type`,
-     * `object_hash`, `object_name`); null for any other type, or for one of its own it cannot open.
-     * @param item - The member as the dataset item listing gives it.
-     * @param shareToken - Share token the dataset was opened with, if any.
-     */
-    describeDatasetItem?: (item: DatasetItem, shareToken?: string) => StudyDescription | null
-}
-
-/**
- * One dataset behind a session token, as `resolveSessionDatasets` returns it.
- * `shareToken` is per dataset rather than per session, so each is loaded under
- * its own grant. `preload` loads the dataset's members up front for this
- * session, as the dataset's own `preload_members` flag does for every reader;
- * a project whose session workflow spans the members sets it here rather than
- * on a dataset the session only reads.
- */
-export interface SessionDatasetRef {
-    id: number
-    name: string
-    preload?: boolean
-    share_token: string
 }

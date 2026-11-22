@@ -172,7 +172,15 @@ def _refused_under_terms(user: Any, obj: Any, terms: ReadAccessTerms) -> ReadAcc
     """Return *terms*, or a denial when a registered terms refusal applies to them."""
     if not (terms.granted and terms.apply_middleware):
         return terms
-    rules = _TERMS_REFUSALS.get(getattr(getattr(obj, "_meta", None), "label_lower", None), ())
+    meta = getattr(obj, "_meta", None)
+    if meta is None:
+        return terms
+    # A proxy or multi-table subclass of a registered model holds the same content, so the rules of its concrete
+    # model and of every model it inherits from apply to it; matching the instance's own label alone lets it through.
+    # ``concrete_model`` answers for a proxy, the parent list for multi-table inheritance.
+    models = [meta.model, meta.concrete_model, *meta.get_parent_list()]
+    labels = dict.fromkeys(model._meta.label_lower for model in models if model is not None)
+    rules = [rule for label in labels for rule in _TERMS_REFUSALS.get(label, ())]
     if not rules:
         return terms
     if user is not None and getattr(user, "is_authenticated", False) and getattr(obj, "author_id", None) == user.pk:
@@ -354,8 +362,10 @@ def get_read_access_result(user: Any, obj: Any, share_token: str | None = None) 
     3. Direct ``AccessRight`` query (user, group, or share-token target).
        Returns metadata from the first matching row.
     4. Registered extension checkers (e.g. Dataset membership).
-       Extensions are only consulted when no direct ``AccessRight`` matched;
-       they always yield default metadata (``apply_middleware=False``).
+       Extensions are only consulted when no direct ``AccessRight`` matched.
+       One that returns ``ReadAccessTerms`` carries the terms of the row it
+       inherited from, ``apply_middleware`` included; a plain ``True`` reads
+       as default metadata.
     5. Terms refusals registered for the object's model
        (:func:`register_terms_refusal`), applied to the grant 3 or 4 found:
        an object that cannot honour ``apply_middleware`` is denied to a caller
@@ -439,6 +449,47 @@ def get_read_access_result(user: Any, obj: Any, share_token: str | None = None) 
             return ReadAccessTerms(granted=True)
 
     return ReadAccessTerms(granted=False)
+
+
+def get_direct_read_terms(
+    user: Any, content_type: Any, object_ids, share_token: str | None = None
+) -> dict[str, ReadAccessTerms]:
+    """The terms of the direct ``AccessRight`` row this caller reads each of *object_ids* by, keyed by object id.
+
+    The batch form of step 3 of :func:`get_read_access_result`, for a listing that has to agree with the per-object
+    answer without a query per row: the same targets (the user, their groups, a presented share token), the same
+    expiry rule and the same ranking, the caller's own row first and the de-identifying row among the rest. An object
+    with no direct row is absent, which is where the per-object check goes on to extensions. Gates, extensions and
+    terms refusals are not consulted, and a superuser gets what their rows say rather than the fast path.
+    """
+    permission_model = _resolve_read_permission_model()
+    keys = [str(object_id) for object_id in object_ids]
+    if permission_model is None or not keys:
+        return {}
+    target_filter = Q()
+    user_id = getattr(user, "pk", None)
+    if user_id is not None and getattr(user, "is_authenticated", False):
+        target_filter |= Q(access_target_id=user_id)
+        group_ids = list(user.groups.values_list("id", flat=True))
+        if group_ids:
+            target_filter |= Q(access_target_group_id__in=group_ids)
+    token_value = (share_token or "").strip()
+    if token_value:
+        target_filter |= Q(public_share_token=token_value)
+    if not target_filter:
+        return {}
+    rows = (
+        permission_model.objects.filter(content_type=content_type, object_id__in=keys, can_read=True)
+        .filter(Q(expires_at__isnull=True) | Q(expires_at__gt=timezone.now()))
+        .filter(target_filter)
+        .order_by(F("access_target_id").asc(nulls_last=True), "-apply_middleware")
+        .values_list("object_id", "apply_middleware")
+    )
+    found: dict[str, ReadAccessTerms] = {}
+    for object_id, apply_middleware in rows:
+        # The first row of an object in this order is the one the per-object check takes.
+        found.setdefault(object_id, ReadAccessTerms(granted=True, apply_middleware=apply_middleware))
+    return found
 
 
 def get_federated_read_access_result(peer, remote_user_id: str, obj) -> ReadAccessTerms:

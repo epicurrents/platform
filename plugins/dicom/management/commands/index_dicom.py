@@ -22,11 +22,12 @@ Options
             is in the archive, which with de-identification on is not the hash
             of the stored file.
 --confirm-burned-in
-            Confirm that the archive's images show no identifying text in
-            their pixels. Without it, an ultrasound, secondary capture or other
-            image, or one flagged Burned In Annotation YES, is held back and
-            counted, as the upload endpoint refuses it without the
-            confirmation. Ignored with de-identification off.
+            Confirm that the archive's files show no identifying text or
+            features. Without it, every file outside the acquisition allowlist
+            (``ingest.pixel_review_required``: anything but an original CT, MR
+            or PET acquisition with no flag set) is held back and counted, as
+            the upload endpoint refuses it without the confirmation. Ignored
+            with de-identification off.
 
 The command recursively walks the given directory, treating every file with
 the ``.dcm`` extension *or* no extension *or* a ``DICM`` magic byte sequence
@@ -69,7 +70,7 @@ class Command(BaseCommand):
         parser.add_argument(
             "--confirm-burned-in",
             action="store_true",
-            help="Confirm the images show no identifying text in their pixels (ultrasound and similar).",
+            help="Confirm the files outside the acquisition allowlist show no identifying text or features.",
         )
         parser.add_argument(
             "--resume",
@@ -172,7 +173,11 @@ class Command(BaseCommand):
                 dst_path = os.path.join(upload_path, stored_name)
                 try:
                     prepared = prepare_file(
-                        src_path, target_path=dst_path, source_hash=file_hash, confirm_burned_in=confirm_burned_in
+                        src_path,
+                        target_path=dst_path,
+                        author_id=user.pk,
+                        source_hash=file_hash,
+                        confirm_burned_in=confirm_burned_in,
                     )
                 except PixelReviewRequired:
                     held += 1
@@ -257,7 +262,7 @@ class Command(BaseCommand):
         if held:
             self.stdout.write(
                 self.style.WARNING(
-                    f"Held back {held} image(s) that may show identifying text in their pixels. Check them, then "
+                    f"Held back {held} image(s) that may show identifying text or features. Check them, then "
                     "re-run with --confirm-burned-in (and --resume to skip what was imported)."
                 )
             )

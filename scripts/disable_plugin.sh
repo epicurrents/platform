@@ -77,5 +77,14 @@ echo "--- Step 2/2: Rebuilding frontend..."
 "$SCRIPT_DIR/rebuild-frontend.sh"
 echo ""
 
+# The restart command is printed for the runtime this host has, from the helper
+# every operator script shares. This script drives no container itself, so a host
+# with no runtime is not refused; the hint then names Docker, the helper's
+# fallback.
+# shellcheck source=scripts/lib/compose.sh
+. "$SCRIPT_DIR/lib/compose.sh"
+compose_detect_runtime
+COMPOSE+=(-f "$ROOT/docker-compose.yml")
+
 echo "==> Plugin '$PLUGIN' disabled (its data was left intact). Restart the stack:"
-echo "    docker compose -f $ROOT/docker-compose.yml up -d"
+echo "    $(compose_command_line) up -d"

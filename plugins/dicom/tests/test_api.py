@@ -21,9 +21,6 @@ from plugins.dicom.tests.conftest import STUDIES_URL, UPLOAD_URL, WADO_URL, stor
 STUDY_UID = "1.2.826.0.1.5555001"
 SERIES_UID = "1.2.826.0.1.5555001.1"
 SOP_UID = "1.2.826.0.1.5555001.1.1"
-# The UIDs an upload stores, replaced by the de-identification pass.
-STORED_STUDY_UID = stored_uid(STUDY_UID)
-STORED_SOP_UID = stored_uid(SOP_UID)
 
 
 def _upload(client, *payloads, **extra_params):
@@ -54,20 +51,20 @@ class TestUpload:
 
         study = DicomStudy.objects.get(content_hash=body["studies"][0]["hash"])
         assert study.author == user
-        assert study.study_instance_uid == STORED_STUDY_UID
+        assert study.study_instance_uid == stored_uid(STUDY_UID, user)
         assert study.num_instances == 1
         assert study.patient_name == ""
 
-        inst = DicomInstance.objects.get(sop_instance_uid=STORED_SOP_UID)
+        inst = DicomInstance.objects.get(sop_instance_uid=stored_uid(SOP_UID, user))
         assert inst.status == DicomInstance.Status.READY
         assert (upload_dir / inst.stored_name).exists()
         assert not any(staging_dir.iterdir())
 
     def test_upload_records_the_modality_lut(self, auth_client, make_dicom_bytes):
-        client, _ = auth_client
+        client, user = auth_client
         payload = make_dicom_bytes(sop_uid=SOP_UID, extra={"RescaleSlope": "1", "RescaleIntercept": "-1024"})
         assert _upload(client, payload).json()["accepted"] == 1
-        inst = DicomInstance.objects.get(sop_instance_uid=STORED_SOP_UID)
+        inst = DicomInstance.objects.get(sop_instance_uid=stored_uid(SOP_UID, user))
         assert (inst.rescale_slope, inst.rescale_intercept) == ("1", "-1024")
 
     def test_author_gets_self_access_right(self, auth_client, make_dicom_bytes):
@@ -113,19 +110,19 @@ class TestUpload:
         assert rejected and rejected[0]["error"]
 
     def test_duplicate_ready_instance_rejected(self, auth_client, make_dicom_bytes):
-        client, _ = auth_client
+        client, user = auth_client
         payload = make_dicom_bytes(study_uid=STUDY_UID, series_uid=SERIES_UID, sop_uid=SOP_UID)
         assert _upload(client, payload).status_code == 200
         response = _upload(client, payload)
         assert response.status_code == 400  # sole file rejected as duplicate
-        assert DicomInstance.objects.filter(sop_instance_uid=STORED_SOP_UID).count() == 1
+        assert DicomInstance.objects.filter(sop_instance_uid=stored_uid(SOP_UID, user)).count() == 1
 
     def test_reupload_replaces_failed_instance(self, auth_client, make_dicom_bytes, dicom_dirs):
-        client, _ = auth_client
+        client, user = auth_client
         upload_dir, _ = dicom_dirs
         payload = make_dicom_bytes(study_uid=STUDY_UID, series_uid=SERIES_UID, sop_uid=SOP_UID)
         _upload(client, payload)
-        inst = DicomInstance.objects.get(sop_instance_uid=STORED_SOP_UID)
+        inst = DicomInstance.objects.get(sop_instance_uid=stored_uid(SOP_UID, user))
         old_stored_name = inst.stored_name
         inst.status = DicomInstance.Status.FAILED
         inst.save(update_fields=["status"])
@@ -151,9 +148,12 @@ class TestUpload:
         hash_b = _upload(client_b, make_dicom_bytes(**payload_kwargs)).json()["studies"][0]["hash"]
 
         assert hash_a != hash_b
-        assert DicomStudy.objects.filter(study_instance_uid=STORED_STUDY_UID).count() == 2
         study_a = DicomStudy.objects.get(content_hash=hash_a)
         study_b = DicomStudy.objects.get(content_hash=hash_b)
+        # Each copy carries its own author's replacement, so the two share no UID.
+        assert study_a.study_instance_uid == stored_uid(STUDY_UID, user_a)
+        assert study_b.study_instance_uid == stored_uid(STUDY_UID, user_b)
+        assert study_a.study_instance_uid != study_b.study_instance_uid
         assert study_a.author == user_a
         assert study_b.author == user_b
         # Each user's copy carries exactly their own instance.
@@ -162,6 +162,95 @@ class TestUpload:
         # Neither sees the other's copy.
         assert client_b.get(f"{STUDIES_URL}{hash_a}/").status_code == 404
         assert client_a.get(f"{STUDIES_URL}{hash_b}/").status_code == 404
+
+    def test_a_database_error_while_persisting_leaves_nothing_staged(
+        self, auth_client, make_dicom_bytes, dicom_dirs, monkeypatch
+    ):
+        from django.db import DataError
+
+        from plugins.dicom import urls
+
+        calls = []
+
+        def fail_on_the_second(**kwargs):
+            calls.append(kwargs)
+            if len(calls) == 2:
+                raise DataError("value too long for type character varying(16)")
+            return persist(**kwargs)
+
+        persist = urls.persist_instance
+        monkeypatch.setattr(urls, "persist_instance", fail_on_the_second)
+        _, user = auth_client
+        _, staging_dir = dicom_dirs
+        client = Client(raise_request_exception=False)
+        client.force_login(user)
+        response = _upload(client, make_dicom_bytes(), make_dicom_bytes())
+        assert response.status_code == 500
+        assert len(calls) == 2
+        # Neither the as-uploaded files nor their rewritten copies outlive the request.
+        assert not any(staging_dir.iterdir())
+        assert DicomStudy.objects.count() == 0
+
+    def test_an_unexpected_failure_while_staging_leaves_nothing_staged(
+        self, auth_client, make_dicom_bytes, dicom_dirs, monkeypatch
+    ):
+        from plugins.dicom import urls
+        from plugins.dicom.ingest import DeidentificationFailed
+
+        prepare = urls.prepare_file
+        seen = []
+
+        def refuse_the_second(source, **kwargs):
+            seen.append(source)
+            if len(seen) == 2:
+                raise DeidentificationFailed("The file could not be de-identified.")
+            return prepare(source, **kwargs)
+
+        def preservation_breaks():
+            raise RuntimeError("originals volume unavailable")
+
+        monkeypatch.setattr(urls, "prepare_file", refuse_the_second)
+        monkeypatch.setattr(urls, "should_preserve_failed", preservation_breaks)
+        _, user = auth_client
+        _, staging_dir = dicom_dirs
+        client = Client(raise_request_exception=False)
+        client.force_login(user)
+        response = _upload(client, make_dicom_bytes(), make_dicom_bytes())
+        assert response.status_code == 500
+        # The first file had been staged and rewritten when the second failed.
+        assert len(seen) == 2
+        assert not any(staging_dir.iterdir())
+        assert DicomStudy.objects.count() == 0
+
+    def test_header_values_are_cut_to_their_columns(self):
+        from types import SimpleNamespace
+
+        from plugins.dicom.ingest import extract_instance_fields, extract_series_fields, extract_study_fields
+        from plugins.dicom.models import DicomSeries
+
+        series = extract_series_fields(
+            SimpleNamespace(SliceThickness="0.699999988079071", SeriesDescription="d" * 300, Modality="CT")
+        )
+        assert series["slice_thickness"] == "0.69999998807907"
+        assert len(series["slice_thickness"]) == DicomSeries._meta.get_field("slice_thickness").max_length
+        assert len(series["series_description"]) == 256
+        assert series["modality"] == "CT"
+        study = extract_study_fields(SimpleNamespace(PatientAge="055YY", StudyDescription="s" * 300))
+        assert (study["patient_age"], len(study["study_description"])) == ("055Y", 256)
+        instance = extract_instance_fields(SimpleNamespace(RescaleSlope="1" * 40, Rows=512, PixelSpacing=["0.5"]))
+        assert (len(instance["rescale_slope"]), instance["rows"], instance["pixel_spacing"]) == (32, 512, ["0.5"])
+
+    def test_an_over_long_uid_is_refused_with_its_file(self):
+        from types import SimpleNamespace
+
+        from plugins.dicom.ingest import MissingUidsError, required_uids
+
+        long_uid = "1.2." + "3" * 61
+        with pytest.raises(MissingUidsError):
+            required_uids(SimpleNamespace(StudyInstanceUID=long_uid, SeriesInstanceUID="1.2", SOPInstanceUID="1.3"))
+        assert required_uids(
+            SimpleNamespace(StudyInstanceUID=long_uid[:64], SeriesInstanceUID="1.2", SOPInstanceUID="1.3")
+        ) == (long_uid[:64], "1.2", "1.3")
 
     def test_too_many_files_rejected(self, auth_client, settings):
         client, _ = auth_client
@@ -220,8 +309,81 @@ class TestUploadAttachment:
             attached_to_type="recording",
             attached_to_id=foreign.content_hash,
         )
-        assert response.status_code == 403
+        # The same answer as for a recording that does not exist.
+        assert response.status_code == 404
         assert DicomStudy.objects.count() == 0
+        missing = _upload(client, make_dicom_bytes(), attached_to_type="recording", attached_to_id="T" * 64)
+        assert (missing.status_code, missing.json()) == (response.status_code, response.json())
+
+    def test_attaches_by_the_recordings_public_hash(self, auth_client, user, make_dicom_bytes):
+        from model_bakery import baker
+
+        from recordings.models import Recording
+
+        client, _ = auth_client
+        public_hash = "AB12" * 8
+        recording = baker.make(Recording, author=user, status=Recording.Status.READY, stored_name=f"{public_hash}.edf")
+        response = _upload(client, make_dicom_bytes(), attached_to_type="recording", attached_to_id=public_hash.lower())
+        assert response.status_code == 200
+        assert DicomStudy.objects.get().attachment == recording
+
+    def test_a_shared_content_fingerprint_resolves_to_the_recording_the_caller_may_write(
+        self, auth_client, user, make_user, make_dicom_bytes
+    ):
+        from model_bakery import baker
+
+        from recordings.models import Recording
+
+        client, _ = auth_client
+        fingerprint = "C" * 64
+        baker.make(Recording, author=make_user(), status=Recording.Status.READY, content_hash=fingerprint)
+        own = baker.make(Recording, author=user, status=Recording.Status.READY, content_hash=fingerprint)
+        baker.make(Recording, author=make_user(), status=Recording.Status.READY, content_hash=fingerprint)
+        response = _upload(client, make_dicom_bytes(), attached_to_type="recording", attached_to_id=fingerprint)
+        assert response.status_code == 200
+        assert DicomStudy.objects.get().attachment == own
+
+    def test_a_batch_of_duplicates_says_the_study_was_not_attached(self, auth_client, recording, make_dicom_bytes):
+        client, _ = auth_client
+        payload = make_dicom_bytes()
+        assert _upload(client, payload).status_code == 200
+        response = _upload(client, payload, attached_to_type="recording", attached_to_id=recording.content_hash)
+        assert response.status_code == 400
+        assert "not attached" in response.json()["detail"]
+        assert DicomStudy.objects.get().attachment is None
+
+    def test_duplicates_beside_a_held_file_report_the_missing_attachment(
+        self, auth_client, recording, make_dicom_bytes
+    ):
+        client, _ = auth_client
+        payload = make_dicom_bytes()
+        assert _upload(client, payload).status_code == 200
+        response = _upload(
+            client,
+            payload,
+            make_dicom_bytes(modality="US"),
+            attached_to_type="recording",
+            attached_to_id=recording.content_hash,
+        )
+        assert response.status_code == 200
+        reports = {r["index"]: r for r in response.json()["files"]}
+        assert "not attached" in reports[0]["error"]
+        assert "not attached" not in reports[1]["error"]
+
+    def test_a_duplicate_beside_a_new_file_attaches_without_the_note(self, auth_client, recording, make_dicom_bytes):
+        client, _ = auth_client
+        payload = make_dicom_bytes(study_uid=STUDY_UID, series_uid=SERIES_UID, sop_uid=SOP_UID)
+        assert _upload(client, payload).status_code == 200
+        response = _upload(
+            client,
+            payload,
+            make_dicom_bytes(study_uid=STUDY_UID, series_uid=SERIES_UID, sop_uid=f"{SERIES_UID}.2"),
+            attached_to_type="recording",
+            attached_to_id=recording.content_hash,
+        )
+        assert response.status_code == 200
+        assert "not attached" not in json.dumps(response.json())
+        assert DicomStudy.objects.get().attachment == recording
 
     def test_attachment_rejected_for_multi_study_batch(self, auth_client, recording, make_dicom_bytes):
         client, _ = auth_client
@@ -273,6 +435,90 @@ class TestStudyListingAndDetail:
         assert len(items) == 1
         assert items[0]["is_author"] is False
 
+    def test_upload_time_is_exact_for_the_author_and_a_month_for_a_grantee(
+        self, auth_client, make_user, make_superuser, make_study
+    ):
+        from datetime import UTC, datetime
+
+        client, user = auth_client
+        other = make_user()
+        granted, own = make_study(other), make_study(user)
+        uploaded = datetime(2026, 3, 17, 14, 22, 33, tzinfo=UTC)
+        DicomStudy.objects.update(created_at=uploaded)
+        ct = ContentType.objects.get_for_model(granted, for_concrete_model=False)
+        AccessRight.objects.create(
+            content_type=ct, object_id=str(granted.pk), access_giver=other, access_target=user, can_read=True
+        )
+
+        def seen(client, study):
+            listed = {item["hash"]: item for item in client.get(STUDIES_URL).json()}[study.content_hash]
+            detail = client.get(f"{STUDIES_URL}{study.content_hash}/").json()
+            assert listed["created_at"] == detail["created_at"]
+            return datetime.fromisoformat(detail["created_at"].replace("Z", "+00:00"))
+
+        assert seen(client, granted) == datetime(2026, 3, 1, tzinfo=UTC)
+        assert seen(client, own) == uploaded
+        for exact_reader in (other, make_superuser()):
+            exact_client = Client()
+            exact_client.force_login(exact_reader)
+            assert seen(exact_client, granted) == uploaded
+
+    def test_list_says_which_studies_the_caller_may_share(self, auth_client, make_user, make_study):
+        client, user = auth_client
+        other = make_user()
+        readable, shareable, own = make_study(other), make_study(other), make_study(user)
+        ct = ContentType.objects.get_for_model(own, for_concrete_model=False)
+        for study, can_share in ((readable, False), (shareable, True)):
+            AccessRight.objects.create(
+                content_type=ct,
+                object_id=str(study.pk),
+                access_giver=other,
+                access_target=user,
+                can_read=True,
+                can_share=can_share,
+            )
+        listed = {item["hash"]: item["can_share"] for item in client.get(STUDIES_URL).json()}
+        assert listed == {readable.content_hash: False, shareable.content_hash: True, own.content_hash: True}
+        for study in (readable, shareable, own):
+            detail = client.get(f"{STUDIES_URL}{study.content_hash}/").json()
+            assert detail["can_share"] is listed[study.content_hash]
+
+    def test_listing_costs_the_same_queries_whatever_its_length(self, auth_client, make_user, make_study):
+        from django.db import connection
+        from django.test.utils import CaptureQueriesContext
+
+        client, user = auth_client
+        other = make_user()
+        ct = ContentType.objects.get_for_model(DicomStudy, for_concrete_model=False)
+
+        def grant_one():
+            study = make_study(other)
+            AccessRight.objects.create(
+                content_type=ct, object_id=str(study.pk), access_giver=other, access_target=user, can_read=True
+            )
+
+        def cost():
+            with CaptureQueriesContext(connection) as queries:
+                assert client.get(STUDIES_URL).status_code == 200
+            return len(queries)
+
+        grant_one()
+        cost()  # the first request also fills the content-type cache
+        one = cost()
+        for _ in range(4):
+            grant_one()
+        assert len(client.get(STUDIES_URL).json()) == 5
+        assert cost() == one
+
+    def test_detail_counts_ready_instances_per_series(self, auth_client, make_study):
+        client, user = auth_client
+        study = make_study(user, instance_count=3)
+        DicomInstance.objects.filter(pk=DicomInstance.objects.filter(series__study=study).first().pk).update(
+            status=DicomInstance.Status.FAILED
+        )
+        body = client.get(f"{STUDIES_URL}{study.content_hash}/").json()
+        assert [s["instance_count"] for s in body["series"]] == [2]
+
     def test_detail_includes_series(self, auth_client, make_study):
         client, user = auth_client
         study = make_study(user, instance_count=2)
@@ -301,9 +547,20 @@ class TestStudyListingAndDetail:
         body = response.json()
         assert body["studies"][0]["StudyInstanceUID"] == study.study_instance_uid
         url = body["studies"][0]["series"][0]["instances"][0]["url"]
-        assert url.startswith("dicomweb:")
-        assert "/plugin/dicom/api/v1/dicom/wado/" in url
+        # Root-relative: a scheme and host taken from the request would be wrong behind a TLS proxy.
+        assert url.startswith("dicomweb:/plugin/dicom/api/v1/dicom/wado/?")
         assert f"studyUID={study.study_instance_uid}" in url
+
+    def test_ohif_json_leaves_out_instances_that_are_not_ready(self, auth_client, make_study):
+        client, user = auth_client
+        study = make_study(user, instance_count=3)
+        failed = DicomInstance.objects.filter(series__study=study).first()
+        DicomInstance.objects.filter(pk=failed.pk).update(status=DicomInstance.Status.FAILED)
+        instances = client.get(f"{STUDIES_URL}{study.content_hash}/ohif-json/").json()["studies"][0]["series"][0][
+            "instances"
+        ]
+        assert len(instances) == 2
+        assert failed.sop_instance_uid not in {i["metadata"]["SOPInstanceUID"] for i in instances}
 
     def test_ohif_json_lists_each_frame_of_a_multiframe_instance(self, auth_client, make_study):
         client, user = auth_client

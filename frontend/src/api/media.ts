@@ -95,8 +95,10 @@ export async function listMediaFiles(opts: {
  * publicly but the integer PK is exposed only through this lookup, used
  * exclusively for membership writes.
  */
-export async function getMediaDetail(contentHash: string): Promise<MediaFileDetail> {
-    const res = await http.get<MediaFileDetail>(`/media/api/v1/${contentHash}`)
+export async function getMediaDetail(contentHash: string, shareToken?: string): Promise<MediaFileDetail> {
+    const res = await http.get<MediaFileDetail>(`/media/api/v1/${contentHash}`, {
+        params: shareToken ? { share_token: shareToken } : undefined,
+    })
     return res.data
 }
 

@@ -8,7 +8,8 @@ Run with the plugin test settings:
 ``/plugin/dicom/api/v1/`` prefix for every test; ``dicom_dirs`` points the
 storage paths at a per-test tmp_path so no test touches real volumes. The
 ``make_dicom_bytes`` / ``make_dicom_file`` factories build minimal valid
-DICOM CT image files with pydicom.
+DICOM CT image files with pydicom: original acquisitions by default, which
+the upload gate's allowlist stores without asking for a confirmation.
 """
 
 import io
@@ -19,13 +20,13 @@ import pytest
 CT_SOP_CLASS_UID = "1.2.840.10008.5.1.4.1.1.2"  # CT Image Storage
 
 
-def stored_uid(uid: str) -> str:
-    """Return the UID the de-identification pass stores for *uid* under the test settings' key."""
+def stored_uid(uid: str, author) -> str:
+    """Return the UID the de-identification pass stores for *uid* uploaded by *author*, under the test key."""
     from django.conf import settings
 
     from plugins.dicom.deidentify import hash_uid
 
-    return hash_uid(uid, settings.DICOM_UID_KEY)
+    return hash_uid(uid, settings.DICOM_UID_KEY, author.pk)
 
 
 @pytest.fixture(autouse=True)
@@ -84,6 +85,8 @@ def _build_dataset(
     ds.PatientID = patient_id
     ds.PatientSex = "O"
     ds.Modality = modality
+    # An original acquisition, so the default CT file is one the upload gate stores without a confirmation.
+    ds.ImageType = ["ORIGINAL", "PRIMARY", "AXIAL"]
     ds.StudyDate = "20260101"
     ds.StudyTime = "101500"
     ds.StudyDescription = "Test study"

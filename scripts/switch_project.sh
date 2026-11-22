@@ -5,7 +5,7 @@
 #
 # The script keeps db and redis running throughout. It stops only the
 # application services, runs activate/deactivate against PostgreSQL via
-# docker compose run, rebuilds the frontend, and restarts everything.
+# compose run (Docker or Podman), rebuilds the frontend, and restarts everything.
 #
 # NEVER run activate_project / deactivate_project directly on the host —
 # those commands would target the local SQLite dev database, not PostgreSQL,
@@ -20,24 +20,45 @@ if [[ "$NEW_PROJECT" == "-h" || "$NEW_PROJECT" == "--help" ]]; then
     echo "Usage: $0 <new-project-name>"
     exit 0
 fi
-if [[ -z "$NEW_PROJECT" || "$NEW_PROJECT" == -* ]]; then
+if [[ $# -ne 1 || -z "$NEW_PROJECT" || "$NEW_PROJECT" == -* ]]; then
     echo "Usage: $0 <new-project-name>" >&2
     exit 1
 fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(dirname "$SCRIPT_DIR")"
+
+# Every other bad name is refused here as well, before anything is stopped. Past
+# this point a name that activate_project would reject has already cost the
+# running services, the active project's deactivation and both env files.
+if [[ ! "$NEW_PROJECT" =~ ^[a-z_][a-z0-9_]*$ ]]; then
+    echo "Error: '$NEW_PROJECT' is not a project name (lower-case letters, digits and underscores)." >&2
+    exit 1
+fi
+if [[ ! -d "$ROOT/projects/$NEW_PROJECT" ]]; then
+    echo "Error: no project at $ROOT/projects/$NEW_PROJECT" >&2
+    exit 1
+fi
+
 ENV_FILE="$ROOT/.env"
 FRONTEND_ENV="$ROOT/frontend/.env"
-COMPOSE="docker compose -f $ROOT/docker-compose.yml"
 
 # Portable in-place sed: BSD/macOS sed requires `-i ''` while GNU sed rejects the
 # empty argument, so `sed -i ''` runs on dev macOS but breaks on the Ubuntu deploy
-# host (GNU). Edit through a temp file instead, which both userlands honour.
+# host (GNU). Edit through a temp file instead, which both userlands honour. The
+# result is written back into the file rather than moved over it: a move would
+# leave .env with mktemp's 0600 mode, which the containers' account may not be
+# able to read, and would replace a symlinked .env with a regular file.
 sed_inplace() {
-    local script="$1" file="$2" tmp
+    local script="$1" file="$2" tmp status=0
     tmp="$(mktemp)"
-    sed "$script" "$file" > "$tmp" && mv "$tmp" "$file"
+    if sed "$script" "$file" > "$tmp"; then
+        cat "$tmp" > "$file" || status=$?
+    else
+        status=$?
+    fi
+    rm -f "$tmp"
+    return "$status"
 }
 
 # Set KEY=VALUE in FILE: replace the line where the key is present, append it
@@ -74,20 +95,30 @@ fi
 echo "==> Switching project: ${CURRENT_PROJECT:-(none)} → $NEW_PROJECT"
 echo ""
 
+# Docker or Podman, settled by the helper every operator script shares. Array form
+# keeps a root path with a space in it one argument. Settled only here, past every
+# refusal and the no-op exit, so those run nothing; a host with no runtime is
+# refused before the first step, with nothing stopped and no env file edited.
+# shellcheck source=scripts/lib/compose.sh
+. "$SCRIPT_DIR/lib/compose.sh"
+compose_detect_runtime
+compose_require_runtime || exit 1
+COMPOSE+=(-f "$ROOT/docker-compose.yml")
+
 # 1. Ensure db and redis are running (idempotent)
 echo "--- Step 1/6: Ensuring database is running..."
-$COMPOSE up -d db redis
+"${COMPOSE[@]}" up -d db redis
 echo ""
 
 # 2. Stop application services only
 echo "--- Step 2/6: Stopping application services..."
-$COMPOSE stop web celery celery-beat || true
+"${COMPOSE[@]}" stop web celery celery-beat || true
 echo ""
 
 # 3. Deactivate current project against PostgreSQL
 if [[ -n "$CURRENT_PROJECT" ]]; then
     echo "--- Step 3/6: Deactivating project '$CURRENT_PROJECT'..."
-    $COMPOSE run --rm --no-deps web python manage.py deactivate_project
+    "${COMPOSE[@]}" run --rm --no-deps web python manage.py deactivate_project
 else
     echo "--- Step 3/6: No project active — nothing to deactivate."
 fi
@@ -107,7 +138,7 @@ echo ""
 
 # 5. Activate new project against PostgreSQL (reads updated .env)
 echo "--- Step 5/6: Activating project '$NEW_PROJECT'..."
-$COMPOSE run --rm --no-deps web python manage.py activate_project "$NEW_PROJECT"
+"${COMPOSE[@]}" run --rm --no-deps web python manage.py activate_project "$NEW_PROJECT"
 echo ""
 
 # 6. Rebuild frontend
@@ -117,7 +148,7 @@ echo ""
 
 # 7. Start all services (recreates containers so they pick up the new .env)
 echo "--- Starting all services..."
-$COMPOSE up -d --force-recreate
+"${COMPOSE[@]}" up -d --force-recreate
 echo ""
 
 echo "==> Done. Project is now '$NEW_PROJECT'."

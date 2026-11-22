@@ -439,7 +439,8 @@ class TestDatasetSurfaces:
         _release(dataset, *items, on=date(2026, 9, 3))
         client.force_login(author)
         rows = self._items(client, dataset).json()
-        assert [row["object_id"] for row in rows] == [str(clip.pk), str(unnamed.pk), str(recording.pk), str(nested.pk)]
+        assert [row["object_name"] for row in rows] == ["Alpha clip", "DDDDDDDD", "middle", None]
+        assert rows[3]["content_type_id"] == ContentType.objects.get_for_model(Dataset).pk
 
     def test_manager_sees_unreleased_members_with_a_null_release_month(self, client, make_user):
         author = make_user()

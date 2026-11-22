@@ -939,7 +939,9 @@ fi
 # podman-docker installs a `docker` that answers every command below by execing
 # podman, so the name in the version string is what tells the two apart — not
 # whether the command exists. Checking that first keeps a host with both from
-# being driven as Docker through a shim.
+# being driven as Docker through a shim. The same decision scripts/lib/compose.sh
+# makes for the checkout's scripts, restated because a package carries no such
+# file; the platform's scripts/tests/test_compose_lib.py holds the two together.
 
 if [ -z "$CONTAINER_RUNTIME" ]; then
     echo "No container runtime found. This package needs either Docker Engine or" >&2

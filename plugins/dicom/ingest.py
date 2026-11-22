@@ -6,8 +6,10 @@ parsing, the de-identification step, tag extraction, and persistence so the two
 callers cannot drift apart.
 
 Preparing a file (:func:`prepare_file`) parses its header and, while
-``DICOM_DEIDENTIFY_ON_INGEST`` is on, rewrites it through
-``plugins/dicom/deidentify.py`` into a new file beside it. The rows are
+``DICOM_DEIDENTIFY_ON_INGEST`` is on, holds every file outside
+:data:`ACQUISITION_ALLOWLIST` until the uploader confirms what it shows, and
+rewrites the file through ``plugins/dicom/deidentify.py`` into a new file
+beside it, with UIDs replaced under the uploading author's own key. The rows are
 extracted from the rewritten file, so every field and every byte the platform
 serves is the de-identified one; the as-uploaded file is kept only until the
 caller has copied it to the originals volume, when the preservation mode asks
@@ -97,16 +99,26 @@ def parse_dicom_header(path: str):
 
 
 class MissingUidsError(ValueError):
-    """Raised when a parsed file lacks any of the three required UIDs."""
+    """Raised when a parsed file lacks any of the three required UIDs, or carries one longer than a UID may be."""
+
+
+#: The longest value the UI value representation allows, and the width of the UID columns.
+MAX_UID_LENGTH = 64
 
 
 def required_uids(ds) -> tuple[str, str, str]:
-    """Return (study_uid, series_uid, sop_uid) or raise :class:`MissingUidsError`."""
+    """Return (study_uid, series_uid, sop_uid) or raise :class:`MissingUidsError`.
+
+    A UID over 64 characters is refused with the file rather than truncated, since a shortened UID names another
+    object and the full one does not fit its column.
+    """
     study_uid = _clean_uid(getattr(ds, "StudyInstanceUID", ""))
     series_uid = _clean_uid(getattr(ds, "SeriesInstanceUID", ""))
     sop_uid = _clean_uid(getattr(ds, "SOPInstanceUID", ""))
     if not study_uid or not series_uid or not sop_uid:
         raise MissingUidsError("Missing required UIDs (Study/Series/SOPInstance).")
+    if max(len(study_uid), len(series_uid), len(sop_uid)) > MAX_UID_LENGTH:
+        raise MissingUidsError("A required UID (Study/Series/SOPInstance) is longer than 64 characters.")
     return study_uid, series_uid, sop_uid
 
 
@@ -132,38 +144,68 @@ class DeidentificationFailed(ValueError):
 
 
 class PixelReviewRequired(ValueError):
-    """Raised for a file that may carry text in its pixels when the author has not confirmed it carries none."""
+    """Raised for a file outside the acquisition allowlist when the author has not confirmed what it shows."""
 
     code = "burned_in_confirmation_required"
 
     def __init__(self):
         super().__init__(
-            "This image may show identifying text in its pixels. Check it and confirm before uploading it."
+            "This file may show identifying text or features in what it displays. "
+            "Check it and confirm before uploading it."
         )
 
 
-#: Modalities whose images routinely carry text rendered into the pixels: ultrasound, secondary capture, other.
-BURNED_IN_MODALITIES = frozenset({"US", "SC", "OT"})
-
-#: SOP class UID prefixes of the same kinds of object, which a screen capture or a converted ultrasound can carry
-#: under another Modality: the Secondary Capture family (…1.1.7), the Ultrasound family (…1.1.6) and the retired
-#: Ultrasound Multi-frame class (…1.1.3.1).
-BURNED_IN_SOP_CLASS_PREFIXES = ("1.2.840.10008.5.1.4.1.1.7", "1.2.840.10008.5.1.4.1.1.6", "1.2.840.10008.5.1.4.1.1.3.1")
+#: The only objects stored without the uploader's confirmation: Modality → the storage SOP classes accepted under
+#: it. Both must agree, so a secondary capture, which keeps the Modality of what it captured, is never here, and
+#: neither is a class this table does not name. Each entry is a cross-sectional acquisition whose scanner
+#: reconstructs the pixels from measurements and draws no text into them:
+#:
+#: - ``CT``: CT Image Storage and Enhanced CT Image Storage.
+#: - ``MR``: MR Image Storage and Enhanced MR Image Storage.
+#: - ``PT``: Positron Emission Tomography Image Storage and Enhanced PET Image Storage.
+#:
+#: Left out on purpose. ``NM``: its storage class also holds planar whole-body images and the result screens of
+#: processing workstations. The Legacy Converted Enhanced classes and Enhanced MR Color: both are produced from
+#: other images, which may be derived ones. MR Spectroscopy and every non-image class (structured reports,
+#: encapsulated documents, presentation states, radiotherapy objects): what a reader is shown from them is not an
+#: acquisition's pixels. Photographs, endoscopy and microscopy (``XC``, ``ES``, ``GM``, ``SM``) show the patient or
+#: a labelled slide; projection radiography and fluoroscopy (``CR``, ``DX``, ``MG``, ``XA``, ``RF``) routinely carry
+#: markers and annotation rendered into the image; ultrasound draws its whole screen. Adding an entry stores that
+#: kind of object with nobody having looked at it, and stamps it Patient Identity Removed ``YES``.
+ACQUISITION_ALLOWLIST: dict[str, frozenset[str]] = {
+    "CT": frozenset({"1.2.840.10008.5.1.4.1.1.2", "1.2.840.10008.5.1.4.1.1.2.1"}),
+    "MR": frozenset({"1.2.840.10008.5.1.4.1.1.4", "1.2.840.10008.5.1.4.1.1.4.1"}),
+    "PT": frozenset({"1.2.840.10008.5.1.4.1.1.128", "1.2.840.10008.5.1.4.1.1.130"}),
+}
 
 
 def pixel_review_required(ds) -> bool:
-    """Return True when *ds* may carry identifying text in its pixels, which the header pass cannot remove.
+    """Return True unless *ds* is an object the platform stores without the uploader's confirmation.
 
-    Decided from the parsed header on the server: an ultrasound, secondary
-    capture or other image by Modality or by SOP class, or any image whose
-    Burned In Annotation is YES. The SOP class is checked as well because a
-    secondary capture keeps the Modality of what it captured.
+    Decided from the parsed header as uploaded, on the server, and by allowlist: the answer is False only when
+    every condition holds, so an object nothing here describes is held. The conditions:
+
+    - Modality and SOP class are a pair in :data:`ACQUISITION_ALLOWLIST`.
+    - Image Type is present and begins ``ORIGINAL``, ``PRIMARY``: an image the examination produced itself. A
+      dose report, a scanner's protocol page, a reformat and a screen save are stored under the acquisition
+      classes as ``DERIVED`` or ``SECONDARY``, and an object that does not say is not taken for an original.
+    - Burned In Annotation is not ``YES``; an absent value is not read as a claim either way.
+    - Recognizable Visual Features is not ``YES``.
+
+    None of this looks at a pixel. The header says what kind of object the file claims to be, and the claim is
+    the uploader's, as everything else about an attachment is.
     """
     modality = _clean_str(getattr(ds, "Modality", "")).upper()
-    burned_in = _clean_str(getattr(ds, "BurnedInAnnotation", "")).upper()
     sop_class = _clean_uid(getattr(ds, "SOPClassUID", ""))
-    by_class = any(sop_class == p or sop_class.startswith(f"{p}.") for p in BURNED_IN_SOP_CLASS_PREFIXES)
-    return modality in BURNED_IN_MODALITIES or burned_in == "YES" or by_class
+    if sop_class not in ACQUISITION_ALLOWLIST.get(modality, ()):
+        return True
+    image_type = getattr(ds, "ImageType", None)
+    if isinstance(image_type, (str, bytes)) or not isinstance(image_type, Sequence):
+        image_type = [image_type] if image_type else []
+    if [_clean_str(v).upper() for v in image_type[:2]] != ["ORIGINAL", "PRIMARY"]:
+        return True
+    flags = (getattr(ds, "BurnedInAnnotation", ""), getattr(ds, "RecognizableVisualFeatures", ""))
+    return any(_clean_str(flag).upper() == "YES" for flag in flags)
 
 
 def deidentification_enabled() -> bool:
@@ -202,18 +244,28 @@ def prepare_file(
     source_path: str,
     *,
     target_path: str,
+    author_id: int,
     source_hash: str | None = None,
     confirm_burned_in: bool = False,
 ) -> PreparedFile:
     """Parse *source_path* and, with de-identification on, rewrite it to *target_path*.
 
+    *author_id* is the primary key of the user the file will be stored for,
+    the same user ``persist_instance`` is given: the pass replaces UIDs under
+    that author's key, so a file prepared for one author and persisted for
+    another would not join the study it belongs to.
+
     Raises whatever pydicom raises for a file that is not DICOM,
     :class:`MissingUidsError` for one lacking the required UIDs,
-    :class:`PixelReviewRequired` for one :func:`pixel_review_required` flags
+    :class:`PixelReviewRequired` for one :func:`pixel_review_required` holds
     when *confirm_burned_in* is not set, and :class:`DeidentificationFailed`
     when the pass cannot rewrite it, after removing anything it wrote at
     *target_path*. With de-identification off, nothing is written, no
     confirmation is asked for, and the returned ``path`` is *source_path*.
+
+    The pixel decision is made from the header as uploaded, before the pass
+    runs, and is handed to the pass: only a file the allowlist passed is
+    stamped Patient Identity Removed ``YES``.
     """
     ds = parse_dicom_header(source_path)
     required_uids(ds)
@@ -235,7 +287,14 @@ def prepare_file(
     key = require_uid_key()
     retain = getattr(settings, "DICOM_RETAIN_PATIENT_CHARACTERISTICS", False)
     try:
-        deidentify_file(source_path, target_path, key=key, retain_patient_characteristics=retain)
+        deidentify_file(
+            source_path,
+            target_path,
+            key=key,
+            author_id=author_id,
+            identity_removed=not review_required,
+            retain_patient_characteristics=retain,
+        )
         cleaned = parse_dicom_header(target_path)
         required_uids(cleaned)
     except Exception as exc:
@@ -302,8 +361,40 @@ def preserve_original(
 # ---------------------------------------------------------------------------
 
 
+def _fit(model, fields: dict) -> dict:
+    """Return *fields* with each string cut to its column's ``max_length`` on *model*.
+
+    A header value longer than the standard allows for its VR (a 17-character
+    DS, an over-long description) would otherwise fail the insert and, with it,
+    the whole batch's transaction.
+    """
+    fitted = {}
+    for name, value in fields.items():
+        limit = getattr(model._meta.get_field(name), "max_length", None)
+        fitted[name] = value[:limit] if limit and isinstance(value, str) else value
+    return fitted
+
+
 def extract_study_fields(ds) -> dict:
-    """Extract study-level tags from a pydicom dataset."""
+    """Extract study-level tags from a pydicom dataset, each cut to its column's length."""
+    return _fit(DicomStudy, _study_fields(ds))
+
+
+def extract_series_fields(ds) -> dict:
+    """Extract series-level tags from a pydicom dataset, each cut to its column's length."""
+    return _fit(DicomSeries, _series_fields(ds))
+
+
+def extract_instance_fields(ds) -> dict:
+    """Extract instance-level tags (identity, geometry, windowing), each string cut to its column's length.
+
+    File identity (stored_name, file_size, file_hash) and lifecycle status are
+    not extracted here — the caller owns those.
+    """
+    return _fit(DicomInstance, _instance_fields(ds))
+
+
+def _study_fields(ds) -> dict:
     return {
         "study_date": _clean_str(getattr(ds, "StudyDate", "")),
         "study_time": _clean_str(getattr(ds, "StudyTime", "")),
@@ -317,8 +408,7 @@ def extract_study_fields(ds) -> dict:
     }
 
 
-def extract_series_fields(ds) -> dict:
-    """Extract series-level tags from a pydicom dataset."""
+def _series_fields(ds) -> dict:
     return {
         "series_description": _clean_str(getattr(ds, "SeriesDescription", "")),
         "series_number": _clean_str(getattr(ds, "SeriesNumber", "")),
@@ -328,12 +418,7 @@ def extract_series_fields(ds) -> dict:
     }
 
 
-def extract_instance_fields(ds) -> dict:
-    """Extract instance-level tags (identity, geometry, windowing).
-
-    File identity (stored_name, file_size, file_hash) and lifecycle status are
-    not extracted here — the caller owns those.
-    """
+def _instance_fields(ds) -> dict:
     pixel_spacing_raw = getattr(ds, "PixelSpacing", None)
     iop_raw = getattr(ds, "ImageOrientationPatient", None)
     ipp_raw = getattr(ds, "ImagePositionPatient", None)

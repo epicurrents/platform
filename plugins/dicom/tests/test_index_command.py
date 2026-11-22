@@ -17,7 +17,7 @@ class TestIndexDicomCommand:
 
         call_command("index_dicom", str(src), "--user", user.username)
 
-        study = DicomStudy.objects.get(study_instance_uid=stored_uid("1.2.3.1"))
+        study = DicomStudy.objects.get(study_instance_uid=stored_uid("1.2.3.1", user))
         assert study.author == user
         assert study.num_instances == 2
         for inst in DicomInstance.objects.all():
